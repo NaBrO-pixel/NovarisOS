@@ -46,10 +46,45 @@ int console_has_framebuffer(void);
 
 void terminal_initialize(void);
 void terminal_setcolor(uint8_t color);
+uint8_t terminal_getcolor(void);
 void terminal_putchar(char c);
 void terminal_write(const char* data, size_t size);
 void terminal_writestring(const char* data);
 void terminal_writestring_color(const char* data, uint8_t color);
 void terminal_backspace(void);
+
+/* --- redirecting the console into a window ----------------------------- */
+/*
+ * Once the desktop is up, "the console" is a Terminal window, not the
+ * whole screen. Rather than teach every terminal_writestring() call site
+ * in the kernel about windows, the console grows a sink: a callback that
+ * receives each character plus the color it was written in. With one
+ * installed, nothing is drawn directly to the framebuffer any more - but
+ * the COM1 mirror still happens first, so the serial transcript
+ * tools/qemu_test.py asserts against is byte-for-byte unchanged.
+ */
+
+typedef struct {
+    char c;
+    uint8_t color;  /* VGA attribute byte: fg in the low nibble */
+} console_cell_t;
+
+typedef void (*console_sink_t)(char c, uint8_t color);
+
+/* Passing 0 restores direct framebuffer/VGA drawing. */
+void console_set_sink(console_sink_t sink);
+
+/* Clears whatever the console currently is: the framebuffer chrome, the
+ * text screen, or the Terminal window's grid. */
+void console_clear(void);
+
+/* Everything written before a sink was installed, so the Terminal window
+ * can open showing the kernel's own boot log rather than a blank screen.
+ * Returns a console_cell_t array. */
+const console_cell_t* console_boot_log(uint32_t* out_len);
+
+/* The 16-color VGA palette entry as a real RGB value, so a window can
+ * render colored console text with the same palette. */
+uint32_t console_vga_rgb(uint8_t index);
 
 #endif

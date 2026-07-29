@@ -26,6 +26,10 @@ HEADERS = $(wildcard include/*.h)
 OBJS = $(BUILD_DIR)/boot.o $(BUILD_DIR)/kernel.o \
        $(BUILD_DIR)/vga_text.o $(BUILD_DIR)/console.o $(BUILD_DIR)/framebuffer.o \
        $(BUILD_DIR)/font8x16.o $(BUILD_DIR)/mouse.o \
+       $(BUILD_DIR)/uifont.o $(BUILD_DIR)/gfx.o $(BUILD_DIR)/uikit.o \
+       $(BUILD_DIR)/wm.o $(BUILD_DIR)/desktop.o $(BUILD_DIR)/cpu.o \
+       $(BUILD_DIR)/app_terminal.o $(BUILD_DIR)/app_files.o \
+       $(BUILD_DIR)/app_monitor.o $(BUILD_DIR)/app_about.o \
        $(BUILD_DIR)/gdt.o $(BUILD_DIR)/gdt_flush.o \
        $(BUILD_DIR)/idt.o $(BUILD_DIR)/idt_flush.o \
        $(BUILD_DIR)/isr.o $(BUILD_DIR)/pic.o \
@@ -140,6 +144,38 @@ $(BUILD_DIR)/kstring.o: kernel/kstring.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/rtc.o: kernel/rtc.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# --- The desktop: compositor, window manager, and the built-in apps ------
+# (see include/gfx.h and include/wm.h for how the layers fit together)
+$(BUILD_DIR)/uifont.o: kernel/uifont.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/gfx.o: kernel/gfx.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/uikit.o: kernel/uikit.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/wm.o: kernel/wm.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/desktop.o: kernel/desktop.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/cpu.o: kernel/cpu.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/app_terminal.o: kernel/app_terminal.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/app_files.o: kernel/app_files.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/app_monitor.o: kernel/app_monitor.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/app_about.o: kernel/app_about.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # --- The Win32 emulation layer (see include/win32.h) ---
@@ -373,7 +409,8 @@ test-qemu: $(ISO)
 # it can't drift out of step with the tree it's built from; build output
 # is excluded, since `make` reproduces all of it.
 ZIP_CONTENTS = boot include kernel tests tools userland Makefile linker.ld \
-               grub.cfg README.md ROADMAP.md .gitignore docs-proof-of-boot.png
+               grub.cfg README.md ROADMAP.md .gitignore \
+               docs-proof-of-boot.png docs-desktop.png
 
 zip:
 	rm -rf $(BUILD_DIR)/pkg novaris.zip

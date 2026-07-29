@@ -269,8 +269,12 @@ static void run_command(char* line) {
         terminal_writestring("            real preemptive scheduling (see ROADMAP.md\n");
         terminal_writestring("            Milestone 9) - watch their output interleave\n");
         terminal_writestring("  echo    - print text back\n");
+        terminal_writestring("\nThis shell runs inside the desktop's Terminal\n");
+        terminal_writestring("window. Cmd-Space searches, Cmd-N/Cmd-O open\n");
+        terminal_writestring("windows, Cmd-W closes one; the Dock and menu bar\n");
+        terminal_writestring("do the rest. (Alt stands in for Command.)\n");
     } else if (streq(line, "clear")) {
-        terminal_initialize();
+        console_clear();
     } else if (streq(line, "about")) {
         terminal_writestring_color("Novaris", VGA_COLOR_LIGHT_CYAN);
         terminal_writestring(" -- a hobby OS kernel. See ROADMAP.md for progress.\n");
@@ -388,30 +392,44 @@ static void run_command(char* line) {
     }
 }
 
-void shell_run(void) {
-    char buffer[CMD_BUFFER_SIZE];
-    uint32_t len = 0;
+/* The line being edited. It's file-scope rather than a local of a loop
+ * because the shell no longer owns a loop - see shell.h. */
+static char line_buffer[CMD_BUFFER_SIZE];
+static uint32_t line_len;
 
+void shell_init(void) {
+    line_len = 0;
     terminal_writestring("\nType 'help' for a list of commands.\n");
     print_prompt();
+}
 
-    for (;;) {
-        char c = keyboard_getchar();
-
-        if (c == '\n') {
-            terminal_putchar('\n');
-            buffer[len] = '\0';
-            run_command(buffer);
-            len = 0;
-            print_prompt();
-        } else if (c == '\b') {
-            if (len > 0) {
-                len--;
-                terminal_backspace();
-            }
-        } else if (len < CMD_BUFFER_SIZE - 1) {
-            buffer[len++] = c;
-            terminal_putchar(c);
+void shell_feed_char(char c) {
+    if (c == '\n') {
+        terminal_putchar('\n');
+        line_buffer[line_len] = '\0';
+        run_command(line_buffer);
+        line_len = 0;
+        print_prompt();
+    } else if (c == '\b') {
+        if (line_len > 0) {
+            line_len--;
+            terminal_backspace();
         }
+    } else if (line_len < CMD_BUFFER_SIZE - 1) {
+        line_buffer[line_len++] = c;
+        terminal_putchar(c);
     }
+}
+
+void shell_run_line(const char* line) {
+    /* Abandon whatever was half-typed, echo the command, then run it
+     * through the same path a typed line takes. */
+    line_len = 0;
+    while (*line) shell_feed_char(*line++);
+    shell_feed_char('\n');
+}
+
+void shell_run(void) {
+    shell_init();
+    for (;;) shell_feed_char(keyboard_getchar());
 }

@@ -25,6 +25,13 @@ void fb_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color
  * whatever was underneath it before drawing at a new position. */
 uint32_t fb_get_pixel(uint32_t x, uint32_t y);
 
+/* Pushes a rectangle of 32-bit pixels (0x00RRGGBB, `src_pitch` pixels per
+ * row) to the framebuffer at (x, y), converting to the hardware's pixel
+ * size. This is the one path the compositor uses to reach VRAM - see
+ * kernel/gfx.c, which assembles a whole frame off-screen first. */
+void fb_blit(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+             const uint32_t* src, uint32_t src_pitch);
+
 /* Shifts a rectangular region up by `dy` pixel rows (for text scrolling)
  * and fills the newly-exposed strip at the bottom with bg_color. */
 void fb_scroll_up(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t dy,
