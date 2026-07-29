@@ -11,7 +11,7 @@ void kheap_init(void);
  * heap's max size is exhausted. */
 void* kmalloc(size_t size);
 
-/* Bytes in use and bytes currently mapped, for Activity Monitor. */
+/* Bytes in use and bytes currently mapped, for Task Manager. */
 void kheap_stats(uint32_t* used, uint32_t* total);
 
 /* Frees a block previously returned by kmalloc() and coalesces it with

@@ -14,7 +14,7 @@ bootloader hands off to a kernel, and the kernel grows from there. Over time
 you can shape it to *feel* like whichever OS inspires you (windowing system,
 shell conventions, UI style) without copying anyone's code.
 
-## Current status: Milestone 11 complete ✅
+## Current status: Milestone 12 complete ✅
 
 - [x] Multiboot bootloader handoff (via GRUB), 32-bit protected mode
 - [x] Freestanding C kernel — no libc, we own the whole stack
@@ -29,14 +29,23 @@ shell conventions, UI style) without copying anyone's code.
 - [x] **Runs real, unmodified Windows `.exe` files** against an emulated
       Win32 API — see below
 - [x] **A real windowing desktop**: a compositing window manager with
-      draggable, resizable, overlapping windows, a menu bar, a Dock and
-      built-in apps — see below
+      draggable, resizable, overlapping windows, a taskbar, a Start menu
+      and built-in apps — see below
+- [x] **Windows-style windowing**: caption buttons, eight-way resizing,
+      Aero-style edge snapping, Alt+Tab, and a taskbar with live window
+      previews — see below
 
 See `ROADMAP.md` for the full history and what's next, in order.
 
 ## The desktop
 
 ![The Novaris desktop](docs-desktop.png)
+
+*Rendered by `make test`, which drives the real compositor, window manager
+and shell on the host — so the chrome, taskbar and icons above are exactly
+what boots. The two windows' contents are the test's stand-in apps rather
+than the real Terminal and File Explorer, since those need the rest of the
+kernel underneath them.*
 
 Novaris boots into a compositing desktop rather than a bare console. The
 shell is still there — it's an app now, running in a Terminal window, the
@@ -48,36 +57,55 @@ What that involves:
   off-screen 32-bit surface and pushed to the framebuffer in one pass, so
   nothing tears or flickers. A single signed-distance function draws every
   rounded corner, antialiased edge and soft shadow in the UI; a two-pass
-  box blur gives the menu bar and the Dock their frosted backdrops. No
+  box blur gives the taskbar and the flyouts their frosted backdrops. No
   floating point anywhere — this kernel doesn't save FPU state across
   interrupts, so it's fixed point throughout.
 - **A window manager** (`kernel/wm.c`). Each window owns a backing
   surface, so moving one is a blit rather than a request that its app
-  redraw everything. Z-order, click-to-focus, drag by the title bar,
-  resize from the edges, and working close / minimize / zoom buttons.
+  redraw everything. Z-order, click-to-focus, drag by the title bar, and
+  the Windows chrome: the window's icon and title read from the left, the
+  minimize / maximize / close buttons sit flush in the top-right corner
+  with the close button turning red under the pointer, and all eight
+  edges and corners resize with the pointer changing shape to match.
   Damage tracking is what keeps it usable at 1280x800 in software: a
   blinking terminal cursor repaints ~200 pixels, not a megapixel.
-- **A desktop shell** (`kernel/desktop.c`): a translucent menu bar with
-  working menus and a live clock read from the CMOS RTC, a Dock with
-  pointer magnification, running indicators and live thumbnails of
-  minimized windows, and a Spotlight-style search over apps and files.
-- **Apps** (`kernel/app_*.c`): Terminal (the kernel shell), Files (browses
-  the initrd, opens text files, runs programs), Activity Monitor (live
-  memory, uptime, and every open window's surface cost), About This
+- **Snapping.** Drag a window against the top of the screen to maximize
+  it, or against a side to fill half the screen — with a translucent
+  preview of where it will land shown before you let go. `Win`+arrows do
+  the same from the keyboard. Dragging a snapped window away hands back
+  its floating size, positioned so the pointer keeps its grip on the
+  title bar.
+- **A desktop shell** (`kernel/desktop.c`): a taskbar with the Start
+  button, a search field, one button per window with a running indicator
+  and a live thumbnail preview on hover, a system tray, and a clock read
+  from the CMOS RTC; a Start menu that both launches apps and searches
+  them and the initrd; icons on the desktop; right-click context menus on
+  the desktop, the taskbar and any title bar; and an Alt+Tab switcher
+  showing live thumbnails of every open window.
+- **Apps** (`kernel/app_*.c`): Terminal (the kernel shell), File Explorer
+  (browses the initrd, opens text files, runs programs), Task Manager
+  (live memory, uptime, and every open window's surface cost), About
   Novaris (which reads the processor's own brand string out of CPUID), a
   text viewer, and alert panels.
 
 | Shortcut | What it does |
 | --- | --- |
-| `Cmd-Space` | Spotlight search over apps and files; Enter opens |
-| `Cmd-N` / `Cmd-O` | Terminal window / Files window |
-| `Cmd-W` / `Cmd-M` | Close / minimize the front window |
-| `Cmd-Q` | Close every window of the frontmost app |
-| ``Cmd-` `` | Cycle windows front to back |
+| `Win` | Open or close the Start menu |
+| `Win-S` / `Win-R` | Start menu with the search field ready |
+| `Alt-Tab` / `Shift-Alt-Tab` | Cycle windows, live thumbnails, commits on release |
+| `Alt-F4` | Close the focused window |
+| `Alt-Space` | The focused window's system menu |
+| `Win-Left` / `Win-Right` | Snap the window to half the screen |
+| `Win-Up` / `Win-Down` | Maximize / restore, then minimize |
+| `Win-D` | Show the desktop, and put it all back |
+| `Win-E` | File Explorer |
+| `Ctrl-Shift-Esc` | Task Manager |
 | Page Up/Down, End | Scroll the Terminal's scrollback |
 
-Alt stands in for Command, because on a PC keyboard it sits roughly where
-a Mac keyboard's Command key does.
+The `Win` key is the physical Windows key; `Alt` is Alt. (Milestone 11
+treated the two interchangeably, because a macOS-style shell wants one
+Command key. A Windows-style one needs them apart: `Alt-Tab` and `Win-Tab`
+are different gestures.)
 
 Everything the shell could do before, it still does: typing `run
 hellowin.exe` into the Terminal window loads and runs a real Windows
@@ -147,12 +175,13 @@ novaris/
 │   ├── gfx.c                  # Compositor: surfaces, shapes, shadows, text
 │   ├── uifont.c               # Generated antialiased UI typeface
 │   ├── wm.c                   # Window manager: z-order, input, chrome
-│   ├── desktop.c              # Menu bar, Dock, Spotlight, the frame loop
+│   ├── desktop.c              # Taskbar, Start menu, Alt+Tab, the frame loop
+│   ├── icons.c                # Every pictogram, drawn from primitives
 │   ├── uikit.c                # Shared widgets for the built-in apps
 │   ├── app_terminal.c         # Terminal: the shell, in a window
-│   ├── app_files.c            # Files + the text viewer
-│   ├── app_monitor.c          # Activity Monitor
-│   ├── app_about.c            # About This Novaris + alert panels
+│   ├── app_files.c            # File Explorer + the text viewer
+│   ├── app_monitor.c          # Task Manager
+│   ├── app_about.c            # About Novaris + alert panels
 │   ├── cpu.c                  # CPUID: vendor, brand string, features
 │   ├── gdt.c / gdt_flush.s    # Global Descriptor Table + TSS + TEB
 │   ├── idt.c / idt_flush.s    # Interrupt Descriptor Table + dispatch

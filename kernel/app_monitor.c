@@ -1,4 +1,4 @@
-/* app_monitor.c - Activity Monitor: what the machine is actually doing.
+/* app_monitor.c - Task Manager: what the machine is actually doing.
  *
  * Every number in here is read live from the subsystem that owns it - the
  * physical frame allocator, the heap's own block list, the PIT's tick
@@ -172,7 +172,7 @@ static void monitor_tick(window_t* win) {
 }
 
 const app_t app_monitor = {
-    "Activity Monitor", monitor_paint, 0, 0, monitor_tick, 0,
+    "Task Manager", monitor_paint, 0, 0, monitor_tick, 0,
 };
 
 window_t* monitor_open(void) {
@@ -181,7 +181,7 @@ window_t* monitor_open(void) {
         wm_focus(existing);
         return existing;
     }
-    window_t* win = wm_open(&app_monitor, "Activity Monitor", 620, 500, 0);
+    window_t* win = wm_open(&app_monitor, "Task Manager", 620, 500, 0);
     if (win) {
         win->bg = GFX_RGB(0xF2, 0xF2, 0xF5);
         win->min_w = 480;

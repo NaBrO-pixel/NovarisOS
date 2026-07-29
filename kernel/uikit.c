@@ -9,29 +9,35 @@ void ui_button(int x, int y, int w, int h, const char* label, int state) {
         case UI_BTN_DEFAULT:
             fill = UI_ACCENT;
             text = GFX_RGB(0xFF, 0xFF, 0xFF);
-            border = GFX_ARGB(0x30, 0, 0, 0);
+            border = GFX_ARGB(0x33, 0, 0, 0);
             break;
         case UI_BTN_PRESSED:
-            fill = GFX_RGB(0xDE, 0xDE, 0xE3);
-            text = UI_TEXT;
-            border = GFX_ARGB(0x30, 0, 0, 0);
+            fill = GFX_RGB(0xF0, 0xF0, 0xF0);
+            text = UI_TEXT_DIM;
+            border = GFX_RGB(0xD8, 0xD8, 0xDB);
             break;
         case UI_BTN_HOVER:
-            fill = GFX_RGB(0xFA, 0xFA, 0xFC);
+            fill = GFX_RGB(0xF7, 0xF7, 0xF7);
             text = UI_TEXT;
-            border = GFX_ARGB(0x35, 0, 0, 0);
+            border = GFX_RGB(0xD0, 0xD0, 0xD4);
             break;
         default:
-            fill = GFX_RGB(0xFF, 0xFF, 0xFF);
+            fill = GFX_RGB(0xFD, 0xFD, 0xFD);
             text = UI_TEXT;
-            border = GFX_ARGB(0x28, 0, 0, 0);
+            border = GFX_RGB(0xDA, 0xDA, 0xDE);
             break;
     }
-    /* A one-pixel shadow under the button, the way a macOS push button
-     * sits slightly proud of its background. */
-    gfx_round_rect(x, y + 1, w, h, h / 2 > 8 ? 7 : h / 2, GFX_ARGB(0x14, 0, 0, 0));
-    gfx_round_rect(x, y, w, h, h / 2 > 8 ? 7 : h / 2, fill);
-    gfx_round_frame(x, y, w, h, h / 2 > 8 ? 7 : h / 2, 1, border);
+    /* Flat, lightly rounded, hairline border - and one darker line along
+     * the bottom edge. That last line is the whole trick: it is all that
+     * remains of the bevel a Windows button used to have, and without it
+     * a flat rectangle reads as a text field rather than a button. */
+    gfx_round_rect(x, y, w, h, UI_RADIUS, fill);
+    gfx_round_frame(x, y, w, h, UI_RADIUS, 1, border);
+    if (state != UI_BTN_PRESSED) {
+        gfx_fill(x + UI_RADIUS, y + h - 1, w - UI_RADIUS * 2, 1,
+                 state == UI_BTN_DEFAULT ? GFX_ARGB(0x44, 0, 0, 0)
+                                         : GFX_RGB(0xC2, 0xC2, 0xC6));
+    }
     gfx_text_center(&uifont_regular, x, y + (h - uifont_regular.line_height) / 2,
                     w, label, text);
 }
