@@ -17,6 +17,7 @@
 #include "mouse.h"
 #include "serial.h"
 #include "win32.h"
+#include "desktop.h"
 
 /* Defined by linker.ld: mark the physical extent of the kernel's own
  * loaded image so the PMM knows never to hand those frames out. These
@@ -273,9 +274,19 @@ void kernel_main(uint32_t magic, multiboot_info_t* mbi) {
     terminal_writestring("    font console and a movable PS/2 mouse cursor\n");
     terminal_writestring("  - Loads and runs real Windows PE32 .exe files against an\n");
     terminal_writestring("    emulated Win32 API ('run prog.exe', 'peinfo', 'winapi')\n");
+    terminal_writestring("  - Composites a real desktop: draggable, resizable windows\n");
+    terminal_writestring("    with a menu bar, a Dock and this shell in a Terminal window\n");
 
     terminal_writestring_color("\nSee ROADMAP.md for what's next.\n", VGA_COLOR_LIGHT_BROWN);
 
-    /* Hand off to the shell - it loops forever reading keyboard input. */
+    /* Hand off to the desktop, which owns the event loop from here on and
+     * runs the shell as an app inside a Terminal window (kernel/desktop.c).
+     * It only returns if it couldn't get the memory it needs; without a
+     * framebuffer there's nothing to composite onto in the first place, so
+     * either way the fallback is the original text shell. */
+    if (console_has_framebuffer()) {
+        terminal_writestring("\nStarting the desktop...\n");
+        desktop_start();
+    }
     shell_run();
 }

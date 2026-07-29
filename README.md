@@ -14,7 +14,7 @@ bootloader hands off to a kernel, and the kernel grows from there. Over time
 you can shape it to *feel* like whichever OS inspires you (windowing system,
 shell conventions, UI style) without copying anyone's code.
 
-## Current status: Milestone 10 complete ✅
+## Current status: Milestone 11 complete ✅
 
 - [x] Multiboot bootloader handoff (via GRUB), 32-bit protected mode
 - [x] Freestanding C kernel — no libc, we own the whole stack
@@ -24,13 +24,71 @@ shell conventions, UI style) without copying anyone's code.
       and a `kmalloc`/`kfree` heap
 - [x] Ring 3 user mode via a TSS and an `int 0x80` syscall interface
 - [x] Initrd (a GRUB module) behind a VFS layer, plus a tiny libc
-- [x] Linear framebuffer desktop with a bitmap font console
 - [x] Round-robin preemptive multitasking with real context switching
 - [x] ELF32 loader
 - [x] **Runs real, unmodified Windows `.exe` files** against an emulated
       Win32 API — see below
+- [x] **A real windowing desktop**: a compositing window manager with
+      draggable, resizable, overlapping windows, a menu bar, a Dock and
+      built-in apps — see below
 
 See `ROADMAP.md` for the full history and what's next, in order.
+
+## The desktop
+
+![The Novaris desktop](docs-desktop.png)
+
+Novaris boots into a compositing desktop rather than a bare console. The
+shell is still there — it's an app now, running in a Terminal window, the
+way a shell is on any windowing OS.
+
+What that involves:
+
+- **A compositor** (`kernel/gfx.c`). Every frame is assembled in an
+  off-screen 32-bit surface and pushed to the framebuffer in one pass, so
+  nothing tears or flickers. A single signed-distance function draws every
+  rounded corner, antialiased edge and soft shadow in the UI; a two-pass
+  box blur gives the menu bar and the Dock their frosted backdrops. No
+  floating point anywhere — this kernel doesn't save FPU state across
+  interrupts, so it's fixed point throughout.
+- **A window manager** (`kernel/wm.c`). Each window owns a backing
+  surface, so moving one is a blit rather than a request that its app
+  redraw everything. Z-order, click-to-focus, drag by the title bar,
+  resize from the edges, and working close / minimize / zoom buttons.
+  Damage tracking is what keeps it usable at 1280x800 in software: a
+  blinking terminal cursor repaints ~200 pixels, not a megapixel.
+- **A desktop shell** (`kernel/desktop.c`): a translucent menu bar with
+  working menus and a live clock read from the CMOS RTC, a Dock with
+  pointer magnification, running indicators and live thumbnails of
+  minimized windows, and a Spotlight-style search over apps and files.
+- **Apps** (`kernel/app_*.c`): Terminal (the kernel shell), Files (browses
+  the initrd, opens text files, runs programs), Activity Monitor (live
+  memory, uptime, and every open window's surface cost), About This
+  Novaris (which reads the processor's own brand string out of CPUID), a
+  text viewer, and alert panels.
+
+| Shortcut | What it does |
+| --- | --- |
+| `Cmd-Space` | Spotlight search over apps and files; Enter opens |
+| `Cmd-N` / `Cmd-O` | Terminal window / Files window |
+| `Cmd-W` / `Cmd-M` | Close / minimize the front window |
+| `Cmd-Q` | Close every window of the frontmost app |
+| ``Cmd-` `` | Cycle windows front to back |
+| Page Up/Down, End | Scroll the Terminal's scrollback |
+
+Alt stands in for Command, because on a PC keyboard it sits roughly where
+a Mac keyboard's Command key does.
+
+Everything the shell could do before, it still does: typing `run
+hellowin.exe` into the Terminal window loads and runs a real Windows
+binary, with its output streaming into the window as it is produced. The
+kernel also still mirrors every character to COM1, which is how the test
+harness drives it.
+
+The two things this deliberately isn't: it is not a GUI *toolkit* — apps
+are kernel code with a paint callback, not separate processes talking to a
+display server — and it is not reachable from `CreateWindowEx`, which
+would need the ability to call back into ring 3 (see `ROADMAP.md`).
 
 ## Running Windows programs
 
@@ -67,8 +125,10 @@ Three shell commands drive it:
 | `winapi [module]` | Lists the emulated DLLs, or one module's exports |
 
 **What this is not**: a Windows clone, a Wine port, or a general-purpose
-compatibility layer. There is no window manager, no registry, no
-networking, no threads. `ROADMAP.md` Milestone 10 is precise about where
+compatibility layer. There is a window manager now, but no path from
+`CreateWindowEx` into it — that needs the ability to call a ring-3 window
+procedure, which doesn't exist yet. There is no registry, no networking
+and no threads. `ROADMAP.md` Milestone 10 is precise about where
 the boundary is and why. A GUI program gets an honest failure from
 `CreateWindowEx` rather than a blank screen; a 64-bit binary is told it's
 64-bit; a program that calls an API Novaris doesn't have prints exactly
@@ -81,9 +141,19 @@ novaris/
 ├── boot/boot.s               # Assembly entry point + Multiboot header
 ├── kernel/
 │   ├── kernel.c               # kernel_main() - C entry point
-│   ├── console.c              # Framebuffer console + desktop chrome
+│   ├── console.c              # Console: framebuffer, VGA, or a window sink
 │   ├── vga_text.c             # VGA text-mode fallback driver
 │   ├── framebuffer.c, font8x16.c, mouse.c
+│   ├── gfx.c                  # Compositor: surfaces, shapes, shadows, text
+│   ├── uifont.c               # Generated antialiased UI typeface
+│   ├── wm.c                   # Window manager: z-order, input, chrome
+│   ├── desktop.c              # Menu bar, Dock, Spotlight, the frame loop
+│   ├── uikit.c                # Shared widgets for the built-in apps
+│   ├── app_terminal.c         # Terminal: the shell, in a window
+│   ├── app_files.c            # Files + the text viewer
+│   ├── app_monitor.c          # Activity Monitor
+│   ├── app_about.c            # About This Novaris + alert panels
+│   ├── cpu.c                  # CPUID: vendor, brand string, features
 │   ├── gdt.c / gdt_flush.s    # Global Descriptor Table + TSS + TEB
 │   ├── idt.c / idt_flush.s    # Interrupt Descriptor Table + dispatch
 │   ├── isr.s                  # Exception/IRQ entry stubs (asm)
@@ -107,8 +177,11 @@ novaris/
 │   ├── libc/                  # Tiny libc for native Novaris programs
 │   ├── pe_test/               # Windows test programs (built with mingw)
 │   └── mkinitrd.py            # Packs the initrd image
+├── tools/
+│   ├── gen_font.py            # Generates the 8x16 terminal font
+│   ├── gen_uifont.py          # Generates the antialiased UI faces
+│   └── qemu_test.py           # Boots the ISO and drives the shell
 ├── tests/                     # Host-side tests of kernel code
-├── tools/qemu_test.py         # Boots the ISO and drives the shell
 ├── linker.ld                  # Places the kernel at the 1MB mark
 ├── grub.cfg                   # GRUB menu config baked into the ISO
 ├── Makefile
@@ -139,6 +212,11 @@ make          # builds build/novaris.bin and novaris.iso
 make run                 # opens a QEMU window (needs a display)
 qemu-system-i386 -cdrom novaris.iso   # same thing, manually
 ```
+
+The desktop needs a framebuffer and a pointer, so this is the way to
+actually use it. Without a usable framebuffer — real hardware with no VBE
+support, say — the kernel says so and falls back to the original
+text-mode shell, which is still a complete way to drive the machine.
 
 Headless, the kernel mirrors its console to COM1, so a plain serial log
 is the easiest way to see what it did:

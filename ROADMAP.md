@@ -169,11 +169,11 @@ The CPU needs proper descriptor tables before we can safely do much more.
       at the computed screen-center default cursor position and lands
       where the injected relative deltas predict - real hardware-level
       confirmation, not just "it compiled."
-- [ ] Real windowing/compositing (multiple draggable/resizable windows)
-      is *not* implemented - the "terminal window" is static chrome, not
-      a window manager. That's a large enough feature (input routing,
-      z-ordering, redraw damage tracking) to deserve its own milestone
-      rather than being half-built here.
+- [x] Real windowing/compositing (multiple draggable/resizable windows)
+      was deliberately *not* attempted here - the "terminal window" was
+      static chrome, not a window manager. Input routing, z-ordering and
+      redraw damage tracking are a large enough feature to deserve their
+      own milestone, and got one: see Milestone 11.
 
 ## Milestone 8 — Windows binary compatibility (Wine) (far future, well past Milestone 6/7)
 
@@ -661,6 +661,89 @@ program, compiled by a real Windows toolchain, runs correctly and
 unmodified" is - and anything outside that says exactly what it needed
 and why it couldn't have it.
 
+## Milestone 11 — A windowing desktop ✅ DONE
+
+The whole point of Milestone 7's framebuffer was to earn this. Novaris now
+boots into a compositing desktop; the shell is an app inside it.
+
+- [x] **A compositor** (`kernel/gfx.c`, `include/gfx.h`). Drawing happens
+      into off-screen 32-bit surfaces and reaches VRAM through exactly one
+      call, `fb_blit`, once per frame. That single indirection is what
+      makes translucency, soft shadows and antialiased edges possible at
+      all: each needs to read the pixel underneath, and reading back from
+      VRAM over the PCI bus is far too slow to do per pixel.
+  - A signed-distance function for a rounded rectangle turned out to be
+    the whole geometry engine: "how far is this pixel from the shape's
+    edge" answers both "how much of this pixel is covered" (antialiasing)
+    and "how dark is the shadow here" from the same three lines of
+    fixed-point math. All of it is fixed point - the kernel doesn't save
+    FPU state across interrupts, so floating point is off the table.
+  - A two-pass sliding-window box blur backs the frosted menu bar and
+    Dock. Panels that blur their backdrop have to be recomposited whole
+    whenever any part of them is damaged, or the blur samples stale
+    pixels - `expand_for_panels()` in `desktop.c` is that rule.
+- [x] **An antialiased proportional UI font** (`tools/gen_uifont.py` ->
+      `kernel/uifont.c`): four faces of 8-bit coverage maps with real
+      bearings and advances, rendered from DejaVu Sans. The 1-bit 8x16
+      font from Milestone 7 stays exactly where it was - it's the terminal
+      font, and a fixed cell is what a character grid wants. Proportional
+      UI text at this resolution needs coverage values, not thresholded
+      bits.
+- [x] **A window manager** (`kernel/wm.c`, `include/wm.h`): windows with
+      their own backing surfaces, z-order, click-to-focus, title-bar
+      dragging, edge resizing, close/minimize/zoom, and damage tracking.
+      The backing surfaces are the load-bearing decision - moving a window
+      full of text is a blit, not a re-render, which is the difference
+      between a desktop that drags smoothly and one that doesn't.
+- [x] **Input, rewritten as events.** The keyboard driver grew a second
+      queue carrying modifiers, press/release and the keys with no ASCII
+      (arrows, Escape, function keys); the mouse driver grew buttons, a
+      negotiated scroll wheel, and stopped drawing the cursor itself. That
+      last part matters: the old save-and-restore-the-pixels-underneath
+      cursor is incoherent once a window can move out from under the
+      pointer, so the cursor became the compositor's topmost layer.
+- [x] **A desktop shell** (`kernel/desktop.c`): wallpaper, a translucent
+      menu bar with working menus and a clock off the CMOS RTC, a Dock
+      with pointer magnification, running indicators and live thumbnails
+      of minimized windows, and a Spotlight-style launcher over apps and
+      initrd files.
+- [x] **The shell became an app.** `console.c` grew a sink: a callback
+      that receives each character and the color it was written in, so
+      every existing `terminal_writestring()` call site in the kernel
+      lands in a Terminal window without knowing windows exist. The COM1
+      mirror still happens first, so the serial transcript that
+      `tools/qemu_test.py` asserts against is byte-for-byte unchanged, and
+      `shell_run()`'s loop was turned inside out into
+      `shell_init()`/`shell_feed_char()` so the desktop can own the event
+      loop.
+- [x] **Built-in apps**: Terminal, Files (browses the initrd, opens text
+      files, runs programs), Activity Monitor (live memory, uptime, and
+      what every open window costs in surface memory), About This Novaris
+      (processor brand string straight out of CPUID), a text viewer, and
+      alert panels.
+- [x] Verified in QEMU by driving the real thing: scripted pointer moves
+      and clicks through the QEMU monitor to open Dock apps, drag a window
+      by its title bar, resize it from the corner, minimize it and restore
+      it from its Dock thumbnail, open menus, and run a Windows `.exe`
+      with its output streaming into the window - screenshotting each
+      step. `make test` and `make test-qemu` both still pass unchanged,
+      which is the real proof the console redirection is transparent.
+
+Known limits, stated plainly:
+
+- [ ] Apps are kernel code with a paint callback, not processes. There is
+      no display-server protocol and no way for a ring-3 program to open a
+      window; that needs kernel-to-ring-3 callbacks (see Milestone 10's
+      follow-ups).
+- [ ] Redraws are whole-window: an app repaints its entire surface when
+      any part of it changes. Cheap at these sizes, and the damage
+      tracking means only the changed screen region is recomposited, but
+      it isn't per-widget invalidation.
+- [ ] One Terminal window, because there is one shell with one line being
+      edited. Two windows would be two views of one conversation.
+- [ ] No drag-and-drop, no clipboard, no window animations beyond the Dock
+      bounce, and minimizing doesn't animate.
+
 ## Later / open-ended
 
 - Networking (a NIC driver + a minimal TCP/IP stack) — big undertaking.
@@ -682,8 +765,11 @@ much each would widen what runs:
 - **Loading real DLL files**, so a program can ship its own libraries.
   The PE loader already does everything needed except handling exports
   and forwarders; most of the work is the module-list bookkeeping.
-- **A window manager** (Milestone 7's unchecked item), which is what
-  `CreateWindowEx` would need in order to stop being an honest failure.
+- ~~**A window manager**~~ - done in Milestone 11. `CreateWindowEx` still
+  fails, though, and now for a different reason: the window manager exists
+  but a Windows program can't be given a window, because delivering
+  `WM_PAINT` means calling a ring-3 window procedure from the kernel. That
+  is the first item on this list, and it is what unblocks this one.
 - **Threads**, which need shared-address-space scheduling — see
   Milestone 8's note on why the Milestone 9 scheduler isn't sufficient
   on its own.

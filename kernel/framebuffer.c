@@ -57,6 +57,33 @@ void fb_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color
     }
 }
 
+void fb_blit(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+             const uint32_t* src, uint32_t src_pitch) {
+    if (!fb_base || x >= fb_w || y >= fb_h) return;
+    if (x + w > fb_w) w = fb_w - x;
+    if (y + h > fb_h) h = fb_h - y;
+
+    for (uint32_t row = 0; row < h; row++) {
+        const uint32_t* s = src + (uint32_t)row * src_pitch;
+        uint8_t* d = fb_base + (y + row) * fb_pitch + x * fb_bytes_per_pixel;
+        if (fb_bytes_per_pixel == 4) {
+            /* The common case: our surfaces are already 0x00RRGGBB, which
+             * is exactly what a 32bpp linear framebuffer wants, so this is
+             * a straight 32-bit copy per row. */
+            uint32_t* d32 = (uint32_t*)d;
+            for (uint32_t i = 0; i < w; i++) d32[i] = s[i] & 0x00FFFFFFu;
+        } else {
+            for (uint32_t i = 0; i < w; i++) {
+                uint32_t c = s[i];
+                d[0] = (uint8_t)(c & 0xFF);
+                d[1] = (uint8_t)((c >> 8) & 0xFF);
+                d[2] = (uint8_t)((c >> 16) & 0xFF);
+                d += 3;
+            }
+        }
+    }
+}
+
 void fb_scroll_up(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t dy,
                    uint32_t bg_color) {
     if (dy >= h) {

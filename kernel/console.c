@@ -38,6 +38,14 @@ static uint32_t cols, rows; /* text area size, in characters */
 static uint32_t terminal_row, terminal_column;
 static uint8_t terminal_color;
 
+/* Where output goes once the desktop owns the screen (see console.h), and
+ * a recording of everything written before that happened. 8K cells is
+ * comfortably more than the boot log's ~3K characters. */
+static console_sink_t sink;
+#define BOOT_LOG_MAX 8192
+static console_cell_t boot_log[BOOT_LOG_MAX];
+static uint32_t boot_log_len;
+
 static uint32_t palette_lookup(uint8_t index) {
     return fb_rgb(palette_rgb[index & 0xF][0], palette_rgb[index & 0xF][1],
                   palette_rgb[index & 0xF][2]);
@@ -143,11 +151,31 @@ void terminal_initialize(void) {
 }
 
 void terminal_setcolor(uint8_t color) {
-    if (has_framebuffer) {
-        terminal_color = color;
-    } else {
-        vga_text_setcolor(color);
+    terminal_color = color;
+    if (!has_framebuffer) vga_text_setcolor(color);
+}
+
+uint8_t terminal_getcolor(void) { return terminal_color; }
+
+void console_set_sink(console_sink_t new_sink) { sink = new_sink; }
+
+void console_clear(void) {
+    if (sink) {
+        /* A form feed is the terminal convention for "clear the screen",
+         * and nothing else in the kernel's output ever emits one. */
+        sink('\f', terminal_color);
+        return;
     }
+    terminal_initialize();
+}
+
+const console_cell_t* console_boot_log(uint32_t* out_len) {
+    if (out_len) *out_len = boot_log_len;
+    return boot_log;
+}
+
+uint32_t console_vga_rgb(uint8_t index) {
+    return palette_lookup(index);
 }
 
 static void fb_scroll_one_line(void) {
@@ -161,6 +189,16 @@ void terminal_putchar(char c) {
      * backend is live. This is the transcript tools/qemu_test.py asserts
      * against - see serial.h. */
     serial_putchar(c);
+
+    if (sink) {
+        sink(c, terminal_color);
+        return;
+    }
+    if (boot_log_len < BOOT_LOG_MAX) {
+        boot_log[boot_log_len].c = c;
+        boot_log[boot_log_len].color = terminal_color;
+        boot_log_len++;
+    }
 
     if (!has_framebuffer) {
         vga_text_putchar(c);
@@ -186,6 +224,11 @@ void terminal_putchar(char c) {
 
 void terminal_backspace(void) {
     serial_putchar('\b');
+
+    if (sink) {
+        sink('\b', terminal_color);
+        return;
+    }
 
     if (!has_framebuffer) {
         vga_text_backspace();

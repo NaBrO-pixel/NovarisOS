@@ -17,6 +17,18 @@ static inline uint8_t inb(uint16_t port) {
     return ret;
 }
 
+/* 16-bit port access. Added for the ACPI shutdown ports, which are the
+ * one thing in this kernel that has to be poked a word at a time. */
+static inline void outw(uint16_t port, uint16_t val) {
+    __asm__ __volatile__("outw %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline uint16_t inw(uint16_t port) {
+    uint16_t ret;
+    __asm__ __volatile__("inw %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
 static inline void io_wait(void) {
     /* Port 0x80 is used for POST diagnostic codes on real hardware, so
      * writing to it is a well-known "burn a few cycles" trick to give
