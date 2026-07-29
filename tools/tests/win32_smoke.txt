@@ -1,0 +1,17 @@
+# Shell commands driven into the booted kernel by tools/qemu_test.py.
+# One per line; blank lines and comments are skipped.
+#
+# The order matters a little: peinfo before run, so a failure in the
+# loader shows up as a header/import report before it shows up as a
+# crash, and hellowin last so the transcript ends on the case that
+# exercises the most of the emulation layer.
+
+peinfo hellowin.exe
+run winapi.exe
+run cppinit.exe
+run guiapp.exe
+run hello64.exe
+run lowbase.exe
+run hellope.exe
+run crash.exe
+run hellowin.exe

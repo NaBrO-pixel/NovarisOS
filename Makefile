@@ -1,0 +1,387 @@
+# Novaris build system
+#
+# We compile freestanding 32-bit C (no libc, no OS underneath us) and
+# assemble the boot stub, then link them at 1MB per the linker script.
+
+CC = gcc
+AS = nasm
+LD = ld
+
+CFLAGS = -std=gnu99 -ffreestanding -fno-builtin -fno-stack-protector \
+         -fno-pic -m32 -Wall -Wextra -O2 -Iinclude
+ASFLAGS = -f elf32
+LDFLAGS = -m elf_i386 -T linker.ld -nostdlib
+
+BUILD_DIR = build
+ISO_DIR = iso
+
+# Every object depends on every header. Coarse, but the alternative here
+# was no header dependencies at all, and that bites hard: changing a
+# struct in include/idt.h left objects compiled against the old layout
+# linked into the same kernel, which fails at runtime (garbage register
+# values in a syscall handler) rather than at build time. This tree is
+# small enough that rebuilding it wholesale costs a couple of seconds.
+HEADERS = $(wildcard include/*.h)
+
+OBJS = $(BUILD_DIR)/boot.o $(BUILD_DIR)/kernel.o \
+       $(BUILD_DIR)/vga_text.o $(BUILD_DIR)/console.o $(BUILD_DIR)/framebuffer.o \
+       $(BUILD_DIR)/font8x16.o $(BUILD_DIR)/mouse.o \
+       $(BUILD_DIR)/gdt.o $(BUILD_DIR)/gdt_flush.o \
+       $(BUILD_DIR)/idt.o $(BUILD_DIR)/idt_flush.o \
+       $(BUILD_DIR)/isr.o $(BUILD_DIR)/pic.o \
+       $(BUILD_DIR)/pit.o $(BUILD_DIR)/keyboard.o $(BUILD_DIR)/shell.o \
+       $(BUILD_DIR)/serial.o \
+       $(BUILD_DIR)/pmm.o $(BUILD_DIR)/paging.o $(BUILD_DIR)/kheap.o \
+       $(BUILD_DIR)/syscall.o $(BUILD_DIR)/process.o $(BUILD_DIR)/process_asm.o \
+       $(BUILD_DIR)/user_hello_blob.o $(BUILD_DIR)/vfs.o $(BUILD_DIR)/initrd.o \
+       $(BUILD_DIR)/elf.o $(BUILD_DIR)/pe.o $(BUILD_DIR)/kstring.o \
+       $(BUILD_DIR)/rtc.o \
+       $(BUILD_DIR)/win32.o $(BUILD_DIR)/win32_kernel32.o \
+       $(BUILD_DIR)/win32_msvcrt.o $(BUILD_DIR)/win32_user32.o \
+       $(BUILD_DIR)/win32_dtoa.o $(BUILD_DIR)/win32_format.o \
+       $(BUILD_DIR)/scheduler.o $(BUILD_DIR)/scheduler_asm.o \
+       $(BUILD_DIR)/task_a_blob.o $(BUILD_DIR)/task_b_blob.o $(BUILD_DIR)/task_c_blob.o
+
+KERNEL = $(BUILD_DIR)/novaris.bin
+ISO = novaris.iso
+
+.PHONY: all clean run run-nographic iso test test-qemu zip
+
+all: $(ISO)
+
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+$(BUILD_DIR)/boot.o: boot/boot.s | $(BUILD_DIR)
+	$(AS) $(ASFLAGS) $< -o $@
+
+$(BUILD_DIR)/kernel.o: kernel/kernel.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/vga_text.o: kernel/vga_text.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/console.o: kernel/console.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/framebuffer.o: kernel/framebuffer.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/font8x16.o: kernel/font8x16.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/mouse.o: kernel/mouse.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/gdt.o: kernel/gdt.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/gdt_flush.o: kernel/gdt_flush.s | $(BUILD_DIR)
+	$(AS) $(ASFLAGS) $< -o $@
+
+$(BUILD_DIR)/idt.o: kernel/idt.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/idt_flush.o: kernel/idt_flush.s | $(BUILD_DIR)
+	$(AS) $(ASFLAGS) $< -o $@
+
+$(BUILD_DIR)/isr.o: kernel/isr.s | $(BUILD_DIR)
+	$(AS) $(ASFLAGS) $< -o $@
+
+$(BUILD_DIR)/pic.o: kernel/pic.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/pit.o: kernel/pit.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/keyboard.o: kernel/keyboard.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/shell.o: kernel/shell.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/serial.o: kernel/serial.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/pmm.o: kernel/pmm.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/paging.o: kernel/paging.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/kheap.o: kernel/kheap.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/syscall.o: kernel/syscall.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/process.o: kernel/process.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/process_asm.o: kernel/process_asm.s | $(BUILD_DIR)
+	nasm -f elf32 $< -o $@
+
+$(BUILD_DIR)/user_hello_blob.o: kernel/user_hello_blob.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/vfs.o: kernel/vfs.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/initrd.o: kernel/initrd.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/elf.o: kernel/elf.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/pe.o: kernel/pe.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/kstring.o: kernel/kstring.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/rtc.o: kernel/rtc.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# --- The Win32 emulation layer (see include/win32.h) ---
+$(BUILD_DIR)/win32.o: kernel/win32.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/win32_kernel32.o: kernel/win32_kernel32.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/win32_msvcrt.o: kernel/win32_msvcrt.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/win32_user32.o: kernel/win32_user32.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/win32_format.o: kernel/win32_format.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/win32_dtoa.o: kernel/win32_dtoa.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/scheduler.o: kernel/scheduler.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/scheduler_asm.o: kernel/scheduler_asm.s | $(BUILD_DIR)
+	nasm -f elf32 $< -o $@
+
+$(BUILD_DIR)/task_a_blob.o: kernel/task_a_blob.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/task_b_blob.o: kernel/task_b_blob.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/task_c_blob.o: kernel/task_c_blob.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# --- Userland: a tiny libc + demo C program, shipped via the initrd ---
+# These are separate flat binaries (not linked into the kernel image),
+# assembled/compiled/linked with their own flags and linker script
+# (userland/user.ld), then packed into build/initrd.img alongside the
+# static files in userland/initrd_files/.
+
+USER_CFLAGS = $(CFLAGS) -fno-asynchronous-unwind-tables -Iuserland/libc
+
+$(BUILD_DIR)/user/crt0.o: userland/libc/crt0.s | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(AS) $(ASFLAGS) $< -o $@
+
+$(BUILD_DIR)/user/libc.o: userland/libc/libc.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/user/hello_c.o: userland/hello_c.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/user/hello_c.elf: $(BUILD_DIR)/user/crt0.o $(BUILD_DIR)/user/hello_c.o $(BUILD_DIR)/user/libc.o userland/user.ld
+	$(LD) -m elf_i386 -T userland/user.ld -nostdlib -o $@ \
+	    $(BUILD_DIR)/user/crt0.o $(BUILD_DIR)/user/hello_c.o $(BUILD_DIR)/user/libc.o
+
+$(BUILD_DIR)/user/hello_c.bin: $(BUILD_DIR)/user/hello_c.elf
+	objcopy -O binary $< $@
+
+$(BUILD_DIR)/user/hello_elf.o: userland/hello_elf.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/user/hello_elf.elf: $(BUILD_DIR)/user/crt0.o $(BUILD_DIR)/user/hello_elf.o $(BUILD_DIR)/user/libc.o userland/user.ld
+	$(LD) -m elf_i386 -T userland/user.ld -nostdlib -o $@ \
+	    $(BUILD_DIR)/user/crt0.o $(BUILD_DIR)/user/hello_elf.o $(BUILD_DIR)/user/libc.o
+
+# --- Windows test binaries -------------------------------------------------
+#
+# These are built with the real mingw-w64 toolchain and are *not* written
+# for Novaris: hello_win.c and win32_api.c are ordinary Windows programs
+# that would run unchanged on Windows, linked against the real msvcrt and
+# kernel32 import libraries. That is what makes them a meaningful test of
+# the Win32 emulation layer rather than a demonstration of itself.
+#
+# Needs mingw-w64 (`apt install mingw-w64`) - only for these binaries; the
+# kernel has no such dependency. Without it, `make` fails on these targets
+# specifically.
+MINGW_LD = i686-w64-mingw32-ld
+MINGW_CC = i686-w64-mingw32-gcc
+MINGW_CXX = i686-w64-mingw32-g++
+MINGW_CC64 = x86_64-w64-mingw32-gcc
+MINGW_CFLAGS = -O2 -Wall
+
+$(BUILD_DIR)/user/hello_pe.obj: userland/pe_test/hello_pe.asm | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(AS) -f win32 $< -o $@
+
+$(BUILD_DIR)/user/hello_pe.exe: $(BUILD_DIR)/user/hello_pe.obj
+	$(MINGW_LD) -e start --subsystem console -o $@ $<
+
+$(BUILD_DIR)/user/hellowin.exe: userland/pe_test/hello_win.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(MINGW_CC) $(MINGW_CFLAGS) -o $@ $<
+
+$(BUILD_DIR)/user/winapi.exe: userland/pe_test/win32_api.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(MINGW_CC) $(MINGW_CFLAGS) -o $@ $< -lgdi32
+
+# A C++ binary, for its global constructors (see the source): they are
+# what exercises the ring-3 _initterm implementation.
+$(BUILD_DIR)/user/cppinit.exe: userland/pe_test/cpp_init.cpp | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(MINGW_CXX) $(MINGW_CFLAGS) -static-libstdc++ -static-libgcc -o $@ $<
+
+# -mwindows makes this a GUI-subsystem binary with a WinMain entry point.
+$(BUILD_DIR)/user/guiapp.exe: userland/pe_test/gui_app.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(MINGW_CC) $(MINGW_CFLAGS) -mwindows -o $@ $<
+
+# The same program linked at an image base Novaris will not hand out
+# (0x50000 is below the 1MB floor the loader enforces), which forces the
+# base relocation path: the loader has to move it into the relocation
+# arena and rewrite every absolute address in it. Same source as
+# hellowin.exe, so any difference in its output is the relocator's doing.
+$(BUILD_DIR)/user/lowbase.exe: userland/pe_test/hello_win.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(MINGW_CC) $(MINGW_CFLAGS) -Wl,--image-base,0x50000 \
+	    -Wl,--dynamicbase -o $@ $<
+
+# A program that faults on purpose, to prove a bad .exe takes only itself
+# down and not the kernel.
+$(BUILD_DIR)/user/crash.exe: userland/pe_test/crash.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(MINGW_CC) $(MINGW_CFLAGS) -o $@ $<
+
+# A 64-bit PE, built purely so the "this is a 64-bit binary" diagnostic
+# has something real to fire on. -nostdlib keeps it to a couple of KB.
+$(BUILD_DIR)/user/hello64.exe: userland/pe_test/x64_marker.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(MINGW_CC64) -O2 -nostdlib -e mainCRTStartup -o $@ $<
+
+# Everything that ends up packed into the initrd: the static files in
+# userland/initrd_files/ plus the compiled demo programs.
+$(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
+        $(BUILD_DIR)/user/hello_elf.elf $(BUILD_DIR)/user/hello_pe.exe \
+        $(BUILD_DIR)/user/hellowin.exe $(BUILD_DIR)/user/winapi.exe \
+        $(BUILD_DIR)/user/cppinit.exe $(BUILD_DIR)/user/guiapp.exe \
+        $(BUILD_DIR)/user/hello64.exe $(BUILD_DIR)/user/lowbase.exe \
+        $(BUILD_DIR)/user/crash.exe
+	mkdir -p $(BUILD_DIR)/initrd_staging
+	cp userland/initrd_files/* $(BUILD_DIR)/initrd_staging/
+	cp $(BUILD_DIR)/user/hello_c.bin $(BUILD_DIR)/initrd_staging/helloc.bin
+	cp $(BUILD_DIR)/user/hello_elf.elf $(BUILD_DIR)/initrd_staging/helloelf.elf
+	cp $(BUILD_DIR)/user/hello_pe.exe $(BUILD_DIR)/initrd_staging/hellope.exe
+	cp $(BUILD_DIR)/user/hellowin.exe $(BUILD_DIR)/initrd_staging/hellowin.exe
+	cp $(BUILD_DIR)/user/winapi.exe $(BUILD_DIR)/initrd_staging/winapi.exe
+	cp $(BUILD_DIR)/user/cppinit.exe $(BUILD_DIR)/initrd_staging/cppinit.exe
+	cp $(BUILD_DIR)/user/guiapp.exe $(BUILD_DIR)/initrd_staging/guiapp.exe
+	cp $(BUILD_DIR)/user/hello64.exe $(BUILD_DIR)/initrd_staging/hello64.exe
+	cp $(BUILD_DIR)/user/lowbase.exe $(BUILD_DIR)/initrd_staging/lowbase.exe
+	cp $(BUILD_DIR)/user/crash.exe $(BUILD_DIR)/initrd_staging/crash.exe
+
+$(BUILD_DIR)/initrd.img: $(BUILD_DIR)/initrd_staging/helloelf.elf userland/mkinitrd.py
+	python3 userland/mkinitrd.py $(BUILD_DIR)/initrd_staging $@
+
+$(KERNEL): $(OBJS) linker.ld
+	$(LD) $(LDFLAGS) -o $@ $(OBJS)
+
+iso: $(KERNEL) $(BUILD_DIR)/initrd.img
+	mkdir -p $(ISO_DIR)/boot/grub
+	cp $(KERNEL) $(ISO_DIR)/boot/novaris.bin
+	cp $(BUILD_DIR)/initrd.img $(ISO_DIR)/boot/initrd.img
+	cp grub.cfg $(ISO_DIR)/boot/grub/grub.cfg
+	grub-mkrescue -o $(ISO) $(ISO_DIR) 2>/dev/null
+
+$(ISO): iso
+
+# Run in QEMU with a graphical window (won't work headless - use run-nographic)
+run: $(ISO)
+	qemu-system-i386 -cdrom $(ISO)
+
+# Run in QEMU headlessly and dump a screenshot to screenshot.png
+run-nographic: $(ISO)
+	qemu-system-i386 -cdrom $(ISO) -display none -serial file:serial.log &
+	sleep 2 && kill %1 2>/dev/null || true
+
+# --- Tests -----------------------------------------------------------------
+#
+# Two layers, deliberately. The host tests link the *actual* kernel
+# sources (not reimplementations) into a host binary and drive them
+# directly, which is where a failure tells you exactly what broke. The
+# QEMU test boots the real ISO and drives the shell, which is the only
+# thing that proves the whole stack works together.
+#
+# Both are 32-bit host builds, because the code under test assumes 32-bit
+# pointers throughout - `apt install gcc-multilib` if the link fails.
+
+HOST_CFLAGS = -std=gnu99 -m32 -Wall -Wextra -Iinclude -g
+
+$(BUILD_DIR)/test/format_test: tests/format_host_test.c kernel/win32_format.c \
+        kernel/win32_dtoa.c kernel/kstring.c $(HEADERS)
+	mkdir -p $(BUILD_DIR)/test
+	$(CC) $(HOST_CFLAGS) -o $@ tests/format_host_test.c kernel/win32_format.c \
+	    kernel/win32_dtoa.c kernel/kstring.c
+
+$(BUILD_DIR)/test/pe_test: tests/pe_host_test.c kernel/pe.c kernel/kstring.c $(HEADERS)
+	mkdir -p $(BUILD_DIR)/test
+	$(CC) $(HOST_CFLAGS) -o $@ tests/pe_host_test.c kernel/pe.c kernel/kstring.c
+
+# The PE test loads binaries out of build/user, so they have to exist.
+test: $(BUILD_DIR)/test/format_test $(BUILD_DIR)/test/pe_test \
+        $(BUILD_DIR)/user/hellowin.exe $(BUILD_DIR)/user/lowbase.exe \
+        $(BUILD_DIR)/user/guiapp.exe $(BUILD_DIR)/user/hello64.exe
+	@echo "=== printf/dtoa engine ==="
+	@$(BUILD_DIR)/test/format_test
+	@echo
+	@echo "=== PE loader ==="
+	@$(BUILD_DIR)/test/pe_test
+
+# Boots the ISO and drives the shell, asserting on the serial transcript.
+# Slow (a couple of minutes) and needs qemu-system-i386.
+test-qemu: $(ISO)
+	python3 tools/qemu_test.py --iso $(ISO) --script tools/tests/win32_smoke.txt \
+	    --boot-wait 16 --settle 5 \
+	    --expect "Hello from a real Windows .exe running on Novaris" \
+	    --expect "floats:     3\.141593 2\.50 1\.234568e\+04 0\.0001" \
+	    --expect "fib\(20\):    6765" \
+	    --expect "\[ctor\]  a C\+\+ global constructor ran before main" \
+	    --expect "HeapAlloc round-trip" \
+	    --expect "64-bit \(PE32\+\) binary" \
+	    --expect "53 of 53 imports resolve" \
+	    --reject "KERNEL PANIC"
+
+# Repackages the source tree as novaris.zip, which is how this project
+# gets moved between machines. Regenerated rather than hand-assembled so
+# it can't drift out of step with the tree it's built from; build output
+# is excluded, since `make` reproduces all of it.
+ZIP_CONTENTS = boot include kernel tests tools userland Makefile linker.ld \
+               grub.cfg README.md ROADMAP.md .gitignore docs-proof-of-boot.png
+
+zip:
+	rm -rf $(BUILD_DIR)/pkg novaris.zip
+	mkdir -p $(BUILD_DIR)/pkg/novaris
+	cp -r $(ZIP_CONTENTS) $(BUILD_DIR)/pkg/novaris/
+	cd $(BUILD_DIR)/pkg && zip -q -r $(CURDIR)/novaris.zip novaris
+	rm -rf $(BUILD_DIR)/pkg
+	@echo "Wrote novaris.zip"
+
+clean:
+	rm -rf $(BUILD_DIR) $(ISO_DIR) $(ISO) serial.log screenshot.png
