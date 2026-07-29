@@ -270,9 +270,10 @@ static void run_command(char* line) {
         terminal_writestring("            Milestone 9) - watch their output interleave\n");
         terminal_writestring("  echo    - print text back\n");
         terminal_writestring("\nThis shell runs inside the desktop's Terminal\n");
-        terminal_writestring("window. Cmd-Space searches, Cmd-N/Cmd-O open\n");
-        terminal_writestring("windows, Cmd-W closes one; the Dock and menu bar\n");
-        terminal_writestring("do the rest. (Alt stands in for Command.)\n");
+        terminal_writestring("window. Press the Windows key for Start, Alt-Tab to\n");
+        terminal_writestring("switch windows, Alt-F4 to close one, and Win-Left or\n");
+        terminal_writestring("Win-Right to snap. Dragging a window to a screen edge\n");
+        terminal_writestring("snaps it too; the taskbar does the rest.\n");
     } else if (streq(line, "clear")) {
         console_clear();
     } else if (streq(line, "about")) {

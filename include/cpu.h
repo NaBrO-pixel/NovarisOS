@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-/* CPUID, for the About window and Activity Monitor. "About This Mac"
+/* CPUID, for the About window and Task Manager. "About This Mac"
  * names the processor it's running on; so does this, and on a hobby OS
  * that string is genuinely useful - it's how you tell a QEMU TCG guest
  * from KVM from real silicon at a glance. */

@@ -274,8 +274,9 @@ void kernel_main(uint32_t magic, multiboot_info_t* mbi) {
     terminal_writestring("    font console and a movable PS/2 mouse cursor\n");
     terminal_writestring("  - Loads and runs real Windows PE32 .exe files against an\n");
     terminal_writestring("    emulated Win32 API ('run prog.exe', 'peinfo', 'winapi')\n");
-    terminal_writestring("  - Composites a real desktop: draggable, resizable windows\n");
-    terminal_writestring("    with a menu bar, a Dock and this shell in a Terminal window\n");
+    terminal_writestring("  - Composites a real desktop: snapping, resizable windows\n");
+    terminal_writestring("    with a taskbar, a Start menu, Alt-Tab, and this shell\n");
+    terminal_writestring("    running in a Terminal window\n");
 
     terminal_writestring_color("\nSee ROADMAP.md for what's next.\n", VGA_COLOR_LIGHT_BROWN);
 

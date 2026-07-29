@@ -27,6 +27,7 @@ OBJS = $(BUILD_DIR)/boot.o $(BUILD_DIR)/kernel.o \
        $(BUILD_DIR)/vga_text.o $(BUILD_DIR)/console.o $(BUILD_DIR)/framebuffer.o \
        $(BUILD_DIR)/font8x16.o $(BUILD_DIR)/mouse.o \
        $(BUILD_DIR)/uifont.o $(BUILD_DIR)/gfx.o $(BUILD_DIR)/uikit.o \
+       $(BUILD_DIR)/icons.o \
        $(BUILD_DIR)/wm.o $(BUILD_DIR)/desktop.o $(BUILD_DIR)/cpu.o \
        $(BUILD_DIR)/app_terminal.o $(BUILD_DIR)/app_files.o \
        $(BUILD_DIR)/app_monitor.o $(BUILD_DIR)/app_about.o \
@@ -155,6 +156,9 @@ $(BUILD_DIR)/gfx.o: kernel/gfx.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/uikit.o: kernel/uikit.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/icons.o: kernel/icons.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/wm.o: kernel/wm.c $(HEADERS) | $(BUILD_DIR)
@@ -380,8 +384,20 @@ $(BUILD_DIR)/test/pe_test: tests/pe_host_test.c kernel/pe.c kernel/kstring.c $(H
 	mkdir -p $(BUILD_DIR)/test
 	$(CC) $(HOST_CFLAGS) -o $@ tests/pe_host_test.c kernel/pe.c kernel/kstring.c
 
+# The window manager and the desktop shell, driven on the host. desktop.c
+# is #included by the test (it needs the shell's file-scope state), so it
+# is a prerequisite but not a source on the command line.
+WM_TEST_SRCS = kernel/wm.c kernel/gfx.c kernel/icons.c kernel/uikit.c \
+               kernel/uifont.c kernel/font8x16.c kernel/kstring.c
+
+$(BUILD_DIR)/test/wm_test: tests/wm_host_test.c kernel/desktop.c \
+        $(WM_TEST_SRCS) $(HEADERS)
+	mkdir -p $(BUILD_DIR)/test
+	$(CC) $(HOST_CFLAGS) -o $@ tests/wm_host_test.c $(WM_TEST_SRCS)
+
 # The PE test loads binaries out of build/user, so they have to exist.
 test: $(BUILD_DIR)/test/format_test $(BUILD_DIR)/test/pe_test \
+        $(BUILD_DIR)/test/wm_test \
         $(BUILD_DIR)/user/hellowin.exe $(BUILD_DIR)/user/lowbase.exe \
         $(BUILD_DIR)/user/guiapp.exe $(BUILD_DIR)/user/hello64.exe
 	@echo "=== printf/dtoa engine ==="
@@ -389,6 +405,9 @@ test: $(BUILD_DIR)/test/format_test $(BUILD_DIR)/test/pe_test \
 	@echo
 	@echo "=== PE loader ==="
 	@$(BUILD_DIR)/test/pe_test
+	@echo
+	@echo "=== window manager / desktop shell ==="
+	@$(BUILD_DIR)/test/wm_test --shots $(BUILD_DIR)/test
 
 # Boots the ISO and drives the shell, asserting on the serial transcript.
 # Slow (a couple of minutes) and needs qemu-system-i386.

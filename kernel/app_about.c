@@ -1,4 +1,4 @@
-/* app_about.c - "About This Novaris", and the alert panel.
+/* app_about.c - "About Novaris", and the alert panel.
  *
  * The About window is the one place the OS introduces itself, so it says
  * true things it had to go and find out: the processor's own brand string
@@ -40,7 +40,7 @@ static void about_paint(window_t* win) {
 
     gfx_text_center(&uifont_title, 0, cy + 46, cw, "Novaris", UI_TEXT);
     gfx_text_center(&uifont_regular, 0, cy + 76, cw,
-                    "Version 0.11 " UI_BULLET " Milestone 11", UI_TEXT_DIM);
+                    "Version 0.12 " UI_BULLET " Milestone 12", UI_TEXT_DIM);
 
     int y = cy + 108;
     int label_w = 132;
@@ -92,10 +92,10 @@ static void about_paint(window_t* win) {
                     UI_TEXT_FAINT);
 
     int by = wm_client_h(win) - 52;
-    ui_button(cw / 2 - 168, by, 160, 30, "System Report" UI_ELLIPSIS,
+    ui_button(cw / 2 - 168, by, 160, 30, "Task Manager",
               about_state.pressed_button == 0 ? UI_BTN_PRESSED :
               (about_state.hover_button == 0 ? UI_BTN_HOVER : UI_BTN_NORMAL));
-    ui_button(cw / 2 + 8, by, 160, 30, "Software Update" UI_ELLIPSIS,
+    ui_button(cw / 2 + 8, by, 160, 30, "Check for updates",
               about_state.pressed_button == 1 ? UI_BTN_PRESSED :
               (about_state.hover_button == 1 ? UI_BTN_HOVER : UI_BTN_NORMAL));
 }
@@ -139,7 +139,7 @@ static void about_mouse(window_t* win, int x, int y, int kind, int buttons,
 }
 
 const app_t app_about = {
-    "About This Novaris", about_paint, 0, about_mouse, 0, 0,
+    "About Novaris", about_paint, 0, about_mouse, 0, 0,
 };
 
 window_t* about_open(void) {
@@ -150,7 +150,7 @@ window_t* about_open(void) {
     }
     about_state.hover_button = -1;
     about_state.pressed_button = -1;
-    window_t* win = wm_open(&app_about, "About This Novaris", ABOUT_W, ABOUT_H, 0);
+    window_t* win = wm_open(&app_about, "About Novaris", ABOUT_W, ABOUT_H, 0);
     if (win) {
         win->resizable = 0;
         win->bg = GFX_RGB(0xF2, 0xF2, 0xF5);

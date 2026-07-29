@@ -113,7 +113,7 @@ void* kmalloc(size_t size) {
     return (void*)(new_block + 1);
 }
 
-/* Walks the block list for Activity Monitor. `used` and `total` come back
+/* Walks the block list for Task Manager. `used` and `total` come back
  * in bytes; `total` is what's currently mapped, not the cap. */
 void kheap_stats(uint32_t* used, uint32_t* total) {
     uint32_t u = 0, t = 0;

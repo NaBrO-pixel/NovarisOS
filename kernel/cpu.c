@@ -1,4 +1,4 @@
-/* cpu.c - CPUID lookups for the About and Activity Monitor windows. */
+/* cpu.c - CPUID lookups for the About and Task Manager windows. */
 
 #include "cpu.h"
 #include "kstring.h"

@@ -744,6 +744,109 @@ Known limits, stated plainly:
 - [ ] No drag-and-drop, no clipboard, no window animations beyond the Dock
       bounce, and minimizing doesn't animate.
 
+## Milestone 12 — Windows-style windowing ✅ DONE
+
+Milestone 11 built the machinery - surfaces, z-order, damage tracking,
+compositing - and dressed it as a Mac. This milestone kept every bit of
+the machinery and replaced the interaction model and the chrome with
+Windows'. Nothing in `gfx.c` changed; almost all of `wm.c` and `desktop.c`
+did.
+
+- [x] **Windows window chrome** (`kernel/wm.c`): the window's icon and
+      title read from the left, and minimize / maximize / close sit flush
+      in the top-right corner in that order, with the close button turning
+      red under the pointer and showing the two-square "restore" mark once
+      the window is maximized.
+  - The buttons are hit-tested from the window's *right* edge rather than
+    from an absolute offset, so they stay put through a resize.
+  - Nothing trims the close button's red fill to the window's rounded
+    corner: the fill runs to the edge of the surface, and the corner
+    rounding that happens at composite time (`gfx_blit_rounded`) cuts it.
+    Trying to round the fill itself would have needed a per-corner radius
+    the compositor doesn't have.
+- [x] **Eight-way resizing.** Every edge and corner drags, with the
+      pointer changing to the matching double-headed arrow. This is why a
+      press now resolves to one of nine frame regions *before* anything
+      else looks at it, and why a resize drag records which edges are
+      anchored rather than tracking a corner - dragging the left edge has
+      to hold the right edge still, which the old corner-only code never
+      had to express.
+- [x] **Aero-style snapping.** Dragging a window against the top of the
+      screen maximizes it and against a side fills half the screen (with
+      quarter-screen corners), previewed as a translucent overlay before
+      the button comes up. `Win`+arrows do the same from the keyboard.
+      Dragging a snapped or maximized window away restores its floating
+      size and re-anchors the pointer proportionally along the title bar,
+      so the window doesn't jump out from under the cursor.
+  - A window remembers exactly one frame to restore to, saved on the way
+    *into* a maximize or a snap and never between two of them - otherwise
+    maximize-then-snap-then-restore lands on the snap instead of on the
+    size the window actually had.
+- [x] **A taskbar** (`kernel/desktop.c`), replacing the menu bar and the
+      Dock: Start button, search field, one button per window with an
+      accent running indicator, a system tray, and a two-line clock. The
+      bar lays its fixed furniture out from both ends and gives what's
+      left to the window buttons, so opening a tenth window narrows the
+      other nine instead of pushing them off the screen. Hovering a window
+      button for a moment raises a live thumbnail of that window, scaled
+      from its backing surface.
+- [x] **A Start menu**: a search field, a pinned grid, the initrd listed
+      as "Recommended", and a power flyout. Typing filters apps and files
+      together - this is Milestone 11's launcher, rebuilt around a single
+      entry list that both the painter and the hit test read, so a tile
+      can't be drawn somewhere it can't be clicked.
+- [x] **The rest of the shell**: icons on the desktop with selection and
+      double-click-to-open, right-click context menus on the desktop, the
+      taskbar and any title bar (the window system menu, also on
+      `Alt-Space`), and an `Alt-Tab` switcher over live thumbnails that
+      holds until Alt is released.
+- [x] **`Alt` and `Win` came apart.** Milestone 11 treated them as one
+      "Command" modifier, which a Windows-style shell can't do: `Alt-Tab`
+      and `Win-Tab` are different gestures. Tapping `Win` on its own opens
+      Start, but using it as a modifier doesn't - tracked by watching for
+      any other key between the press and the release, which is what
+      Windows does.
+- [x] **All the icons are drawn, not stored** (`kernel/icons.c`). There
+      are no image files anywhere in Novaris and adding a bitmap format
+      plus a decoder to draw a folder would be a lot of machinery for a
+      folder. Everything is drawn from primitives at whatever size the
+      caller asks for, so one routine serves the 16px title-bar icon, the
+      24px taskbar button and the 40px desktop icon.
+
+**Verified with a new host test** (`tests/wm_host_test.c`, wired into
+`make test`), which links the real `wm.c`, `desktop.c`, `gfx.c` and
+`icons.c` and stubs only what's below the compositor. Window management is
+mostly geometry, and geometry is exactly the kind of code that looks right
+in a screenshot and is off by two pixels: "the right edge did not move
+during a left-edge resize" is a claim a test can make and an eyeball
+can't. 52 assertions cover resize anchoring, snap previews and their
+follow-through, maximize/restore round trips, the caption buttons,
+`Alt-Tab`, `Win`+arrows, show-desktop, the taskbar and the Start menu. It
+also renders frames to PPM (`--shots DIR`), which is how the chrome gets
+looked at without booting anything.
+
+Two real bugs it caught, both invisible until something asserted on them:
+
+  1. `wm_toggle_show_desktop()` decided which way to go from whether it
+     had a remembered list, not from what was actually on screen. Close
+     the windows it hid and open new ones, and the next press would
+     "restore" an empty list while leaving the new windows sitting there.
+     It now looks at what's visible.
+  2. Pressing the title bar didn't clear the caption hover, so grabbing a
+     window right after passing over its close button left that button
+     lit red for the whole drag - the drag path returns early and never
+     looks at hovering again.
+
+Known limits, unchanged from Milestone 11 unless noted:
+
+- [ ] Apps are still kernel code with a paint callback, not processes.
+- [ ] Snapping has no "snap assist" - filling one half doesn't offer the
+      other half to a second window.
+- [ ] No window animations: maximizing, minimizing and snapping all
+      happen in one frame.
+- [ ] The taskbar doesn't group multiple windows of one app behind a
+      single button, and can't be moved off the bottom edge.
+
 ## Later / open-ended
 
 - Networking (a NIC driver + a minimal TCP/IP stack) — big undertaking.

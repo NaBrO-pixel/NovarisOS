@@ -4,9 +4,10 @@
 #include "wm.h"
 
 /* The apps that ship with the desktop. Each is an app_t vtable plus an
- * "open me" function the Dock, the menu bar and Spotlight all call. Every
- * one of these opens a single window and reuses it if it's already open,
- * which is how clicking a Dock icon twice behaves. */
+ * "open me" function the taskbar, the Start menu and the desktop icons
+ * all call. Every one of these opens a single window and reuses it if
+ * it's already open, which is how clicking a taskbar button twice
+ * behaves. */
 
 /* Terminal - the window the kernel shell lives in. Its buffer is a
  * singleton: there is one shell, with one line being edited, so a second
@@ -19,15 +20,15 @@ void terminal_app_init(void);
 /* Types a command into the shell as if the user had. */
 void terminal_run(const char* command);
 
-/* Files - browses the initrd. */
+/* File Explorer - browses the initrd. */
 extern const app_t app_files;
 window_t* files_open(void);
 
-/* Activity Monitor - live memory, uptime and system counters. */
+/* Task Manager - live memory, uptime and system counters. */
 extern const app_t app_monitor;
 window_t* monitor_open(void);
 
-/* About This Novaris. */
+/* About Novaris. */
 extern const app_t app_about;
 window_t* about_open(void);
 

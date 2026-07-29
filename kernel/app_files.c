@@ -305,7 +305,7 @@ static void files_key(window_t* win, const key_event_t* ev) {
 }
 
 const app_t app_files = {
-    "Files", files_paint, files_key, files_mouse, 0, 0,
+    "File Explorer", files_paint, files_key, files_mouse, 0, 0,
 };
 
 window_t* files_open(void) {
@@ -318,7 +318,7 @@ window_t* files_open(void) {
     files_state.selected = -1;
     files_state.hover_row = -1;
     files_state.scroll = 0;
-    window_t* win = wm_open(&app_files, "Novaris " UI_EMDASH " initrd", 700, 430, 0);
+    window_t* win = wm_open(&app_files, "File Explorer " UI_EMDASH " This Novaris", 700, 430, 0);
     if (win) win->min_w = 520;
     return win;
 }

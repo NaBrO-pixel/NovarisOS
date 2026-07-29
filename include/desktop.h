@@ -3,9 +3,9 @@
 
 #include <stdint.h>
 
-/* desktop - the shell you actually see: wallpaper, menu bar, Dock,
- * Spotlight, and the event loop that ties the window manager to the
- * keyboard and mouse drivers.
+/* desktop - the shell you actually see: wallpaper, desktop icons, the
+ * taskbar, the Start menu, and the event loop that ties the window
+ * manager to the keyboard and mouse drivers.
  *
  * This is the layer that replaced shell_run() as the kernel's final
  * destination. The shell is still there - it's an app now (see
@@ -27,9 +27,8 @@ void desktop_start(void);
  * repaint. */
 void desktop_pump_output(void);
 
-/* The area windows are allowed to occupy, i.e. the screen minus the menu
- * bar and the Dock. */
-int desktop_menubar_height(void);
-int desktop_dock_reserved(void);
+/* The strip along the bottom of the screen the taskbar owns. Everything
+ * above it is the work area: what a maximized window fills. */
+int desktop_taskbar_height(void);
 
 #endif
