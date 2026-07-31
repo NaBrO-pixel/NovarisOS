@@ -28,6 +28,61 @@ uint32_t user_fs_selector = 0x23;
  * to a user program or to the kernel. */
 static int user_active = 0;
 
+/* --- the running program's address space -------------------------------
+ *
+ * Milestone 15. Milestone 14 built page directories that a process could
+ * run in; this is where one actually does.
+ *
+ * The whole thing rests on a single property of Milestone 14's design,
+ * and it is worth being explicit about it because it is what keeps this
+ * change small: the kernel half is *identical* in every address space. So
+ * once CR3 holds the process's directory, the kernel keeps working
+ * unchanged - its code, its stack, kmalloc, the console, the initrd are
+ * all still exactly where they were - while the user half is now the
+ * process's own. Which means an `int 0x81` handler that reads a program's
+ * arguments by casting a ring-3 pointer, as the entire Win32 layer does,
+ * *still reads the right memory*, because the kernel never leaves the
+ * process's address space while servicing it.
+ *
+ * That is why win32.c, pe.c and win32_callback.c did not have to be
+ * rewritten to walk page tables. The rule they now depend on is narrower
+ * than "one flat address space" but just as simple: never switch CR3
+ * while holding a pointer into a process.
+ */
+static uint32_t current_as = 0;   /* the running process's directory */
+static uint32_t previous_as = 0;  /* what to go back to when it ends */
+
+uint32_t process_current_address_space(void) {
+    return current_as;
+}
+
+int process_enter_address_space(void) {
+    uint32_t as = paging_create_address_space();
+    /* Out of memory, or paging_finalize_kernel_space() never ran. Running
+     * in the kernel's own directory is what every milestone before this
+     * one did, so falling back to it is a real degradation but not a
+     * broken one - and saying so beats failing to start the program. */
+    if (!as) return 0;
+
+    previous_as = paging_current_address_space();
+    current_as = as;
+    paging_switch_address_space(as);
+    return 1;
+}
+
+void process_leave_address_space(void) {
+    if (!current_as) return;
+    /* Order matters: callers unmap the program's pages first, while still
+     * standing in its address space, so their frames go back to the PMM
+     * through the ordinary paths. Destroying the directory afterwards
+     * reclaims anything they missed rather than being the only thing that
+     * reclaims anything. */
+    paging_switch_address_space(previous_as);
+    paging_destroy_address_space(current_as);
+    current_as = 0;
+    previous_as = 0;
+}
+
 void process_set_user_fs(uint16_t selector) {
     user_fs_selector = selector;
 }
@@ -48,6 +103,8 @@ void process_run_flat_binary(const uint8_t* image, uint32_t size) {
     uint32_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     if (pages == 0) pages = 1;
 
+    int owns_as = process_enter_address_space();
+
     for (uint32_t i = 0; i < pages; i++) {
         uint32_t phys = pmm_alloc_frame();
         paging_map_page(USER_LOAD_VADDR + i * PAGE_SIZE, phys,
@@ -65,6 +122,11 @@ void process_run_flat_binary(const uint8_t* image, uint32_t size) {
                      PAGE_PRESENT | PAGE_RW | PAGE_USER);
 
     enter_user_mode(USER_LOAD_VADDR, USER_STACK_TOP);
+
+    /* Everything this program mapped lived in its own directory, so
+     * destroying it is the unmap - there is no page-by-page teardown to
+     * do here the way there was before Milestone 15. */
+    if (owns_as) process_leave_address_space();
 }
 
 void process_run_demo_user_program(void) {
@@ -72,14 +134,26 @@ void process_run_demo_user_program(void) {
 }
 
 int process_run_elf(const uint8_t* image, uint32_t size) {
+    /* Validated before the address space is created, so a file that isn't
+     * an ELF doesn't cost a page directory. `image` itself is a kernel
+     * heap buffer, which is mapped identically either side of the switch. */
+    if (!elf_is_valid(image, size)) return 0;
+
+    int owns_as = process_enter_address_space();
+
     uint32_t entry;
-    if (!elf_load(image, size, &entry)) return 0;
+    if (!elf_load(image, size, &entry)) {
+        if (owns_as) process_leave_address_space();
+        return 0;
+    }
 
     uint32_t stack_phys = pmm_alloc_frame();
     paging_map_page(USER_STACK_TOP - PAGE_SIZE, stack_phys,
                      PAGE_PRESENT | PAGE_RW | PAGE_USER);
 
     enter_user_mode(entry, USER_STACK_TOP);
+
+    if (owns_as) process_leave_address_space();
     return 1;
 }
 

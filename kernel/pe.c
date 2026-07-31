@@ -309,7 +309,15 @@ static char* img_str(const pe_image_t* img, uint32_t rva) {
 static int region_is_available(uint32_t base, uint32_t bytes) {
     if (base < PE_MIN_LOAD_ADDR) return 0;
     if ((uint64_t)base + bytes > PE_MAX_LOAD_ADDR) return 0;
-    return paging_region_conflict(base, base + bytes) == 0;
+    if (paging_region_conflict(base, base + bytes) != 0) return 0;
+    /* Since Milestone 15 an image is mapped into the running process's own
+     * address space, which only means anything if the page tables it lands
+     * in are private to that process. A range covered by a shared kernel
+     * page table would put the image in every address space at once - and
+     * silently, since it would still run correctly. The shared set is
+     * 4MB-granular, so this can reject a range that is nowhere near
+     * anything the kernel uses; the loader just relocates elsewhere. */
+    return paging_range_is_private(base, base + bytes);
 }
 
 /* Picks where the image actually goes: its preferred ImageBase if that

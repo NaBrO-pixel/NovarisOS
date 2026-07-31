@@ -1024,6 +1024,9 @@ memory/clock variance.
 
 ## Milestone 14 — Per-process address spaces ✅ DONE (mechanism)
 
+> Milestone 15 below is the other half of this: it is where processes
+> actually start running in these address spaces. Read them together.
+
 The first of the prerequisites for **Path A** — see the note below on why
 the project pivoted to porting Wine rather than hand-writing more Win32.
 Wine assumes a POSIX-shaped kernel underneath it, and the very first
@@ -1157,6 +1160,205 @@ it is.
 - [ ] The scheduler (Milestone 9) does not know address spaces exist and
       does not switch CR3 on a context switch.
 
+## Milestone 15 — Processes actually run in their own address spaces ✅ DONE
+
+Milestone 14 built page directories a process *could* run in and was
+explicit that none did. This is the milestone where they do. Every path
+that reaches ring 3 — `win32_run_pe()`, `process_run_elf()`,
+`process_run_flat_binary()`, including the boot-time demo — now creates a
+private page directory, runs the program in it, and destroys it on exit.
+
+### The idea that kept this small
+
+The obvious expectation was that this would require rewriting `win32.c`,
+`pe.c` and `win32_callback.c` to walk page tables, because all three
+reach into a program's memory by casting a ring-3 pointer. Milestone 10's
+own header comment says as much: *"there are no per-process address
+spaces yet, so the kernel can read it directly"*.
+
+None of that was needed, and the reason is worth stating plainly because
+it is the whole design:
+
+> The kernel half is **identical** in every address space. So once CR3
+> holds the process's directory, the kernel keeps working unchanged — its
+> code, its stack, `kmalloc`, the console, the initrd are all exactly
+> where they were — while the user half is now the process's own. An
+> `int 0x81` handler that reads a program's arguments by casting a
+> pointer **still reads the right memory**, because the kernel never
+> leaves the process's address space while servicing it.
+
+The rule the emulation layer now depends on is narrower than "one flat
+address space", but just as simple: *never switch CR3 while holding a
+pointer into a process*. The bracketing in `process.h` is the whole
+mechanism:
+
+```c
+int owns_as = process_enter_address_space();   /* now on a private CR3 */
+... load the image, map the stack, run it, unmap ...
+if (owns_as) process_leave_address_space();    /* back on the kernel's */
+```
+
+Ordering inside the bracket matters and is commented at each site: the
+existing teardown (`w32_mem_reset`, `unmap_stack`, `pe_unload`) runs
+*before* leaving, while still standing in the program's directory, so its
+frames go back to the PMM through the ordinary paths. Destroying the
+directory afterwards reclaims anything they missed rather than being the
+only thing that reclaims anything.
+
+If creating an address space fails (out of memory), the program runs in
+the kernel's directory exactly as it did through Milestone 14. That is a
+real degradation, and it says so on the console rather than pretending.
+
+### Where the line between shared and private actually falls
+
+The freeze point moved: `paging_finalize_kernel_space()` now runs *after*
+`win32_init()`. That puts the Win32 thunk and data arenas into the shared
+set, and it is deliberate — they are built exactly once at boot and a
+program's import address table points straight into them, so they have to
+be visible in every address space, the same way a vDSO is.
+
+`vmtest` prints the resulting set, which on this boot is:
+
+```
+  [vm] shared kernel directory entries: 0(0x00000000) 492(0x7b000000)
+       496(0x7c000000) 768(0xc0000000) 832-843(0xd0000000) 1012(0xfd000000)
+```
+
+That is: the identity-mapped low 4MB, the thunk arena, the data arena,
+the kernel image, the 48MB heap, and the framebuffer. **Everything mapped
+after that line is private** — a program's image, its stack, and its
+Win32 heap all get page tables belonging to whichever address space is
+current when they are mapped.
+
+Two guards keep that honest rather than aspirational:
+
+- `pe.c`'s `region_is_available()` now also requires
+  `paging_range_is_private()`. An image placed in a shared page table
+  would land in *every* address space at once — and would still run
+  correctly, which is exactly why nothing else would catch it. The shared
+  set is 4MB-granular, so this can reject a range nowhere near anything
+  the kernel uses; the loader just relocates elsewhere.
+- After a program exits and its directory is destroyed, `win32_run_pe()`
+  checks that the image base is no longer mapped in the kernel's address
+  space. Silent when it holds; loud when it doesn't.
+
+### Verified
+
+The full smoke script, extended to 14 cases — the ten Win32 ones, `vmtest`
+before and after, and the ELF, flat-binary and scheduler paths that
+Milestone 15 also touched.
+
+Every program now announces its directory:
+
+```
+novaris> run hellowin.exe
+[win32] running in its own address space, page directory 0x00d0c000
+Hello from a real Windows .exe running on Novaris!
+...
+```
+
+The strongest evidence is what *didn't* change. Every program's output is
+**byte-identical** to the Milestone 14 transcript apart from those
+address-space lines — which is what a correct isolation change looks
+like: `printf`, `malloc`, `qsort`'s ring-3 callbacks, the exit trampoline
+and the deliberate null-pointer crash in `crash.exe` all behave exactly
+as before, while running on a different page directory than the kernel.
+
+Other things the run establishes:
+
+- The same physical frame is handed back and reused as the page directory
+  across successive runs, which is the destroy path working.
+- No `LEAK:` report from any run — no image outlived its address space.
+- `crash.exe` still faults, is still reported as
+  `EXCEPTION_ACCESS_VIOLATION`, and still returns to the shell — the
+  fault path unwinds correctly *out of* a foreign address space.
+- `qsorttest.exe` still passes in full, so ring-3 callbacks (which build
+  a call frame on the program's stack by storing through a pointer) work
+  unchanged inside a private address space.
+
+### Two real bugs this milestone's testing found
+
+`meminfo` across the whole suite did *not* come out even: 29542 frames
+free before, 29371 after. Worth chasing rather than waving at, so it was
+measured per command — `meminfo` between every run, then the same
+programs a second time:
+
+| after | 1st pass | 2nd pass |
+| --- | --- | --- |
+| `run hellowin.exe` | −62 | 0 |
+| `run winapi.exe` | 0 | 0 |
+| `run cppinit.exe` | −87 | 0 |
+| `run lowbase.exe` | 0 | 0 |
+| `run crash.exe` | 0 | — |
+| `run qsorttest.exe` | 0 | — |
+| `multitask` | −8 | −6 |
+| `vmtest` | 0 | 0 |
+
+Two different things are mixed together there, and separating them is the
+whole point of measuring rather than eyeballing a total.
+
+**The address-space work itself was clean.** `vmtest` is exactly
+balanced, and so is every repeated program run — which is what Milestone
+14 claimed and this confirms.
+
+**Bug 1 — the Win32 data arena never gave anything back (since Milestone
+10).** `w32_data_alloc()` is a bump allocator and `data_next` was never
+reset. The fake module headers and data exports allocated at boot are
+meant to last forever, but `build_teb()` and `build_peb()` allocate out
+of the same arena *per program* — a page-aligned TEB plus a PEB — and
+nothing reclaimed them. That is the steady −2 per PE run. The arena is
+capped at 1MB, so after roughly 120 program runs `w32_data_alloc()` would
+have started returning 0 and programs would have stopped starting, for no
+reason a user could have diagnosed. Fixed by recording where boot-time
+allocation stopped (`data_reset_mark`) and rewinding the bump pointer to
+it on exit; the pages stay mapped and get reused, so the fix costs
+nothing.
+
+**Bug 2 — the scheduler unmapped pages without freeing frames (since
+Milestone 9).** `reap_all()` called `paging_unmap_page()` on each demo
+task's code and stack pages and stopped there. Unmapping removes the
+translation; the physical frame stays marked in use forever. Six frames
+— three tasks × (code + stack) — vanished every time `multitask` ran.
+Fixed by freeing the frame behind each page, the same way `win32.c`'s
+`unmap_stack()` already did.
+
+After both fixes, the second pass costs **zero frames for every single
+command, `multitask` included**. What remains is one-time only: −62 on
+the first PE run (the data arena being populated), −87 on the first
+`cppinit.exe` (a much larger binary pushing the arenas' high-water mark),
+−2 on the first `multitask` (kernel heap growth for task stacks). Those
+are bounded high-water marks, not leaks — they do not recur.
+
+The reason both surfaced now is worth noting: nothing before Milestone 15
+had a reason to check that a program gave back everything it took.
+Address spaces made that question worth asking, and the answer was no,
+twice, in code that had been shipping since Milestones 9 and 10.
+
+### Honest scope
+
+- [x] One process at a time, in a real private address space, with its
+      image, stack and heap invisible to the kernel's own space.
+- [x] A program's frames are fully reclaimed on exit — steady-state cost
+      of running one is zero frames, verified by repeated runs.
+- [ ] **Still one process at a time.** This is isolation, not
+      concurrency. Two programs cannot run simultaneously, so the
+      isolation is not yet load-bearing against a hostile neighbour — it
+      is the foundation that makes such a thing possible.
+- [ ] **The scheduler still does not switch CR3.** The `multitask` demo's
+      three tasks are spawned into whatever address space is current
+      (the kernel's) and share it, exactly as they did in Milestone 9.
+      Making the scheduler address-space-aware is threads' problem, and
+      is the next prerequisite on the Path A list.
+- [ ] The Win32 thunk and data arenas are shared, so the TEB/PEB are
+      global rather than per-process. Harmless with one process; it has
+      to change before there are two.
+- [ ] No copy-on-write, no `fork`, no demand paging. Mapping is still
+      eager, and a program's whole image and 1MB stack are committed up
+      front.
+- [ ] `TSS.esp0` is still a single global kernel stack (borrowed and
+      restored around ring-3 callbacks, see Milestone 13). Real
+      preemption across address spaces needs per-process kernel stacks.
+
 ## Path A — porting Wine (the current direction)
 
 Milestone 8 laid out two ways to run Windows binaries: port Wine (Path
@@ -1171,8 +1373,9 @@ actual breadth instead of a bespoke subset. This is an honest
 architectural pivot, not an incremental feature, and the prerequisites
 are forced into an order:
 
-1. **Per-process address spaces** — ✅ mechanism done, Milestone 14.
-   Still to do: run processes in them.
+1. **Per-process address spaces** — ✅ done. Milestone 14 built the
+   mechanism; Milestone 15 put processes in it. Still to do: make the
+   scheduler address-space-aware, which is really item 2's problem.
 2. **Real threads.**
 3. **A POSIX-ish syscall surface** — `mmap`/`munmap`/`mprotect`, file
    descriptors, `pthread_*`, something signal-shaped. This is what

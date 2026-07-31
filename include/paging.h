@@ -93,6 +93,19 @@ void paging_finalize_kernel_space(void);
  * a runtime condition to recover from. */
 int paging_kernel_pde_violated(void);
 
+/* True if every page table covering [start, end) is private to the
+ * current address space - i.e. mapping something there affects only this
+ * process. A process's own mappings *must* satisfy this: a page table in
+ * the shared kernel set is shared by every address space, so writing an
+ * entry into one would hand the mapping to the kernel and to every other
+ * process too. The shared set is 4MB-granular, so a range can fail this
+ * while being nowhere near anything the kernel actually uses. */
+int paging_range_is_private(uint32_t start, uint32_t end);
+
+/* Index of the first shared directory entry at or after `from`, or 1024
+ * if there is none. For reporting the layout; see the `vmtest` command. */
+uint32_t paging_next_global_pde(uint32_t from);
+
 /* Allocates a page directory whose kernel half is the frozen shared set
  * and whose user half is empty, with its own recursive mapping in place.
  * Returns its physical address, or 0 (out of memory, or called before

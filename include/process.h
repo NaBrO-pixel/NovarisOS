@@ -51,4 +51,30 @@ int process_user_active(void);
  * idt_install(). */
 void process_install_fault_handler(void);
 
+/* --- per-process address spaces (Milestone 15) --------------------------
+ *
+ * Wraps the Milestone 14 paging API into the lifecycle a program needs.
+ * Every path that runs ring-3 code brackets itself with these:
+ *
+ *     if (process_enter_address_space()) { ... }   // now on a private CR3
+ *     ... map the image, the stack, run it, unmap ...
+ *     process_leave_address_space();               // back on the kernel's
+ *
+ * Because the kernel half is identical in every address space, everything
+ * between those two calls - kmalloc, the console, reading the initrd, and
+ * every Win32 API that reads a program's memory by casting a pointer -
+ * carries on working unchanged. See the long comment in process.c.
+ *
+ * process_enter_address_space() returns 0 if it could not create one (out
+ * of memory). That is not fatal: the caller runs the program in the
+ * kernel's address space instead, exactly as every milestone before this
+ * one did, and must not call process_leave_address_space() afterwards. */
+int  process_enter_address_space(void);
+void process_leave_address_space(void);
+
+/* The page directory the running program is using, or 0 if it is sharing
+ * the kernel's. Reported by `run` so the isolation is visible rather than
+ * merely claimed. */
+uint32_t process_current_address_space(void);
+
 #endif
