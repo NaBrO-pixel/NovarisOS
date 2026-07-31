@@ -99,20 +99,27 @@ static void enter_user_mode(uint32_t entry, uint32_t stack_top) {
     user_active = 0;
 }
 
-void process_run_flat_binary(const uint8_t* image, uint32_t size) {
+int process_map_image(uint32_t load_vaddr, const uint8_t* image,
+                      uint32_t size) {
     uint32_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     if (pages == 0) pages = 1;
 
-    int owns_as = process_enter_address_space();
-
     for (uint32_t i = 0; i < pages; i++) {
         uint32_t phys = pmm_alloc_frame();
-        paging_map_page(USER_LOAD_VADDR + i * PAGE_SIZE, phys,
+        if (!phys) return 0;
+        paging_map_page(load_vaddr + i * PAGE_SIZE, phys,
                          PAGE_PRESENT | PAGE_RW | PAGE_USER);
     }
 
-    uint8_t* dest = (uint8_t*)USER_LOAD_VADDR;
+    uint8_t* dest = (uint8_t*)load_vaddr;
     for (uint32_t i = 0; i < size; i++) dest[i] = image[i];
+    return 1;
+}
+
+void process_run_flat_binary(const uint8_t* image, uint32_t size) {
+    int owns_as = process_enter_address_space();
+
+    process_map_image(USER_LOAD_VADDR, image, size);
 
     /* One page of user stack, mapped just below USER_STACK_TOP so the
      * initial ESP we hand to ring 3 is a valid "one past the mapped

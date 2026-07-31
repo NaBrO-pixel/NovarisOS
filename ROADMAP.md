@@ -1359,6 +1359,189 @@ twice, in code that had been shipping since Milestones 9 and 10.
       restored around ring-3 callbacks, see Milestone 13). Real
       preemption across address spaces needs per-process kernel stacks.
 
+## Milestone 16 — Address-space-aware scheduling, and threads ✅ DONE
+
+Item 2 on the Path A list. Milestone 15 put one process in its own
+address space, but the scheduler still knew nothing about them: the
+`multitask` demo's three tasks shared whatever directory happened to be
+loaded, which is why they had to be assembled at three *different*
+addresses to avoid overwriting each other.
+
+This milestone teaches the scheduler about address spaces, and gets
+threads almost for free as a consequence.
+
+### One line in the switch path
+
+Each task now records the page directory it runs in, and the switch path
+loads CR3 when the next task's differs from the outgoing one. That is
+essentially the whole change:
+
+```c
+static void switch_to(process_t* next) {
+    if (next->page_directory != current->page_directory) {
+        paging_switch_address_space(next->page_directory);
+    }
+    current = next;
+    current->state = PROC_RUNNING;
+    gdt_set_kernel_stack(current->kernel_stack_top);
+    scheduler_next_esp = current->esp;
+}
+```
+
+Doing the CR3 load *there* — several C frames deep, on the outgoing
+task's kernel stack, before the isr.s epilogue performs the actual stack
+swap — is safe for the same reason Milestone 15's change was small: the
+kernel half is identical in every address space, so this code, this
+stack, and the frame `scheduler_next_esp` points at are all at the same
+addresses before and after the load. Only the user half changes, and
+nothing on the switch path touches that.
+
+Skipping the load when the directory is unchanged is not just an
+optimisation — a CR3 write flushes the entire TLB, and it is what makes
+switching between two threads of one process cheap.
+
+### Threads are what is left when you take the address space away
+
+The existing `scheduler_spawn_flat()` was split into a `spawn_common()`
+that builds a kernel stack, a user stack and a synthetic trap frame, plus
+a thin wrapper that loads an image. Three public spawns now sit on top:
+
+| | address space | image | owns the directory |
+| --- | --- | --- | --- |
+| `scheduler_spawn_flat` | the current one | loads | no |
+| `scheduler_spawn_process` | a brand-new one | loads | yes |
+| `scheduler_spawn_thread` | the current one | none | no |
+
+A thread is that third row: `load_pages = 0` ("I own no code") and
+`owns_page_directory = 0` ("the directory I run in is somebody else's").
+What remains — a stack and a register context — *is* the thread. No new
+scheduling machinery was needed; the round-robin loop, the preemption and
+the synthetic-frame trick all work on threads unmodified.
+
+`scheduler_spawn_process()` loads into its new address space by simply
+standing in it:
+
+```c
+paging_switch_address_space(as);
+pages = load_image(image, size, load_vaddr);
+pid   = spawn_common(...);
+paging_switch_address_space(caller_as);
+```
+
+Neither `load_image()` nor `spawn_common()` knows address spaces exist —
+they call the ordinary paging functions, which act on whatever is in CR3.
+Safe because the image bytes are read out of a kernel buffer that is at
+the same address either side of the switch.
+
+Reaping got two passes, because a task's pages can only be unmapped from
+inside its own address space, and a directory cannot be destroyed while
+it is loaded in CR3: switch to each task in turn and free its pages, then
+come back and destroy the directories whose owners created them.
+
+### Verified: `multitask`, rewritten to prove isolation
+
+All three demo tasks are now assembled at the **same** `ORG 0x50000000`
+and spawned with `scheduler_spawn_process()` at the same load address and
+the same stack address. Through Milestone 15 that would have been three
+tasks scribbling over each other's code.
+
+```
+novaris> multitask
+[kernel] Spawning 3 demo processes under the preemptive scheduler...
+PIDs: 1, 2, 3 - if you see their tags interleaved below
+rather than grouped, the timer is really preempting them:
+
+[A]
+[A]
+[B]
+[B]
+[B]
+[C]
+[C]
+[C]
+[A]
+...
+```
+
+The evidence is in the tags. All three images live at `0x50000000` — if
+the address spaces were not real, the last one spawned would have
+overwritten the other two and every line would read `[C]`. Getting `[A]`,
+`[B]` *and* `[C]`, interleaved by the timer, means three different
+physical pages are answering to one virtual address while the scheduler
+switches between them.
+
+### Verified: `threadtest`, proving the opposite
+
+Isolation is only half the story; threads need the other half, which is
+tasks that genuinely *do* share memory. `userland/thread_demo.s` is one
+image with two entry points, run by two tasks in one address space, both
+incrementing the same word:
+
+```
+novaris> threadtest
+Two threads in ONE address space (ROADMAP Milestone 16)
+  page directory 0x00c7b000, one image at 0x51000000
+  thread PIDs 4 and 5, separate stacks at 0x51100000 and 0x51200000
+
+[thread 0]
+[thread 0]
+[thread 1]
+[thread 1]
+[thread 1]
+[thread 0]
+...
+
+  shared counter at 0x51000200 reads 16, expected 16
+  both threads incremented the SAME word - they share one address space
+threadtest done.
+```
+
+Two threads × 8 iterations = 16, read back by the kernel after both have
+exited. Had they been given private copies the count would have been 8.
+The interleaved tags show the timer preempting between them, and the
+separate stacks at `0x51100000` and `0x51200000` show they are genuinely
+independent contexts rather than one task looping twice.
+
+The shell owns the address space in this demo rather than the scheduler,
+for a specific reason worth recording: the counter lives in the image, so
+if a *task* owned the directory the reaper would destroy it — and the
+counter with it — before there was anything left to read.
+
+### Frame accounting
+
+`meminfo` before and after two full rounds of `multitask` + `threadtest`:
+**29541 → 29541 → 29541**. Exactly balanced, with five address spaces
+created and destroyed per round. The full 16-case smoke suite is
+unchanged from Milestone 15 apart from the added `threadtest` output, and
+its 149-frame delta is entirely the one-time arena high-water marks
+documented there.
+
+Host tests: 38 + 30 + 52 checks, 0 failures.
+
+### Honest scope
+
+- [x] Preemptive round-robin across separate address spaces, switching
+      CR3 on the task switch.
+- [x] Multiple threads per address space, preemptively scheduled, sharing
+      memory.
+- [ ] **These are still only the scheduler's tasks, not the shell's
+      programs.** `run prog.exe` remains the synchronous "one process,
+      blocks the shell" path from Milestone 15. A Win32 program still
+      cannot spawn a thread — `CreateThread` and `_beginthreadex` are
+      still stubs. Wiring the Win32 layer onto this scheduler is the
+      obvious next step and is *not* done here.
+- [ ] No synchronisation primitives at all: no mutex, no semaphore, no
+      condition variable, no futex. `threadtest` gets away with `lock inc`
+      because a single core can only preempt between whole instructions.
+      Anything Wine needs will want real ones.
+- [ ] No thread-local storage. Every thread in an address space shares one
+      TEB, which is wrong the moment a second thread runs Win32 code.
+- [ ] No thread exit/join semantics beyond "every task calls sys_exit and
+      the batch ends". No detach, no return values.
+- [ ] `MAX_PROCESSES` is 8, and kernel stacks are a fixed 4KB each.
+- [ ] Still no priorities, no blocking/sleeping, no I/O wait — a task that
+      wants to wait busy-spins.
+
 ## Path A — porting Wine (the current direction)
 
 Milestone 8 laid out two ways to run Windows binaries: port Wine (Path
@@ -1376,7 +1559,10 @@ are forced into an order:
 1. **Per-process address spaces** — ✅ done. Milestone 14 built the
    mechanism; Milestone 15 put processes in it. Still to do: make the
    scheduler address-space-aware, which is really item 2's problem.
-2. **Real threads.**
+2. **Real threads** — ✅ done for the kernel's own scheduler in Milestone
+   16 (address-space-aware switching, multiple threads per address
+   space). Still to do: synchronisation primitives, thread-local storage,
+   and connecting Win32's `CreateThread` to any of it.
 3. **A POSIX-ish syscall surface** — `mmap`/`munmap`/`mprotect`, file
    descriptors, `pthread_*`, something signal-shaped. This is what
    Wine's own build actually links against.

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Regenerates kernel/task_{a,b,c}_blob.c from userland/task_{a,b,c}.bin.
+"""Regenerates kernel/*_blob.c from the assembled flat binaries in this
+directory (the scheduler demo's three tasks, plus Milestone 16's thread demo).
 Same idea as embed.py, generalized for the scheduler demo's three tasks.
 
 Usage:
@@ -31,5 +32,5 @@ def embed(name):
         f.write(f"const unsigned int {name}_bin_len = sizeof({name}_bin);\n")
     print(f"wrote {dst} ({len(data)} bytes)")
 
-for n in ("task_a", "task_b", "task_c"):
+for n in ("task_a", "task_b", "task_c", "thread_demo"):
     embed(n)

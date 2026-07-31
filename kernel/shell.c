@@ -16,6 +16,7 @@
 #include "task_a.h"
 #include "task_b.h"
 #include "task_c.h"
+#include "thread_demo.h"
 
 #define CMD_BUFFER_SIZE 128
 
@@ -412,6 +413,94 @@ static void cmd_vmtest(void) {
                          "page directory.\n");
 }
 
+/* --- threadtest ---------------------------------------------------------
+ *
+ * Milestone 16's evidence for threads, as opposed to processes.
+ *
+ * `multitask` shows three tasks that cannot see each other - three page
+ * directories, same virtual address, three different physical pages. This
+ * shows the opposite and equally necessary half: two tasks that *can* see
+ * each other, because they share one directory.
+ *
+ * The shell owns the address space here rather than the scheduler, for a
+ * specific reason: the counter the two threads increment lives in the
+ * image, and if a task owned the directory the reaper would destroy it -
+ * and the counter with it - before there was anything left to read. So
+ * the shell creates the address space, maps the image itself, spawns two
+ * threads that own no image and no directory, and reads the shared word
+ * back afterwards while still standing in that address space.
+ */
+#define THREAD_DEMO_BASE   0x51000000u
+#define THREAD_DEMO_STACK0 0x51100000u
+#define THREAD_DEMO_STACK1 0x51200000u
+
+static void cmd_threadtest(void) {
+    terminal_writestring("Two threads in ONE address space (ROADMAP Milestone 16)\n");
+
+    if (!process_enter_address_space()) {
+        terminal_writestring_color("Could not create an address space.\n",
+                                   VGA_COLOR_LIGHT_RED);
+        return;
+    }
+
+    /* One image, mapped once. Both threads run out of these same pages. */
+    if (!process_map_image(THREAD_DEMO_BASE, thread_demo_bin,
+                           thread_demo_bin_len)) {
+        terminal_writestring_color("Out of memory mapping the demo image.\n",
+                                   VGA_COLOR_LIGHT_RED);
+        process_leave_address_space();
+        return;
+    }
+
+    int t0 = scheduler_spawn_thread("thread0", THREAD_DEMO_BASE,
+                                    THREAD_DEMO_STACK0);
+    int t1 = scheduler_spawn_thread("thread1",
+                                    THREAD_DEMO_BASE + THREAD_DEMO_THREAD1_ENTRY,
+                                    THREAD_DEMO_STACK1);
+    if (t0 < 0 || t1 < 0) {
+        terminal_writestring_color("Could not spawn both threads.\n",
+                                   VGA_COLOR_LIGHT_RED);
+        process_leave_address_space();
+        return;
+    }
+
+    terminal_writestring("  page directory ");
+    print_hex(process_current_address_space(), 8);
+    terminal_writestring(", one image at ");
+    print_hex(THREAD_DEMO_BASE, 8);
+    terminal_writestring("\n  thread PIDs ");
+    print_uint((uint32_t)t0);
+    terminal_writestring(" and ");
+    print_uint((uint32_t)t1);
+    terminal_writestring(", separate stacks at ");
+    print_hex(THREAD_DEMO_STACK0, 8);
+    terminal_writestring(" and ");
+    print_hex(THREAD_DEMO_STACK1, 8);
+    terminal_writestring("\n\n");
+
+    scheduler_run_until_idle();
+
+    /* Both threads have exited and the reaper has taken their stacks, but
+     * the image is the shell's, so the counter is still here to read. */
+    uint32_t counter = *(volatile uint32_t*)(THREAD_DEMO_BASE +
+                                             THREAD_DEMO_COUNTER);
+    uint32_t expected = THREAD_DEMO_ITERATIONS * 2;
+
+    terminal_writestring("\n  shared counter at ");
+    print_hex(THREAD_DEMO_BASE + THREAD_DEMO_COUNTER, 8);
+    terminal_writestring(" reads ");
+    print_uint(counter);
+    terminal_writestring(", expected ");
+    print_uint(expected);
+    terminal_writestring(counter == expected
+                             ? "\n  both threads incremented the SAME word - "
+                               "they share one address space\n"
+                             : "\n  WRONG - the threads did not share memory\n");
+
+    process_leave_address_space();
+    terminal_writestring("threadtest done.\n");
+}
+
 static void print_prompt(void) {
     terminal_writestring_color("novaris", VGA_COLOR_LIGHT_CYAN);
     terminal_writestring_color("> ", VGA_COLOR_LIGHT_GREY);
@@ -428,6 +517,8 @@ static void run_command(char* line) {
         terminal_writestring("  about   - about Novaris\n");
         terminal_writestring("  uptime  - timer ticks since boot\n");
         terminal_writestring("  meminfo - physical memory frame usage\n");
+        terminal_writestring("  threadtest - two threads sharing one address space,\n");
+        terminal_writestring("            incrementing one shared counter (Milestone 16)\n");
         terminal_writestring("  vmtest  - prove per-process address spaces work:\n");
         terminal_writestring("            two page directories, one virtual address,\n");
         terminal_writestring("            two different contents (ROADMAP Milestone 14)\n");
@@ -465,6 +556,8 @@ static void run_command(char* line) {
         terminal_writestring(" total (");
         print_uint(pmm_free_frames() * 4);
         terminal_writestring("KB free)\n");
+    } else if (streq(line, "threadtest")) {
+        cmd_threadtest();
     } else if (streq(line, "vmtest")) {
         cmd_vmtest();
     } else if (streq(line, "ls")) {
@@ -528,18 +621,18 @@ static void run_command(char* line) {
         terminal_writestring_color("[kernel] ", VGA_COLOR_LIGHT_GREEN);
         terminal_writestring("Spawning 3 demo processes under the preemptive scheduler...\n");
 
-        /* Distinct, non-overlapping load addresses - see scheduler.h's
-         * top-of-file comment for why concurrently-scheduled tasks can't
-         * share USER_LOAD_VADDR (0x40000000, used by `run`/`runuser`)
-         * the way single-process programs do: there's still only one
-         * shared page directory, so "concurrent" here means "distinct
-         * addresses", not "isolated address spaces". */
-        int pa = scheduler_spawn_flat("task_a", task_a_bin, task_a_bin_len,
-                                       0x50000000u, 0x50100000u);
-        int pb = scheduler_spawn_flat("task_b", task_b_bin, task_b_bin_len,
-                                       0x50200000u, 0x50300000u);
-        int pc = scheduler_spawn_flat("task_c", task_c_bin, task_c_bin_len,
-                                       0x50400000u, 0x50500000u);
+        /* The same load address and the same stack address for all three,
+         * which through Milestone 15 would have meant three tasks
+         * scribbling over each other's code. Since Milestone 16 each gets
+         * its own page directory, so 0x50000000 resolves to a different
+         * physical page in each - "concurrent" now means isolated address
+         * spaces, not merely distinct addresses. */
+        int pa = scheduler_spawn_process("task_a", task_a_bin, task_a_bin_len,
+                                          0x50000000u, 0x50100000u);
+        int pb = scheduler_spawn_process("task_b", task_b_bin, task_b_bin_len,
+                                          0x50000000u, 0x50100000u);
+        int pc = scheduler_spawn_process("task_c", task_c_bin, task_c_bin_len,
+                                          0x50000000u, 0x50100000u);
 
         if (pa < 0 || pb < 0 || pc < 0) {
             terminal_writestring_color("Failed to spawn one or more demo processes.\n", VGA_COLOR_LIGHT_RED);

@@ -14,7 +14,7 @@ bootloader hands off to a kernel, and the kernel grows from there. Over time
 you can shape it to *feel* like whichever OS inspires you (windowing system,
 shell conventions, UI style) without copying anyone's code.
 
-## Current status: Milestone 15 complete ✅
+## Current status: Milestone 16 complete ✅
 
 - [x] Multiboot bootloader handoff (via GRUB), 32-bit protected mode
 - [x] Freestanding C kernel — no libc, we own the whole stack
@@ -24,7 +24,9 @@ shell conventions, UI style) without copying anyone's code.
       and a `kmalloc`/`kfree` heap
 - [x] Ring 3 user mode via a TSS and an `int 0x80` syscall interface
 - [x] Initrd (a GRUB module) behind a VFS layer, plus a tiny libc
-- [x] Round-robin preemptive multitasking with real context switching
+- [x] Round-robin preemptive multitasking with real context switching,
+      across separate address spaces — plus real threads (several
+      preemptively-scheduled contexts sharing one address space)
 - [x] ELF32 loader
 - [x] **Runs real, unmodified Windows `.exe` files** against an emulated
       Win32 API — see below
@@ -159,7 +161,10 @@ Three shell commands drive it:
 | `peinfo prog.exe` | Dumps a PE's headers and shows, per symbol, which imports resolve |
 | `winapi [module]` | Lists the emulated DLLs, or one module's exports |
 
-And `vmtest` demonstrates the Milestone 14 paging work: two page
+`multitask` runs three tasks from the same virtual address in three
+different address spaces, and `threadtest` runs two threads in one
+address space incrementing a shared counter. `vmtest` demonstrates the
+underlying Milestone 14 paging work: two page
 directories with different contents at the same virtual address, an
 identical kernel half in both, and the kernel still running throughout.
 

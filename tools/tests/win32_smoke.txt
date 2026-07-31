@@ -23,12 +23,14 @@ run crash.exe
 run qsorttest.exe
 run hellowin.exe
 
-# The non-PE paths through process.c, which Milestone 15 also moved into
-# private address spaces, and the scheduler demo, which deliberately did
-# not move (see ROADMAP Milestone 15).
+# The non-PE paths through process.c, which Milestone 15 moved into
+# private address spaces, and the two scheduler demos Milestone 16 added:
+# multitask is three tasks in three address spaces at one address,
+# threadtest is two threads in one address space sharing one counter.
 run helloelf.elf
 run helloc.bin
 multitask
+threadtest
 
 vmtest
 meminfo

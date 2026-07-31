@@ -13,11 +13,18 @@
  * several ring-3 programs concurrently under real timer-driven
  * preemption, exercised by the shell's `multitask` command.
  *
- * There is still only one shared page directory (no per-process address
- * spaces / CR3 switching - see ROADMAP.md), so concurrently-scheduled
- * tasks must be loaded at distinct, non-overlapping virtual addresses
- * chosen by the caller. That per-process-address-space work is real,
- * separately-scoped follow-up, not something this milestone attempts. */
+ * Milestone 16 gave it address spaces and threads. Each task records the
+ * page directory it runs in, and the switch path loads CR3 when the next
+ * task's differs from the outgoing one - so concurrently-scheduled tasks
+ * no longer have to live at distinct virtual addresses. Three copies of
+ * the same program, at the same address, each isolated from the others,
+ * is now a thing that works (`multitask`).
+ *
+ * Threads fall out of the same structure: a thread is a task that shares
+ * another task's page directory instead of getting its own. Same
+ * scheduler, same preemption, same synthetic-frame trick - the only
+ * differences are that nothing is loaded for it, and CR3 does not change
+ * when the scheduler switches between siblings (`threadtest`). */
 
 #define PROCESS_MAX_NAME 16
 
@@ -45,8 +52,19 @@ typedef struct process {
     uint32_t kernel_stack_top;  /* fixed TSS esp0 value while this process runs */
 
     uint32_t load_vaddr;
-    uint32_t load_pages;
+    uint32_t load_pages;   /* 0 for a thread: it loaded nothing of its own */
     uint32_t stack_top;
+
+    /* The address space this task runs in. Milestone 16: the switch path
+     * loads CR3 with this when it differs from the outgoing task's, which
+     * is exactly what makes two tasks at the same virtual address
+     * possible - and what makes two tasks sharing one directory a pair of
+     * threads rather than two processes. */
+    uint32_t page_directory;
+    /* 1 if this task created that directory and must destroy it when the
+     * batch is reaped. Threads sharing a sibling's directory, and tasks
+     * spawned into a directory the caller owns, both leave this 0. */
+    int owns_page_directory;
 
     process_state_t state;
 } process_t;
@@ -63,6 +81,25 @@ void scheduler_init(void);
  * PID (>0), or -1 on failure (table full or out of memory). */
 int scheduler_spawn_flat(const char* name, const uint8_t* image, uint32_t size,
                           uint32_t load_vaddr, uint32_t stack_top);
+
+/* Same, but in a brand-new address space of its own, which the scheduler
+ * destroys when the batch is reaped. Because the task is alone in its
+ * address space, `load_vaddr` and `stack_top` are free to be identical
+ * across every task spawned this way. Returns -1 if an address space
+ * could not be created. */
+int scheduler_spawn_process(const char* name, const uint8_t* image,
+                            uint32_t size, uint32_t load_vaddr,
+                            uint32_t stack_top);
+
+/* Adds another thread of execution to the *current* address space:
+ * its own kernel stack, its own one-page user stack ending at
+ * `stack_top`, its own register context, starting at `entry` - and
+ * nothing else. Nothing is loaded and no address space is created, so
+ * `entry` must already be mapped and executable, and every global the
+ * code touches is shared with its siblings. That sharing is the whole
+ * definition of a thread here. Returns the new PID, or -1. */
+int scheduler_spawn_thread(const char* name, uint32_t entry,
+                           uint32_t stack_top);
 
 /* Starts round-robin preemptive multitasking among every process spawned
  * since the last call, and blocks the caller (same "looks like an
