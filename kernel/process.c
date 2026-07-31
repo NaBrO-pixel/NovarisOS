@@ -9,6 +9,7 @@
 #include "console.h"
 #include "kstring.h"
 #include "posix.h"
+#include "scheduler.h"
 
 /* Referenced from process_asm.s: the kernel-side stack pointer/frame
  * pointer to restore when the user program exits, so control returns to
@@ -23,6 +24,8 @@ uint32_t user_fs_selector = 0x23;
 #define USER_LOAD_VADDR 0x40000000u /* must match userland/user.ld */
 #define USER_STACK_TOP      0x40100000u /* 1MB above the program; grows down */
 #define PAGE_SIZE 4096u
+/* 64KB of stack for an ELF program - see process_run_elf(). */
+#define ELF_STACK_SIZE (16u * PAGE_SIZE)
 
 /* Non-zero between entering ring 3 and coming back out of it. Only the
  * fault path reads it, and only to decide whether a CPU exception belongs
@@ -160,11 +163,28 @@ int process_run_elf(const uint8_t* image, uint32_t size) {
         return 0;
     }
 
-    uint32_t stack_phys = pmm_alloc_frame();
-    paging_map_page(USER_STACK_TOP - PAGE_SIZE, stack_phys,
-                     PAGE_PRESENT | PAGE_RW | PAGE_USER);
+    /* An ELF program gets a larger stack than the single page a flat
+     * binary makes do with: since Milestone 20 it can clone() threads,
+     * and each of those needs somewhere to put a stack of its own out of
+     * its mmap arena, but the main thread's own frames also get deeper
+     * once there is a real program on top. */
+    for (uint32_t va = USER_STACK_TOP - ELF_STACK_SIZE; va < USER_STACK_TOP;
+         va += PAGE_SIZE) {
+        uint32_t phys = pmm_alloc_frame();
+        if (!phys) break;
+        paging_map_page(va, phys, PAGE_PRESENT | PAGE_RW | PAGE_USER);
+    }
 
-    enter_user_mode(entry, USER_STACK_TOP);
+    /* Run as a scheduler task rather than through the older blocking
+     * path. That is what makes clone() possible at all: a second thread
+     * is simply a second task in this same address space, and
+     * scheduler_run_single() blocks its caller exactly the way
+     * process_run_user_mode() did. */
+    user_active = 1;
+    posix_process_begin();
+    scheduler_run_single("main", entry, USER_STACK_TOP);
+    posix_process_end();
+    user_active = 0;
 
     if (owns_as) process_leave_address_space();
     return 1;

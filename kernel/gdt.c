@@ -17,12 +17,12 @@ struct gdt_ptr {
     uint32_t base;
 } __attribute__((packed));
 
-/* 7 entries: null, kernel code, kernel data, user code, user data, TSS,
+/* 8 entries: null, kernel code, kernel data, user code, user data, TSS,
  * and the Win32 TEB segment. The user-mode ones were set up back in
  * Milestone 2; the TSS entry came with Milestone 5; entry 6 is
  * Milestone 10's, and is the only one whose base changes at runtime -
  * see gdt_set_teb(). */
-#define GDT_ENTRIES 7
+#define GDT_ENTRIES 8
 static struct gdt_entry gdt[GDT_ENTRIES];
 static struct gdt_ptr   gp;
 
@@ -111,6 +111,14 @@ void gdt_install(void) {
      * access faults rather than silently addressing something real. */
     gdt_set_gate(6, 0, 0, 0xF2, 0x40);
 
+    /* Thread-local storage segment (selector 0x3B = entry 7, RPL 3), for
+     * POSIX threads. Milestone 20: glibc-shaped i386 TLS reaches its
+     * per-thread data through gs:[...], exactly as Windows code reaches
+     * its TEB through fs:[...], so it needs a segment whose base is the
+     * thread's TLS block. Filled in by set_thread_area()/CLONE_SETTLS and
+     * reprogrammed on every thread switch - see gdt_set_tls(). */
+    gdt_set_gate(7, 0, 0, 0xF2, 0x40);
+
     gdt_flush((uint32_t)&gp);
 
     /* Selector 0x28 = GDT entry 5 (5*8), ring 0 (RPL bits already 0). */
@@ -123,6 +131,17 @@ void gdt_set_kernel_stack(uint32_t esp0) {
 
 uint32_t gdt_get_kernel_stack(void) {
     return tss.esp0;
+}
+
+void gdt_set_tls(uint32_t base, uint32_t limit) {
+    /* Byte granularity below 1MB, page granularity above, so a thread can
+     * describe either a small TLS block or a large one. The 0x40/0xC0
+     * difference is the G bit. */
+    if (limit >= 0x100000u) {
+        gdt_set_gate(7, base, limit >> 12, 0xF2, 0xC0);
+    } else {
+        gdt_set_gate(7, base, limit, 0xF2, 0x40);
+    }
 }
 
 void gdt_set_teb(uint32_t base, uint32_t limit) {

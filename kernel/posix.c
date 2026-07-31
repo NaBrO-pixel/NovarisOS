@@ -460,10 +460,20 @@ void posix_syscall(registers_t* regs) {
             r = posix_raise((int)(n == SYS_kill ? b : c));
             break;
 
-        /* Still accepted and ignored: TLS setup, which needs per-thread
-         * GDT entries the POSIX side does not have yet. */
+        /* Real since Milestone 20 - see kernel/posix_thread.c. */
         case SYS_set_thread_area:
-            r = 0;
+            r = posix_sys_set_thread_area(a);
+            break;
+        case SYS_clone:
+            r = posix_sys_clone(a, b, (uint32_t*)c, d, (uint32_t*)e, regs);
+            break;
+        case SYS_futex:
+            r = posix_sys_futex(a, (int)b, c);
+            break;
+        case SYS_set_tid_address:
+            /* glibc calls this at startup to register where to clear the
+             * tid. One process, so the value is simply reported back. */
+            r = scheduler_current_pid() ? scheduler_current_pid() : 0x100;
             break;
 
         /* isatty() is ioctl(TCGETS) under the covers; saying "yes, a
@@ -474,6 +484,11 @@ void posix_syscall(registers_t* regs) {
             break;
 
         case SYS_exit:
+            /* A thread exiting has to clear the word its creator asked
+             * for, or a joiner waits for ever. exit_group takes the whole
+             * program with it, so it does not. */
+            posix_thread_exiting();
+            /* fall through */
         case SYS_exit_group:
             /* Same two paths sys_exit always had: into the scheduler's
              * ready queue when one is running, or back to the kernel. */
@@ -488,6 +503,18 @@ void posix_syscall(registers_t* regs) {
             report_unimplemented(n);
             r = -ENOSYS;
             break;
+    }
+
+    /* An implementation can ask for the whole call to happen again rather
+     * than return - futex(FUTEX_WAIT) does. Restoring eax matters: the
+     * syscall number lives there and would otherwise be replaced by this
+     * call's result, so the re-executed `int $0x80` would dispatch to
+     * whatever that value happened to name. `int $0x80` is two bytes. */
+    if (posix_retry_pending()) {
+        regs->eax = n;
+        regs->eip -= 2;
+        scheduler_yield_from_trap(regs);
+        return;
     }
 
     regs->eax = (uint32_t)r;

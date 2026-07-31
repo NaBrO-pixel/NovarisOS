@@ -32,6 +32,7 @@ run helloelf.elf
 run helloc.bin
 run posixtest.elf
 run sigtest.elf
+run pthtest.elf
 multitask
 threadtest
 

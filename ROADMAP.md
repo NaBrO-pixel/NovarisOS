@@ -1994,6 +1994,147 @@ host tests are 38 + 30 + 52 with no failures.
 - [ ] `SIGKILL` cannot be blocked, but nothing can send it from outside —
       there is one process and no `ps`.
 
+## Milestone 20 — POSIX threads: clone, futex and TLS ✅ DONE
+
+Third instalment of item 3. Wine is threaded, and it reaches threads the
+Unix way: `clone()` to create them, `futex()` to make them wait, and a
+gs-based TLS block so each has its own errno and thread pointer.
+
+Novaris has had real preemptive threads since Milestone 16 and has run
+Win32 programs on them since Milestone 17. What was missing was the POSIX
+doorway to the same machinery — which is most of what this milestone is.
+`clone` lands on `scheduler_spawn_posix_thread()`, and the scheduler that
+already switches CR3 and the TEB descriptor now switches a TLS descriptor
+too.
+
+### What was actually new
+
+**A TLS segment.** i386 TLS lives behind `gs` exactly as a Windows TEB
+lives behind `fs`, so GDT entry 7 (selector `0x3B`) was added alongside
+Milestone 10's entry 6, and `switch_to()` reprograms it per thread.
+Without that, two threads would share one thread pointer, which is the
+one thing TLS may not do.
+
+**`clone` returning twice.** The child starts at the instruction after
+the caller's `int $0x80` — which is exactly `regs->eip`, since the CPU has
+already advanced past it — on the stack the caller supplied, with `eax`
+set to 0 in its synthetic trap frame. The parent gets the tid from the
+syscall's return. Only the thread shape (`CLONE_VM`) is supported; a
+fork-shaped clone is refused with `-ENOSYS` rather than handed back a
+child with a shared address space it does not expect.
+
+**`futex`.** `FUTEX_WAIT` sleeps only if the word still holds the value
+the caller passed, which is what closes the race between testing a lock
+and going to sleep on it. Waiting reuses Milestone 17's mechanism —
+rewind the trap frame so the whole syscall re-executes, and yield —
+because the scheduler resumes tasks from a trap frame and cannot suspend
+one mid-syscall. One detail that bit: the syscall number lives in `eax`
+and is overwritten by the result, so the retry restores it before
+rewinding `eip` past the two bytes of `int $0x80`; without that the
+re-executed call would dispatch to whatever the return value happened to
+name.
+
+**`CLONE_CHILD_CLEARTID`.** The kernel zeroes a caller-nominated word
+when the thread exits. That pairing with `futex` *is* `pthread_join`, and
+implementing it is what lets a joiner stop waiting.
+
+ELF programs also moved onto the scheduler, the same change Milestone 17
+made for Win32 — a program's main thread has to be a scheduler task
+before a second one can join it.
+
+### Verified: a third binary, on Linux and on Novaris
+
+`userland/thread_posix_test.c` uses no pthreads, because there is no libc
+here — it is what pthreads is *made of*. Same rules as before: raw
+`int $0x80`, `gcc -m32 -static -nostdlib -ffreestanding`, linked against
+nothing.
+
+```
+$ make test-posix
+41 lines compared, 20 checks, 0 failing, 0 unexpected difference(s)
+PASS: posixtest.elf behaves identically on Linux and Novaris
+29 lines compared, 17 checks, 0 failing, 0 unexpected difference(s)
+PASS: sigtest.elf behaves identically on Linux and Novaris
+26 lines compared, 8 checks, 0 failing, 0 unexpected difference(s)
+PASS: pthtest.elf behaves identically on Linux and Novaris
+```
+
+All 26 lines byte-identical, including:
+
+```
+4. per-thread TLS
+  worker 1 read gs:0 = 2000
+  worker 2 read gs:0 = 2001
+  worker 3 read gs:0 = 2002
+  [ok]   each worker read its own TLS tag
+  [ok]   the main thread's TLS survived
+```
+
+Each thread reading its own tag out of `gs:0` is a direct test that the
+segment really is per-thread, and the main thread's tag surviving three
+context switches is a direct test that the descriptor is restored rather
+than left wherever the last thread put it.
+
+**The negative control.** A passing mutex test proves nothing if the
+threads never raced. Rebuilding with `lock()` returning immediately, on
+both systems:
+
+| | with the mutex | without it |
+| --- | --- | --- |
+| Linux host | 60 | **36** |
+| Novaris | 60 | **40** |
+
+Twenty and twenty-four lost increments respectively — the race is real on
+both, and the futex mutex is what prevents it.
+
+That control also caught something first time round: with a 20,000-cycle
+critical section the Novaris run came out at 60 *without* any lock,
+because a 20ms time slice was long enough for each worker to finish
+inside one and the threads never overlapped. The section had to be
+widened to 300,000 cycles before the lock was genuinely under test — the
+same lesson Milestone 17 taught, and worth recording twice.
+
+### Two things the host taught, not the guest
+
+Both were found because the test ran on Linux first.
+
+**`CLONE_SETTLS` cannot allocate a TLS entry**, only use one. And the
+entry number is not portable: i386 Linux uses GDT entries 6–8, a 32-bit
+process on an x86-64 kernel gets 12–14, and Novaris has one, at 7. The
+portable sequence — and what glibc does — is `set_thread_area(-1)` once to
+allocate and *learn* the number, then name that entry in every subsequent
+clone. The first version hardcoded `-1` everywhere and failed with
+`-EINVAL` on Linux.
+
+**Where the boundaries are is a kernel's choice, not the ABI's.** The
+test computes its `gs` selector from the entry number the kernel returned
+rather than hardcoding one, which is why the same binary works on a
+kernel that answers 12 and a kernel that answers 7.
+
+The full 23-case smoke suite passes, repeated runs cost zero frames
+(29470 across three `meminfo` calls with `pthtest.elf` run twice, cloned
+threads and all), and host tests are 38 + 30 + 52 with no failures.
+
+### Honest scope
+
+- [x] `clone` (thread shape), `futex` WAIT/WAKE, `set_thread_area`,
+      per-thread TLS, `CLONE_CHILD_CLEARTID`, `CLONE_PARENT_SETTID`,
+      `set_tid_address`, and thread-vs-process exit.
+- [ ] **`futex` still does not block.** A waiter stays runnable and
+      re-tests its word every slice. `FUTEX_WAKE` therefore has nothing to
+      wake and only reports a count. Correct, and wasteful.
+- [ ] No `FUTEX_REQUEUE`, `FUTEX_WAIT_BITSET`, `FUTEX_LOCK_PI` or
+      timeouts — a `FUTEX_WAIT` timeout argument is ignored.
+- [ ] **No `fork`.** A clone without `CLONE_VM` returns `-ENOSYS`; a real
+      fork needs copy-on-write, which does not exist.
+- [ ] One TLS entry, not three. A program asking for a second gets
+      `-EINVAL` rather than a descriptor aliasing the first.
+- [ ] Signal state is still per process, so a `kill` cannot target one
+      thread and `CLONE_SIGHAND` is accepted without meaning anything.
+- [ ] 8 tasks total across the whole system, kernel stacks 8KB each.
+- [ ] `gettid` returns the scheduler PID, and `getpid` is still a
+      constant, so they disagree in a way real code could notice.
+
 ## Path A — porting Wine (the current direction)
 
 Milestone 8 laid out two ways to run Windows binaries: port Wine (Path
@@ -2024,8 +2165,10 @@ are forced into an order:
    one binary on both Linux and Novaris. Milestone 19 added real signals
    — delivery, masking, `rt_sigreturn`, and a `SIGSEGV` handler that can
    fix a fault and resume the faulting instruction, which is the pattern
-   Wine is built on. Still to do: `ucontext_t`, `clone`/`futex` and
-   `pthread_*`, file-backed `mmap`, and a writable filesystem.
+   Wine is built on. Milestone 20 added `clone`, `futex` and per-thread
+   TLS — enough for what pthreads is made of. Still to do: `ucontext_t`,
+   blocking (rather than retrying) futexes, file-backed `mmap`, and a
+   writable filesystem.
 4. **A dynamic linker** — Wine's DLL-equivalents load and relocate at
    runtime.
 5. **Pull in real Wine source**, cross-compile it against that surface,

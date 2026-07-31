@@ -69,6 +69,9 @@
 #define SYS_set_thread_area 243
 #define SYS_rt_sigreturn   173
 #define SYS_tgkill         270
+#define SYS_clone          120
+#define SYS_futex          240
+#define SYS_set_tid_address 258
 #define SYS_clock_gettime  265
 
 /* --- errno values, negated on return ------------------------------------ */
@@ -85,6 +88,7 @@
 #define ESPIPE  29
 #define EROFS   30
 #define ENOSYS  38
+#define EAGAIN  11
 
 /* --- mmap / mprotect flags, as Linux defines them ----------------------- */
 #define PROT_NONE   0x0
@@ -210,6 +214,22 @@ int32_t posix_sys_rt_sigaction(int signo, const k_sigaction_t* act,
 int32_t posix_sys_rt_sigprocmask(int how, const uint32_t* set, uint32_t* old,
                                  uint32_t sigsetsize);
 int32_t posix_sys_rt_sigreturn(registers_t* regs);
+
+/* --- threads (kernel/posix_thread.c, Milestone 20) ---------------------- */
+int32_t posix_sys_clone(uint32_t flags, uint32_t child_stack, uint32_t* ptid,
+                        uint32_t udesc, uint32_t* ctid, registers_t* regs);
+int32_t posix_sys_futex(uint32_t uaddr, int op, uint32_t val);
+int32_t posix_sys_set_thread_area(uint32_t udesc);
+
+/* Zeroes the CLONE_CHILD_CLEARTID word of the thread that is exiting, so
+ * a joiner spinning on it sees the thread finish. */
+void posix_thread_exiting(void);
+
+/* True (once) if the syscall just serviced asked to be re-executed rather
+ * than to return - how futex(FUTEX_WAIT) waits without the scheduler
+ * being able to suspend a task mid-syscall. Consumed by posix_syscall(),
+ * which restores eax, rewinds eip past the `int $0x80`, and yields. */
+int posix_retry_pending(void);
 
 /* How many syscalls this program made that Novaris does not implement,
  * for the same reason the Win32 layer counts missing APIs: a program that

@@ -36,6 +36,11 @@ TESTS = {
         # Novaris rather than from a stale host run.
         "expected": [("sysname = Linux", "sysname = Novaris")],
     },
+    "pthtest.elf": {
+        "start": "posix thread test",
+        "end": "posix thread test done.",
+        "expected": [],   # nothing at all may differ here either
+    },
     "sigtest.elf": {
         "start": "signal test",
         "end": "signal test done.",
