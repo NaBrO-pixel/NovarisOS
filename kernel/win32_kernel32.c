@@ -211,7 +211,7 @@ static uint32_t k32_GetCurrentProcess(win32_call_t* call) {
 
 static uint32_t k32_GetCurrentThread(win32_call_t* call) {
     (void)call;
-    return W32_THREAD_HANDLE;
+    return W32_THREAD_HANDLE; /* the pseudo-handle, as on Windows */
 }
 
 static uint32_t k32_GetCurrentProcessId(win32_call_t* call) {
@@ -221,7 +221,10 @@ static uint32_t k32_GetCurrentProcessId(win32_call_t* call) {
 
 static uint32_t k32_GetCurrentThreadId(win32_call_t* call) {
     (void)call;
-    return 0x104;
+    /* A real id since Milestone 17: the scheduler PID of the calling
+     * thread, which differs between threads of one program - the whole
+     * point of the call, and something the old constant could not do. */
+    return w32_thread_id();
 }
 
 static uint32_t k32_GetModuleHandleA(win32_call_t* call) {
@@ -431,17 +434,56 @@ static uint32_t k32_GetEnvironmentVariableA(win32_call_t* call) {
 }
 
 static uint32_t k32_Sleep(win32_call_t* call) {
-    /* Busy-waits on the PIT tick counter. Interrupts are off inside an
-     * interrupt gate, so the counter would never advance - re-enable them
-     * for the duration, which is safe here because nothing in this call
-     * holds kernel state that an IRQ handler touches. */
+    /* Waits on the PIT tick counter. Interrupts are off inside an
+     * interrupt gate, so the counter cannot advance while this runs -
+     * which leaves two ways to wait, and Milestone 17 changed which one
+     * is right.
+     *
+     * The old way was `sti; hlt` until the deadline. That works for a
+     * program that is the only thing running, and is wrong now that a
+     * program can have several threads: it holds the CPU in this thread's
+     * syscall for the whole duration, so its siblings do not run either.
+     *
+     * Instead the deadline is computed once, stashed, and the whole call
+     * rewound and retried - which puts this thread back on the run queue
+     * and lets every other thread have the intervening slices. */
     uint32_t ms = ARG(0);
-    uint32_t target = pit_get_ticks() + (ms + 9) / 10; /* the PIT runs at 100Hz */
-    __asm__ __volatile__("sti");
-    while (pit_get_ticks() < target) {
-        __asm__ __volatile__("hlt");
+    uint32_t ticks = (ms + 9) / 10;      /* the PIT runs at 100Hz */
+    if (ticks == 0) {
+        /* Sleep(0) means "yield if anyone else wants the CPU". */
+        w32_retry_call_later(call);
+        return 0;
     }
-    __asm__ __volatile__("cli");
+
+    /* One deadline per sleeping thread, keyed by thread id, because the
+     * retry re-enters this function from the top and must not restart the
+     * clock each time round. */
+    static uint32_t sleep_owner[8];
+    static uint32_t sleep_until[8];
+    uint32_t me = w32_thread_id();
+    uint32_t slot = me % 8;
+
+    if (sleep_owner[slot] != me) {
+        sleep_owner[slot] = me;
+        sleep_until[slot] = pit_get_ticks() + ticks;
+    }
+
+    if (pit_get_ticks() < sleep_until[slot]) {
+        /* Not yet. If nothing else is runnable the yield does nothing and
+         * this spins - so let the timer advance in that case, which is
+         * the old behaviour and correct when there is only one thread. */
+        if (!w32_yield_if_others(call)) {
+            __asm__ __volatile__("sti");
+            while (pit_get_ticks() < sleep_until[slot]) {
+                __asm__ __volatile__("hlt");
+            }
+            __asm__ __volatile__("cli");
+        }
+        sleep_owner[slot] = 0;
+        return 0;
+    }
+
+    sleep_owner[slot] = 0;
     return 0;
 }
 
@@ -628,29 +670,165 @@ static uint32_t k32_IsBadPtr(win32_call_t* call) {
 
 /* --- synchronization --------------------------------------------------- */
 
-/* One thread means a critical section never contends. The struct still
- * gets initialized, because programs read RecursionCount and OwningThread
- * out of it. */
+/* Critical sections, real since Milestone 17. Through Milestone 16 these
+ * were no-ops, which was correct when a program had exactly one thread
+ * and is exactly wrong now that it can have several.
+ *
+ * The state lives in the program's own CRITICAL_SECTION struct rather
+ * than in a kernel table, because programs read RecursionCount and
+ * OwningThread out of it directly. The fields used are the documented
+ * ones at their documented offsets:
+ *
+ *   +0  DebugInfo        (left null)
+ *   +4  LockCount        (-1 when free, on real Windows)
+ *   +8  RecursionCount
+ *   +12 OwningThread
+ *   +16 LockSemaphore    (left null: waiting is a retry, see below)
+ *   +20 SpinCount
+ *
+ * No atomics are needed to test and set them: `int 0x81` is an interrupt
+ * gate, so interrupts are off for the whole of this function and a
+ * one-core kernel cannot preempt it midway. */
+/* How many times EnterCriticalSection actually found a lock held by
+ * another thread. Reported at program exit: it is the difference between
+ * "the guarded counter came out right" and "the guarded counter came out
+ * right *and* the lock was genuinely contended while it did". */
+static uint32_t cs_contentions = 0;
+
+uint32_t w32_cs_contention_count(void) { return cs_contentions; }
+
+#define CS_LOCK_COUNT(cs)  (*(int32_t*)((cs) + 4))
+#define CS_RECURSION(cs)   (*(uint32_t*)((cs) + 8))
+#define CS_OWNER(cs)       (*(uint32_t*)((cs) + 12))
+
 static uint32_t k32_InitializeCriticalSection(win32_call_t* call) {
-    uint32_t* cs = (uint32_t*)ARG(0);
-    if (cs) kmemset(cs, 0, 24);
+    uint32_t cs = ARG(0);
+    if (!cs) return 0;
+    kmemset((void*)cs, 0, 24);
+    CS_LOCK_COUNT(cs) = -1; /* what Windows uses for "free" */
     return 0;
 }
 
 static uint32_t k32_InitializeCriticalSectionAndSpinCount(win32_call_t* call) {
-    uint32_t* cs = (uint32_t*)ARG(0);
-    if (cs) kmemset(cs, 0, 24);
+    k32_InitializeCriticalSection(call);
     return 1;
 }
 
-static uint32_t k32_CriticalSectionNop(win32_call_t* call) {
-    (void)call;
+static uint32_t k32_EnterCriticalSection(win32_call_t* call) {
+    uint32_t cs = ARG(0);
+    if (!cs) return 0;
+
+    uint32_t me = w32_thread_id();
+    if (CS_OWNER(cs) == 0 || CS_OWNER(cs) == me) {
+        CS_OWNER(cs) = me;
+        CS_RECURSION(cs)++;
+        CS_LOCK_COUNT(cs) = (int32_t)CS_RECURSION(cs) - 1;
+        return 0;
+    }
+
+    cs_contentions++;
+    /* Held by another thread. Rather than block - which would mean
+     * suspending this thread's kernel stack mid-syscall, something the
+     * scheduler cannot do - the whole call is rewound and retried after
+     * a trip through the run queue. Nothing above has been modified yet,
+     * so re-running it is harmless. See w32_retry_call_later(). */
+    w32_retry_call_later(call);
+    return 0;
+}
+
+static uint32_t k32_LeaveCriticalSection(win32_call_t* call) {
+    uint32_t cs = ARG(0);
+    if (!cs) return 0;
+    if (CS_OWNER(cs) != w32_thread_id()) return 0; /* not ours to release */
+
+    if (CS_RECURSION(cs) > 0) CS_RECURSION(cs)--;
+    if (CS_RECURSION(cs) == 0) {
+        CS_OWNER(cs) = 0;
+        CS_LOCK_COUNT(cs) = -1;
+    }
+    return 0;
+}
+
+static uint32_t k32_DeleteCriticalSection(win32_call_t* call) {
+    uint32_t cs = ARG(0);
+    if (cs) kmemset((void*)cs, 0, 24);
     return 0;
 }
 
 static uint32_t k32_TryEnterCriticalSection(win32_call_t* call) {
-    (void)call;
-    return 1; /* uncontended, always */
+    uint32_t cs = ARG(0);
+    if (!cs) return 0;
+    uint32_t me = w32_thread_id();
+    if (CS_OWNER(cs) != 0 && CS_OWNER(cs) != me) return 0; /* contended */
+    CS_OWNER(cs) = me;
+    CS_RECURSION(cs)++;
+    CS_LOCK_COUNT(cs) = (int32_t)CS_RECURSION(cs) - 1;
+    return 1;
+}
+
+/* --- threads ----------------------------------------------------------- */
+
+static uint32_t k32_CreateThread(win32_call_t* call) {
+    /* (attributes, stackSize, start, param, flags, out_tid) */
+    uint32_t stack_size = ARG(1);
+    uint32_t start      = ARG(2);
+    uint32_t param      = ARG(3);
+    uint32_t flags      = ARG(4);
+    uint32_t* out_tid   = (uint32_t*)ARG(5);
+
+    if (flags & 0x4) { /* CREATE_SUSPENDED */
+        w32_report("CreateThread: CREATE_SUSPENDED is not implemented - "
+                   "the thread starts running immediately");
+    }
+
+    uint32_t handle = w32_thread_create(start, param, stack_size, out_tid);
+    if (!handle) {
+        w32_set_error(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+    return handle;
+}
+
+static uint32_t k32_ExitThread(win32_call_t* call) {
+    w32_thread_exit(ARG(0));
+    return 0;
+}
+
+static uint32_t k32_GetExitCodeThread(win32_call_t* call) {
+    uint32_t handle = ARG(0);
+    uint32_t* out = (uint32_t*)ARG(1);
+    uint32_t code = 0;
+    if (w32_thread_handle_alive(handle, &code)) {
+        if (out) *out = 259; /* STILL_ACTIVE */
+        return 1;
+    }
+    if (out) *out = code;
+    return 1;
+}
+
+#define WAIT_OBJECT_0 0u
+#define WAIT_TIMEOUT  0x102u
+#define WAIT_FAILED   0xFFFFFFFFu
+
+static uint32_t k32_WaitForSingleObject(win32_call_t* call) {
+    uint32_t handle = ARG(0);
+    uint32_t timeout = ARG(1);
+
+    if (!w32_thread_handle_alive(handle, 0)) {
+        /* Already finished - or not a thread handle at all, in which case
+         * "signalled" is the least surprising answer for the events and
+         * mutexes this layer hands out as inert handles. */
+        return WAIT_OBJECT_0;
+    }
+
+    if (timeout == 0) return WAIT_TIMEOUT; /* a poll, not a wait */
+
+    /* Still running: rewind and retry after a trip through the run queue,
+     * which is what gives the thread being waited on time to finish.
+     * A finite timeout is honoured as "wait forever" - see ROADMAP.md
+     * Milestone 17 on what is missing here. */
+    w32_retry_call_later(call);
+    return WAIT_OBJECT_0;
 }
 
 #define MAX_TLS_SLOTS 64
@@ -690,9 +868,11 @@ static uint32_t k32_TlsFree(win32_call_t* call) {
     return 1;
 }
 
-/* The Interlocked* family. With one thread and interrupts already
- * disabled inside the dispatcher, plain reads and writes *are* atomic
- * here - the guarantee these APIs promise is met, just trivially. */
+/* The Interlocked* family. Interrupts are already off inside the
+ * dispatcher (int 0x81 is an interrupt gate) and there is one core, so a
+ * plain read-modify-write here cannot be interleaved with another
+ * thread's - the atomicity these APIs promise is met, just cheaply.
+ * Milestone 17's threads.exe checks it holds across three real threads. */
 static uint32_t k32_InterlockedIncrement(win32_call_t* call) {
     int32_t* p = (int32_t*)ARG(0);
     return p ? (uint32_t)(++(*p)) : 0;
@@ -1163,6 +1343,7 @@ void w32_kernel32_reset(void) {
      * dangling pointer. */
     cmdline_ansi = 0;
     cmdline_wide = 0;
+    cs_contentions = 0;
 
     for (uint32_t i = 0; i < MAX_TLS_SLOTS; i++) {
         tls_slots[i] = 0;
@@ -1261,9 +1442,10 @@ static const win32_export_t kernel32_exports[] = {
     WEXP("GetVersionExW", 1, k32_GetVersionExA),
     WSTUB("GetProcessAffinityMask", 3, 1),
     WSTUB("SetPriorityClass", 2, 1),
-    WSTUB("WaitForSingleObject", 2, 0),
-    WSTUB("CreateThread", 6, 0),
-    WSTUB("ExitThread", 1, 0),
+    WEXP("WaitForSingleObject", 2, k32_WaitForSingleObject),
+    WEXP("CreateThread", 6, k32_CreateThread),
+    WEXP("ExitThread", 1, k32_ExitThread),
+    WEXP("GetExitCodeThread", 2, k32_GetExitCodeThread),
     WSTUB("GetExitCodeProcess", 2, 1),
     WSTUB("CreateProcessA", 10, 0),
     WSTUB("SetThreadStackGuarantee", 1, 1),
@@ -1308,9 +1490,9 @@ static const win32_export_t kernel32_exports[] = {
     WEXP("InitializeCriticalSectionAndSpinCount", 2,
          k32_InitializeCriticalSectionAndSpinCount),
     WSTUB("InitializeCriticalSectionEx", 3, 1),
-    WEXP("EnterCriticalSection", 1, k32_CriticalSectionNop),
-    WEXP("LeaveCriticalSection", 1, k32_CriticalSectionNop),
-    WEXP("DeleteCriticalSection", 1, k32_CriticalSectionNop),
+    WEXP("EnterCriticalSection", 1, k32_EnterCriticalSection),
+    WEXP("LeaveCriticalSection", 1, k32_LeaveCriticalSection),
+    WEXP("DeleteCriticalSection", 1, k32_DeleteCriticalSection),
     WEXP("TryEnterCriticalSection", 1, k32_TryEnterCriticalSection),
     WSTUB("InitializeSListHead", 1, 0),
     WSTUB("InitializeSRWLock", 1, 0),

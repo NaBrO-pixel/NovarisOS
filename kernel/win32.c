@@ -17,8 +17,14 @@
 #include "process.h"
 #include "gdt.h"
 #include "pe.h"
+#include "scheduler.h"
 
 #define PAGE_SIZE 4096u
+
+/* The running program's PEB. Every thread's TEB points at the same one -
+ * a PEB is per *process* - so it outlives any single thread and has to be
+ * reachable from w32_thread_create(). 0 outside a program. */
+static uint32_t current_peb = 0;
 
 /* --- module registry --------------------------------------------------- */
 
@@ -599,6 +605,14 @@ void w32_exit_process(uint32_t code) {
      * to re-enter if a handler calls exit() itself. */
     w32_msvcrt_run_atexit();
 
+    /* Every thread goes with it: ExitProcess means the process. The
+     * scheduler unwinds to win32_run_pe()'s scheduler_run_until_idle()
+     * call, which is where teardown lives. */
+    if (scheduler_is_active()) {
+        scheduler_terminate_all();
+        __builtin_unreachable();
+    }
+
     /* Unwinds straight back to win32_run_pe's frame, discarding the
      * interrupt/dispatch call chain we're standing on - the same trick
      * process.c already uses for sys_exit. Teardown happens there, on the
@@ -1075,6 +1089,26 @@ static uint32_t build_exit_trampoline(void) {
     return addr;
 }
 
+/* The same shape, but for a thread: when a CreateThread start routine
+ * returns, its return value is its exit code and it must end only that
+ * thread, not the program. Identical bytes to build_exit_trampoline()
+ * except for which thunk it calls. */
+static uint32_t build_thread_exit_trampoline(void) {
+    uint32_t exit_thunk = resolve_symbol("kernel32.dll", "ExitThread", 0);
+    if (!exit_thunk) return 0;
+
+    uint32_t addr = thunk_alloc();
+    if (!addr) return 0;
+
+    uint8_t* p = (uint8_t*)addr;
+    p[0] = 0x50;                        /* push eax - the return value */
+    p[1] = 0xB8;
+    *(uint32_t*)(p + 2) = exit_thunk;   /* mov eax, ExitThread thunk */
+    p[6] = 0xFF; p[7] = 0xD0;           /* call eax */
+    p[8] = 0xEB; p[9] = 0xFE;           /* jmp $ - ExitThread never returns */
+    return addr;
+}
+
 /* Emits a trampoline that runs the image's TLS callbacks (each stdcall
  * with (base, DLL_PROCESS_ATTACH, NULL)) and then jumps to the real entry
  * point. Only used when the image actually has callbacks. Byte layout is
@@ -1138,6 +1172,156 @@ static void unmap_stack(void) {
     stack_pages_mapped = 0;
 }
 
+/* --- threads ------------------------------------------------------------
+ *
+ * A Win32 program is one or more scheduler tasks in one address space -
+ * which is what Milestone 16 built. Everything specific to Win32 is here:
+ * a per-thread TEB, a stack out of the Win32 arena, and the handle table
+ * entry a program waits on.
+ *
+ * Thread *stacks* deliberately come from w32_mem_alloc_pages() rather
+ * than being mapped by the scheduler, so they are freed wholesale by
+ * w32_mem_reset() when the program exits - no per-task teardown, and
+ * nothing for the scheduler's reaper to double-free. */
+
+#define W32_MAX_THREADS 8
+#define W32_DEFAULT_THREAD_STACK (64u * 1024u)
+
+typedef struct {
+    int      pid;        /* scheduler task, 0 for a free slot */
+    uint32_t handle;
+    uint32_t exit_code;
+    uint32_t teb;
+} w32_thread_t;
+
+static w32_thread_t threads[W32_MAX_THREADS];
+static uint32_t thread_count = 0;
+/* Handles are small integers with a tag, like the other pseudo-handles in
+ * win32_internal.h, so a program that prints one gets something sane. */
+#define W32_THREAD_HANDLE_BASE 0x10000100u
+
+static void threads_reset(void) {
+    for (uint32_t i = 0; i < W32_MAX_THREADS; i++) threads[i].pid = 0;
+    thread_count = 0;
+}
+
+static w32_thread_t* thread_by_handle(uint32_t handle) {
+    for (uint32_t i = 0; i < W32_MAX_THREADS; i++) {
+        if (threads[i].pid && threads[i].handle == handle) return &threads[i];
+    }
+    return 0;
+}
+
+int w32_thread_handle_alive(uint32_t handle, uint32_t* exit_code) {
+    w32_thread_t* t = thread_by_handle(handle);
+    if (!t) return 0;
+    if (scheduler_task_alive(t->pid)) return 1;
+    if (exit_code) *exit_code = t->exit_code;
+    return 0;
+}
+
+static w32_thread_t* thread_by_pid(int pid) {
+    for (uint32_t i = 0; i < W32_MAX_THREADS; i++) {
+        if (threads[i].pid == pid) return &threads[i];
+    }
+    return 0;
+}
+
+uint32_t w32_thread_id(void) {
+    return (uint32_t)scheduler_current_pid();
+}
+
+/* Records a scheduler task as a thread of this program and hands back its
+ * handle. Used for the main thread as well as CreateThread's, so there is
+ * one place that knows what a Win32 thread is. */
+static uint32_t thread_register(int pid, uint32_t teb) {
+    if (thread_count >= W32_MAX_THREADS) return 0;
+    w32_thread_t* t = &threads[thread_count];
+    t->pid = pid;
+    t->handle = W32_THREAD_HANDLE_BASE + thread_count;
+    t->exit_code = 0;
+    t->teb = teb;
+    thread_count++;
+    return t->handle;
+}
+
+uint32_t w32_thread_create(uint32_t start, uint32_t param, uint32_t stack_size,
+                           uint32_t* out_tid) {
+    if (!start) return 0;
+    if (thread_count >= W32_MAX_THREADS) {
+        w32_report("CreateThread: this program already has the maximum "
+                   "number of threads");
+        return 0;
+    }
+    if (stack_size == 0) stack_size = W32_DEFAULT_THREAD_STACK;
+    if (stack_size < PAGE_SIZE) stack_size = PAGE_SIZE;
+
+    uint32_t stack_low = w32_mem_alloc_pages(stack_size);
+    if (!stack_low) return 0;
+    uint32_t stack_top = stack_low + stack_size;
+
+    uint32_t teb = build_teb(current_peb, stack_top, stack_low);
+    if (!teb) return 0;
+
+    uint32_t tramp = build_thread_exit_trampoline();
+    if (!tramp) return 0;
+
+    /* The start routine is stdcall with one argument, and it is *called*,
+     * not jumped to: the thread-exit trampoline sits where its return
+     * address goes, so `return 0;` from a thread procedure ends the
+     * thread exactly the way returning from main ends the program. */
+    uint32_t esp = (stack_top - 16) & ~15u;
+    esp -= 4; *(uint32_t*)esp = param;
+    esp -= 4; *(uint32_t*)esp = tramp;
+
+    int pid = scheduler_spawn_win32_thread("thread", start, esp, teb);
+    if (pid < 0) return 0;
+
+    if (out_tid) *out_tid = (uint32_t)pid;
+    return thread_register(pid, teb);
+}
+
+void w32_thread_exit(uint32_t code) {
+    w32_thread_t* t = thread_by_pid(scheduler_current_pid());
+    if (t) t->exit_code = code;
+
+    /* Ends this task only. If it was the last one still running, the
+     * scheduler unwinds to win32_run_pe() by itself, which is exactly
+     * the right behaviour: a program is over when its last thread is.
+     *
+     * This *must* return normally. scheduler_exit_current() does not
+     * switch stacks itself - it records the decision and lets this whole
+     * call chain unwind back to isr.s's epilogue, which is the only place
+     * it is safe to repoint esp. Halting here instead (as an earlier
+     * version did, on the theory that a function called ExitThread should
+     * not return) hangs the machine: the switch never happens, and
+     * interrupts are off inside an interrupt gate, so the `hlt` is
+     * forever. The thread's own thunk never gets to run its `ret`,
+     * because by then the epilogue has moved to another task. */
+    scheduler_exit_current();
+}
+
+int w32_yield_if_others(win32_call_t* call) {
+    /* Rewind-and-yield, but only if the yield will actually happen.
+     * Sleep() needs this: when it is the only runnable thread there is
+     * nothing to gain by spinning, and it should fall back to letting the
+     * timer advance while halted. Leaves eip untouched when it returns 0,
+     * so the caller's call completes normally. */
+    if (!scheduler_yield_would_switch()) return 0;
+    w32_retry_call_later(call);
+    return 1;
+}
+
+void w32_retry_call_later(win32_call_t* call) {
+    /* The thunk is `B8 id32` (5 bytes) then `CD 81` (2), and eip in the
+     * trap frame points just past the int. Rewinding all 7 re-runs the
+     * `mov` too, which is what puts the slot id back in eax - rewinding
+     * only the int would re-enter the dispatcher with eax holding this
+     * call's *return value* instead. */
+    call->regs->eip -= 7;
+    scheduler_yield_from_trap(call->regs);
+}
+
 pe_load_result_t win32_run_pe(const uint8_t* image, uint32_t size,
                               const char* name, const char* cmdline,
                               int strict, uint32_t* out_exit_code) {
@@ -1174,6 +1358,7 @@ pe_load_result_t win32_run_pe(const uint8_t* image, uint32_t size,
     }
 
     uint32_t peb = build_peb(current_image.base);
+    current_peb = peb;
     uint32_t stack_low = WIN32_STACK_TOP - WIN32_STACK_SIZE;
     teb_address = build_teb(peb, WIN32_STACK_TOP, stack_low);
     if (!peb || !teb_address) {
@@ -1216,8 +1401,12 @@ pe_load_result_t win32_run_pe(const uint8_t* image, uint32_t size,
     /* fs must address the TEB while the program runs (see build_teb) -
      * GDT entry 6, selector 0x33. process_asm.s loads whatever
      * process_set_user_fs() last set. */
+    /* Both of these are now the scheduler's job: it repoints the TEB
+     * descriptor on every switch (each thread has its own), and the
+     * synthetic trap frame it builds carries fs = 0x33 for any task that
+     * has a TEB. Set here anyway so the descriptor is valid before the
+     * very first task is entered. */
     gdt_set_teb(teb_address, PAGE_SIZE - 1);
-    process_set_user_fs(0x33);
 
     if (owns_as) {
         w32_report_hex("running in its own address space, page directory",
@@ -1229,7 +1418,26 @@ pe_load_result_t win32_run_pe(const uint8_t* image, uint32_t size,
 
     uint32_t image_base = current_image.base;
 
-    process_run_user_mode(start, esp);
+    /* Milestone 17: the program's main thread is a scheduler task, not a
+     * one-off process_run_user_mode() call. That is what makes
+     * CreateThread possible at all - a second thread is simply a second
+     * task in this same address space - and scheduler_run_until_idle()
+     * blocks exactly the way process_run_user_mode() used to, so
+     * everything around this call is unchanged.
+     *
+     * The address space is already current, so the task inherits it. */
+    threads_reset();
+    int main_pid = scheduler_spawn_win32_thread("main", start, esp,
+                                                teb_address);
+    if (main_pid < 0) {
+        unmap_stack();
+        pe_unload(&current_image);
+        if (owns_as) process_leave_address_space();
+        return PE_ERR_OUT_OF_MEMORY;
+    }
+    thread_register(main_pid, teb_address);
+
+    scheduler_run_until_idle();
 
     /* Reached only via w32_exit_process() or a fault - both unwind here
      * through process_exit_to_kernel(). */
@@ -1260,11 +1468,19 @@ pe_load_result_t win32_run_pe(const uint8_t* image, uint32_t size,
     /* Still standing in the program's address space, deliberately: these
      * unmap ring-3 pages and hand their frames back to the PMM, and they
      * have to be looking at the program's page tables to do it. */
+    if (thread_count > 1) {
+        w32_report_dec("threads this program ran", thread_count);
+        w32_report_dec("times a critical section was found already held",
+                       w32_cs_contention_count());
+    }
+
     w32_handles_reset();
     w32_mem_reset();
     unmap_stack();
     pe_unload(&current_image);
     teb_address = 0;
+    current_peb = 0;
+    threads_reset();
     /* Hand back the TEB/PEB the program was given - see data_reset_mark. */
     if (data_reset_mark) data_next = data_reset_mark;
 

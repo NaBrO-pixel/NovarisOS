@@ -21,6 +21,7 @@ run lowbase.exe
 run hellope.exe
 run crash.exe
 run qsorttest.exe
+run threads.exe
 run hellowin.exe
 
 # The non-PE paths through process.c, which Milestone 15 moved into

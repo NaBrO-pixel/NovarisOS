@@ -62,9 +62,16 @@ static uint32_t wcmdln_cell = 0;
 static uint32_t argv_block = 0;
 static uint32_t rand_state = 1;
 
-/* Shared scratch for one formatted line. Interrupts are disabled inside
- * the dispatcher (int 0x81 is an interrupt gate) and there is one thread,
- * so this can't be re-entered. */
+/* Shared scratch for one formatted line. Safe to share because int 0x81
+ * is an interrupt gate: interrupts are off for the whole of a dispatch,
+ * so no timer can preempt one printf into another.
+ *
+ * That was originally justified by "there is only one thread", which
+ * stopped being true in Milestone 17. The interrupt gate is what actually
+ * carries it, and it still does - but note the standing condition: an API
+ * that yields mid-call (EnterCriticalSection, WaitForSingleObject, Sleep -
+ * see w32_retry_call_later) must not be holding this buffer when it does.
+ * None of them format anything, so none of them do. */
 static char format_buffer[2048];
 
 static int stream_id(uint32_t file_ptr) {

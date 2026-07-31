@@ -38,7 +38,11 @@
 #include "console.h"
 
 #define MAX_PROCESSES 8
-#define PROC_KSTACK_SIZE 4096u
+/* 8KB, not 4KB. Milestone 17 runs Win32 programs as scheduler tasks, and
+ * their kernel-side call chains are far deeper than a demo task's
+ * sys_write: int 0x81 -> win32_dispatch -> printf -> the format engine ->
+ * the float renderer, plus a ring-3 callback's borrowed slice on top. */
+#define PROC_KSTACK_SIZE 8192u
 #define PAGE_SIZE 4096u
 
 /* Preempt every this-many PIT ticks. At the 100Hz pit_install(100) rate
@@ -105,11 +109,16 @@ static void copy_name(process_t* p, const char* name) {
  * processes and threads alike. */
 static int spawn_common(const char* name, uint32_t entry, uint32_t load_vaddr,
                         uint32_t load_pages, uint32_t stack_top,
-                        int owns_pd) {
-    uint32_t stack_phys = pmm_alloc_frame();
-    if (!stack_phys) return -1;
-    paging_map_page(stack_top - PAGE_SIZE, stack_phys,
-                     PAGE_PRESENT | PAGE_RW | PAGE_USER);
+                        int owns_pd, uint32_t teb, int map_stack) {
+    /* A Win32 thread arrives with its stack already mapped - out of the
+     * emulation layer's own arena, which is freed wholesale when the
+     * program exits - so it asks for no stack page here and owns none. */
+    if (map_stack) {
+        uint32_t stack_phys = pmm_alloc_frame();
+        if (!stack_phys) return -1;
+        paging_map_page(stack_top - PAGE_SIZE, stack_phys,
+                         PAGE_PRESENT | PAGE_RW | PAGE_USER);
+    }
 
     uint8_t* kstack_base = (uint8_t*)kmalloc(PROC_KSTACK_SIZE);
     if (!kstack_base) return -1;
@@ -121,7 +130,11 @@ static int spawn_common(const char* name, uint32_t entry, uint32_t load_vaddr,
     registers_t* frame = (registers_t*)(kstack_top - sizeof(registers_t));
     frame->ds = 0x23;               /* user data selector | RPL3 */
     frame->es = 0x23;
-    frame->fs = 0x23;
+    /* A task with a TEB runs with fs addressing it (selector 0x33, GDT
+     * entry 6), the same arrangement process_asm.s sets up for a
+     * single Win32 program - see gdt_set_teb(). Everything else gets the
+     * flat user data selector. */
+    frame->fs = teb ? 0x33 : 0x23;
     frame->gs = 0x23;
     frame->edi = 0;
     frame->esi = 0;
@@ -151,6 +164,8 @@ static int spawn_common(const char* name, uint32_t entry, uint32_t load_vaddr,
     p->stack_top = stack_top;
     p->page_directory = paging_current_address_space();
     p->owns_page_directory = owns_pd;
+    p->teb = teb;
+    p->owns_stack = map_stack;
     p->state = PROC_READY;
     return p->pid;
 }
@@ -182,7 +197,7 @@ int scheduler_spawn_flat(const char* name, const uint8_t* image, uint32_t size,
     uint32_t pages = load_image(image, size, load_vaddr);
     if (!pages) return -1;
 
-    return spawn_common(name, load_vaddr, load_vaddr, pages, stack_top, 0);
+    return spawn_common(name, load_vaddr, load_vaddr, pages, stack_top, 0, 0, 1);
 }
 
 int scheduler_spawn_process(const char* name, const uint8_t* image,
@@ -205,13 +220,24 @@ int scheduler_spawn_process(const char* name, const uint8_t* image,
 
     uint32_t pages = load_image(image, size, load_vaddr);
     int pid = pages ? spawn_common(name, load_vaddr, load_vaddr, pages,
-                                   stack_top, 1)
+                                   stack_top, 1, 0, 1)
                     : -1;
 
     paging_switch_address_space(caller_as);
 
     if (pid < 0) paging_destroy_address_space(as);
     return pid;
+}
+
+int scheduler_spawn_win32_thread(const char* name, uint32_t entry,
+                                 uint32_t esp, uint32_t teb) {
+    if (process_count >= MAX_PROCESSES) return -1;
+    /* map_stack 0: the Win32 layer allocated this thread's stack out of
+     * its own arena and frees it wholesale when the program exits, so the
+     * reaper must keep its hands off it. `esp` is a fully-built initial
+     * stack pointer (argument and return address already pushed), not
+     * merely the top of a blank page. */
+    return spawn_common(name, entry, entry, 0, esp, 0, teb, 0);
 }
 
 int scheduler_spawn_thread(const char* name, uint32_t entry,
@@ -221,7 +247,7 @@ int scheduler_spawn_thread(const char* name, uint32_t entry,
      * owns_pd 0 says "the directory I run in is somebody else's". What is
      * left - a stack and a register context - is exactly what a thread
      * is. */
-    return spawn_common(name, entry, entry, 0, stack_top, 0);
+    return spawn_common(name, entry, entry, 0, stack_top, 0, 0, 1);
 }
 
 /* Round robin: scans forward from just after `current`'s slot, wrapping,
@@ -253,6 +279,20 @@ static void switch_to(process_t* next);
 
 void scheduler_tick(registers_t* regs) {
     if (!active || !current) return;
+
+    /* Only preempt ring-3 code. A timer that lands while this task is
+     * inside a syscall must not switch away: `regs` would be a same-
+     * privilege interrupt frame, which has no useresp/ss on it at all, so
+     * the registers_t the resume path expects would be two fields short
+     * and resuming it would return to garbage. It also would not be
+     * *useful* - the task's kernel-side C call chain cannot be resumed
+     * from a trap frame anyway.
+     *
+     * This was latent until Milestone 17. Before it, the only tasks the
+     * scheduler ran were tiny demo programs whose syscalls never
+     * re-enabled interrupts; now it runs Win32 programs, and Sleep()
+     * deliberately does exactly that. */
+    if ((regs->cs & 3) != 3) return;
 
     if (tick_countdown > 0) {
         tick_countdown--;
@@ -289,6 +329,11 @@ static void switch_to(process_t* next) {
     if (next->page_directory != current->page_directory) {
         paging_switch_address_space(next->page_directory);
     }
+    /* Each Win32 thread has its own TEB, and fs is a segment whose *base*
+     * is that TEB - so the GDT descriptor has to be repointed on every
+     * switch between threads, not just once per program. Getting this
+     * wrong would give two threads one errno and one SEH chain. */
+    if (next->teb) gdt_set_teb(next->teb, PAGE_SIZE - 1);
     current = next;
     current->state = PROC_RUNNING;
     gdt_set_kernel_stack(current->kernel_stack_top);
@@ -324,7 +369,7 @@ static void reap_all(void) {
         for (uint32_t pg = 0; pg < p->load_pages; pg++) {
             free_user_page(p->load_vaddr + pg * PAGE_SIZE);
         }
-        free_user_page(p->stack_top - PAGE_SIZE);
+        if (p->owns_stack) free_user_page(p->stack_top - PAGE_SIZE);
         kfree((void*)p->kernel_stack_base);
     }
 
@@ -366,6 +411,61 @@ void scheduler_exit_current(void) {
     /* Returns normally: back up through the syscall handler -> isr
      * dispatch -> isr_common_stub, whose epilogue performs the actual
      * switch once it sees scheduler_next_esp set. */
+}
+
+int scheduler_current_pid(void) {
+    return current ? current->pid : 0;
+}
+
+int scheduler_task_alive(int pid) {
+    for (int i = 0; i < process_count; i++) {
+        if (process_table[i].pid == pid) {
+            return process_table[i].state != PROC_ZOMBIE;
+        }
+    }
+    return 0; /* unknown pid: treat as finished, not as never-finishing */
+}
+
+int scheduler_yield_would_switch(void) {
+    if (!active || !current) return 0;
+    process_t* next = pick_next_ready();
+    return next && next != current;
+}
+
+int scheduler_yield_from_trap(registers_t* regs) {
+    if (!active || !current) return 0;
+
+    process_t* next = pick_next_ready();
+    if (!next || next == current) return 0; /* nothing else can run */
+
+    /* Exactly what scheduler_tick() does on a timer preemption, and for
+     * exactly the same reason it is safe: `regs` is this task's complete
+     * ring-3 state, so resuming from it later re-enters ring 3 at the
+     * instruction the trap frame names. A caller that first rewinds eip
+     * to re-execute its own trap therefore gets a retry loop that other
+     * threads can run in the middle of - which is how waiting is
+     * implemented in Milestone 17. See w32_retry_call_later(). */
+    current->esp = (uint32_t)regs;
+    current->state = PROC_READY;
+    tick_countdown = SCHED_TICKS_PER_SLICE;
+    switch_to(next);
+    return 1;
+}
+
+void scheduler_terminate_all(void) {
+    /* Nothing is being scheduled, so there is no saved caller stack to
+     * unwind to. Returning is the only safe answer; the caller is
+     * expected to have checked scheduler_is_active() first. */
+    if (!active) return;
+    /* Every task, including whichever one is calling. Nothing is left
+     * runnable, so control goes straight back to whoever called
+     * scheduler_run_until_idle(), which then reaps the batch. */
+    for (int i = 0; i < process_count; i++) {
+        process_table[i].state = PROC_ZOMBIE;
+    }
+    active = 0;
+    current = 0;
+    scheduler_return_to_caller();
 }
 
 void scheduler_run_until_idle(void) {

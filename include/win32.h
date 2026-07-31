@@ -43,10 +43,12 @@
  * of that storage.
  *
  * What this deliberately is not: a Windows kernel. There are no real
- * DLLs, one process at a time, one thread, no registry, no window
- * manager, no GDI, no sockets. An .exe that needs any of those gets an
- * honest diagnostic naming the API it wanted - see win32_report() - not
- * a silent hang. `winapi` in the shell lists exactly what is provided. */
+ * DLLs, one process at a time, no registry, no window manager, no GDI,
+ * no sockets. (Threads *are* real since Milestone 17: a program's main
+ * thread is a scheduler task, CreateThread adds more of them in the same
+ * address space, and critical sections genuinely lock.) An .exe that
+ * needs any of the missing pieces gets an honest diagnostic naming the
+ * API it wanted - see win32_report() - not a silent hang. `winapi` in the shell lists exactly what is provided. */
 
 /* Ring-3 entry vector for the emulation layer, separate from the OS's own
  * `int 0x80` so the two calling conventions never have to share a
@@ -68,9 +70,13 @@
 #define WIN32_STACK_SIZE  0x00100000u /* 1MB, matching the usual PE default */
 
 /* Arguments of an emulated call, as seen from the kernel. `args` points
- * straight at the caller's ring-3 stack (there are no per-process address
- * spaces yet - see ROADMAP.md Milestone 9 - so the kernel can read it
- * directly), with args[0] the first argument. */
+ * straight at the caller's ring-3 stack, with args[0] the first argument.
+ *
+ * The kernel can read it directly because it is standing in the program's
+ * own address space while servicing the call and never switches CR3 while
+ * holding a pointer into it - see the long comment in process.c. Through
+ * Milestone 14 the reason was simpler and weaker: there was only one
+ * address space. */
 typedef struct win32_call {
     registers_t* regs;
     const uint32_t* args;

@@ -14,7 +14,7 @@ bootloader hands off to a kernel, and the kernel grows from there. Over time
 you can shape it to *feel* like whichever OS inspires you (windowing system,
 shell conventions, UI style) without copying anyone's code.
 
-## Current status: Milestone 16 complete ✅
+## Current status: Milestone 17 complete ✅
 
 - [x] Multiboot bootloader handoff (via GRUB), 32-bit protected mode
 - [x] Freestanding C kernel — no libc, we own the whole stack
@@ -27,6 +27,9 @@ shell conventions, UI style) without copying anyone's code.
 - [x] Round-robin preemptive multitasking with real context switching,
       across separate address spaces — plus real threads (several
       preemptively-scheduled contexts sharing one address space)
+- [x] **Real Win32 threads**: a `.exe` can call `CreateThread`, join with
+      `WaitForSingleObject`, and be protected by a `CRITICAL_SECTION`
+      that actually locks
 - [x] ELF32 loader
 - [x] **Runs real, unmodified Windows `.exe` files** against an emulated
       Win32 API — see below

@@ -61,6 +61,14 @@ typedef struct process {
      * possible - and what makes two tasks sharing one directory a pair of
      * threads rather than two processes. */
     uint32_t page_directory;
+    /* This task's Thread Environment Block, or 0 for a task that has
+     * none. Non-zero also means "run with fs addressing it", and makes
+     * the switch path repoint the TEB GDT descriptor - see switch_to(). */
+    uint32_t teb;
+    /* 1 if this task's user stack page was mapped for it here and is its
+     * to free. A Win32 thread's stack comes from the emulation layer's
+     * arena instead, which is freed wholesale when the program exits. */
+    int owns_stack;
     /* 1 if this task created that directory and must destroy it when the
      * batch is reaped. Threads sharing a sibling's directory, and tasks
      * spawned into a directory the caller owns, both leave this 0. */
@@ -101,6 +109,15 @@ int scheduler_spawn_process(const char* name, const uint8_t* image,
 int scheduler_spawn_thread(const char* name, uint32_t entry,
                            uint32_t stack_top);
 
+/* A thread of a Win32 program: same as above except that the caller has
+ * already built the initial ring-3 stack (so `esp` is a real stack
+ * pointer with the start routine's argument and return address on it,
+ * not the top of a blank page), the stack belongs to the Win32 arena
+ * rather than to this task, and the thread runs with fs addressing its
+ * own `teb`. See kernel/win32.c's w32_thread_create(). */
+int scheduler_spawn_win32_thread(const char* name, uint32_t entry,
+                                 uint32_t esp, uint32_t teb);
+
 /* Starts round-robin preemptive multitasking among every process spawned
  * since the last call, and blocks the caller (same "looks like an
  * ordinary function call" trick process.c uses for the single-process
@@ -124,6 +141,47 @@ int scheduler_is_active(void);
  * after this returns all the way back up through the interrupt
  * dispatch); does not return at all in the "last process" case. */
 void scheduler_exit_current(void);
+
+/* The PID of the task currently running, or 0 outside multitasking. */
+int scheduler_current_pid(void);
+
+/* Whether `pid` names a task that has not yet exited. An unknown PID
+ * reads as finished rather than as never-finishing, so waiting on a
+ * handle whose thread has already been reaped returns immediately
+ * instead of hanging. */
+int scheduler_task_alive(int pid);
+
+/* Gives up the rest of this task's time slice from inside a trap, using
+ * `regs` as the resume point. Returns 1 if it switched, 0 if there was
+ * nothing else runnable.
+ *
+ * The resume point is the whole trick. `regs` is the task's complete
+ * ring-3 state, so a caller that rewinds regs->eip to re-execute the
+ * instruction that trapped in gets a retry loop with other threads
+ * running in between - which is how Milestone 17 implements waiting
+ * (WaitForSingleObject, EnterCriticalSection) without needing the
+ * scheduler to be able to block a task mid-syscall and resume its kernel
+ * stack later. Honest consequence: a waiting thread stays runnable and
+ * burns its slices retrying rather than sleeping. */
+int scheduler_yield_from_trap(registers_t* regs);
+
+/* Whether scheduler_yield_from_trap() would actually switch - i.e.
+ * whether any task other than the current one is runnable. Lets a caller
+ * decide between yielding and waiting some other way, without having to
+ * rewind its trap frame speculatively. */
+int scheduler_yield_would_switch(void);
+
+/* Ends every task in the batch at once and unwinds to whoever called
+ * scheduler_run_until_idle(). This is process termination as opposed to
+ * thread termination: ExitProcess, and an unhandled exception, both take
+ * every thread of the program with them.
+ *
+ * Does not return when the scheduler is running, which is the only case
+ * a caller should reach it in - hence no `noreturn` attribute: it returns
+ * immediately, having done nothing, if called while nothing is being
+ * scheduled, so a caller that got its state wrong gets a no-op rather
+ * than an unwind into a stale saved stack. */
+void scheduler_terminate_all(void);
 
 /* Registered against IRQ0 (see kernel/pit.c): advances the round-robin
  * scheduler every SCHED_TICKS_PER_SLICE ticks while multitasking is
