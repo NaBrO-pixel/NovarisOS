@@ -18,10 +18,13 @@ struct Banner {
         value = 1234;
     }
     ~Banner() {
-        /* Global destructors run through atexit, which Novaris registers
-         * but does not call - see ROADMAP.md Milestone 10. This line is
-         * expected NOT to appear, and saying so here is the point. */
-        printf("[dtor]  global destructor (not expected to run on Novaris)\n");
+        /* Global destructors run through atexit, which the C++ runtime
+         * registers them with. Through Milestone 12 Novaris accepted the
+         * registration and never called anything back, so this line did
+         * not appear; Milestone 13's ring-3 callback mechanism made
+         * atexit real, and it does now. Nothing in this file changed to
+         * make that happen - which is the point of checking it here. */
+        printf("[dtor]  global destructor ran at exit\n");
     }
     int value;
 };

@@ -847,6 +847,181 @@ Known limits, unchanged from Milestone 11 unless noted:
 - [ ] The taskbar doesn't group multiple windows of one app behind a
       single button, and can't be moved off the bottom edge.
 
+## Milestone 13 — Calling ring 3 from the kernel ✅ DONE
+
+The item Milestone 10 called "the single highest-leverage item on this
+list". Milestone 10 shipped ~500 Win32 functions and left three of them
+conspicuously missing: `qsort`, `bsearch` and `atexit`. Each takes a
+function pointer belonging to the program and is supposed to *call* it,
+and the kernel implements these APIs from inside an `int 0x81` interrupt
+handler, in ring 0, with no way to run ring-3 code and come back.
+`win32_msvcrt.c` said so in a comment and left them unresolved on
+purpose, because a stubbed `qsort` that silently doesn't sort is worse
+than an honest "unimplemented API called" report.
+
+This milestone builds the missing mechanism.
+
+### How it works
+
+`kernel/win32_callback.c` + `kernel/win32_callback_asm.s`, a new
+`int 0x82` vector, and about 150 lines of C:
+
+1. The kernel builds a cdecl call frame on the *program's own* stack,
+   just below the ring-3 esp captured when the API call trapped in:
+   arguments right-to-left, then a return address.
+2. That return address points at a two-byte stub the kernel planted in
+   the thunk arena at boot — literally `CD 82`, `int 0x82`.
+3. `win32_callback_enter` saves the kernel's esp/ebp into a caller-
+   supplied frame and `iret`s to ring 3, the same trick
+   `process_run_user_mode()` uses to start a whole program.
+4. The callback runs, returns, lands on the stub, and traps back in.
+   The handler reads its return value out of `eax`, restores the saved
+   kernel esp, and finishes `win32_callback_enter`'s epilogue — so from
+   the API implementation's side, `win32_callback_call()` was an ordinary
+   blocking function call that returned a value.
+
+The resume context is passed in by address rather than kept in globals
+(which is what `process_asm.s` does), because callbacks nest: a qsort
+comparator is free to call qsort. The C side keeps a stack of them,
+capped at 8 deep.
+
+### The part that actually took the time
+
+The `iret`-out-and-trap-back-in shape works on the first try. What does
+not is the kernel stack, and the failure is subtle enough to be worth
+writing down.
+
+Every ring3 → ring0 transition loads esp from the **same fixed
+`TSS.esp0`**. So while a callback is running in ring 3, the kernel frames
+of the `qsort` that started it are still live between `esp0` and wherever
+the kernel had got to — and any trap that callback takes re-enters ring 0
+with esp reset to `esp0` and starts pushing straight over them. Not just
+the callback's own `int 0x82`: an `int 0x81` from a comparator that calls
+`printf`, or a plain timer IRQ, does it too.
+
+The fix is one line — lower `TSS.esp0` below the current kernel esp
+before entering ring 3, restore it on the way back — and it is what makes
+nesting work at all.
+
+This was verified, not assumed. Building the identical kernel with that
+single `gdt_set_kernel_stack()` call removed and nothing else changed:
+
+```
+novaris> run qsorttest.exe
+qsort/bsearch/atexit test - real callbacks into ring 3
+
+before:  42 -7 0 1000 3 3 -100 17 8 99 5 5 64 2 1
+
+[win32] Unhandled exception in qsorttest.exe:
+        EXCEPTION_ACCESS_VIOLATION at eip=0x7b001fd2 accessing 0x00000000
+```
+
+The very first callback round trip kills the program, and `eip` lands at
+`0x7b001fd2` — inside the thunk arena (`WIN32_THUNK_BASE` is
+`0x7B000000`), i.e. the corrupted frame sent execution into the middle of
+a thunk. With the line restored the same binary runs to completion.
+
+One honest correction to the story: `win32_call_t` also grew a `useresp`
+field, snapshotting the ring-3 esp by value at the top of
+`win32_dispatch()` instead of re-reading `regs->useresp` (a pointer into
+the trap frame) later. That looked like the load-bearing fix while the
+bug was being chased. It is not. A second control build — `esp0` handling
+intact, `qsort` deliberately re-reading `call->regs->useresp` the old way
+— passes the full test unchanged, because once `esp0` is lowered the trap
+frame `regs` points at is no longer overwritten. The snapshot is worth
+keeping as defensive clarity about which stack pointer belongs to which
+call, but it is not what fixes anything, and Milestone 13 should not be
+remembered as though it were.
+
+### What this bought
+
+- `qsort` — quicksort with insertion sort under 8 elements, recursing
+  into the smaller partition and looping on the larger, so kernel stack
+  stays O(log n) frames. Every comparison is a ring-3 callback.
+- `bsearch` — binary search, same callback per comparison.
+- `atexit` / `_onexit` / `_crt_atexit` / `_register_onexit_function` —
+  handlers run in reverse registration order from `w32_exit_process()`,
+  which is the one point every exit path converges on (`exit()`,
+  `abort()`, `ExitProcess()`, and `return` from `main` via the exit
+  trampoline). Re-entrant `exit()` from inside a handler is ignored, as
+  C requires.
+- **C++ global destructors, for free.** Nobody set out to fix these.
+  `cppinit.exe` has a global object whose destructor prints, and the
+  source comment said it was "expected NOT to appear" — mingw's C++
+  runtime registers destructors through `atexit`, which Novaris accepted
+  and never called back. Making `atexit` real made them run. The test
+  source's message has been corrected to say so; nothing else in it
+  changed.
+
+### Verified
+
+`tools/qemu_test.py --iso novaris.iso --script tools/tests/win32_smoke.txt`,
+with `qsorttest.exe` added to the script. The test program is built with
+real `i686-w64-mingw32-gcc` against real `msvcrt.dll` imports and is
+written the way any C program uses these functions — it would produce
+identical output on Windows.
+
+```
+novaris> run qsorttest.exe
+qsort/bsearch/atexit test - real callbacks into ring 3
+
+before:  42 -7 0 1000 3 3 -100 17 8 99 5 5 64 2 1
+after:   -100 -7 0 1 2 3 3 5 5 8 17 42 64 99 1000
+sorted: yes
+
+comparator that prints (nested int 0x81 inside a callback):
+    comparator called from ring 3: 30 vs 10
+    comparator called from ring 3: 30 vs 20
+    comparator called from ring 3: 10 vs 20
+  result: 10 20 30
+  comparator ran 3 time(s)
+
+nested qsort inside comparator: 1 2 3 4 5
+sorted: yes
+
+strings: alpha bravo charlie delta echo
+
+bsearch    64 -> found
+bsearch  -100 -> found
+bsearch  1000 -> found
+bsearch     7 -> not found
+
+qsort test done.
+atexit: handler registered SECOND, so it runs FIRST
+atexit: handler registered FIRST, so it runs LAST
+```
+
+Each block is there to fail differently: the printing comparator is a
+nested `int 0x81` taken several kernel frames deep inside the `qsort`
+that called it — precisely the case a fixed `esp0` corrupts. The
+recursive comparator puts a second callback in flight while the first is
+still on the stack. `bsearch 7` must miss. The `atexit` lines arrive
+*after* `main` has already returned, from the exit path rather than from
+inside an API call.
+
+The other eight smoke cases are byte-identical to the Milestone 12
+transcript apart from the new `[dtor]` line and the expected
+memory/clock variance.
+
+### Honest scope
+
+- [x] Callbacks with up to 8 dword arguments, cdecl, nesting 8 deep.
+- [ ] **Not** yet used for window procedures. `CreateWindowEx` still
+      fails. The mechanism this needed now exists — that is what
+      Milestone 13 was for — but wiring the window manager to deliver
+      `WM_PAINT` into a ring-3 `WndProc` is its own piece of work and
+      was not done here.
+- [ ] Not used for thread entry points either; there are still no
+      threads.
+- [ ] The callback layer reads and writes the program's stack by casting
+      the ring-3 pointer, which works only because Novaris still runs one
+      program in one flat address space. Milestone 14 changes that, and
+      this is one of the places that has to change with it.
+- [ ] A callback that faults is handled by the existing unhandled-
+      exception path (the program dies, the shell comes back), not by
+      anything callback-aware. `win32_callback_reset()` puts `esp0` and
+      the depth counter back when a program ends either way.
+
 ## Later / open-ended
 
 - Networking (a NIC driver + a minimal TCP/IP stack) — big undertaking.
@@ -858,11 +1033,12 @@ Known limits, unchanged from Milestone 11 unless noted:
 Follow-ups specifically unlocked by Milestone 10, roughly in order of how
 much each would widen what runs:
 
-- **Calling ring-3 callbacks from the kernel** — a synthesized user frame
-  plus a trampoline that re-enters the kernel when the callback returns.
-  This one mechanism gets `qsort`, `bsearch`, `atexit` handlers, window
-  procedures, `EnumWindows`-style APIs and thread entry points all at
-  once. The single highest-leverage item on this list.
+- ~~**Calling ring-3 callbacks from the kernel**~~ — done in Milestone
+  13, and it landed exactly as described: a synthesized user frame plus a
+  trampoline that re-enters the kernel when the callback returns. It got
+  `qsort`, `bsearch` and `atexit` (plus C++ global destructors as a side
+  effect). Window procedures, `EnumWindows`-style APIs and thread entry
+  points are now *unblocked* by it but not yet built on it.
 - **Structured exception handling** — walking the `fs:[0]` chain on a
   fault instead of terminating, so `__try`/`__except` works.
 - **Loading real DLL files**, so a program can ship its own libraries.

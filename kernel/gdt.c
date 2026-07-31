@@ -121,6 +121,10 @@ void gdt_set_kernel_stack(uint32_t esp0) {
     tss.esp0 = esp0;
 }
 
+uint32_t gdt_get_kernel_stack(void) {
+    return tss.esp0;
+}
+
 void gdt_set_teb(uint32_t base, uint32_t limit) {
     /* Byte granularity (gran 0x40 = 32-bit operand size, G clear) so the
      * limit is exact: the TEB is one page, and a program that walks off

@@ -74,6 +74,20 @@
 typedef struct win32_call {
     registers_t* regs;
     const uint32_t* args;
+    /* The ring-3 esp at the moment this call trapped, copied *by value*
+     * at the top of win32_dispatch().
+     *
+     * This is not a convenience: `regs` points into the trap frame on the
+     * kernel stack, and since Milestone 13 a Win32 API implementation can
+     * call back into ring 3 (win32_callback.h). Every ring3 -> ring0
+     * transition loads esp from the same fixed TSS.esp0, so a trap taken
+     * during that callback pushes its frame at exactly the addresses this
+     * one occupies. win32_callback.c keeps that from happening by
+     * lowering esp0 around the callback - but code that wants the
+     * caller's stack pointer should still read this snapshot rather than
+     * regs->useresp, because it is the value that is true for *this*
+     * call regardless of what happens underneath it. */
+    uint32_t useresp;
 } win32_call_t;
 
 typedef uint32_t (*win32_fn_t)(win32_call_t* call);

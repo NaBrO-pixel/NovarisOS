@@ -16,6 +16,12 @@ void gdt_install(void);
  * kernel stack before any user-mode code runs. */
 void gdt_set_kernel_stack(uint32_t esp0);
 
+/* Reads it back. The Win32 callback layer lowers esp0 while a ring-3
+ * callback runs, so that traps taken during the callback don't land on
+ * the kernel frames of the API call that started it, and needs the old
+ * value to put back afterwards - see kernel/win32_callback.c. */
+uint32_t gdt_get_kernel_stack(void);
+
 /* Points GDT entry 6 (selector 0x33) at a Thread Environment Block, the
  * one place segmentation still earns its keep on x86: Windows code
  * reaches its TEB through fs:[...], so fs has to be a segment whose base
