@@ -8,7 +8,13 @@
 ; concurrently produce visibly interleaved output if - and only if - the
 ; kernel is really switching between them on a timer.
 ;
-; ORG must match the load address scheduler_spawn_flat() is given for
+; Since Milestone 16 all three demo tasks are assembled at the SAME ORG.
+; `multitask` gives each of them its own address space, so one virtual
+; address means three different physical pages - which is the point the
+; demo now makes. Before Milestone 16 they shared one page directory and
+; had to be given distinct addresses instead.
+;
+; ORG must match the load address scheduler_spawn_process() is given for
 ; this task in kernel/shell.c's `multitask` command (0x50000000) - flat,
 ; non-relocatable binary, same convention as userland/user_hello.s.
 ;

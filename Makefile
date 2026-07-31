@@ -46,7 +46,8 @@ OBJS = $(BUILD_DIR)/boot.o $(BUILD_DIR)/kernel.o \
        $(BUILD_DIR)/win32_dtoa.o $(BUILD_DIR)/win32_format.o \
        $(BUILD_DIR)/win32_callback.o $(BUILD_DIR)/win32_callback_asm.o \
        $(BUILD_DIR)/scheduler.o $(BUILD_DIR)/scheduler_asm.o \
-       $(BUILD_DIR)/task_a_blob.o $(BUILD_DIR)/task_b_blob.o $(BUILD_DIR)/task_c_blob.o
+       $(BUILD_DIR)/task_a_blob.o $(BUILD_DIR)/task_b_blob.o $(BUILD_DIR)/task_c_blob.o \
+       $(BUILD_DIR)/thread_demo_blob.o
 
 KERNEL = $(BUILD_DIR)/novaris.bin
 ISO = novaris.iso
@@ -221,6 +222,9 @@ $(BUILD_DIR)/task_b_blob.o: kernel/task_b_blob.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/task_c_blob.o: kernel/task_c_blob.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/thread_demo_blob.o: kernel/thread_demo_blob.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # --- Userland: a tiny libc + demo C program, shipped via the initrd ---

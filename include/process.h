@@ -72,6 +72,15 @@ void process_install_fault_handler(void);
 int  process_enter_address_space(void);
 void process_leave_address_space(void);
 
+/* Maps `size` bytes of a flat image at `load_vaddr` in the *current*
+ * address space and copies it in. Split out of
+ * process_run_flat_binary() for Milestone 16's `threadtest`, where the
+ * shell maps an image itself and then points two threads at it rather
+ * than letting either of them own it. Returns 0 if it ran out of
+ * physical memory partway. */
+int process_map_image(uint32_t load_vaddr, const uint8_t* image,
+                      uint32_t size);
+
 /* The page directory the running program is using, or 0 if it is sharing
  * the kernel's. Reported by `run` so the isolation is visible rather than
  * merely claimed. */

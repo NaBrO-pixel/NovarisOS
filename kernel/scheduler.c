@@ -96,23 +96,16 @@ static void copy_name(process_t* p, const char* name) {
     p->name[i] = '\0';
 }
 
-int scheduler_spawn_flat(const char* name, const uint8_t* image, uint32_t size,
-                          uint32_t load_vaddr, uint32_t stack_top) {
-    if (process_count >= MAX_PROCESSES) return -1;
-
-    uint32_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-    if (pages == 0) pages = 1;
-
-    for (uint32_t i = 0; i < pages; i++) {
-        uint32_t phys = pmm_alloc_frame();
-        if (!phys) return -1;
-        paging_map_page(load_vaddr + i * PAGE_SIZE, phys,
-                         PAGE_PRESENT | PAGE_RW | PAGE_USER);
-    }
-
-    uint8_t* dest = (uint8_t*)load_vaddr;
-    for (uint32_t i = 0; i < size; i++) dest[i] = image[i];
-
+/* The part every spawn shares: a kernel stack, a one-page user stack, and
+ * a synthetic trap frame that makes a never-run task indistinguishable
+ * from a preempted one. `entry` is where ring 3 starts; `load_pages` is
+ * how many image pages this task is responsible for freeing (0 for a
+ * thread, which loaded nothing of its own). Everything it maps goes into
+ * whatever address space is current, which is how one function serves
+ * processes and threads alike. */
+static int spawn_common(const char* name, uint32_t entry, uint32_t load_vaddr,
+                        uint32_t load_pages, uint32_t stack_top,
+                        int owns_pd) {
     uint32_t stack_phys = pmm_alloc_frame();
     if (!stack_phys) return -1;
     paging_map_page(stack_top - PAGE_SIZE, stack_phys,
@@ -140,7 +133,7 @@ int scheduler_spawn_flat(const char* name, const uint8_t* image, uint32_t size,
     frame->eax = 0;
     frame->int_no = 0;              /* skipped by `add esp,8`, value unused */
     frame->err_code = 0;
-    frame->eip = load_vaddr;        /* program entry point */
+    frame->eip = entry;             /* where ring 3 starts */
     frame->cs = 0x1B;               /* user code selector | RPL3 */
     frame->eflags = 0x202;          /* IF=1 (so this task can itself be
                                       * preempted), reserved bit 1 set */
@@ -154,10 +147,81 @@ int scheduler_spawn_flat(const char* name, const uint8_t* image, uint32_t size,
     p->kernel_stack_base = (uint32_t)kstack_base;
     p->kernel_stack_top = kstack_top;
     p->load_vaddr = load_vaddr;
-    p->load_pages = pages;
+    p->load_pages = load_pages;
     p->stack_top = stack_top;
+    p->page_directory = paging_current_address_space();
+    p->owns_page_directory = owns_pd;
     p->state = PROC_READY;
     return p->pid;
+}
+
+/* Maps and copies a flat image into the current address space. Returns
+ * the page count, or 0 if physical memory ran out partway (the pages it
+ * did map are left for the reaper to free). */
+static uint32_t load_image(const uint8_t* image, uint32_t size,
+                           uint32_t load_vaddr) {
+    uint32_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (pages == 0) pages = 1;
+
+    for (uint32_t i = 0; i < pages; i++) {
+        uint32_t phys = pmm_alloc_frame();
+        if (!phys) return 0;
+        paging_map_page(load_vaddr + i * PAGE_SIZE, phys,
+                         PAGE_PRESENT | PAGE_RW | PAGE_USER);
+    }
+
+    uint8_t* dest = (uint8_t*)load_vaddr;
+    for (uint32_t i = 0; i < size; i++) dest[i] = image[i];
+    return pages;
+}
+
+int scheduler_spawn_flat(const char* name, const uint8_t* image, uint32_t size,
+                          uint32_t load_vaddr, uint32_t stack_top) {
+    if (process_count >= MAX_PROCESSES) return -1;
+
+    uint32_t pages = load_image(image, size, load_vaddr);
+    if (!pages) return -1;
+
+    return spawn_common(name, load_vaddr, load_vaddr, pages, stack_top, 0);
+}
+
+int scheduler_spawn_process(const char* name, const uint8_t* image,
+                            uint32_t size, uint32_t load_vaddr,
+                            uint32_t stack_top) {
+    if (process_count >= MAX_PROCESSES) return -1;
+
+    uint32_t caller_as = paging_current_address_space();
+    uint32_t as = paging_create_address_space();
+    if (!as) return -1;
+
+    /* Load into the new address space by standing in it. Every mapping
+     * spawn_common() and load_image() make goes through the ordinary
+     * paging calls, which act on whatever is in CR3 - so switching here
+     * is the entire mechanism, and neither of them needs to know that
+     * address spaces exist. Safe because the kernel half is identical in
+     * both: the image bytes are read out of a kernel buffer that is at
+     * the same address either side of the switch. */
+    paging_switch_address_space(as);
+
+    uint32_t pages = load_image(image, size, load_vaddr);
+    int pid = pages ? spawn_common(name, load_vaddr, load_vaddr, pages,
+                                   stack_top, 1)
+                    : -1;
+
+    paging_switch_address_space(caller_as);
+
+    if (pid < 0) paging_destroy_address_space(as);
+    return pid;
+}
+
+int scheduler_spawn_thread(const char* name, uint32_t entry,
+                           uint32_t stack_top) {
+    if (process_count >= MAX_PROCESSES) return -1;
+    /* No image, no address space: load_pages 0 says "I own no code", and
+     * owns_pd 0 says "the directory I run in is somebody else's". What is
+     * left - a stack and a register context - is exactly what a thread
+     * is. */
+    return spawn_common(name, entry, entry, 0, stack_top, 0);
 }
 
 /* Round robin: scans forward from just after `current`'s slot, wrapping,
@@ -185,6 +249,8 @@ static process_t* pick_next_ready(void) {
     return 0;
 }
 
+static void switch_to(process_t* next);
+
 void scheduler_tick(registers_t* regs) {
     if (!active || !current) return;
 
@@ -205,6 +271,24 @@ void scheduler_tick(registers_t* regs) {
         return;
     }
 
+    switch_to(next);
+}
+
+/* Makes `next` the running task. The CR3 load is the Milestone 16
+ * addition, and it is safe to do here - several C frames deep, on the
+ * outgoing task's kernel stack - precisely because Milestone 14 made the
+ * kernel half identical in every address space: this code, this stack and
+ * the frame `scheduler_next_esp` points at are all at the same addresses
+ * before and after the load. Only the user half changes, and nothing on
+ * the switch path touches that.
+ *
+ * Skipping the load when the directory is unchanged is not just an
+ * optimisation - it is what makes switching between two threads of one
+ * process cheap, since a CR3 write flushes the whole TLB. */
+static void switch_to(process_t* next) {
+    if (next->page_directory != current->page_directory) {
+        paging_switch_address_space(next->page_directory);
+    }
     current = next;
     current->state = PROC_RUNNING;
     gdt_set_kernel_stack(current->kernel_stack_top);
@@ -229,14 +313,33 @@ static void free_user_page(uint32_t virt) {
 }
 
 static void reap_all(void) {
+    uint32_t caller_as = paging_current_address_space();
+
+    /* Two passes, because a task's pages can only be unmapped from inside
+     * its own address space, and a directory cannot be destroyed while it
+     * is the one loaded in CR3. */
     for (int i = 0; i < process_count; i++) {
         process_t* p = &process_table[i];
+        paging_switch_address_space(p->page_directory);
         for (uint32_t pg = 0; pg < p->load_pages; pg++) {
             free_user_page(p->load_vaddr + pg * PAGE_SIZE);
         }
         free_user_page(p->stack_top - PAGE_SIZE);
         kfree((void*)p->kernel_stack_base);
     }
+
+    paging_switch_address_space(caller_as);
+
+    for (int i = 0; i < process_count; i++) {
+        process_t* p = &process_table[i];
+        /* Only the task that created a directory destroys it. Threads
+         * share a sibling's and must not, and a task spawned into a
+         * directory the caller owns must leave it to the caller. */
+        if (p->owns_page_directory) {
+            paging_destroy_address_space(p->page_directory);
+        }
+    }
+
     process_count = 0;
 }
 
@@ -259,10 +362,7 @@ void scheduler_exit_current(void) {
         __builtin_unreachable();
     }
 
-    current = next;
-    current->state = PROC_RUNNING;
-    gdt_set_kernel_stack(current->kernel_stack_top);
-    scheduler_next_esp = current->esp;
+    switch_to(next);
     /* Returns normally: back up through the syscall handler -> isr
      * dispatch -> isr_common_stub, whose epilogue performs the actual
      * switch once it sees scheduler_next_esp set. */
@@ -271,15 +371,25 @@ void scheduler_exit_current(void) {
 void scheduler_run_until_idle(void) {
     if (process_count == 0) return;
 
+    uint32_t caller_as = paging_current_address_space();
+
     active = 1;
     tick_countdown = SCHED_TICKS_PER_SLICE;
     current = &process_table[0];
     current->state = PROC_RUNNING;
     gdt_set_kernel_stack(current->kernel_stack_top);
+    /* The first task is entered directly rather than through switch_to(),
+     * so its address space has to be loaded by hand here. */
+    paging_switch_address_space(current->page_directory);
 
     /* Blocks here - from this function's own point of view - until every
      * spawned process has called sys_exit. See scheduler_asm.s. */
     scheduler_bootstrap_save_and_jump(current->esp);
 
+    /* Control lands here on whichever task exited last, so CR3 still
+     * holds *its* directory. reap_all() walks every address space and
+     * comes back to whatever is current when it starts, so put the
+     * caller's back first. */
+    paging_switch_address_space(caller_as);
     reap_all();
 }
