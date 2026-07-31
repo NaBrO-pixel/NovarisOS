@@ -67,6 +67,8 @@
 #define SYS_gettid         224
 #define SYS_exit_group     252
 #define SYS_set_thread_area 243
+#define SYS_rt_sigreturn   173
+#define SYS_tgkill         270
 #define SYS_clock_gettime  265
 
 /* --- errno values, negated on return ------------------------------------ */
@@ -95,6 +97,57 @@
 #define MAP_FIXED     0x10
 #define MAP_ANONYMOUS 0x20
 
+/* --- signals (Milestone 19) ---------------------------------------------
+ *
+ * Wine needs these more than it needs almost anything else on this list:
+ * it installs a SIGSEGV handler and uses page faults as a control-flow
+ * mechanism, so a kernel that cannot deliver a signal to a handler and
+ * resume the faulting instruction afterwards cannot run it at all. */
+#define SIGHUP   1
+#define SIGINT   2
+#define SIGQUIT  3
+#define SIGILL   4
+#define SIGTRAP  5
+#define SIGABRT  6
+#define SIGBUS   7
+#define SIGFPE   8
+#define SIGKILL  9
+#define SIGUSR1 10
+#define SIGSEGV 11
+#define SIGUSR2 12
+#define SIGPIPE 13
+#define SIGALRM 14
+#define SIGTERM 15
+#define NSIG    32
+
+#define SIG_DFL 0u
+#define SIG_IGN 1u
+
+/* sigprocmask's `how`. */
+#define SIG_BLOCK   0
+#define SIG_UNBLOCK 1
+#define SIG_SETMASK 2
+
+/* sa_flags. SA_RESTORER matters here: raw rt_sigaction on i386 requires
+ * the *caller* to supply the trampoline that issues rt_sigreturn (glibc
+ * supplies one; a program using raw syscalls has to too). Novaris uses
+ * the caller's, exactly as Linux does, which is what lets one binary run
+ * on both. */
+#define SA_NOCLDSTOP 0x00000001u
+#define SA_SIGINFO   0x00000004u
+#define SA_RESTORER  0x04000000u
+#define SA_NODEFER   0x40000000u
+#define SA_RESETHAND 0x80000000u
+
+/* The i386 rt_sigaction argument, as the kernel sees it. Not libc's
+ * struct sigaction - the field order differs. */
+typedef struct {
+    uint32_t handler;
+    uint32_t flags;
+    uint32_t restorer;
+    uint32_t mask[2];   /* 64-bit sigset; only the low word is used */
+} k_sigaction_t;
+
 /* --- open flags --------------------------------------------------------- */
 #define O_RDONLY   0x0000
 #define O_WRONLY   0x0001
@@ -118,6 +171,45 @@ void posix_syscall(registers_t* regs);
  * descriptors and mappings belong to the process, not to the kernel. */
 void posix_process_begin(void);
 void posix_process_end(void);
+
+/* --- signal delivery ----------------------------------------------------
+ *
+ * Delivery happens on the way back to ring 3, which is the only moment a
+ * signal can be injected: the trap frame about to be iret'ed from *is*
+ * the thread's user-mode state, so redirecting eip to a handler and
+ * stashing the original frame on the user stack is all it takes. See
+ * posix_signal.c. */
+
+/* Called on the way out of every interrupt that is returning to ring 3.
+ * Delivers one pending, unblocked signal if there is one. */
+void posix_deliver_pending(registers_t* regs);
+
+/* A CPU exception that belongs to a signal - a page fault is SIGSEGV, a
+ * divide error SIGFPE, and so on. Returns 1 if the process had a handler
+ * and it has been set up to run (so the fault is handled and the
+ * instruction will be retried or the handler will decide otherwise), 0 if
+ * the process should die instead. */
+int posix_handle_fault_signal(registers_t* regs, uint32_t vector);
+
+/* Raises a signal against the running process. */
+int posix_raise(int signo);
+
+/* Clears every handler and mask. Called when a program starts, since
+ * signal dispositions belong to the process. */
+void posix_signal_reset(void);
+
+/* Terminates the running process. Implemented in posix.c, used by the
+ * signal layer's default action and by its "this cannot be recovered
+ * from" paths. Does not return. */
+void posix_exit_process(void);
+
+/* The signal syscalls, implemented in posix_signal.c and dispatched from
+ * posix.c's table. */
+int32_t posix_sys_rt_sigaction(int signo, const k_sigaction_t* act,
+                               k_sigaction_t* old, uint32_t sigsetsize);
+int32_t posix_sys_rt_sigprocmask(int how, const uint32_t* set, uint32_t* old,
+                                 uint32_t sigsetsize);
+int32_t posix_sys_rt_sigreturn(registers_t* regs);
 
 /* How many syscalls this program made that Novaris does not implement,
  * for the same reason the Win32 layer counts missing APIs: a program that

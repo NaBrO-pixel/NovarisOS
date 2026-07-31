@@ -199,6 +199,13 @@ static int handle_user_fault(registers_t* regs) {
         return win32_handle_user_fault(regs); /* does not return */
     }
 
+    /* A POSIX program that installed a handler for the signal this fault
+     * maps to gets it delivered instead of being killed - and, crucially,
+     * gets to *return* from the handler, at which point the faulting
+     * instruction is retried. That is the pattern Wine is built on: fault
+     * on purpose, fix the mapping in the handler, carry on. */
+    if (posix_handle_fault_signal(regs, regs->int_no)) return 1;
+
     char buf[16];
     terminal_writestring("\n");
     terminal_writestring_color("[kernel] ", VGA_COLOR_LIGHT_RED);

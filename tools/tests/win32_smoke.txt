@@ -31,6 +31,7 @@ run hellowin.exe
 run helloelf.elf
 run helloc.bin
 run posixtest.elf
+run sigtest.elf
 multitask
 threadtest
 

@@ -14,7 +14,7 @@ bootloader hands off to a kernel, and the kernel grows from there. Over time
 you can shape it to *feel* like whichever OS inspires you (windowing system,
 shell conventions, UI style) without copying anyone's code.
 
-## Current status: Milestone 18 complete ✅
+## Current status: Milestone 19 complete ✅
 
 - [x] Multiboot bootloader handoff (via GRUB), 32-bit protected mode
 - [x] Freestanding C kernel — no libc, we own the whole stack
@@ -31,6 +31,10 @@ shell conventions, UI style) without copying anyone's code.
       (raw `int $0x80`, built with plain `gcc -m32 -static -nostdlib`)
       runs unmodified; `make test-posix` runs the *same binary* on the
       Linux host and on Novaris and diffs the transcripts
+- [x] **Real signals** — `rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`,
+      delivery from `kill` and from CPU faults, and a `SIGSEGV` handler
+      that can fix the fault and let the faulting instruction be retried
+      (the pattern Wine is built on)
 - [x] **Real Win32 threads**: a `.exe` can call `CreateThread`, join with
       `WaitForSingleObject`, and be protected by a `CRITICAL_SECTION`
       that actually locks

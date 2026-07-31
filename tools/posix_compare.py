@@ -23,19 +23,33 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-START = "posix syscall test"
-END = "posix test done."
 
-# The one line allowed to differ, as (host substring, novaris substring).
-EXPECTED_DIFFERENCE = ("sysname = Linux", "sysname = Novaris")
+# Each test names the first and last line of its own output, plus any line
+# that is *expected* to differ between the two systems, as
+# (host substring, novaris substring). Everything else must match exactly.
+TESTS = {
+    "posixtest.elf": {
+        "start": "posix syscall test",
+        "end": "posix test done.",
+        # uname is the one thing that should differ - and its differing is
+        # useful, since it proves the QEMU transcript really came from
+        # Novaris rather than from a stale host run.
+        "expected": [("sysname = Linux", "sysname = Novaris")],
+    },
+    "sigtest.elf": {
+        "start": "signal test",
+        "end": "signal test done.",
+        "expected": [],   # nothing at all may differ here
+    },
+}
 
 
-def extract(text):
+def extract(text, start, end):
     """The test's own output, from its banner to its last line."""
     lines = text.replace("\r", "").replace("\x00", "").split("\n")
     try:
-        first = next(i for i, l in enumerate(lines) if START in l)
-        last = next(i for i, l in enumerate(lines) if END in l)
+        first = next(i for i, l in enumerate(lines) if start in l)
+        last = next(i for i, l in enumerate(lines) if end in l)
     except StopIteration:
         return None
     return [l.rstrip() for l in lines[first:last + 1]]
@@ -48,6 +62,12 @@ def main():
     ap.add_argument("--name", default="posixtest.elf",
                     help="the binary's name on the initrd")
     args = ap.parse_args()
+
+    spec = TESTS.get(args.name)
+    if spec is None:
+        print(f"FAIL: no comparison spec for {args.name}")
+        return 1
+    start, end, expected = spec["start"], spec["end"], spec["expected"]
 
     if not os.access(args.binary, os.X_OK):
         os.chmod(args.binary, 0o755)
@@ -62,7 +82,7 @@ def main():
     host = subprocess.run([os.path.abspath(args.binary)], cwd=cwd,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                           text=True, timeout=60)
-    host_lines = extract(host.stdout)
+    host_lines = extract(host.stdout, start, end)
     if not host_lines:
         print("FAIL: the binary produced no recognisable output on the host")
         print(host.stdout)
@@ -72,7 +92,7 @@ def main():
         [sys.executable, os.path.join(HERE, "qemu_test.py"),
          "--iso", args.iso, "--cmd", "run " + args.name],
         capture_output=True, text=True, timeout=900)
-    guest_lines = extract(guest.stdout)
+    guest_lines = extract(guest.stdout, start, end)
     if not guest_lines:
         print("FAIL: the binary produced no recognisable output on Novaris")
         print(guest.stdout[-3000:])
@@ -89,14 +109,15 @@ def main():
     failures = [l for l in guest_lines if "[FAIL]" in l]
     differences = [(h, g) for h, g in zip(host_lines, guest_lines) if h != g]
 
+    def is_expected(h, g):
+        return any(eh in h and eg in g for eh, eg in expected)
+
     for h, g in differences:
-        expected = (EXPECTED_DIFFERENCE[0] in h and EXPECTED_DIFFERENCE[1] in g)
-        print(("  expected difference: " if expected else "  UNEXPECTED: ")
+        print(("  expected difference: " if is_expected(h, g)
+               else "  UNEXPECTED: ")
               + f"host {h.strip()!r} vs novaris {g.strip()!r}")
 
-    unexpected = [(h, g) for h, g in differences
-                  if not (EXPECTED_DIFFERENCE[0] in h
-                          and EXPECTED_DIFFERENCE[1] in g)]
+    unexpected = [(h, g) for h, g in differences if not is_expected(h, g)]
 
     checks = sum(1 for l in guest_lines if "[ok]" in l or "[FAIL]" in l)
     print(f"{len(host_lines)} lines compared, {checks} checks, "
@@ -107,7 +128,7 @@ def main():
             print("  " + l.strip())
         return 1
 
-    print("PASS: the same binary behaves identically on Linux and Novaris")
+    print(f"PASS: {args.name} behaves identically on Linux and Novaris")
     return 0
 
 

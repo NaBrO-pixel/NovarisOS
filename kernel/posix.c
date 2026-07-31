@@ -81,7 +81,19 @@ static uint32_t prot_to_pte(int prot) {
     return flags;
 }
 
+void posix_exit_process(void) {
+    if (scheduler_is_active()) {
+        scheduler_exit_current();
+        /* Returns normally; isr.s's epilogue performs the switch as this
+         * call chain unwinds - see w32_thread_exit() for the same shape
+         * and why halting here instead would hang. */
+        return;
+    }
+    process_exit_to_kernel(); /* does not return */
+}
+
 void posix_process_begin(void) {
+    posix_signal_reset();
     for (int i = 0; i < MAX_FDS; i++) fds[i].kind = FD_FREE;
     for (int i = 0; i < 3; i++) {
         fds[i].kind = FD_CONSOLE;
@@ -425,12 +437,31 @@ void posix_syscall(registers_t* regs) {
         case SYS_time:     r = (int32_t)rtc_unix_time(); break;
         case SYS_nanosleep: r = sys_nanosleep((const uint32_t*)a); break;
 
-        /* Accepted and ignored. A program that installs a signal handler
-         * or masks signals gets success, because failing these makes a
-         * libc give up at startup - but nothing is ever delivered, which
-         * ROADMAP.md Milestone 18 says out loud. */
+        /* Real since Milestone 19 - see kernel/posix_signal.c. */
         case SYS_rt_sigaction:
+            r = posix_sys_rt_sigaction((int)a, (const k_sigaction_t*)b,
+                                       (k_sigaction_t*)c, d);
+            break;
         case SYS_rt_sigprocmask:
+            r = posix_sys_rt_sigprocmask((int)a, (const uint32_t*)b,
+                                         (uint32_t*)c, d);
+            break;
+        case SYS_rt_sigreturn:
+            /* Restores the interrupted context wholesale, so eax is set
+             * by the restore rather than by the usual `regs->eax = r`
+             * below - returning here would overwrite it. */
+            posix_sys_rt_sigreturn(regs);
+            return;
+
+        case SYS_kill:
+        case SYS_tgkill:
+            /* One process, so the pid is only checked for sanity; the
+             * signal number is the last argument in both. */
+            r = posix_raise((int)(n == SYS_kill ? b : c));
+            break;
+
+        /* Still accepted and ignored: TLS setup, which needs per-thread
+         * GDT entries the POSIX side does not have yet. */
         case SYS_set_thread_area:
             r = 0;
             break;

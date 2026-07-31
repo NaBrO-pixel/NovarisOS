@@ -37,7 +37,7 @@ OBJS = $(BUILD_DIR)/boot.o $(BUILD_DIR)/kernel.o \
        $(BUILD_DIR)/pit.o $(BUILD_DIR)/keyboard.o $(BUILD_DIR)/shell.o \
        $(BUILD_DIR)/serial.o \
        $(BUILD_DIR)/pmm.o $(BUILD_DIR)/paging.o $(BUILD_DIR)/kheap.o \
-       $(BUILD_DIR)/syscall.o $(BUILD_DIR)/posix.o $(BUILD_DIR)/process.o $(BUILD_DIR)/process_asm.o \
+       $(BUILD_DIR)/syscall.o $(BUILD_DIR)/posix.o $(BUILD_DIR)/posix_signal.o $(BUILD_DIR)/process.o $(BUILD_DIR)/process_asm.o \
        $(BUILD_DIR)/user_hello_blob.o $(BUILD_DIR)/vfs.o $(BUILD_DIR)/initrd.o \
        $(BUILD_DIR)/elf.o $(BUILD_DIR)/pe.o $(BUILD_DIR)/kstring.o \
        $(BUILD_DIR)/rtc.o \
@@ -123,6 +123,9 @@ $(BUILD_DIR)/syscall.o: kernel/syscall.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/posix.o: kernel/posix.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/posix_signal.o: kernel/posix_signal.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/process.o: kernel/process.c $(HEADERS) | $(BUILD_DIR)
@@ -276,6 +279,11 @@ $(BUILD_DIR)/user/posixtest.elf: userland/posix_test.c | $(BUILD_DIR)
 	$(CC) -m32 -static -nostdlib -ffreestanding -fno-builtin -O2 -Wall \
 	    -o $@ $<
 
+$(BUILD_DIR)/user/sigtest.elf: userland/signal_test.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(CC) -m32 -static -nostdlib -ffreestanding -fno-builtin -O2 -Wall \
+	    -o $@ $<
+
 $(BUILD_DIR)/user/hello_elf.elf: $(BUILD_DIR)/user/crt0.o $(BUILD_DIR)/user/hello_elf.o $(BUILD_DIR)/user/libc.o userland/user.ld
 	$(LD) -m elf_i386 -T userland/user.ld -nostdlib -o $@ \
 	    $(BUILD_DIR)/user/crt0.o $(BUILD_DIR)/user/hello_elf.o $(BUILD_DIR)/user/libc.o
@@ -362,7 +370,7 @@ $(BUILD_DIR)/user/hello64.exe: userland/pe_test/x64_marker.c | $(BUILD_DIR)
 # Everything that ends up packed into the initrd: the static files in
 # userland/initrd_files/ plus the compiled demo programs.
 $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
-        $(BUILD_DIR)/user/hello_elf.elf $(BUILD_DIR)/user/posixtest.elf \
+        $(BUILD_DIR)/user/hello_elf.elf $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf \
         $(BUILD_DIR)/user/hello_pe.exe \
         $(BUILD_DIR)/user/hellowin.exe $(BUILD_DIR)/user/winapi.exe \
         $(BUILD_DIR)/user/cppinit.exe $(BUILD_DIR)/user/guiapp.exe \
@@ -374,6 +382,7 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
 	cp $(BUILD_DIR)/user/hello_c.bin $(BUILD_DIR)/initrd_staging/helloc.bin
 	cp $(BUILD_DIR)/user/hello_elf.elf $(BUILD_DIR)/initrd_staging/helloelf.elf
 	cp $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/initrd_staging/posixtest.elf
+	cp $(BUILD_DIR)/user/sigtest.elf $(BUILD_DIR)/initrd_staging/sigtest.elf
 	cp $(BUILD_DIR)/user/hello_pe.exe $(BUILD_DIR)/initrd_staging/hellope.exe
 	cp $(BUILD_DIR)/user/hellowin.exe $(BUILD_DIR)/initrd_staging/hellowin.exe
 	cp $(BUILD_DIR)/user/winapi.exe $(BUILD_DIR)/initrd_staging/winapi.exe
@@ -462,9 +471,11 @@ test: $(BUILD_DIR)/test/format_test $(BUILD_DIR)/test/pe_test \
 # The same binary, run on Linux and on Novaris, transcripts compared.
 # See tools/posix_compare.py and ROADMAP.md Milestone 18.
 .PHONY: test-posix
-test-posix: $(ISO) $(BUILD_DIR)/user/posixtest.elf
+test-posix: $(ISO) $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf
 	python3 tools/posix_compare.py --iso $(ISO) \
-	    --binary $(BUILD_DIR)/user/posixtest.elf
+	    --binary $(BUILD_DIR)/user/posixtest.elf --name posixtest.elf
+	python3 tools/posix_compare.py --iso $(ISO) \
+	    --binary $(BUILD_DIR)/user/sigtest.elf --name sigtest.elf
 
 test-qemu: $(ISO)
 	python3 tools/qemu_test.py --iso $(ISO) --script tools/tests/win32_smoke.txt \

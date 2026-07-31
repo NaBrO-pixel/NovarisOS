@@ -1864,6 +1864,136 @@ This is the memory-and-files half of item 3. The rest is not here.
       character-at-a-time path.
 - [ ] Only 32 descriptors, and `getpid` is a constant.
 
+## Milestone 19 — Signals ✅ DONE
+
+The second instalment of item 3, and the piece Wine needs most. Wine does
+not merely tolerate signals: it installs a `SIGSEGV` handler and uses page
+faults as a control-flow mechanism. A kernel that cannot deliver a signal
+to a handler *and resume the faulting instruction afterwards* cannot run
+it, however much of the rest of the ABI it implements.
+
+Milestone 18 accepted `rt_sigaction` and `rt_sigprocmask` and did nothing
+with them, and said so. This makes them real.
+
+### The mechanism
+
+The whole thing turns on identifying the right moment. A signal can only
+be delivered on the way back to ring 3, because the trap frame the kernel
+is about to `iret` from **is** the thread's user-mode state. So delivery
+is:
+
+1. copy that frame, plus the current signal mask, onto the user stack
+   below the interrupted `esp` — the sigframe;
+2. push the handler's cdecl arguments and, above them, a return address;
+3. rewrite `eip` and `useresp` in the trap frame to point at the handler
+   and the frame just built;
+4. `iret`, which now enters the handler instead of resuming what was
+   interrupted.
+
+When the handler returns it lands on a restorer that issues
+`rt_sigreturn`, and the kernel copies the saved frame back over the trap
+frame. The interrupted instruction resumes as if nothing had happened —
+which is the property Wine is built on.
+
+Delivery hooks into `isr_handler` and `irq_handler` in `idt.c`, and into
+the ring-3 fault path in `process.c` where a page fault becomes `SIGSEGV`,
+a divide error `SIGFPE`, an invalid opcode `SIGILL`.
+
+### Three things that had to match Linux rather than be sensible
+
+**`SA_SIGINFO` is not just a richer handler signature.** On i386 it
+selects which *frame* and which *return syscall* are in play: without it
+Linux builds the old sigframe and expects `sigreturn` (119); with it, the
+rt\_ frame and `rt_sigreturn` (173) go together. Getting this wrong is how
+the test first failed — on Linux, not on Novaris. The rt\_ path is the one
+glibc and Wine use, and is what Novaris implements.
+
+**A missing `SA_RESTORER` must be accepted.** The first implementation
+returned `-EINVAL`, on the reasonable-sounding grounds that a handler with
+no way back would run off its own end. Linux accepts it and plants a
+trampoline itself, so Novaris now does too — into the signal frame, which
+works for the same reason Linux's does: 32-bit x86 without PAE has no NX
+bit, so the user stack is executable. Being stricter was defensible in
+isolation and would have made the same binary behave differently on the
+two systems, which is the one thing this ABI must not do.
+
+**Never restore user-supplied `cs`, `ss` or `eflags` wholesale.**
+`rt_sigreturn` takes its data from the user stack, so a program could ask
+for ring-0 selectors or `IOPL=3` on the way back. The restore keeps the
+segment registers the kernel already trusts and masks `eflags` down to the
+arithmetic flags.
+
+### Verified: the same binary again, with nothing differing at all
+
+`userland/signal_test.c`, same rules as Milestone 18's — raw `int $0x80`,
+Linux numbers, `gcc -m32 -static -nostdlib -ffreestanding`, linked against
+nothing:
+
+```
+$ make test-posix
+41 lines compared, 20 checks, 0 failing, 0 unexpected difference(s)
+PASS: posixtest.elf behaves identically on Linux and Novaris
+29 lines compared, 17 checks, 0 failing, 0 unexpected difference(s)
+PASS: sigtest.elf behaves identically on Linux and Novaris
+```
+
+The signal test has **no expected differences at all** — all 29 lines are
+byte-identical between Linux and Novaris, unlike the POSIX test where
+`uname` legitimately differs.
+
+What the 17 checks cover:
+
+- a handler runs, receives the right signal number, runs again, and
+  ordinary locals survive across it — the last of which is what
+  `rt_sigreturn` is responsible for;
+- a handler installed *without* `SA_RESTORER` still runs, on the
+  kernel-planted trampoline;
+- `rt_sigprocmask` genuinely blocks: the signal does **not** run its
+  handler while blocked, stays pending, and arrives on unblock;
+- and the one that matters:
+
+```
+4. SIGSEGV handler that fixes the fault and returns
+  [ok]   rt_sigaction(SIGSEGV) accepted
+  [ok]   mapped a page to make unwritable
+  [ok]   made the page read-only
+  [ok]   SIGSEGV handler ran once
+  the faulting store now reads back as 1 (1 = it completed)
+  [ok]   the faulting instruction was retried and succeeded
+```
+
+A store to a read-only page faults; the handler `mprotect`s it back to
+read/write and returns; the store is retried and succeeds. That is Wine's
+pattern, running unmodified.
+
+The full 22-case smoke suite passes, repeated runs cost zero frames
+(29474 across three `meminfo` calls with `sigtest.elf` run twice), and
+host tests are 38 + 30 + 52 with no failures.
+
+### Honest scope
+
+- [x] `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `kill`, `tgkill`,
+      delivery from both `kill` and CPU faults, blocking and pending,
+      `SA_NODEFER`, `SA_RESETHAND`, per-handler `sa_mask`.
+- [ ] **`ucontext_t` is not populated.** An `SA_SIGINFO` handler gets a
+      valid, readable third argument full of zeroes. Wine reads the
+      faulting registers out of it, so this will have to be filled in —
+      the saved state is already in the frame, it just is not laid out in
+      the ABI's shape yet.
+- [ ] `siginfo_t` carries only `si_signo`; `si_addr` (the faulting
+      address) and `si_code` are zero.
+- [ ] One signal is delivered per return to ring 3, and `pending` is a
+      bitmask, so a signal raised twice while blocked is delivered once.
+      Real-time signal queueing is not implemented.
+- [ ] No `sigaltstack`, no `sigsuspend`, no `sigpending`, no
+      `sigtimedwait`. No `SIGALRM`, because there are no timers.
+- [ ] Signal state is per *process*, not per thread: `kill` targets the
+      whole program, and a Win32 program's several threads share one
+      disposition table. Per-thread masks need `clone`/`gettid` semantics
+      that do not exist yet.
+- [ ] `SIGKILL` cannot be blocked, but nothing can send it from outside —
+      there is one process and no `ps`.
+
 ## Path A — porting Wine (the current direction)
 
 Milestone 8 laid out two ways to run Windows binaries: port Wine (Path
@@ -1891,9 +2021,11 @@ are forced into an order:
    the real Linux/i386 ABI and implemented the memory and file halves
    (`mmap2`/`munmap`/`mprotect`/`brk`, a descriptor table,
    `open`/`read`/`write`/`writev`/`lseek`/`fstat64`), verified by running
-   one binary on both Linux and Novaris. Still to do: signals,
-   `clone`/`futex` and `pthread_*`, file-backed `mmap`, and a writable
-   filesystem.
+   one binary on both Linux and Novaris. Milestone 19 added real signals
+   — delivery, masking, `rt_sigreturn`, and a `SIGSEGV` handler that can
+   fix a fault and resume the faulting instruction, which is the pattern
+   Wine is built on. Still to do: `ucontext_t`, `clone`/`futex` and
+   `pthread_*`, file-backed `mmap`, and a writable filesystem.
 4. **A dynamic linker** — Wine's DLL-equivalents load and relocate at
    runtime.
 5. **Pull in real Wine source**, cross-compile it against that surface,
