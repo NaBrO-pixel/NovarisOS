@@ -1732,6 +1732,138 @@ program via `scheduler_terminate_all()`. Host tests: 38 + 30 + 52 checks,
 - [ ] 8 threads per program, 8 tasks total, 8KB kernel stack each.
 - [ ] Still one *process* at a time.
 
+## Milestone 18 — The Linux syscall ABI ✅ DONE (memory + files)
+
+Item 3 on the Path A list, first instalment. The item is stated there as
+"a POSIX-ish syscall surface — `mmap`/`munmap`/`mprotect`, file
+descriptors, `pthread_*`, something signal-shaped — this is what Wine's
+own build actually links against", and as being comparable in scope to
+everything built so far. This is the memory-and-files half of it.
+
+### Why the old syscalls had to go
+
+Milestone 5 defined three ad-hoc calls: `SYS_EXIT=0`, `SYS_WRITE=1`,
+`SYS_MMAP=2`. They were enough to prove ring 3 worked, and they are the
+wrong shape for what comes next. Wine is not a Windows program — it is a
+*Unix* program that happens to implement Windows — so cross-compiling it
+means giving it a kernel whose syscall numbers, argument registers and
+error convention it recognises.
+
+The two numberings cannot coexist: Linux's `exit` is 1, which was
+Novaris's `write`. So this is a replacement, not an addition, and the
+handful of in-tree demos that used the old numbers were migrated rather
+than bridged — `user_hello.s`, `task_a/b/c.s`, `thread_demo.s` and
+`userland/libc/`.
+
+The ABI is now Linux's, and not ours to choose:
+
+```
+eax = syscall number
+ebx, ecx, edx, esi, edi, ebp = arguments 1..6
+eax = result; errors come back as -errno in [-4095, -1]
+```
+
+### What is implemented
+
+`kernel/posix.c`, with `kernel/syscall.c` reduced to the IDT registration.
+
+- **Files**: `open`, `close`, `read`, `write`, `writev`, `lseek`,
+  `stat64`, `fstat64`. A real per-process descriptor table — 0/1/2 are the
+  console, the rest are initrd files. `write` takes counted bytes rather
+  than a NUL-terminated string, which is a real behavioural change: the
+  old `SYS_WRITE` could not have written a buffer containing an embedded
+  NUL, and the test does exactly that. `writev` is there because a real
+  libc's `printf` reaches for it before `write`.
+- **Memory**: `mmap2`, `munmap`, `mprotect`, `brk`. Real page-level work
+  on the process's own page directory (Milestone 15), so a mapping is
+  private, `munmap` genuinely frees its frames, and `mprotect` genuinely
+  rewrites the page-table permission bits.
+- **Misc**: `uname`, `getpid`, `gettid`, `time`, `nanosleep`, the
+  `get[ug]id32` family, `ioctl` enough for `isatty`, and
+  `rt_sigaction`/`rt_sigprocmask`/`set_thread_area` accepted-and-ignored
+  so a libc does not give up at startup.
+- Anything else returns `-ENOSYS` **and says so on the console**, the same
+  way the Win32 layer reports an unimplemented API rather than returning a
+  plausible-looking zero.
+
+### Verified: the same binary, on Linux and on Novaris
+
+This is the part worth reading. `userland/posix_test.c` contains nothing
+that knows Novaris exists. It makes raw `int $0x80` calls with Linux's
+numbers, is built with an ordinary
+`gcc -m32 -static -nostdlib -ffreestanding`, and links against no library
+of any kind — not even the tiny one in `userland/libc/`. It is a Linux
+program.
+
+`tools/posix_compare.py` runs that **one binary** twice — once on the
+Linux build host, once inside QEMU on Novaris — and diffs the transcripts:
+
+```
+$ make test-posix
+  expected difference: host 'sysname = Linux' vs novaris 'sysname = Novaris'
+41 lines compared, 20 checks, 0 failing, 0 unexpected difference(s)
+PASS: the same binary behaves identically on Linux and Novaris
+```
+
+Forty of forty-one lines are byte-identical. The one that differs is
+`uname()`'s sysname, and its differing is itself useful — it proves the
+QEMU transcript really came from Novaris rather than from a stale host
+run.
+
+The twenty checks are chosen to fail rather than pass by accident:
+
+- a `write()` of eight bytes containing a NUL in the middle, which a
+  string-based write would truncate at three;
+- `writev` returning exactly 22 across three iovecs;
+- `fstat64`'s `st_size` agreeing with `lseek(SEEK_END)` on a real file,
+  then seeking back and re-reading;
+- `open` of a missing file returning exactly `-ENOENT` (`-2`), not just
+  "something negative";
+- fresh anonymous memory reading as zero *before* anything writes it;
+- writing and reading back all 8192 bytes of a two-page mapping, so a
+  mapping that only really covered one page fails;
+- `brk` growing, the new memory being usable at both ends, and shrinking
+  back to exactly where it started.
+
+The transcripts are also literally "binary files differ" to `diff` —
+because of that embedded NUL, which is its own small proof that `write`
+carries counted bytes.
+
+### Migration, verified by everything else still working
+
+Every in-tree program that made a syscall was rewritten for the new ABI,
+and the full 21-case smoke suite is the check on that: the boot-time ring-3
+demo, `multitask`'s three tasks, `threadtest`'s two threads, the ELF and
+flat-binary demos, and all the Win32 programs (which go through `int 0x81`
+and were unaffected) all still produce their expected output.
+
+Repeated runs cost **zero frames** — 29478 across five successive
+`meminfo` calls with `posixtest.elf` and `helloelf.elf` run twice each —
+so descriptors and mappings are genuinely released with the process.
+Host tests: 38 + 30 + 52 checks, 0 failures.
+
+### Honest scope — what a real Wine build would still miss
+
+This is the memory-and-files half of item 3. The rest is not here.
+
+- [ ] **No signals.** `rt_sigaction` and `rt_sigprocmask` return success
+      and nothing is ever delivered. Wine needs real signal delivery —
+      it uses `SIGSEGV` for its own page-fault handling.
+- [ ] **No `clone`/`futex`**, so no `pthread_create` and no POSIX
+      threading. Novaris has real threads (Milestones 16-17), but they are
+      reached through the Win32 side, not through a POSIX API.
+- [ ] **No file-backed `mmap`.** `MAP_ANONYMOUS` only; a file-backed
+      request is refused with `-ENOSYS` rather than quietly returning
+      zeroed memory. A dynamic linker will need this.
+- [ ] The initrd is read-only, so `open` for writing returns `-EROFS` and
+      there is no `unlink`, `mkdir`, `rename` or `creat`.
+- [ ] `PROT_EXEC` is accepted and ignored — 32-bit x86 without PAE has no
+      NX bit, so "readable but not executable" cannot be expressed.
+- [ ] No `dup`/`dup2`/`pipe`, no `poll`/`select`, no sockets.
+- [ ] `read()` on fd 0 returns `-ENOSYS`; the console has no
+      character-at-a-time path.
+- [ ] Only 32 descriptors, and `getpid` is a constant.
+
 ## Path A — porting Wine (the current direction)
 
 Milestone 8 laid out two ways to run Windows binaries: port Wine (Path
@@ -1755,9 +1887,13 @@ are forced into an order:
    `WaitForSingleObject`, working critical sections). Still to do: real
    blocking rather than retry loops, per-thread TLS, and event/mutex
    objects.
-3. **A POSIX-ish syscall surface** — `mmap`/`munmap`/`mprotect`, file
-   descriptors, `pthread_*`, something signal-shaped. This is what
-   Wine's own build actually links against.
+3. **A POSIX-ish syscall surface** — ⏳ in progress. Milestone 18 adopted
+   the real Linux/i386 ABI and implemented the memory and file halves
+   (`mmap2`/`munmap`/`mprotect`/`brk`, a descriptor table,
+   `open`/`read`/`write`/`writev`/`lseek`/`fstat64`), verified by running
+   one binary on both Linux and Novaris. Still to do: signals,
+   `clone`/`futex` and `pthread_*`, file-backed `mmap`, and a writable
+   filesystem.
 4. **A dynamic linker** — Wine's DLL-equivalents load and relocate at
    runtime.
 5. **Pull in real Wine source**, cross-compile it against that surface,
@@ -1819,7 +1955,7 @@ much each would widen what runs:
    ```bash
    apt-get install nasm grub-pc-bin grub-common xorriso mtools \
        qemu-system-x86 build-essential gcc-multilib mingw-w64
-   make && make test && make test-qemu
+   make && make test && make test-qemu && make test-posix
    ```
 
    `mingw-w64` builds the Windows test programs in `userland/pe_test/`;

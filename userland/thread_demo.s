@@ -25,8 +25,10 @@
 BITS 32
 ORG 0x51000000
 
-%define SYS_EXIT   0
-%define SYS_WRITE  1
+; Linux/i386 syscall numbers - Milestone 18 adopted the real ABI, see
+; include/posix.h.
+%define SYS_EXIT   1
+%define SYS_WRITE  4
 %define ITERATIONS 8
 
 ; --- thread 0 entry: the load address itself ----------------------------
@@ -56,7 +58,9 @@ body:
     lock inc dword [counter]
 
     mov eax, SYS_WRITE
-    mov ebx, ebp
+    mov ebx, 1              ; fd 1 = stdout
+    mov ecx, ebp            ; this thread's message
+    mov edx, MSG_LEN
     int 0x80
 
     ; Busy-wait so a single ~20ms time slice cannot run the whole loop
@@ -71,13 +75,15 @@ body:
     jnz .loop
 
     mov eax, SYS_EXIT
+    xor ebx, ebx
     int 0x80
 
 .hang:
     jmp .hang               ; sys_exit does not return
 
-msg0: db "[thread 0]", 10, 0
-msg1: db "[thread 1]", 10, 0
+msg0: db "[thread 0]", 10
+msg1: db "[thread 1]", 10
+MSG_LEN equ 11          ; both messages are the same length
 
 ; The shared counter, parked at a fixed offset for the same reason
 ; thread1's entry is: the kernel reads it back through

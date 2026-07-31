@@ -18,14 +18,22 @@ BITS 32
 ORG 0x40000000
 
 _start:
-    mov eax, 1              ; SYS_WRITE
-    mov ebx, msg
+    mov eax, 4              ; Linux SYS_write
+    mov ebx, 1              ; fd 1 = stdout
+    mov ecx, msg
+    mov edx, msg_len
     int 0x80
 
-    mov eax, 0              ; SYS_EXIT
+    mov eax, 1              ; Linux SYS_exit
+    xor ebx, ebx
     int 0x80
 
 .halt_loop:
     jmp .halt_loop           ; should never be reached: sys_exit doesn't return
 
 msg: db "Hello from ring 3 user mode!", 10, 0
+msg_len equ $ - msg - 1   ; Linux write() takes a length, not a
+                          ; NUL-terminated string; the -1 drops the
+                          ; terminator, which is only there because
+                          ; the old Novaris SYS_WRITE needed it.
+

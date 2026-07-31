@@ -8,6 +8,7 @@
 #include "idt.h"
 #include "console.h"
 #include "kstring.h"
+#include "posix.h"
 
 /* Referenced from process_asm.s: the kernel-side stack pointer/frame
  * pointer to restore when the user program exits, so control returns to
@@ -95,7 +96,12 @@ int process_user_active(void) {
  * out of step with reality. */
 static void enter_user_mode(uint32_t entry, uint32_t stack_top) {
     user_active = 1;
+    /* File descriptors and the mmap/brk arenas belong to the process, so
+     * they are set up per run rather than once at boot - otherwise the
+     * second program to run would inherit the first one's open files. */
+    posix_process_begin();
     process_run_user_mode(entry, stack_top);
+    posix_process_end();
     user_active = 0;
 }
 

@@ -30,6 +30,7 @@ run hellowin.exe
 # threadtest is two threads in one address space sharing one counter.
 run helloelf.elf
 run helloc.bin
+run posixtest.elf
 multitask
 threadtest
 
