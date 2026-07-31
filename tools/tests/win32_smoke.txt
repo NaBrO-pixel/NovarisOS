@@ -6,6 +6,11 @@
 # crash, and hellowin last so the transcript ends on the case that
 # exercises the most of the emulation layer.
 
+# vmtest first: it is not a Win32 case, but it exercises the paging
+# machinery everything below stands on, and running it before and after
+# the programs catches an address space that leaks frames.
+vmtest
+
 peinfo hellowin.exe
 run winapi.exe
 run cppinit.exe
@@ -16,3 +21,6 @@ run hellope.exe
 run crash.exe
 run qsorttest.exe
 run hellowin.exe
+
+vmtest
+meminfo

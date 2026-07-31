@@ -7,6 +7,7 @@
 #include "process.h"
 #include "vfs.h"
 #include "kheap.h"
+#include "paging.h"
 #include "elf.h"
 #include "pe.h"
 #include "win32.h"
@@ -241,6 +242,154 @@ static void cmd_run(const char* fname) {
     terminal_writestring("Back in the shell.\n");
 }
 
+/* --- vmtest -------------------------------------------------------------
+ *
+ * Milestone 14's evidence. Two address spaces, one virtual address, two
+ * different values living there at the same time - which is exactly the
+ * thing a single flat address space cannot do, and exactly what
+ * everything from here on (threads, mmap, Wine) is built on.
+ *
+ * The test is arranged so that the interesting failure modes are loud
+ * rather than quiet:
+ *
+ *   - It runs with interrupts on. While a user address space is loaded,
+ *     the timer and keyboard IRQs keep firing and running kernel code on
+ *     the kernel stack, and every line it prints goes through the
+ *     framebuffer console and the kernel heap. If the shared kernel half
+ *     were not genuinely identical in all three directories, the machine
+ *     would triple-fault here instead of printing.
+ *   - It writes through the *virtual* address in each space rather than
+ *     poking the physical frames, so the mapping is what is being
+ *     checked, not the bookkeeping.
+ *   - It checks the address is unmapped back in the kernel's own space,
+ *     confirming the private half really is private.
+ */
+#define VMTEST_VADDR 0x30000000u
+
+static void vmtest_step(const char* text) {
+    terminal_writestring_color("  [vm] ", VGA_COLOR_LIGHT_CYAN);
+    terminal_writestring(text);
+}
+
+static void cmd_vmtest(void) {
+    uint32_t kernel_as = paging_kernel_address_space();
+
+    terminal_writestring("Per-process address spaces (ROADMAP Milestone 14)\n");
+    vmtest_step("kernel page directory at ");
+    print_hex(kernel_as, 8);
+    terminal_writestring("\n");
+
+    const char* clash = paging_region_conflict(VMTEST_VADDR,
+                                               VMTEST_VADDR + 0x1000);
+    if (clash) {
+        terminal_writestring("  test address is reserved by: ");
+        terminal_writestring(clash);
+        terminal_writestring(" - aborting\n");
+        return;
+    }
+
+    uint32_t as1 = paging_create_address_space();
+    uint32_t as2 = paging_create_address_space();
+    if (!as1 || !as2) {
+        terminal_writestring("  could not create two address spaces (out of memory)\n");
+        if (as1) paging_destroy_address_space(as1);
+        if (as2) paging_destroy_address_space(as2);
+        return;
+    }
+    vmtest_step("created two more: ");
+    print_hex(as1, 8);
+    terminal_writestring(" and ");
+    print_hex(as2, 8);
+    terminal_writestring("\n");
+
+    /* One frame each, mapped at the *same* virtual address, written into
+     * the other address space's tables through the foreign window - no
+     * CR3 switching involved yet. */
+    uint32_t f1 = pmm_alloc_frame();
+    uint32_t f2 = pmm_alloc_frame();
+    if (!f1 || !f2 ||
+        !paging_map_page_in(as1, VMTEST_VADDR, f1,
+                            PAGE_PRESENT | PAGE_RW | PAGE_USER) ||
+        !paging_map_page_in(as2, VMTEST_VADDR, f2,
+                            PAGE_PRESENT | PAGE_RW | PAGE_USER)) {
+        terminal_writestring("  mapping failed (out of memory)\n");
+        paging_destroy_address_space(as1);
+        paging_destroy_address_space(as2);
+        return;
+    }
+    vmtest_step("mapped ");
+    print_hex(VMTEST_VADDR, 8);
+    terminal_writestring(" -> frame ");
+    print_hex(f1, 8);
+    terminal_writestring(" in the first, ");
+    print_hex(f2, 8);
+    terminal_writestring(" in the second\n");
+
+    /* Now switch into each and write through the virtual address. */
+    volatile uint32_t* p = (volatile uint32_t*)VMTEST_VADDR;
+
+    paging_switch_address_space(as1);
+    *p = 0x11111111u;
+    paging_switch_address_space(as2);
+    *p = 0x22222222u;
+    paging_switch_address_space(kernel_as);
+    vmtest_step("wrote 0x11111111 in the first, 0x22222222 in the second\n");
+
+    /* Read both back. Values are collected before printing so the console
+     * (kernel heap, framebuffer) is only touched from the kernel's own
+     * address space - not because it would fail otherwise, but so a
+     * failure here can only mean the mapping. */
+    paging_switch_address_space(as1);
+    uint32_t v1 = *p;
+    paging_switch_address_space(as2);
+    uint32_t v2 = *p;
+    paging_switch_address_space(kernel_as);
+
+    vmtest_step("read back ");
+    print_hex(v1, 8);
+    terminal_writestring(" and ");
+    print_hex(v2, 8);
+    terminal_writestring(v1 == 0x11111111u && v2 == 0x22222222u
+                             ? "  <- isolated\n"
+                             : "  <- WRONG, they are not isolated\n");
+
+    /* And the same address in the kernel's own space, which never had it
+     * mapped. Checked through the page tables rather than by
+     * dereferencing, since dereferencing it is precisely what should
+     * fault. */
+    vmtest_step("same address in the kernel's space: ");
+    terminal_writestring(paging_get_entry(VMTEST_VADDR) & PAGE_PRESENT
+                             ? "MAPPED - leaked\n"
+                             : "unmapped, as it should be\n");
+
+    /* Prove the kernel half is shared rather than copied per space: the
+     * heap's directory entry must be the identical physical page table in
+     * all three, or an interrupt taken on as1 would have died above. */
+    uint32_t kern_pte = paging_get_entry(KHEAP_VIRTUAL_BASE);
+    uint32_t as1_pte = paging_get_entry_in(as1, KHEAP_VIRTUAL_BASE);
+    uint32_t as2_pte = paging_get_entry_in(as2, KHEAP_VIRTUAL_BASE);
+    vmtest_step("kernel heap page at ");
+    print_hex(KHEAP_VIRTUAL_BASE, 8);
+    terminal_writestring(kern_pte == as1_pte && kern_pte == as2_pte
+                             ? " is the same frame in all three\n"
+                             : " DIFFERS between address spaces\n");
+
+    if (paging_kernel_pde_violated()) {
+        terminal_writestring("  WARNING: a kernel page-directory entry was added\n");
+        terminal_writestring("           after the address space was frozen - some\n");
+        terminal_writestring("           address spaces are missing a kernel mapping.\n");
+    }
+
+    uint32_t free_before = pmm_free_frames();
+    paging_destroy_address_space(as1);
+    paging_destroy_address_space(as2);
+    vmtest_step("destroyed both; frames reclaimed: ");
+    print_uint(pmm_free_frames() - free_before);
+    terminal_writestring("\n");
+    terminal_writestring("vmtest done - the kernel is still running, on its own "
+                         "page directory.\n");
+}
+
 static void print_prompt(void) {
     terminal_writestring_color("novaris", VGA_COLOR_LIGHT_CYAN);
     terminal_writestring_color("> ", VGA_COLOR_LIGHT_GREY);
@@ -257,6 +406,9 @@ static void run_command(char* line) {
         terminal_writestring("  about   - about Novaris\n");
         terminal_writestring("  uptime  - timer ticks since boot\n");
         terminal_writestring("  meminfo - physical memory frame usage\n");
+        terminal_writestring("  vmtest  - prove per-process address spaces work:\n");
+        terminal_writestring("            two page directories, one virtual address,\n");
+        terminal_writestring("            two different contents (ROADMAP Milestone 14)\n");
         terminal_writestring("  ls      - list files on the initrd\n");
         terminal_writestring("  cat     - print a file, e.g. cat hello.txt\n");
         terminal_writestring("  run     - run a program: flat binary, ELF, or a real\n");
@@ -291,6 +443,8 @@ static void run_command(char* line) {
         terminal_writestring(" total (");
         print_uint(pmm_free_frames() * 4);
         terminal_writestring("KB free)\n");
+    } else if (streq(line, "vmtest")) {
+        cmd_vmtest();
     } else if (streq(line, "ls")) {
         if (!vfs_root) {
             terminal_writestring("No filesystem mounted.\n");

@@ -219,6 +219,19 @@ void kernel_main(uint32_t magic, multiboot_info_t* mbi) {
     terminal_writestring("\n");
     kfree(test_buf);
 
+    /* Every kernel-wide mapping is in place by this point: the kernel
+     * image, the heap, the framebuffer and the initrd. Reserve the page
+     * tables the heap will need as it grows - it is the one kernel range
+     * that gets bigger after boot, and a directory entry added later
+     * would exist only in whichever address space happened to be loaded -
+     * then freeze the set, which is what lets every address space created
+     * from here on share an identical kernel half. See paging.h. */
+    paging_reserve_kernel_tables(KHEAP_VIRTUAL_BASE,
+                                 KHEAP_VIRTUAL_BASE + KHEAP_MAX_SIZE);
+    paging_finalize_kernel_space();
+    terminal_writestring_color("[OK] ", VGA_COLOR_LIGHT_GREEN);
+    terminal_writestring("Kernel address space frozen (shared by every process)\n");
+
     syscall_install();
     terminal_writestring_color("[OK] ", VGA_COLOR_LIGHT_GREEN);
     terminal_writestring("Syscall interface installed (int 0x80, DPL=3)\n");

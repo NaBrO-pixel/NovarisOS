@@ -4,6 +4,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Where the heap lives and how far it can grow. Public because the page
+ * tables covering this range have to be pre-created before the kernel
+ * address space is frozen (see paging_reserve_kernel_tables): the heap is
+ * the one kernel range that gets bigger after boot, and a page directory
+ * entry added later would exist only in whichever address space happened
+ * to be loaded at the time. kheap.c uses these directly, so there is one
+ * definition rather than two that can drift. */
+#define KHEAP_VIRTUAL_BASE 0xD0000000u
+#define KHEAP_MAX_SIZE     (48u * 1024u * 1024u)
+
 /* Maps in the heap's initial pages. Must run after paging_init(). */
 void kheap_init(void);
 

@@ -1022,6 +1022,179 @@ memory/clock variance.
       anything callback-aware. `win32_callback_reset()` puts `esp0` and
       the depth counter back when a program ends either way.
 
+## Milestone 14 — Per-process address spaces ✅ DONE (mechanism)
+
+The first of the prerequisites for **Path A** — see the note below on why
+the project pivoted to porting Wine rather than hand-writing more Win32.
+Wine assumes a POSIX-shaped kernel underneath it, and the very first
+thing that assumption needs is real, separate page directories per
+process.
+
+Through Milestone 13 Novaris ran one program at a time in one flat,
+unprotected address space. That was deliberate and it bought a lot: it is
+why the Win32 layer can read a program's stack by casting a pointer, why
+`pe.c` can memcpy an image into place, and why the callback layer in
+Milestone 13 could build a ring-3 call frame with a plain store. All of
+that has to be unwound eventually, and unwinding it is not this
+milestone. **This milestone builds the mechanism and proves it works.**
+
+### What was built
+
+`kernel/paging.c` grew an address-space API. An address space is
+identified by the physical address of its page directory — the value
+that goes in CR3 — rather than by a struct, so there is nothing to keep
+in step and `paging_current_address_space()` can answer by reading the
+register.
+
+```
+paging_reserve_kernel_tables(start, end)   pre-create tables for ranges that grow
+paging_finalize_kernel_space()             freeze what "the kernel half" means
+paging_create_address_space()              -> pd_phys
+paging_destroy_address_space(pd_phys)
+paging_switch_address_space(pd_phys)
+paging_map_page_in(pd_phys, virt, phys, flags)
+paging_get_entry_in(pd_phys, virt)
+```
+
+Two design decisions carried the weight.
+
+**A second recursive slot.** Editing another address space's page tables
+normally means either switching CR3 to it (can't — the kernel is running)
+or a scratch-page mapping dance (needs an allocator, and the invalidation
+is easy to get subtly wrong). Instead, directory entry **1022** points at
+the *foreign* directory. The CPU then treats that directory as an
+ordinary page table, so its entries become the PTEs of the 4MB window at
+`0xFF800000` — foreign page table N reads and writes at
+`0xFF800000 + N*4096` — and because entry 1022 is itself reachable
+through the existing 1023 recursion, the foreign directory itself sits at
+`0xFFFFE000`. Attach, edit, detach. Entry 1022 is deliberately *not*
+shared, so every address space has its own window and no process can see
+another's attachment.
+
+**An empirically frozen kernel set.** "The kernel range is identical in
+every address space" is easy to say and easy to get wrong: copy the
+kernel's directory entries at creation time, then add a kernel mapping
+later, and every address space created before that point silently lacks
+it. The fix is to make kernel directory entries immutable.
+`paging_finalize_kernel_space()` snapshots which entries exist at the end
+of boot and calls that set global.
+
+Snapshotting rather than hardcoding an index range is deliberate: the
+kernel's mappings are scattered and two of them move. On this boot they
+land at directory entries 0 (the identity-mapped low 4MB), 768 (the
+kernel image at `0xC0000000`), 832 (the heap at `0xD0000000`), and 1012
+(the linear framebuffer, wherever the bootloader put it — QEMU chose
+`0xFD000000` here, and the initrd's entry depends on where GRUB dropped
+the module). Any hand-written list of those is a list that goes stale.
+
+The heap is the one kernel range that grows after boot, so `kernel.c`
+calls `paging_reserve_kernel_tables()` over its full 48MB before
+freezing. And `paging_map_page()` now *records* any attempt to add a
+kernel-half directory entry after the freeze — `vmtest` reports it. That
+is a design error to find and fix at the call site, not a runtime
+condition to recover from, so it is surfaced rather than papered over.
+
+### Verified
+
+A `vmtest` shell command, wired into `tools/tests/win32_smoke.txt` (twice
+— before and after the programs run, so an address space that leaks
+frames shows up as a `meminfo` difference):
+
+```
+novaris> vmtest
+Per-process address spaces (ROADMAP Milestone 14)
+  [vm] kernel page directory at 0x001a1000
+  [vm] created two more: 0x00c7d000 and 0x00c7e000
+  [vm] mapped 0x30000000 -> frame 0x00c7f000 in the first, 0x00c80000 in the second
+  [vm] wrote 0x11111111 in the first, 0x22222222 in the second
+  [vm] read back 0x11111111 and 0x22222222  <- isolated
+  [vm] same address in the kernel's space: unmapped, as it should be
+  [vm] kernel heap page at 0xd0000000 is the same frame in all three
+  [vm] destroyed both; frames reclaimed: 6
+vmtest done - the kernel is still running, on its own page directory.
+```
+
+The test is arranged so the interesting failures are loud:
+
+- **One virtual address, two contents.** `0x30000000` holds `0x11111111`
+  and `0x22222222` *at the same time*, in two directories. This is the
+  thing a single flat address space cannot do.
+- **Written through the virtual address, not the frame.** The mapping is
+  what's under test, not the bookkeeping.
+- **Interrupts stay on.** While a foreign directory is in CR3, the timer
+  and keyboard IRQs keep firing and running kernel code on the kernel
+  stack. If the shared kernel half were not genuinely identical in all
+  three directories, this would triple-fault rather than print.
+- **The private half is private.** `0x30000000` is checked to be unmapped
+  in the kernel's own space — through the page tables, since
+  dereferencing it is exactly what should fault.
+- **6 frames reclaimed**, which is exactly right: two directories, two
+  page tables, two data frames. `meminfo` before and after the whole
+  smoke run is unchanged, so nothing leaks.
+
+The other ten smoke cases (including Milestone 13's `qsorttest.exe`) are
+unchanged.
+
+### Honest scope — what this does *not* yet do
+
+This is the load-bearing caveat, and it should not be read as more than
+it is.
+
+- [ ] **No process actually runs in one yet.** `win32_run_pe()`,
+      `process_run_flat_binary()` and `process_run_elf()` still all run
+      in the kernel's own directory, exactly as before. Nothing in the
+      normal boot or `run` path switches CR3. The mechanism exists and is
+      proven; wiring processes onto it is the next milestone.
+- [ ] The single-address-space assumption is still baked into `win32.c`,
+      `pe.c`, the heap/stack arena logic and `win32_callback.c` — every
+      one of them reaches user memory by casting a pointer. Unwinding
+      that is the bulk of the work and was explicitly not attempted here.
+- [ ] No copy-on-write, no `fork`, no demand paging, no swapping. Mapping
+      is eager and explicit.
+- [ ] No per-process kernel stacks, which real preemption between
+      address spaces will need. `TSS.esp0` is still one global value
+      (borrowed and restored around ring-3 callbacks, see Milestone 13).
+- [ ] The scheduler (Milestone 9) does not know address spaces exist and
+      does not switch CR3 on a context switch.
+
+## Path A — porting Wine (the current direction)
+
+Milestone 8 laid out two ways to run Windows binaries: port Wine (Path
+A) or reimplement the API surface (Path B). Milestone 10 took a third,
+smaller road — hand-written clean-room Win32, no Wine or ReactOS source
+anywhere — and Milestones 10–13 took it as far as ~500 APIs, real
+`.exe` loading, and now real ring-3 callbacks.
+
+That road works, and it stays narrower than real Win32 forever. The
+project has chosen **Path A**: port real Wine on top of Novaris, and get
+actual breadth instead of a bespoke subset. This is an honest
+architectural pivot, not an incremental feature, and the prerequisites
+are forced into an order:
+
+1. **Per-process address spaces** — ✅ mechanism done, Milestone 14.
+   Still to do: run processes in them.
+2. **Real threads.**
+3. **A POSIX-ish syscall surface** — `mmap`/`munmap`/`mprotect`, file
+   descriptors, `pthread_*`, something signal-shaped. This is what
+   Wine's own build actually links against.
+4. **A dynamic linker** — Wine's DLL-equivalents load and relocate at
+   runtime.
+5. **Pull in real Wine source**, cross-compile it against that surface,
+   and find out what is still missing. Expect that to surface more gaps;
+   a display backend for GDI is the obvious one.
+
+Each is roughly milestone-sized. (3) and (4) are each comparable in scope
+to everything built so far combined. No Wine or ReactOS source gets
+vendored in before step 5, and when it does it stays clearly separated
+from Novaris's own clean-room code — Wine is LGPL-2.1, which is fine, but
+the boundary has to stay visible.
+
+**Stated honestly:** the goal is real Win32 GUI programs, and eventually
+broader real-world Windows software, running on Novaris via Wine. It is
+not a claim that anything at all will run. Chrome will not: that needs
+networking, GPU acceleration, sandboxing and hundreds of DLLs far beyond
+this project's scope, Wine or no Wine.
+
 ## Later / open-ended
 
 - Networking (a NIC driver + a minimal TCP/IP stack) — big undertaking.
