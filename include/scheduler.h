@@ -65,6 +65,20 @@ typedef struct process {
      * none. Non-zero also means "run with fs addressing it", and makes
      * the switch path repoint the TEB GDT descriptor - see switch_to(). */
     uint32_t teb;
+    /* This thread's local-storage segment, for POSIX threads: base and
+     * limit of the block gs should address, and 0 for a task that has
+     * none. Reprogrammed into GDT entry 7 on every switch, the same way
+     * `teb` is into entry 6 - both are per-thread, and both would
+     * otherwise leak one thread's view into another's. */
+    uint32_t tls_base;
+    uint32_t tls_limit;
+
+    /* CLONE_CHILD_CLEARTID: the address in the *shared* address space to
+     * zero when this thread exits, and futex-wake. That is how a joiner
+     * finds out the thread is gone, and is what pthread_join is built
+     * from. 0 when the thread was not created with the flag. */
+    uint32_t clear_child_tid;
+
     /* 1 if this task's user stack page was mapped for it here and is its
      * to free. A Win32 thread's stack comes from the emulation layer's
      * arena instead, which is freed wholesale when the program exits. */
@@ -117,6 +131,33 @@ int scheduler_spawn_thread(const char* name, uint32_t entry,
  * own `teb`. See kernel/win32.c's w32_thread_create(). */
 int scheduler_spawn_win32_thread(const char* name, uint32_t entry,
                                  uint32_t esp, uint32_t teb);
+
+/* A POSIX thread, created by clone(). Like the Win32 form, the caller has
+ * already built the ring-3 stack, and the stack belongs to the program
+ * (it came out of the program's own mmap) rather than to this task. The
+ * child starts at `entry` with eax = 0, which is how clone tells parent
+ * from child, and runs with gs addressing [tls_base, tls_base+tls_limit]
+ * when tls_base is non-zero. Returns the new tid, or -1. */
+int scheduler_spawn_posix_thread(const char* name, uint32_t entry,
+                                 uint32_t esp, uint32_t tls_base,
+                                 uint32_t tls_limit, uint32_t clear_child_tid);
+
+/* Records the current task's TLS block, so a switch away and back
+ * reprograms the descriptor with this thread's values rather than
+ * whichever thread last called set_thread_area. */
+void scheduler_set_current_tls(uint32_t base, uint32_t limit);
+
+/* The clear_child_tid of the task that is exiting, or 0. Read by the
+ * POSIX layer on thread exit so it can zero the word and wake anyone
+ * waiting on it. */
+uint32_t scheduler_current_clear_child_tid(void);
+
+/* Runs `entry` as the only task in the current address space and blocks
+ * until it (and anything it clones) has finished - the scheduler-based
+ * equivalent of process_run_user_mode(). This is what lets an ordinary
+ * program call clone(): its main thread has to be a scheduler task before
+ * a second one can join it. */
+void scheduler_run_single(const char* name, uint32_t entry, uint32_t esp);
 
 /* Starts round-robin preemptive multitasking among every process spawned
  * since the last call, and blocks the caller (same "looks like an

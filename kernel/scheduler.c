@@ -166,6 +166,9 @@ static int spawn_common(const char* name, uint32_t entry, uint32_t load_vaddr,
     p->owns_page_directory = owns_pd;
     p->teb = teb;
     p->owns_stack = map_stack;
+    p->tls_base = 0;
+    p->tls_limit = 0;
+    p->clear_child_tid = 0;
     p->state = PROC_READY;
     return p->pid;
 }
@@ -227,6 +230,45 @@ int scheduler_spawn_process(const char* name, const uint8_t* image,
 
     if (pid < 0) paging_destroy_address_space(as);
     return pid;
+}
+
+int scheduler_spawn_posix_thread(const char* name, uint32_t entry,
+                                 uint32_t esp, uint32_t tls_base,
+                                 uint32_t tls_limit,
+                                 uint32_t clear_child_tid) {
+    if (process_count >= MAX_PROCESSES) return -1;
+    int pid = spawn_common(name, entry, entry, 0, esp, 0, 0, 0);
+    if (pid < 0) return -1;
+
+    process_t* p = &process_table[process_count - 1];
+    p->tls_base = tls_base;
+    p->tls_limit = tls_limit;
+    p->clear_child_tid = clear_child_tid;
+
+    /* clone() returns 0 in the child and the tid in the parent, and the
+     * synthetic frame is the child's whole initial state - so eax is set
+     * here rather than anywhere the child could observe being changed. */
+    registers_t* frame = (registers_t*)p->esp;
+    frame->eax = 0;
+    if (tls_base) frame->gs = 0x3B; /* GDT entry 7 | RPL 3 */
+    return pid;
+}
+
+void scheduler_set_current_tls(uint32_t base, uint32_t limit) {
+    if (!current) return;
+    current->tls_base = base;
+    current->tls_limit = limit;
+}
+
+uint32_t scheduler_current_clear_child_tid(void) {
+    return current ? current->clear_child_tid : 0;
+}
+
+void scheduler_run_single(const char* name, uint32_t entry, uint32_t esp) {
+    /* map_stack 0: the caller has already mapped the stack this esp points
+     * into, and owns it. */
+    if (spawn_common(name, entry, entry, 0, esp, 0, 0, 0) < 0) return;
+    scheduler_run_until_idle();
 }
 
 int scheduler_spawn_win32_thread(const char* name, uint32_t entry,
@@ -334,6 +376,9 @@ static void switch_to(process_t* next) {
      * switch between threads, not just once per program. Getting this
      * wrong would give two threads one errno and one SEH chain. */
     if (next->teb) gdt_set_teb(next->teb, PAGE_SIZE - 1);
+    /* Same reasoning for POSIX thread-local storage, which lives behind
+     * gs rather than fs - see gdt_set_tls(). */
+    if (next->tls_base) gdt_set_tls(next->tls_base, next->tls_limit);
     current = next;
     current->state = PROC_RUNNING;
     gdt_set_kernel_stack(current->kernel_stack_top);

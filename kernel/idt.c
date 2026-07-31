@@ -1,6 +1,7 @@
 #include "idt.h"
 #include "pic.h"
 #include "console.h"
+#include "posix.h"
 
 struct idt_entry {
     uint16_t base_low;
@@ -67,6 +68,10 @@ static const char* exception_name(uint8_t n) {
     return names[n];
 }
 
+/* Set by kernel/scheduler.c when a context switch is pending - see
+ * irq_handler() below for why signal delivery has to stand aside for it. */
+extern uint32_t scheduler_next_esp;
+
 static fault_hook_t user_fault_hook = 0;
 
 void idt_set_user_fault_hook(fault_hook_t hook) {
@@ -77,6 +82,11 @@ void idt_set_user_fault_hook(fault_hook_t hook) {
 void isr_handler(registers_t* regs) {
     if (handlers[regs->int_no]) {
         handlers[regs->int_no](regs);
+        /* On the way back to ring 3 is the one moment a signal can be
+         * injected: the frame about to be iret'ed from is the thread's
+         * user-mode state, so redirecting it into a handler is all
+         * delivery takes. See kernel/posix_signal.c. */
+        posix_deliver_pending(regs);
         return;
     }
 
@@ -117,6 +127,13 @@ void irq_handler(registers_t* regs) {
     }
 
     pic_send_eoi(irq);
+
+    /* Not while a context switch is pending: the scheduler is about to
+     * repoint esp at a different task's frame, and `regs` is the outgoing
+     * one - delivering into it would install a handler nobody is going to
+     * run. The signal stays pending and arrives on the next return to
+     * ring 3 instead. */
+    if (!scheduler_next_esp) posix_deliver_pending(regs);
 }
 
 void register_interrupt_handler(uint8_t n, isr_handler_t handler) {

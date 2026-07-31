@@ -8,6 +8,8 @@
 #include "idt.h"
 #include "console.h"
 #include "kstring.h"
+#include "posix.h"
+#include "scheduler.h"
 
 /* Referenced from process_asm.s: the kernel-side stack pointer/frame
  * pointer to restore when the user program exits, so control returns to
@@ -22,6 +24,8 @@ uint32_t user_fs_selector = 0x23;
 #define USER_LOAD_VADDR 0x40000000u /* must match userland/user.ld */
 #define USER_STACK_TOP      0x40100000u /* 1MB above the program; grows down */
 #define PAGE_SIZE 4096u
+/* 64KB of stack for an ELF program - see process_run_elf(). */
+#define ELF_STACK_SIZE (16u * PAGE_SIZE)
 
 /* Non-zero between entering ring 3 and coming back out of it. Only the
  * fault path reads it, and only to decide whether a CPU exception belongs
@@ -95,7 +99,12 @@ int process_user_active(void) {
  * out of step with reality. */
 static void enter_user_mode(uint32_t entry, uint32_t stack_top) {
     user_active = 1;
+    /* File descriptors and the mmap/brk arenas belong to the process, so
+     * they are set up per run rather than once at boot - otherwise the
+     * second program to run would inherit the first one's open files. */
+    posix_process_begin();
     process_run_user_mode(entry, stack_top);
+    posix_process_end();
     user_active = 0;
 }
 
@@ -154,11 +163,28 @@ int process_run_elf(const uint8_t* image, uint32_t size) {
         return 0;
     }
 
-    uint32_t stack_phys = pmm_alloc_frame();
-    paging_map_page(USER_STACK_TOP - PAGE_SIZE, stack_phys,
-                     PAGE_PRESENT | PAGE_RW | PAGE_USER);
+    /* An ELF program gets a larger stack than the single page a flat
+     * binary makes do with: since Milestone 20 it can clone() threads,
+     * and each of those needs somewhere to put a stack of its own out of
+     * its mmap arena, but the main thread's own frames also get deeper
+     * once there is a real program on top. */
+    for (uint32_t va = USER_STACK_TOP - ELF_STACK_SIZE; va < USER_STACK_TOP;
+         va += PAGE_SIZE) {
+        uint32_t phys = pmm_alloc_frame();
+        if (!phys) break;
+        paging_map_page(va, phys, PAGE_PRESENT | PAGE_RW | PAGE_USER);
+    }
 
-    enter_user_mode(entry, USER_STACK_TOP);
+    /* Run as a scheduler task rather than through the older blocking
+     * path. That is what makes clone() possible at all: a second thread
+     * is simply a second task in this same address space, and
+     * scheduler_run_single() blocks its caller exactly the way
+     * process_run_user_mode() did. */
+    user_active = 1;
+    posix_process_begin();
+    scheduler_run_single("main", entry, USER_STACK_TOP);
+    posix_process_end();
+    user_active = 0;
 
     if (owns_as) process_leave_address_space();
     return 1;
@@ -192,6 +218,13 @@ static int handle_user_fault(registers_t* regs) {
     if (win32_process_active()) {
         return win32_handle_user_fault(regs); /* does not return */
     }
+
+    /* A POSIX program that installed a handler for the signal this fault
+     * maps to gets it delivered instead of being killed - and, crucially,
+     * gets to *return* from the handler, at which point the faulting
+     * instruction is retried. That is the pattern Wine is built on: fault
+     * on purpose, fix the mapping in the handler, carry on. */
+    if (posix_handle_fault_signal(regs, regs->int_no)) return 1;
 
     char buf[16];
     terminal_writestring("\n");

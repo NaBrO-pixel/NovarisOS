@@ -1732,6 +1732,409 @@ program via `scheduler_terminate_all()`. Host tests: 38 + 30 + 52 checks,
 - [ ] 8 threads per program, 8 tasks total, 8KB kernel stack each.
 - [ ] Still one *process* at a time.
 
+## Milestone 18 — The Linux syscall ABI ✅ DONE (memory + files)
+
+Item 3 on the Path A list, first instalment. The item is stated there as
+"a POSIX-ish syscall surface — `mmap`/`munmap`/`mprotect`, file
+descriptors, `pthread_*`, something signal-shaped — this is what Wine's
+own build actually links against", and as being comparable in scope to
+everything built so far. This is the memory-and-files half of it.
+
+### Why the old syscalls had to go
+
+Milestone 5 defined three ad-hoc calls: `SYS_EXIT=0`, `SYS_WRITE=1`,
+`SYS_MMAP=2`. They were enough to prove ring 3 worked, and they are the
+wrong shape for what comes next. Wine is not a Windows program — it is a
+*Unix* program that happens to implement Windows — so cross-compiling it
+means giving it a kernel whose syscall numbers, argument registers and
+error convention it recognises.
+
+The two numberings cannot coexist: Linux's `exit` is 1, which was
+Novaris's `write`. So this is a replacement, not an addition, and the
+handful of in-tree demos that used the old numbers were migrated rather
+than bridged — `user_hello.s`, `task_a/b/c.s`, `thread_demo.s` and
+`userland/libc/`.
+
+The ABI is now Linux's, and not ours to choose:
+
+```
+eax = syscall number
+ebx, ecx, edx, esi, edi, ebp = arguments 1..6
+eax = result; errors come back as -errno in [-4095, -1]
+```
+
+### What is implemented
+
+`kernel/posix.c`, with `kernel/syscall.c` reduced to the IDT registration.
+
+- **Files**: `open`, `close`, `read`, `write`, `writev`, `lseek`,
+  `stat64`, `fstat64`. A real per-process descriptor table — 0/1/2 are the
+  console, the rest are initrd files. `write` takes counted bytes rather
+  than a NUL-terminated string, which is a real behavioural change: the
+  old `SYS_WRITE` could not have written a buffer containing an embedded
+  NUL, and the test does exactly that. `writev` is there because a real
+  libc's `printf` reaches for it before `write`.
+- **Memory**: `mmap2`, `munmap`, `mprotect`, `brk`. Real page-level work
+  on the process's own page directory (Milestone 15), so a mapping is
+  private, `munmap` genuinely frees its frames, and `mprotect` genuinely
+  rewrites the page-table permission bits.
+- **Misc**: `uname`, `getpid`, `gettid`, `time`, `nanosleep`, the
+  `get[ug]id32` family, `ioctl` enough for `isatty`, and
+  `rt_sigaction`/`rt_sigprocmask`/`set_thread_area` accepted-and-ignored
+  so a libc does not give up at startup.
+- Anything else returns `-ENOSYS` **and says so on the console**, the same
+  way the Win32 layer reports an unimplemented API rather than returning a
+  plausible-looking zero.
+
+### Verified: the same binary, on Linux and on Novaris
+
+This is the part worth reading. `userland/posix_test.c` contains nothing
+that knows Novaris exists. It makes raw `int $0x80` calls with Linux's
+numbers, is built with an ordinary
+`gcc -m32 -static -nostdlib -ffreestanding`, and links against no library
+of any kind — not even the tiny one in `userland/libc/`. It is a Linux
+program.
+
+`tools/posix_compare.py` runs that **one binary** twice — once on the
+Linux build host, once inside QEMU on Novaris — and diffs the transcripts:
+
+```
+$ make test-posix
+  expected difference: host 'sysname = Linux' vs novaris 'sysname = Novaris'
+41 lines compared, 20 checks, 0 failing, 0 unexpected difference(s)
+PASS: the same binary behaves identically on Linux and Novaris
+```
+
+Forty of forty-one lines are byte-identical. The one that differs is
+`uname()`'s sysname, and its differing is itself useful — it proves the
+QEMU transcript really came from Novaris rather than from a stale host
+run.
+
+The twenty checks are chosen to fail rather than pass by accident:
+
+- a `write()` of eight bytes containing a NUL in the middle, which a
+  string-based write would truncate at three;
+- `writev` returning exactly 22 across three iovecs;
+- `fstat64`'s `st_size` agreeing with `lseek(SEEK_END)` on a real file,
+  then seeking back and re-reading;
+- `open` of a missing file returning exactly `-ENOENT` (`-2`), not just
+  "something negative";
+- fresh anonymous memory reading as zero *before* anything writes it;
+- writing and reading back all 8192 bytes of a two-page mapping, so a
+  mapping that only really covered one page fails;
+- `brk` growing, the new memory being usable at both ends, and shrinking
+  back to exactly where it started.
+
+The transcripts are also literally "binary files differ" to `diff` —
+because of that embedded NUL, which is its own small proof that `write`
+carries counted bytes.
+
+### Migration, verified by everything else still working
+
+Every in-tree program that made a syscall was rewritten for the new ABI,
+and the full 21-case smoke suite is the check on that: the boot-time ring-3
+demo, `multitask`'s three tasks, `threadtest`'s two threads, the ELF and
+flat-binary demos, and all the Win32 programs (which go through `int 0x81`
+and were unaffected) all still produce their expected output.
+
+Repeated runs cost **zero frames** — 29478 across five successive
+`meminfo` calls with `posixtest.elf` and `helloelf.elf` run twice each —
+so descriptors and mappings are genuinely released with the process.
+Host tests: 38 + 30 + 52 checks, 0 failures.
+
+### Honest scope — what a real Wine build would still miss
+
+This is the memory-and-files half of item 3. The rest is not here.
+
+- [ ] **No signals.** `rt_sigaction` and `rt_sigprocmask` return success
+      and nothing is ever delivered. Wine needs real signal delivery —
+      it uses `SIGSEGV` for its own page-fault handling.
+- [ ] **No `clone`/`futex`**, so no `pthread_create` and no POSIX
+      threading. Novaris has real threads (Milestones 16-17), but they are
+      reached through the Win32 side, not through a POSIX API.
+- [ ] **No file-backed `mmap`.** `MAP_ANONYMOUS` only; a file-backed
+      request is refused with `-ENOSYS` rather than quietly returning
+      zeroed memory. A dynamic linker will need this.
+- [ ] The initrd is read-only, so `open` for writing returns `-EROFS` and
+      there is no `unlink`, `mkdir`, `rename` or `creat`.
+- [ ] `PROT_EXEC` is accepted and ignored — 32-bit x86 without PAE has no
+      NX bit, so "readable but not executable" cannot be expressed.
+- [ ] No `dup`/`dup2`/`pipe`, no `poll`/`select`, no sockets.
+- [ ] `read()` on fd 0 returns `-ENOSYS`; the console has no
+      character-at-a-time path.
+- [ ] Only 32 descriptors, and `getpid` is a constant.
+
+## Milestone 19 — Signals ✅ DONE
+
+The second instalment of item 3, and the piece Wine needs most. Wine does
+not merely tolerate signals: it installs a `SIGSEGV` handler and uses page
+faults as a control-flow mechanism. A kernel that cannot deliver a signal
+to a handler *and resume the faulting instruction afterwards* cannot run
+it, however much of the rest of the ABI it implements.
+
+Milestone 18 accepted `rt_sigaction` and `rt_sigprocmask` and did nothing
+with them, and said so. This makes them real.
+
+### The mechanism
+
+The whole thing turns on identifying the right moment. A signal can only
+be delivered on the way back to ring 3, because the trap frame the kernel
+is about to `iret` from **is** the thread's user-mode state. So delivery
+is:
+
+1. copy that frame, plus the current signal mask, onto the user stack
+   below the interrupted `esp` — the sigframe;
+2. push the handler's cdecl arguments and, above them, a return address;
+3. rewrite `eip` and `useresp` in the trap frame to point at the handler
+   and the frame just built;
+4. `iret`, which now enters the handler instead of resuming what was
+   interrupted.
+
+When the handler returns it lands on a restorer that issues
+`rt_sigreturn`, and the kernel copies the saved frame back over the trap
+frame. The interrupted instruction resumes as if nothing had happened —
+which is the property Wine is built on.
+
+Delivery hooks into `isr_handler` and `irq_handler` in `idt.c`, and into
+the ring-3 fault path in `process.c` where a page fault becomes `SIGSEGV`,
+a divide error `SIGFPE`, an invalid opcode `SIGILL`.
+
+### Three things that had to match Linux rather than be sensible
+
+**`SA_SIGINFO` is not just a richer handler signature.** On i386 it
+selects which *frame* and which *return syscall* are in play: without it
+Linux builds the old sigframe and expects `sigreturn` (119); with it, the
+rt\_ frame and `rt_sigreturn` (173) go together. Getting this wrong is how
+the test first failed — on Linux, not on Novaris. The rt\_ path is the one
+glibc and Wine use, and is what Novaris implements.
+
+**A missing `SA_RESTORER` must be accepted.** The first implementation
+returned `-EINVAL`, on the reasonable-sounding grounds that a handler with
+no way back would run off its own end. Linux accepts it and plants a
+trampoline itself, so Novaris now does too — into the signal frame, which
+works for the same reason Linux's does: 32-bit x86 without PAE has no NX
+bit, so the user stack is executable. Being stricter was defensible in
+isolation and would have made the same binary behave differently on the
+two systems, which is the one thing this ABI must not do.
+
+**Never restore user-supplied `cs`, `ss` or `eflags` wholesale.**
+`rt_sigreturn` takes its data from the user stack, so a program could ask
+for ring-0 selectors or `IOPL=3` on the way back. The restore keeps the
+segment registers the kernel already trusts and masks `eflags` down to the
+arithmetic flags.
+
+### Verified: the same binary again, with nothing differing at all
+
+`userland/signal_test.c`, same rules as Milestone 18's — raw `int $0x80`,
+Linux numbers, `gcc -m32 -static -nostdlib -ffreestanding`, linked against
+nothing:
+
+```
+$ make test-posix
+41 lines compared, 20 checks, 0 failing, 0 unexpected difference(s)
+PASS: posixtest.elf behaves identically on Linux and Novaris
+29 lines compared, 17 checks, 0 failing, 0 unexpected difference(s)
+PASS: sigtest.elf behaves identically on Linux and Novaris
+```
+
+The signal test has **no expected differences at all** — all 29 lines are
+byte-identical between Linux and Novaris, unlike the POSIX test where
+`uname` legitimately differs.
+
+What the 17 checks cover:
+
+- a handler runs, receives the right signal number, runs again, and
+  ordinary locals survive across it — the last of which is what
+  `rt_sigreturn` is responsible for;
+- a handler installed *without* `SA_RESTORER` still runs, on the
+  kernel-planted trampoline;
+- `rt_sigprocmask` genuinely blocks: the signal does **not** run its
+  handler while blocked, stays pending, and arrives on unblock;
+- and the one that matters:
+
+```
+4. SIGSEGV handler that fixes the fault and returns
+  [ok]   rt_sigaction(SIGSEGV) accepted
+  [ok]   mapped a page to make unwritable
+  [ok]   made the page read-only
+  [ok]   SIGSEGV handler ran once
+  the faulting store now reads back as 1 (1 = it completed)
+  [ok]   the faulting instruction was retried and succeeded
+```
+
+A store to a read-only page faults; the handler `mprotect`s it back to
+read/write and returns; the store is retried and succeeds. That is Wine's
+pattern, running unmodified.
+
+The full 22-case smoke suite passes, repeated runs cost zero frames
+(29474 across three `meminfo` calls with `sigtest.elf` run twice), and
+host tests are 38 + 30 + 52 with no failures.
+
+### Honest scope
+
+- [x] `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `kill`, `tgkill`,
+      delivery from both `kill` and CPU faults, blocking and pending,
+      `SA_NODEFER`, `SA_RESETHAND`, per-handler `sa_mask`.
+- [ ] **`ucontext_t` is not populated.** An `SA_SIGINFO` handler gets a
+      valid, readable third argument full of zeroes. Wine reads the
+      faulting registers out of it, so this will have to be filled in —
+      the saved state is already in the frame, it just is not laid out in
+      the ABI's shape yet.
+- [ ] `siginfo_t` carries only `si_signo`; `si_addr` (the faulting
+      address) and `si_code` are zero.
+- [ ] One signal is delivered per return to ring 3, and `pending` is a
+      bitmask, so a signal raised twice while blocked is delivered once.
+      Real-time signal queueing is not implemented.
+- [ ] No `sigaltstack`, no `sigsuspend`, no `sigpending`, no
+      `sigtimedwait`. No `SIGALRM`, because there are no timers.
+- [ ] Signal state is per *process*, not per thread: `kill` targets the
+      whole program, and a Win32 program's several threads share one
+      disposition table. Per-thread masks need `clone`/`gettid` semantics
+      that do not exist yet.
+- [ ] `SIGKILL` cannot be blocked, but nothing can send it from outside —
+      there is one process and no `ps`.
+
+## Milestone 20 — POSIX threads: clone, futex and TLS ✅ DONE
+
+Third instalment of item 3. Wine is threaded, and it reaches threads the
+Unix way: `clone()` to create them, `futex()` to make them wait, and a
+gs-based TLS block so each has its own errno and thread pointer.
+
+Novaris has had real preemptive threads since Milestone 16 and has run
+Win32 programs on them since Milestone 17. What was missing was the POSIX
+doorway to the same machinery — which is most of what this milestone is.
+`clone` lands on `scheduler_spawn_posix_thread()`, and the scheduler that
+already switches CR3 and the TEB descriptor now switches a TLS descriptor
+too.
+
+### What was actually new
+
+**A TLS segment.** i386 TLS lives behind `gs` exactly as a Windows TEB
+lives behind `fs`, so GDT entry 7 (selector `0x3B`) was added alongside
+Milestone 10's entry 6, and `switch_to()` reprograms it per thread.
+Without that, two threads would share one thread pointer, which is the
+one thing TLS may not do.
+
+**`clone` returning twice.** The child starts at the instruction after
+the caller's `int $0x80` — which is exactly `regs->eip`, since the CPU has
+already advanced past it — on the stack the caller supplied, with `eax`
+set to 0 in its synthetic trap frame. The parent gets the tid from the
+syscall's return. Only the thread shape (`CLONE_VM`) is supported; a
+fork-shaped clone is refused with `-ENOSYS` rather than handed back a
+child with a shared address space it does not expect.
+
+**`futex`.** `FUTEX_WAIT` sleeps only if the word still holds the value
+the caller passed, which is what closes the race between testing a lock
+and going to sleep on it. Waiting reuses Milestone 17's mechanism —
+rewind the trap frame so the whole syscall re-executes, and yield —
+because the scheduler resumes tasks from a trap frame and cannot suspend
+one mid-syscall. One detail that bit: the syscall number lives in `eax`
+and is overwritten by the result, so the retry restores it before
+rewinding `eip` past the two bytes of `int $0x80`; without that the
+re-executed call would dispatch to whatever the return value happened to
+name.
+
+**`CLONE_CHILD_CLEARTID`.** The kernel zeroes a caller-nominated word
+when the thread exits. That pairing with `futex` *is* `pthread_join`, and
+implementing it is what lets a joiner stop waiting.
+
+ELF programs also moved onto the scheduler, the same change Milestone 17
+made for Win32 — a program's main thread has to be a scheduler task
+before a second one can join it.
+
+### Verified: a third binary, on Linux and on Novaris
+
+`userland/thread_posix_test.c` uses no pthreads, because there is no libc
+here — it is what pthreads is *made of*. Same rules as before: raw
+`int $0x80`, `gcc -m32 -static -nostdlib -ffreestanding`, linked against
+nothing.
+
+```
+$ make test-posix
+41 lines compared, 20 checks, 0 failing, 0 unexpected difference(s)
+PASS: posixtest.elf behaves identically on Linux and Novaris
+29 lines compared, 17 checks, 0 failing, 0 unexpected difference(s)
+PASS: sigtest.elf behaves identically on Linux and Novaris
+26 lines compared, 8 checks, 0 failing, 0 unexpected difference(s)
+PASS: pthtest.elf behaves identically on Linux and Novaris
+```
+
+All 26 lines byte-identical, including:
+
+```
+4. per-thread TLS
+  worker 1 read gs:0 = 2000
+  worker 2 read gs:0 = 2001
+  worker 3 read gs:0 = 2002
+  [ok]   each worker read its own TLS tag
+  [ok]   the main thread's TLS survived
+```
+
+Each thread reading its own tag out of `gs:0` is a direct test that the
+segment really is per-thread, and the main thread's tag surviving three
+context switches is a direct test that the descriptor is restored rather
+than left wherever the last thread put it.
+
+**The negative control.** A passing mutex test proves nothing if the
+threads never raced. Rebuilding with `lock()` returning immediately, on
+both systems:
+
+| | with the mutex | without it |
+| --- | --- | --- |
+| Linux host | 60 | **36** |
+| Novaris | 60 | **40** |
+
+Twenty and twenty-four lost increments respectively — the race is real on
+both, and the futex mutex is what prevents it.
+
+That control also caught something first time round: with a 20,000-cycle
+critical section the Novaris run came out at 60 *without* any lock,
+because a 20ms time slice was long enough for each worker to finish
+inside one and the threads never overlapped. The section had to be
+widened to 300,000 cycles before the lock was genuinely under test — the
+same lesson Milestone 17 taught, and worth recording twice.
+
+### Two things the host taught, not the guest
+
+Both were found because the test ran on Linux first.
+
+**`CLONE_SETTLS` cannot allocate a TLS entry**, only use one. And the
+entry number is not portable: i386 Linux uses GDT entries 6–8, a 32-bit
+process on an x86-64 kernel gets 12–14, and Novaris has one, at 7. The
+portable sequence — and what glibc does — is `set_thread_area(-1)` once to
+allocate and *learn* the number, then name that entry in every subsequent
+clone. The first version hardcoded `-1` everywhere and failed with
+`-EINVAL` on Linux.
+
+**Where the boundaries are is a kernel's choice, not the ABI's.** The
+test computes its `gs` selector from the entry number the kernel returned
+rather than hardcoding one, which is why the same binary works on a
+kernel that answers 12 and a kernel that answers 7.
+
+The full 23-case smoke suite passes, repeated runs cost zero frames
+(29470 across three `meminfo` calls with `pthtest.elf` run twice, cloned
+threads and all), and host tests are 38 + 30 + 52 with no failures.
+
+### Honest scope
+
+- [x] `clone` (thread shape), `futex` WAIT/WAKE, `set_thread_area`,
+      per-thread TLS, `CLONE_CHILD_CLEARTID`, `CLONE_PARENT_SETTID`,
+      `set_tid_address`, and thread-vs-process exit.
+- [ ] **`futex` still does not block.** A waiter stays runnable and
+      re-tests its word every slice. `FUTEX_WAKE` therefore has nothing to
+      wake and only reports a count. Correct, and wasteful.
+- [ ] No `FUTEX_REQUEUE`, `FUTEX_WAIT_BITSET`, `FUTEX_LOCK_PI` or
+      timeouts — a `FUTEX_WAIT` timeout argument is ignored.
+- [ ] **No `fork`.** A clone without `CLONE_VM` returns `-ENOSYS`; a real
+      fork needs copy-on-write, which does not exist.
+- [ ] One TLS entry, not three. A program asking for a second gets
+      `-EINVAL` rather than a descriptor aliasing the first.
+- [ ] Signal state is still per process, so a `kill` cannot target one
+      thread and `CLONE_SIGHAND` is accepted without meaning anything.
+- [ ] 8 tasks total across the whole system, kernel stacks 8KB each.
+- [ ] `gettid` returns the scheduler PID, and `getpid` is still a
+      constant, so they disagree in a way real code could notice.
+
 ## Path A — porting Wine (the current direction)
 
 Milestone 8 laid out two ways to run Windows binaries: port Wine (Path
@@ -1755,9 +2158,17 @@ are forced into an order:
    `WaitForSingleObject`, working critical sections). Still to do: real
    blocking rather than retry loops, per-thread TLS, and event/mutex
    objects.
-3. **A POSIX-ish syscall surface** — `mmap`/`munmap`/`mprotect`, file
-   descriptors, `pthread_*`, something signal-shaped. This is what
-   Wine's own build actually links against.
+3. **A POSIX-ish syscall surface** — ⏳ in progress. Milestone 18 adopted
+   the real Linux/i386 ABI and implemented the memory and file halves
+   (`mmap2`/`munmap`/`mprotect`/`brk`, a descriptor table,
+   `open`/`read`/`write`/`writev`/`lseek`/`fstat64`), verified by running
+   one binary on both Linux and Novaris. Milestone 19 added real signals
+   — delivery, masking, `rt_sigreturn`, and a `SIGSEGV` handler that can
+   fix a fault and resume the faulting instruction, which is the pattern
+   Wine is built on. Milestone 20 added `clone`, `futex` and per-thread
+   TLS — enough for what pthreads is made of. Still to do: `ucontext_t`,
+   blocking (rather than retrying) futexes, file-backed `mmap`, and a
+   writable filesystem.
 4. **A dynamic linker** — Wine's DLL-equivalents load and relocate at
    runtime.
 5. **Pull in real Wine source**, cross-compile it against that surface,
@@ -1819,7 +2230,7 @@ much each would widen what runs:
    ```bash
    apt-get install nasm grub-pc-bin grub-common xorriso mtools \
        qemu-system-x86 build-essential gcc-multilib mingw-w64
-   make && make test && make test-qemu
+   make && make test && make test-qemu && make test-posix
    ```
 
    `mingw-w64` builds the Windows test programs in `userland/pe_test/`;

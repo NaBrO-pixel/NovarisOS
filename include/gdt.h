@@ -29,4 +29,12 @@ uint32_t gdt_get_kernel_stack(void);
  * kernel/win32.c. `limit` is in bytes (byte granularity). */
 void gdt_set_teb(uint32_t base, uint32_t limit);
 
+/* Points GDT entry 7 (selector 0x3B) at a thread's local-storage block.
+ * The POSIX counterpart of gdt_set_teb: i386 TLS is reached through
+ * gs:[...], so gs has to be a segment whose base *is* the thread's TLS
+ * area. Set by set_thread_area() and by clone(CLONE_SETTLS), and
+ * reprogrammed by the scheduler on every switch, since it is per-thread.
+ * See kernel/posix_thread.c. */
+void gdt_set_tls(uint32_t base, uint32_t limit);
+
 #endif
