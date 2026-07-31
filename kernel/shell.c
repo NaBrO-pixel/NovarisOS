@@ -279,6 +279,28 @@ static void cmd_vmtest(void) {
     print_hex(kernel_as, 8);
     terminal_writestring("\n");
 
+    /* The shared set, as ranges of 4MB directory slots. Worth printing:
+     * which entries are shared decides where a process may put its own
+     * mappings, and two of them (the framebuffer, the initrd) land
+     * wherever the bootloader chose this boot. */
+    vmtest_step("shared kernel directory entries:");
+    uint32_t i = paging_next_global_pde(0);
+    while (i < 1024) {
+        uint32_t run_end = i;
+        while (run_end < 1024 && paging_next_global_pde(run_end) == run_end) run_end++;
+        terminal_writestring(" ");
+        print_uint(i);
+        if (run_end - 1 != i) {
+            terminal_writestring("-");
+            print_uint(run_end - 1);
+        }
+        terminal_writestring("(");
+        print_hex(i << 22, 8);
+        terminal_writestring(")");
+        i = paging_next_global_pde(run_end);
+    }
+    terminal_writestring("\n");
+
     const char* clash = paging_region_conflict(VMTEST_VADDR,
                                                VMTEST_VADDR + 0x1000);
     if (clash) {

@@ -76,6 +76,23 @@ int paging_kernel_pde_violated(void) {
     return kernel_pde_violation;
 }
 
+int paging_range_is_private(uint32_t start, uint32_t end) {
+    if (end <= start) return 1;
+    uint32_t first = PD_INDEX(start);
+    uint32_t last = PD_INDEX(end - 1);
+    for (uint32_t i = first; i <= last; i++) {
+        if (pde_is_global(i)) return 0;
+    }
+    return 1;
+}
+
+uint32_t paging_next_global_pde(uint32_t from) {
+    for (uint32_t i = from; i < ENTRIES_PER_TABLE; i++) {
+        if (pde_is_global(i)) return i;
+    }
+    return ENTRIES_PER_TABLE;
+}
+
 void paging_map_page(uint32_t virt_addr, uint32_t phys_addr, uint32_t flags) {
     uint32_t pd_idx = PD_INDEX(virt_addr);
     uint32_t pt_idx = PT_INDEX(virt_addr);

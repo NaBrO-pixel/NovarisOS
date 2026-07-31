@@ -133,6 +133,22 @@ static uint32_t thunk_mapped_end = WIN32_THUNK_BASE;
 static uint32_t data_next = WIN32_DATA_BASE;
 static uint32_t data_mapped_end = WIN32_DATA_BASE;
 
+/* Where boot-time allocation in the data arena stopped: the fake module
+ * headers and the data exports below this mark belong to the emulation
+ * layer itself and last forever, everything above it belongs to whichever
+ * program is running (its TEB and PEB) and does not.
+ *
+ * Without this the arena only ever grew. Every program cost it another
+ * TEB page plus a PEB, nothing ever gave them back, and after roughly a
+ * hundred and twenty runs w32_data_alloc() would start returning 0 and
+ * programs would stop starting. That has been true since Milestone 10 and
+ * was found by watching `meminfo` lose exactly two frames per run across
+ * the Milestone 15 smoke suite.
+ *
+ * The reset moves the bump pointer only; the pages stay mapped and get
+ * reused by the next program, which is why it costs nothing to do. */
+static uint32_t data_reset_mark = 0;
+
 /* Maps arena pages on demand. Returns 0 if physical memory ran out. */
 static int arena_grow(uint32_t* mapped_end, uint32_t want_end, uint32_t limit) {
     if (want_end > limit) return 0;
@@ -981,6 +997,10 @@ void win32_init(void) {
      * has an address, which is why this runs last. */
     w32_msvcrt_init();
 
+    /* Everything allocated in the data arena from here on belongs to a
+     * running program and is reclaimed when it exits. */
+    data_reset_mark = data_next;
+
     /* Put the x87 unit in a known state. Nothing in the kernel uses it,
      * but a couple of emulated CRT functions are ring-3 x87 code blobs
      * (see win32_msvcrt.c), and starting from a defined control word
@@ -1129,8 +1149,19 @@ pe_load_result_t win32_run_pe(const uint8_t* image, uint32_t size,
 
     missing_count = 0; /* the report is per-program, not cumulative */
 
+    /* From here until the matching process_leave_address_space() below,
+     * CR3 holds this program's own page directory. Everything the loader
+     * and the emulation layer do with ring-3 pointers - mapping the
+     * image, zeroing the stack, reading arguments off it inside an
+     * int 0x81 - lands in that address space, because the kernel never
+     * switches away while it is holding one. See process.h. */
+    int owns_as = process_enter_address_space();
+
     pe_load_result_t r = pe_load(image, size, &ops, &current_image);
-    if (r != PE_OK) return r;
+    if (r != PE_OK) {
+        if (owns_as) process_leave_address_space();
+        return r;
+    }
 
     kstrlcpy(current_name, name ? name : "program.exe", sizeof(current_name));
     kstrlcpy(current_cmdline, cmdline ? cmdline : current_name,
@@ -1138,6 +1169,7 @@ pe_load_result_t win32_run_pe(const uint8_t* image, uint32_t size,
 
     if (!map_stack()) {
         pe_unload(&current_image);
+        if (owns_as) process_leave_address_space();
         return PE_ERR_OUT_OF_MEMORY;
     }
 
@@ -1147,6 +1179,7 @@ pe_load_result_t win32_run_pe(const uint8_t* image, uint32_t size,
     if (!peb || !teb_address) {
         unmap_stack();
         pe_unload(&current_image);
+        if (owns_as) process_leave_address_space();
         return PE_ERR_OUT_OF_MEMORY;
     }
 
@@ -1154,6 +1187,7 @@ pe_load_result_t win32_run_pe(const uint8_t* image, uint32_t size,
     if (!exit_tramp) {
         unmap_stack();
         pe_unload(&current_image);
+        if (owns_as) process_leave_address_space();
         return PE_ERR_OUT_OF_MEMORY;
     }
 
@@ -1185,6 +1219,16 @@ pe_load_result_t win32_run_pe(const uint8_t* image, uint32_t size,
     gdt_set_teb(teb_address, PAGE_SIZE - 1);
     process_set_user_fs(0x33);
 
+    if (owns_as) {
+        w32_report_hex("running in its own address space, page directory",
+                       process_current_address_space());
+    } else {
+        w32_report("no private address space available - "
+                   "sharing the kernel's, as before Milestone 15");
+    }
+
+    uint32_t image_base = current_image.base;
+
     process_run_user_mode(start, esp);
 
     /* Reached only via w32_exit_process() or a fault - both unwind here
@@ -1213,11 +1257,33 @@ pe_load_result_t win32_run_pe(const uint8_t* image, uint32_t size,
         terminal_writestring(" were actually called.\n");
     }
 
+    /* Still standing in the program's address space, deliberately: these
+     * unmap ring-3 pages and hand their frames back to the PMM, and they
+     * have to be looking at the program's page tables to do it. */
     w32_handles_reset();
     w32_mem_reset();
     unmap_stack();
     pe_unload(&current_image);
     teb_address = 0;
+    /* Hand back the TEB/PEB the program was given - see data_reset_mark. */
+    if (data_reset_mark) data_next = data_reset_mark;
+
+    /* Only now is it safe to leave. Destroying the directory reclaims
+     * anything the four calls above missed, rather than being the only
+     * thing that reclaims anything - the teardown paths are unchanged
+     * from Milestone 14 and still carry their own weight. */
+    if (owns_as) process_leave_address_space();
+
+    /* Back in the kernel's address space now. The program's image must
+     * not be reachable from it - if it is, the loader put the image in a
+     * page table belonging to the shared kernel set, which would mean the
+     * isolation is nominal and every process can see every other one's
+     * code. Silent when it holds, which is the normal case; loud when it
+     * doesn't, because nothing else would notice. */
+    if (owns_as && (paging_get_entry(image_base) & PAGE_PRESENT)) {
+        w32_report_hex("LEAK: the image is still mapped in the kernel "
+                       "address space at", image_base);
+    }
 
     if (out_exit_code) *out_exit_code = exit_code;
     return PE_OK;

@@ -217,13 +217,24 @@ void scheduler_tick(registers_t* regs) {
  * back on the original caller's own stack) - never from inside a
  * process's own exit path, which would mean freeing memory out from
  * under code still (about to be) executing on it. */
+/* Unmaps a page *and* hands its frame back to the PMM. Unmapping alone
+ * only removes the translation - the frame stays marked in use forever,
+ * which is how `multitask` came to lose six frames every time it ran.
+ * Found while checking that Milestone 15's address spaces gave back
+ * everything they took; the bug itself dates from Milestone 9. */
+static void free_user_page(uint32_t virt) {
+    uint32_t pte = paging_get_entry(virt);
+    paging_unmap_page(virt);
+    if (pte & PAGE_PRESENT) pmm_free_frame(pte & ~0xFFFu);
+}
+
 static void reap_all(void) {
     for (int i = 0; i < process_count; i++) {
         process_t* p = &process_table[i];
         for (uint32_t pg = 0; pg < p->load_pages; pg++) {
-            paging_unmap_page(p->load_vaddr + pg * PAGE_SIZE);
+            free_user_page(p->load_vaddr + pg * PAGE_SIZE);
         }
-        paging_unmap_page(p->stack_top - PAGE_SIZE);
+        free_user_page(p->stack_top - PAGE_SIZE);
         kfree((void*)p->kernel_stack_base);
     }
     process_count = 0;

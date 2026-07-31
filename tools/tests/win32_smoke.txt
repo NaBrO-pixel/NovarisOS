@@ -10,6 +10,7 @@
 # machinery everything below stands on, and running it before and after
 # the programs catches an address space that leaks frames.
 vmtest
+meminfo
 
 peinfo hellowin.exe
 run winapi.exe
@@ -21,6 +22,13 @@ run hellope.exe
 run crash.exe
 run qsorttest.exe
 run hellowin.exe
+
+# The non-PE paths through process.c, which Milestone 15 also moved into
+# private address spaces, and the scheduler demo, which deliberately did
+# not move (see ROADMAP Milestone 15).
+run helloelf.elf
+run helloc.bin
+multitask
 
 vmtest
 meminfo

@@ -62,6 +62,14 @@ const char* paging_region_conflict(uint32_t s, uint32_t e) {
     (void)s; (void)e;
     return 0; /* the host has no kernel-owned regions to collide with */
 }
+/* Since Milestone 15 the loader also refuses ranges whose page tables are
+ * shared with the kernel. There is no shared set on the host - every
+ * mapping here is an mmap into this process - so every range qualifies,
+ * and the loader's placement logic is exercised exactly as before. */
+int paging_range_is_private(uint32_t s, uint32_t e) {
+    (void)s; (void)e;
+    return 1;
+}
 
 /* The frame allocator's return value is only ever handed back to
  * paging_map_page(), which ignores it here - so any non-zero value does. */

@@ -14,7 +14,7 @@ bootloader hands off to a kernel, and the kernel grows from there. Over time
 you can shape it to *feel* like whichever OS inspires you (windowing system,
 shell conventions, UI style) without copying anyone's code.
 
-## Current status: Milestone 14 complete ✅
+## Current status: Milestone 15 complete ✅
 
 - [x] Multiboot bootloader handoff (via GRUB), 32-bit protected mode
 - [x] Freestanding C kernel — no libc, we own the whole stack
@@ -31,9 +31,10 @@ shell conventions, UI style) without copying anyone's code.
 - [x] Synchronous kernel → ring-3 callbacks, so the emulated C runtime can
       call a program's own functions: real `qsort`, `bsearch`, `atexit`
       (and C++ global destructors as a side effect)
-- [x] Per-process address spaces — separate page directories with an
-      identical shared kernel half (the mechanism; no process runs in one
-      yet)
+- [x] Per-process address spaces — every program runs in its own page
+      directory, with its image, stack and heap invisible to the kernel's
+      own address space (one process at a time; the scheduler does not
+      switch CR3 yet)
 - [x] **A real windowing desktop**: a compositing window manager with
       draggable, resizable, overlapping windows, a taskbar, a Start menu
       and built-in apps — see below
