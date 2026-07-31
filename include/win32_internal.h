@@ -73,6 +73,16 @@ uint32_t w32_strdup_user(const char* s);
  * of its allocations with it. */
 void w32_mem_reset(void);
 
+/* --- the thunk arena --------------------------------------------------- */
+
+/* Copies `size` bytes of machine code into the user-executable thunk
+ * arena and returns its ring-3 address, claiming as many 16-byte thunk
+ * slots as it needs. This is the WCODE mechanism (see win32.h) exposed
+ * for the callback layer, which plants a two-byte `int 0x82` stub that
+ * every kernel-initiated ring-3 callback returns through. Returns 0 if
+ * the arena is full. */
+uint32_t w32_emit_ring3_code(const uint8_t* code, uint32_t size);
+
 /* --- the data arena ---------------------------------------------------- */
 
 /* Bump allocator for things that live as long as the emulation layer
@@ -155,6 +165,19 @@ const char*       w32_current_cmdline(void);
 
 /* Terminates the running program and unwinds to the shell. Never returns. */
 void w32_exit_process(uint32_t exit_code) __attribute__((noreturn));
+
+/* The ring-3 esp of the innermost emulated call currently in flight, or 0
+ * outside one. The callback layer needs somewhere on the program's stack
+ * to build a call frame; an API implementation normally passes
+ * win32_call_t.useresp, but w32_exit_process() runs atexit handlers from
+ * a context that no longer has the win32_call_t, so it reads this. */
+uint32_t w32_current_user_esp(void);
+
+/* Runs the program's atexit handlers, most-recently-registered first, and
+ * forgets them. Called once from w32_exit_process(); a second call while
+ * the first is still running (a handler that calls exit()) does nothing,
+ * which is what the C standard asks for. */
+void w32_msvcrt_run_atexit(void);
 
 /* Registers a program-supplied callback the emulation layer honors:
  * atexit handlers and the unhandled-exception filter. */

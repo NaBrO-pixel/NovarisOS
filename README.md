@@ -14,7 +14,7 @@ bootloader hands off to a kernel, and the kernel grows from there. Over time
 you can shape it to *feel* like whichever OS inspires you (windowing system,
 shell conventions, UI style) without copying anyone's code.
 
-## Current status: Milestone 12 complete ✅
+## Current status: Milestone 14 complete ✅
 
 - [x] Multiboot bootloader handoff (via GRUB), 32-bit protected mode
 - [x] Freestanding C kernel — no libc, we own the whole stack
@@ -28,6 +28,12 @@ shell conventions, UI style) without copying anyone's code.
 - [x] ELF32 loader
 - [x] **Runs real, unmodified Windows `.exe` files** against an emulated
       Win32 API — see below
+- [x] Synchronous kernel → ring-3 callbacks, so the emulated C runtime can
+      call a program's own functions: real `qsort`, `bsearch`, `atexit`
+      (and C++ global destructors as a side effect)
+- [x] Per-process address spaces — separate page directories with an
+      identical shared kernel half (the mechanism; no process runs in one
+      yet)
 - [x] **A real windowing desktop**: a compositing window manager with
       draggable, resizable, overlapping windows, a taskbar, a Start menu
       and built-in apps — see below
@@ -152,12 +158,23 @@ Three shell commands drive it:
 | `peinfo prog.exe` | Dumps a PE's headers and shows, per symbol, which imports resolve |
 | `winapi [module]` | Lists the emulated DLLs, or one module's exports |
 
+And `vmtest` demonstrates the Milestone 14 paging work: two page
+directories with different contents at the same virtual address, an
+identical kernel half in both, and the kernel still running throughout.
+
 **What this is not**: a Windows clone, a Wine port, or a general-purpose
 compatibility layer. There is a window manager now, but no path from
 `CreateWindowEx` into it — that needs the ability to call a ring-3 window
 procedure, which doesn't exist yet. There is no registry, no networking
 and no threads. `ROADMAP.md` Milestone 10 is precise about where
-the boundary is and why. A GUI program gets an honest failure from
+the boundary is and why.
+
+The project has since committed to **Path A** — porting real Wine on top
+of Novaris rather than hand-writing more Win32 forever. That is a long
+road with forced prerequisites (address spaces, threads, a POSIX-ish
+syscall surface, a dynamic linker) and no Wine or ReactOS source is
+vendored in until the last of them is done. `ROADMAP.md` has the plan and
+is honest about the scope. A GUI program gets an honest failure from
 `CreateWindowEx` rather than a blank screen; a 64-bit binary is told it's
 64-bit; a program that calls an API Novaris doesn't have prints exactly
 which one.

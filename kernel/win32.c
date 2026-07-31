@@ -7,6 +7,7 @@
  * win32_kernel32.c, win32_msvcrt.c and win32_user32.c. */
 
 #include "win32_internal.h"
+#include "win32_callback.h"
 #include "paging.h"
 #include "pmm.h"
 #include "kheap.h"
@@ -214,6 +215,10 @@ static uint32_t emit_code(const uint8_t* code, uint16_t size) {
 
     kmemcpy((void*)addr, code, size);
     return addr;
+}
+
+uint32_t w32_emit_ring3_code(const uint8_t* code, uint32_t size) {
+    return emit_code(code, (uint16_t)size);
 }
 
 /* --- console ----------------------------------------------------------- */
@@ -568,6 +573,16 @@ uint32_t w32_get_exception_filter(void) { return exception_filter; }
 
 void w32_exit_process(uint32_t code) {
     exit_code = code;
+
+    /* Anything the program registered with atexit() runs here, in ring 3,
+     * before the unwind below throws away the stack it would need. This
+     * is the one place every exit path converges on - exit(), abort(),
+     * ExitProcess(), and `return` from main via the exit trampoline - so
+     * putting it here means handlers run for all of them.
+     * w32_msvcrt_run_atexit() is a no-op if there are none, and refuses
+     * to re-enter if a handler calls exit() itself. */
+    w32_msvcrt_run_atexit();
+
     /* Unwinds straight back to win32_run_pe's frame, discarding the
      * interrupt/dispatch call chain we're standing on - the same trick
      * process.c already uses for sys_exit. Teardown happens there, on the
@@ -577,6 +592,14 @@ void w32_exit_process(uint32_t code) {
 }
 
 /* --- dispatch ---------------------------------------------------------- */
+
+/* The ring-3 esp of the innermost emulated call in flight, 0 outside one.
+ * See where win32_dispatch() sets it. */
+static uint32_t dispatch_user_esp = 0;
+
+uint32_t w32_current_user_esp(void) {
+    return dispatch_user_esp;
+}
 
 static void report_missing_call(uint32_t index, registers_t* regs) {
     win32_missing_t* m = &missing[index];
@@ -615,28 +638,37 @@ static void win32_dispatch(registers_t* regs) {
 
     win32_call_t call;
     call.regs = regs;
+    /* Snapshot the ring-3 esp before anything this call does can lead to
+     * a nested trap - see the comment on win32_call_t.useresp. */
+    call.useresp = regs->useresp;
     /* [useresp] is the thunk's return address; the arguments follow it. */
-    call.args = (const uint32_t*)(regs->useresp + 4);
+    call.args = (const uint32_t*)(call.useresp + 4);
+
+    /* Published for the handful of places that need the caller's stack
+     * but don't have the win32_call_t to hand - w32_exit_process() running
+     * atexit handlers, mainly. Saved and restored so a nested dispatch
+     * (an API called from inside a ring-3 callback) doesn't leave the
+     * outer call looking at the wrong stack. */
+    uint32_t prev_user_esp = dispatch_user_esp;
+    dispatch_user_esp = call.useresp;
 
     if (id & MISSING_ID_FLAG) {
         uint32_t index = id & ~MISSING_ID_FLAG;
         if (index < missing_count) report_missing_call(index, regs);
         regs->eax = 0;
-        return;
-    }
-
-    if (id >= slot_count) {
+    } else if (id >= slot_count) {
         w32_report_hex("dispatch called with an unknown slot id", id);
         regs->eax = 0;
-        return;
+    } else {
+        const win32_export_t* e = slots[id].exp;
+        if (e->fn) {
+            regs->eax = e->fn(&call);
+        } else {
+            regs->eax = e->stub_ret;
+        }
     }
 
-    const win32_export_t* e = slots[id].exp;
-    if (e->fn) {
-        regs->eax = e->fn(&call);
-    } else {
-        regs->eax = e->stub_ret;
-    }
+    dispatch_user_esp = prev_user_esp;
 }
 
 /* --- resolution -------------------------------------------------------- */
@@ -936,6 +968,13 @@ void win32_init(void) {
     }
 
     register_interrupt_handler(WIN32_INT_VECTOR, win32_dispatch);
+
+    /* Emits the ring-3 callback-return stub and claims int 0x82. Has to
+     * come after the export thunks so it lands past them in the arena. */
+    if (!win32_callback_init()) {
+        w32_report("thunk arena full - qsort/bsearch/atexit callbacks disabled");
+    }
+
     w32_handles_reset();
 
     /* The CRT's stdio table can only be filled in once its data export
@@ -1152,6 +1191,11 @@ pe_load_result_t win32_run_pe(const uint8_t* image, uint32_t size,
      * through process_exit_to_kernel(). */
     process_set_user_fs(0x23);
     process_active = 0;
+    /* Both ways out of ring 3 - exiting and faulting - unwind past any
+     * win32_callback_call() frames without them returning, so the
+     * callback layer's depth counter and its borrowed TSS.esp0 have to be
+     * put back by hand here. */
+    win32_callback_reset();
 
     if (missing_count > 0) {
         uint32_t called = 0;

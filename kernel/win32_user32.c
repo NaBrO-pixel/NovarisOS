@@ -67,7 +67,11 @@ static uint32_t u32_MessageBoxW(win32_call_t* call) {
     w32_wide_to_ascii((const uint16_t*)ARG(2), caption, sizeof(caption));
 
     uint32_t narrowed[4] = { ARG(0), (uint32_t)text, (uint32_t)caption, ARG(3) };
-    win32_call_t inner = { call->regs, narrowed };
+    /* The synthesized call keeps the outer one's ring-3 esp: it is the
+     * same trap, just with narrowed arguments, so anything downstream that
+     * needs the caller's stack (a callback, a fault report) should see
+     * the real one rather than 0. */
+    win32_call_t inner = { call->regs, narrowed, call->useresp };
     return u32_MessageBoxA(&inner);
 }
 

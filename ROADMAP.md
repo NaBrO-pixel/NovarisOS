@@ -847,6 +847,354 @@ Known limits, unchanged from Milestone 11 unless noted:
 - [ ] The taskbar doesn't group multiple windows of one app behind a
       single button, and can't be moved off the bottom edge.
 
+## Milestone 13 — Calling ring 3 from the kernel ✅ DONE
+
+The item Milestone 10 called "the single highest-leverage item on this
+list". Milestone 10 shipped ~500 Win32 functions and left three of them
+conspicuously missing: `qsort`, `bsearch` and `atexit`. Each takes a
+function pointer belonging to the program and is supposed to *call* it,
+and the kernel implements these APIs from inside an `int 0x81` interrupt
+handler, in ring 0, with no way to run ring-3 code and come back.
+`win32_msvcrt.c` said so in a comment and left them unresolved on
+purpose, because a stubbed `qsort` that silently doesn't sort is worse
+than an honest "unimplemented API called" report.
+
+This milestone builds the missing mechanism.
+
+### How it works
+
+`kernel/win32_callback.c` + `kernel/win32_callback_asm.s`, a new
+`int 0x82` vector, and about 150 lines of C:
+
+1. The kernel builds a cdecl call frame on the *program's own* stack,
+   just below the ring-3 esp captured when the API call trapped in:
+   arguments right-to-left, then a return address.
+2. That return address points at a two-byte stub the kernel planted in
+   the thunk arena at boot — literally `CD 82`, `int 0x82`.
+3. `win32_callback_enter` saves the kernel's esp/ebp into a caller-
+   supplied frame and `iret`s to ring 3, the same trick
+   `process_run_user_mode()` uses to start a whole program.
+4. The callback runs, returns, lands on the stub, and traps back in.
+   The handler reads its return value out of `eax`, restores the saved
+   kernel esp, and finishes `win32_callback_enter`'s epilogue — so from
+   the API implementation's side, `win32_callback_call()` was an ordinary
+   blocking function call that returned a value.
+
+The resume context is passed in by address rather than kept in globals
+(which is what `process_asm.s` does), because callbacks nest: a qsort
+comparator is free to call qsort. The C side keeps a stack of them,
+capped at 8 deep.
+
+### The part that actually took the time
+
+The `iret`-out-and-trap-back-in shape works on the first try. What does
+not is the kernel stack, and the failure is subtle enough to be worth
+writing down.
+
+Every ring3 → ring0 transition loads esp from the **same fixed
+`TSS.esp0`**. So while a callback is running in ring 3, the kernel frames
+of the `qsort` that started it are still live between `esp0` and wherever
+the kernel had got to — and any trap that callback takes re-enters ring 0
+with esp reset to `esp0` and starts pushing straight over them. Not just
+the callback's own `int 0x82`: an `int 0x81` from a comparator that calls
+`printf`, or a plain timer IRQ, does it too.
+
+The fix is one line — lower `TSS.esp0` below the current kernel esp
+before entering ring 3, restore it on the way back — and it is what makes
+nesting work at all.
+
+This was verified, not assumed. Building the identical kernel with that
+single `gdt_set_kernel_stack()` call removed and nothing else changed:
+
+```
+novaris> run qsorttest.exe
+qsort/bsearch/atexit test - real callbacks into ring 3
+
+before:  42 -7 0 1000 3 3 -100 17 8 99 5 5 64 2 1
+
+[win32] Unhandled exception in qsorttest.exe:
+        EXCEPTION_ACCESS_VIOLATION at eip=0x7b001fd2 accessing 0x00000000
+```
+
+The very first callback round trip kills the program, and `eip` lands at
+`0x7b001fd2` — inside the thunk arena (`WIN32_THUNK_BASE` is
+`0x7B000000`), i.e. the corrupted frame sent execution into the middle of
+a thunk. With the line restored the same binary runs to completion.
+
+One honest correction to the story: `win32_call_t` also grew a `useresp`
+field, snapshotting the ring-3 esp by value at the top of
+`win32_dispatch()` instead of re-reading `regs->useresp` (a pointer into
+the trap frame) later. That looked like the load-bearing fix while the
+bug was being chased. It is not. A second control build — `esp0` handling
+intact, `qsort` deliberately re-reading `call->regs->useresp` the old way
+— passes the full test unchanged, because once `esp0` is lowered the trap
+frame `regs` points at is no longer overwritten. The snapshot is worth
+keeping as defensive clarity about which stack pointer belongs to which
+call, but it is not what fixes anything, and Milestone 13 should not be
+remembered as though it were.
+
+### What this bought
+
+- `qsort` — quicksort with insertion sort under 8 elements, recursing
+  into the smaller partition and looping on the larger, so kernel stack
+  stays O(log n) frames. Every comparison is a ring-3 callback.
+- `bsearch` — binary search, same callback per comparison.
+- `atexit` / `_onexit` / `_crt_atexit` / `_register_onexit_function` —
+  handlers run in reverse registration order from `w32_exit_process()`,
+  which is the one point every exit path converges on (`exit()`,
+  `abort()`, `ExitProcess()`, and `return` from `main` via the exit
+  trampoline). Re-entrant `exit()` from inside a handler is ignored, as
+  C requires.
+- **C++ global destructors, for free.** Nobody set out to fix these.
+  `cppinit.exe` has a global object whose destructor prints, and the
+  source comment said it was "expected NOT to appear" — mingw's C++
+  runtime registers destructors through `atexit`, which Novaris accepted
+  and never called back. Making `atexit` real made them run. The test
+  source's message has been corrected to say so; nothing else in it
+  changed.
+
+### Verified
+
+`tools/qemu_test.py --iso novaris.iso --script tools/tests/win32_smoke.txt`,
+with `qsorttest.exe` added to the script. The test program is built with
+real `i686-w64-mingw32-gcc` against real `msvcrt.dll` imports and is
+written the way any C program uses these functions — it would produce
+identical output on Windows.
+
+```
+novaris> run qsorttest.exe
+qsort/bsearch/atexit test - real callbacks into ring 3
+
+before:  42 -7 0 1000 3 3 -100 17 8 99 5 5 64 2 1
+after:   -100 -7 0 1 2 3 3 5 5 8 17 42 64 99 1000
+sorted: yes
+
+comparator that prints (nested int 0x81 inside a callback):
+    comparator called from ring 3: 30 vs 10
+    comparator called from ring 3: 30 vs 20
+    comparator called from ring 3: 10 vs 20
+  result: 10 20 30
+  comparator ran 3 time(s)
+
+nested qsort inside comparator: 1 2 3 4 5
+sorted: yes
+
+strings: alpha bravo charlie delta echo
+
+bsearch    64 -> found
+bsearch  -100 -> found
+bsearch  1000 -> found
+bsearch     7 -> not found
+
+qsort test done.
+atexit: handler registered SECOND, so it runs FIRST
+atexit: handler registered FIRST, so it runs LAST
+```
+
+Each block is there to fail differently: the printing comparator is a
+nested `int 0x81` taken several kernel frames deep inside the `qsort`
+that called it — precisely the case a fixed `esp0` corrupts. The
+recursive comparator puts a second callback in flight while the first is
+still on the stack. `bsearch 7` must miss. The `atexit` lines arrive
+*after* `main` has already returned, from the exit path rather than from
+inside an API call.
+
+The other eight smoke cases are byte-identical to the Milestone 12
+transcript apart from the new `[dtor]` line and the expected
+memory/clock variance.
+
+### Honest scope
+
+- [x] Callbacks with up to 8 dword arguments, cdecl, nesting 8 deep.
+- [ ] **Not** yet used for window procedures. `CreateWindowEx` still
+      fails. The mechanism this needed now exists — that is what
+      Milestone 13 was for — but wiring the window manager to deliver
+      `WM_PAINT` into a ring-3 `WndProc` is its own piece of work and
+      was not done here.
+- [ ] Not used for thread entry points either; there are still no
+      threads.
+- [ ] The callback layer reads and writes the program's stack by casting
+      the ring-3 pointer, which works only because Novaris still runs one
+      program in one flat address space. Milestone 14 changes that, and
+      this is one of the places that has to change with it.
+- [ ] A callback that faults is handled by the existing unhandled-
+      exception path (the program dies, the shell comes back), not by
+      anything callback-aware. `win32_callback_reset()` puts `esp0` and
+      the depth counter back when a program ends either way.
+
+## Milestone 14 — Per-process address spaces ✅ DONE (mechanism)
+
+The first of the prerequisites for **Path A** — see the note below on why
+the project pivoted to porting Wine rather than hand-writing more Win32.
+Wine assumes a POSIX-shaped kernel underneath it, and the very first
+thing that assumption needs is real, separate page directories per
+process.
+
+Through Milestone 13 Novaris ran one program at a time in one flat,
+unprotected address space. That was deliberate and it bought a lot: it is
+why the Win32 layer can read a program's stack by casting a pointer, why
+`pe.c` can memcpy an image into place, and why the callback layer in
+Milestone 13 could build a ring-3 call frame with a plain store. All of
+that has to be unwound eventually, and unwinding it is not this
+milestone. **This milestone builds the mechanism and proves it works.**
+
+### What was built
+
+`kernel/paging.c` grew an address-space API. An address space is
+identified by the physical address of its page directory — the value
+that goes in CR3 — rather than by a struct, so there is nothing to keep
+in step and `paging_current_address_space()` can answer by reading the
+register.
+
+```
+paging_reserve_kernel_tables(start, end)   pre-create tables for ranges that grow
+paging_finalize_kernel_space()             freeze what "the kernel half" means
+paging_create_address_space()              -> pd_phys
+paging_destroy_address_space(pd_phys)
+paging_switch_address_space(pd_phys)
+paging_map_page_in(pd_phys, virt, phys, flags)
+paging_get_entry_in(pd_phys, virt)
+```
+
+Two design decisions carried the weight.
+
+**A second recursive slot.** Editing another address space's page tables
+normally means either switching CR3 to it (can't — the kernel is running)
+or a scratch-page mapping dance (needs an allocator, and the invalidation
+is easy to get subtly wrong). Instead, directory entry **1022** points at
+the *foreign* directory. The CPU then treats that directory as an
+ordinary page table, so its entries become the PTEs of the 4MB window at
+`0xFF800000` — foreign page table N reads and writes at
+`0xFF800000 + N*4096` — and because entry 1022 is itself reachable
+through the existing 1023 recursion, the foreign directory itself sits at
+`0xFFFFE000`. Attach, edit, detach. Entry 1022 is deliberately *not*
+shared, so every address space has its own window and no process can see
+another's attachment.
+
+**An empirically frozen kernel set.** "The kernel range is identical in
+every address space" is easy to say and easy to get wrong: copy the
+kernel's directory entries at creation time, then add a kernel mapping
+later, and every address space created before that point silently lacks
+it. The fix is to make kernel directory entries immutable.
+`paging_finalize_kernel_space()` snapshots which entries exist at the end
+of boot and calls that set global.
+
+Snapshotting rather than hardcoding an index range is deliberate: the
+kernel's mappings are scattered and two of them move. On this boot they
+land at directory entries 0 (the identity-mapped low 4MB), 768 (the
+kernel image at `0xC0000000`), 832 (the heap at `0xD0000000`), and 1012
+(the linear framebuffer, wherever the bootloader put it — QEMU chose
+`0xFD000000` here, and the initrd's entry depends on where GRUB dropped
+the module). Any hand-written list of those is a list that goes stale.
+
+The heap is the one kernel range that grows after boot, so `kernel.c`
+calls `paging_reserve_kernel_tables()` over its full 48MB before
+freezing. And `paging_map_page()` now *records* any attempt to add a
+kernel-half directory entry after the freeze — `vmtest` reports it. That
+is a design error to find and fix at the call site, not a runtime
+condition to recover from, so it is surfaced rather than papered over.
+
+### Verified
+
+A `vmtest` shell command, wired into `tools/tests/win32_smoke.txt` (twice
+— before and after the programs run, so an address space that leaks
+frames shows up as a `meminfo` difference):
+
+```
+novaris> vmtest
+Per-process address spaces (ROADMAP Milestone 14)
+  [vm] kernel page directory at 0x001a1000
+  [vm] created two more: 0x00c7d000 and 0x00c7e000
+  [vm] mapped 0x30000000 -> frame 0x00c7f000 in the first, 0x00c80000 in the second
+  [vm] wrote 0x11111111 in the first, 0x22222222 in the second
+  [vm] read back 0x11111111 and 0x22222222  <- isolated
+  [vm] same address in the kernel's space: unmapped, as it should be
+  [vm] kernel heap page at 0xd0000000 is the same frame in all three
+  [vm] destroyed both; frames reclaimed: 6
+vmtest done - the kernel is still running, on its own page directory.
+```
+
+The test is arranged so the interesting failures are loud:
+
+- **One virtual address, two contents.** `0x30000000` holds `0x11111111`
+  and `0x22222222` *at the same time*, in two directories. This is the
+  thing a single flat address space cannot do.
+- **Written through the virtual address, not the frame.** The mapping is
+  what's under test, not the bookkeeping.
+- **Interrupts stay on.** While a foreign directory is in CR3, the timer
+  and keyboard IRQs keep firing and running kernel code on the kernel
+  stack. If the shared kernel half were not genuinely identical in all
+  three directories, this would triple-fault rather than print.
+- **The private half is private.** `0x30000000` is checked to be unmapped
+  in the kernel's own space — through the page tables, since
+  dereferencing it is exactly what should fault.
+- **6 frames reclaimed**, which is exactly right: two directories, two
+  page tables, two data frames. `meminfo` before and after the whole
+  smoke run is unchanged, so nothing leaks.
+
+The other ten smoke cases (including Milestone 13's `qsorttest.exe`) are
+unchanged.
+
+### Honest scope — what this does *not* yet do
+
+This is the load-bearing caveat, and it should not be read as more than
+it is.
+
+- [ ] **No process actually runs in one yet.** `win32_run_pe()`,
+      `process_run_flat_binary()` and `process_run_elf()` still all run
+      in the kernel's own directory, exactly as before. Nothing in the
+      normal boot or `run` path switches CR3. The mechanism exists and is
+      proven; wiring processes onto it is the next milestone.
+- [ ] The single-address-space assumption is still baked into `win32.c`,
+      `pe.c`, the heap/stack arena logic and `win32_callback.c` — every
+      one of them reaches user memory by casting a pointer. Unwinding
+      that is the bulk of the work and was explicitly not attempted here.
+- [ ] No copy-on-write, no `fork`, no demand paging, no swapping. Mapping
+      is eager and explicit.
+- [ ] No per-process kernel stacks, which real preemption between
+      address spaces will need. `TSS.esp0` is still one global value
+      (borrowed and restored around ring-3 callbacks, see Milestone 13).
+- [ ] The scheduler (Milestone 9) does not know address spaces exist and
+      does not switch CR3 on a context switch.
+
+## Path A — porting Wine (the current direction)
+
+Milestone 8 laid out two ways to run Windows binaries: port Wine (Path
+A) or reimplement the API surface (Path B). Milestone 10 took a third,
+smaller road — hand-written clean-room Win32, no Wine or ReactOS source
+anywhere — and Milestones 10–13 took it as far as ~500 APIs, real
+`.exe` loading, and now real ring-3 callbacks.
+
+That road works, and it stays narrower than real Win32 forever. The
+project has chosen **Path A**: port real Wine on top of Novaris, and get
+actual breadth instead of a bespoke subset. This is an honest
+architectural pivot, not an incremental feature, and the prerequisites
+are forced into an order:
+
+1. **Per-process address spaces** — ✅ mechanism done, Milestone 14.
+   Still to do: run processes in them.
+2. **Real threads.**
+3. **A POSIX-ish syscall surface** — `mmap`/`munmap`/`mprotect`, file
+   descriptors, `pthread_*`, something signal-shaped. This is what
+   Wine's own build actually links against.
+4. **A dynamic linker** — Wine's DLL-equivalents load and relocate at
+   runtime.
+5. **Pull in real Wine source**, cross-compile it against that surface,
+   and find out what is still missing. Expect that to surface more gaps;
+   a display backend for GDI is the obvious one.
+
+Each is roughly milestone-sized. (3) and (4) are each comparable in scope
+to everything built so far combined. No Wine or ReactOS source gets
+vendored in before step 5, and when it does it stays clearly separated
+from Novaris's own clean-room code — Wine is LGPL-2.1, which is fine, but
+the boundary has to stay visible.
+
+**Stated honestly:** the goal is real Win32 GUI programs, and eventually
+broader real-world Windows software, running on Novaris via Wine. It is
+not a claim that anything at all will run. Chrome will not: that needs
+networking, GPU acceleration, sandboxing and hundreds of DLLs far beyond
+this project's scope, Wine or no Wine.
+
 ## Later / open-ended
 
 - Networking (a NIC driver + a minimal TCP/IP stack) — big undertaking.
@@ -858,11 +1206,12 @@ Known limits, unchanged from Milestone 11 unless noted:
 Follow-ups specifically unlocked by Milestone 10, roughly in order of how
 much each would widen what runs:
 
-- **Calling ring-3 callbacks from the kernel** — a synthesized user frame
-  plus a trampoline that re-enters the kernel when the callback returns.
-  This one mechanism gets `qsort`, `bsearch`, `atexit` handlers, window
-  procedures, `EnumWindows`-style APIs and thread entry points all at
-  once. The single highest-leverage item on this list.
+- ~~**Calling ring-3 callbacks from the kernel**~~ — done in Milestone
+  13, and it landed exactly as described: a synthesized user frame plus a
+  trampoline that re-enters the kernel when the callback returns. It got
+  `qsort`, `bsearch` and `atexit` (plus C++ global destructors as a side
+  effect). Window procedures, `EnumWindows`-style APIs and thread entry
+  points are now *unblocked* by it but not yet built on it.
 - **Structured exception handling** — walking the `fs:[0]` chain on a
   fault instead of terminating, so `__try`/`__except` works.
 - **Loading real DLL files**, so a program can ship its own libraries.

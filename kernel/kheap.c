@@ -6,13 +6,13 @@
 /* The heap lives in its own dedicated virtual range, well away from the
  * kernel image and the 0xC0000000-0xC0800000 low-memory alias set up by
  * paging_init(), and grows on demand up to HEAP_MAX_SIZE. */
-#define HEAP_START        0xD0000000u
+#define HEAP_START        KHEAP_VIRTUAL_BASE
 #define HEAP_INITIAL_SIZE (16u * 4096u)        /* 64KB to start */
 /* The compositor changed what "a big allocation" means here: the screen
  * back buffer and the pre-rendered wallpaper are ~4MB each at 1280x800,
  * and every open window owns a backing surface besides. 4MB was plenty
  * for a shell reading files; it isn't for a desktop. */
-#define HEAP_MAX_SIZE      (48u * 1024u * 1024u)
+#define HEAP_MAX_SIZE      KHEAP_MAX_SIZE
 #define PAGE_SIZE 4096u
 
 typedef struct block_header {

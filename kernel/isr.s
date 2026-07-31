@@ -78,6 +78,13 @@ ISR_NOERR 128
 ; share a dispatcher - see include/win32.h.
 ISR_NOERR 129
 
+; Win32 ring-3 callback return (int 0x82), also DPL=3. Raised by the
+; two-byte stub a kernel-initiated callback uses as its return address -
+; see include/win32_callback.h. Its handler never returns through the
+; epilogue below: it switches esp back to the kernel context that entered
+; ring 3 and abandons this frame.
+ISR_NOERR 130
+
 ; Hardware IRQs 0-15, remapped by the PIC driver to vectors 32-47.
 IRQ 0, 32
 IRQ 1, 33

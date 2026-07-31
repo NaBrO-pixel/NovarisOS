@@ -44,6 +44,7 @@ OBJS = $(BUILD_DIR)/boot.o $(BUILD_DIR)/kernel.o \
        $(BUILD_DIR)/win32.o $(BUILD_DIR)/win32_kernel32.o \
        $(BUILD_DIR)/win32_msvcrt.o $(BUILD_DIR)/win32_user32.o \
        $(BUILD_DIR)/win32_dtoa.o $(BUILD_DIR)/win32_format.o \
+       $(BUILD_DIR)/win32_callback.o $(BUILD_DIR)/win32_callback_asm.o \
        $(BUILD_DIR)/scheduler.o $(BUILD_DIR)/scheduler_asm.o \
        $(BUILD_DIR)/task_a_blob.o $(BUILD_DIR)/task_b_blob.o $(BUILD_DIR)/task_c_blob.o
 
@@ -198,6 +199,12 @@ $(BUILD_DIR)/win32_user32.o: kernel/win32_user32.c $(HEADERS) | $(BUILD_DIR)
 $(BUILD_DIR)/win32_format.o: kernel/win32_format.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/win32_callback.o: kernel/win32_callback.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/win32_callback_asm.o: kernel/win32_callback_asm.s | $(BUILD_DIR)
+	$(AS) $(ASFLAGS) $< -o $@
+
 $(BUILD_DIR)/win32_dtoa.o: kernel/win32_dtoa.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -310,6 +317,13 @@ $(BUILD_DIR)/user/crash.exe: userland/pe_test/crash.c | $(BUILD_DIR)
 	mkdir -p $(BUILD_DIR)/user
 	$(MINGW_CC) $(MINGW_CFLAGS) -o $@ $<
 
+# Exercises the kernel -> ring-3 callback mechanism: qsort/bsearch
+# comparators and atexit handlers are all functions the kernel has to call
+# back into ring 3 (see include/win32_callback.h).
+$(BUILD_DIR)/user/qsorttest.exe: userland/pe_test/qsort_test.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(MINGW_CC) $(MINGW_CFLAGS) -o $@ $<
+
 # A 64-bit PE, built purely so the "this is a 64-bit binary" diagnostic
 # has something real to fire on. -nostdlib keeps it to a couple of KB.
 $(BUILD_DIR)/user/hello64.exe: userland/pe_test/x64_marker.c | $(BUILD_DIR)
@@ -323,7 +337,7 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
         $(BUILD_DIR)/user/hellowin.exe $(BUILD_DIR)/user/winapi.exe \
         $(BUILD_DIR)/user/cppinit.exe $(BUILD_DIR)/user/guiapp.exe \
         $(BUILD_DIR)/user/hello64.exe $(BUILD_DIR)/user/lowbase.exe \
-        $(BUILD_DIR)/user/crash.exe
+        $(BUILD_DIR)/user/crash.exe $(BUILD_DIR)/user/qsorttest.exe
 	mkdir -p $(BUILD_DIR)/initrd_staging
 	cp userland/initrd_files/* $(BUILD_DIR)/initrd_staging/
 	cp $(BUILD_DIR)/user/hello_c.bin $(BUILD_DIR)/initrd_staging/helloc.bin
@@ -336,6 +350,7 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
 	cp $(BUILD_DIR)/user/hello64.exe $(BUILD_DIR)/initrd_staging/hello64.exe
 	cp $(BUILD_DIR)/user/lowbase.exe $(BUILD_DIR)/initrd_staging/lowbase.exe
 	cp $(BUILD_DIR)/user/crash.exe $(BUILD_DIR)/initrd_staging/crash.exe
+	cp $(BUILD_DIR)/user/qsorttest.exe $(BUILD_DIR)/initrd_staging/qsorttest.exe
 
 $(BUILD_DIR)/initrd.img: $(BUILD_DIR)/initrd_staging/helloelf.elf userland/mkinitrd.py
 	python3 userland/mkinitrd.py $(BUILD_DIR)/initrd_staging $@

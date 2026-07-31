@@ -50,4 +50,76 @@ void paging_reserve_region(uint32_t start, uint32_t end, const char* name);
  * [start, end), or 0 if the range is clear. */
 const char* paging_region_conflict(uint32_t start, uint32_t end);
 
+/* --- address spaces ------------------------------------------------------
+ *
+ * Milestone 14. Through Milestone 13 there was exactly one page directory
+ * and every program ran in it, which is why the Win32 layer can read a
+ * program's stack by casting a pointer. These functions add the other
+ * half: as many directories as you like, each with a private user half
+ * and a kernel half identical to every other one's.
+ *
+ * An address space is identified by the physical address of its page
+ * directory - the value that goes in CR3 - rather than by a struct, so
+ * there is nothing to allocate, free or keep in step, and
+ * paging_current_address_space() can answer by reading the register.
+ *
+ * The order of operations at boot matters:
+ *
+ *   1. paging_init()                     - build the kernel directory
+ *   2. ... map the heap, initrd, framebuffer, whatever else is kernel-wide
+ *   3. paging_reserve_kernel_tables()    - for kernel ranges that grow later
+ *   4. paging_finalize_kernel_space()    - freeze what "kernel" means
+ *   5. paging_create_address_space()     - any number of times, afterwards
+ */
+
+/* Pre-creates the page tables covering [start, end) in the kernel
+ * directory, so that later mappings into that range only fill in page
+ * table entries and never add a directory entry. Call before
+ * paging_finalize_kernel_space() for every kernel range that can grow
+ * after boot - the kernel heap being the one that does. */
+void paging_reserve_kernel_tables(uint32_t start, uint32_t end);
+
+/* Freezes the current set of directory entries as the shared kernel set.
+ * Every address space created afterwards gets exactly these, which is
+ * what makes the kernel reachable at the same addresses in all of them -
+ * including from an interrupt that arrives while a user address space is
+ * loaded. Call once, at the end of boot-time kernel mapping. */
+void paging_finalize_kernel_space(void);
+
+/* Non-zero if the kernel tried to add a directory entry to its own half
+ * after finalizing - i.e. a kernel mapping that address spaces created
+ * before it would not have. Surfaced by the `vmtest` shell command rather
+ * than being made fatal, since it is a design error to find and fix, not
+ * a runtime condition to recover from. */
+int paging_kernel_pde_violated(void);
+
+/* Allocates a page directory whose kernel half is the frozen shared set
+ * and whose user half is empty, with its own recursive mapping in place.
+ * Returns its physical address, or 0 (out of memory, or called before
+ * finalizing). */
+uint32_t paging_create_address_space(void);
+
+/* Frees an address space: every page table in its private half, every
+ * frame those tables map, and the directory itself. Shared kernel tables
+ * are left alone. Refuses to destroy the kernel's own directory, or the
+ * one currently loaded in CR3. */
+void paging_destroy_address_space(uint32_t pd_phys);
+
+/* Loads a page directory into CR3. */
+void paging_switch_address_space(uint32_t pd_phys);
+
+/* The directory currently in CR3, and the kernel's own. */
+uint32_t paging_current_address_space(void);
+uint32_t paging_kernel_address_space(void);
+
+/* paging_map_page() / paging_get_entry() against an address space that
+ * is *not* the one currently loaded, reached through a second recursive
+ * directory slot rather than by switching CR3 - see the comment on
+ * FOREIGN_PD_INDEX in paging.c. Passing the current address space (or 0)
+ * falls through to the ordinary versions. paging_map_page_in() returns 0
+ * if it needed a page table and no physical memory was left. */
+int      paging_map_page_in(uint32_t pd_phys, uint32_t virt_addr,
+                            uint32_t phys_addr, uint32_t flags);
+uint32_t paging_get_entry_in(uint32_t pd_phys, uint32_t virt_addr);
+
 #endif

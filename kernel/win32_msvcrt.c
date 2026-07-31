@@ -13,9 +13,16 @@
  * Two things can't be done from the kernel side and are emitted as native
  * ring-3 code instead (see WCODE and the blobs at the bottom): _initterm
  * and _initterm_e, which call arrays of function pointers belonging to
- * the program, and sqrt/fabs, which must return in st(0). */
+ * the program, and sqrt/fabs, which must return in st(0).
+ *
+ * qsort, bsearch and atexit used to be a third category - deliberately
+ * absent, because they call a function pointer of the program's with a
+ * signature the _initterm blob trick doesn't generalize to. Milestone 13
+ * added a real kernel -> ring-3 callback mechanism
+ * (include/win32_callback.h), so they are ordinary implementations now. */
 
 #include "win32_internal.h"
+#include "win32_callback.h"
 #include "kstring.h"
 #include "console.h"
 #include "vfs.h"
@@ -586,6 +593,171 @@ static uint32_t crt_tolower(win32_call_t* call) {
     return (c >= 'A' && c <= 'Z') ? c + 32 : c;
 }
 
+/* --- searching and sorting --------------------------------------------- */
+
+/* The three functions below are what the ring-3 callback mechanism was
+ * built for. Each one calls into the program - a comparator, an atexit
+ * handler - from inside the kernel's `int 0x81` handler, and carries on
+ * with the result. See include/win32_callback.h.
+ *
+ * All of them address the program's data by casting the ring-3 pointer
+ * they were handed, which works because Novaris still runs one program in
+ * one flat address space. Per-process page directories (Milestone 14)
+ * will make that a copy through the target directory instead; these
+ * functions touch user memory only through the two helpers below, so the
+ * change lands in one place. */
+
+static uint8_t* user_ptr(uint32_t addr) {
+    return (uint8_t*)addr;
+}
+
+static void user_swap(uint8_t* a, uint8_t* b, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        uint8_t t = a[i];
+        a[i] = b[i];
+        b[i] = t;
+    }
+}
+
+/* Calls the program's comparator and returns its verdict. A comparator
+ * the kernel could not call (nesting limit, no arena) compares equal, so
+ * a sort degrades into "left alone" rather than into corrupted data. */
+static int user_compare(uint32_t cmp, uint32_t a, uint32_t b, uint32_t ustack) {
+    uint32_t args[2] = { a, b };
+    uint32_t r = 0;
+    if (!win32_callback_call(cmp, args, 2, ustack, &r)) return 0;
+    return (int32_t)r;
+}
+
+/* Quicksort, median-ish pivot (the middle element), recursing into the
+ * smaller partition and looping on the larger one. That last detail is
+ * what keeps kernel stack use at O(log n) frames instead of O(n) - and
+ * kernel stack is in short supply here, because every comparison also
+ * borrows a slice of it for the ring-3 callback. Runs of a handful of
+ * elements finish with insertion sort, which is both faster and fewer
+ * comparator calls at that size. */
+static void user_qsort(uint32_t base, uint32_t n, uint32_t size,
+                       uint32_t cmp, uint32_t ustack) {
+    while (n > 1) {
+        if (n <= 8) {
+            for (uint32_t i = 1; i < n; i++) {
+                for (uint32_t j = i;
+                     j > 0 && user_compare(cmp, base + (j - 1) * size,
+                                           base + j * size, ustack) > 0;
+                     j--) {
+                    user_swap(user_ptr(base + (j - 1) * size),
+                              user_ptr(base + j * size), size);
+                }
+            }
+            return;
+        }
+
+        /* Park the pivot at the end, partition everything before it. */
+        user_swap(user_ptr(base + (n / 2) * size),
+                  user_ptr(base + (n - 1) * size), size);
+        uint32_t pivot = base + (n - 1) * size;
+
+        uint32_t store = 0;
+        for (uint32_t i = 0; i + 1 < n; i++) {
+            if (user_compare(cmp, base + i * size, pivot, ustack) < 0) {
+                if (i != store) {
+                    user_swap(user_ptr(base + i * size),
+                              user_ptr(base + store * size), size);
+                }
+                store++;
+            }
+        }
+        user_swap(user_ptr(base + store * size), user_ptr(pivot), size);
+
+        uint32_t left = store;              /* [base, store)          */
+        uint32_t right = n - store - 1;     /* (store, n)             */
+        if (left < right) {
+            user_qsort(base, left, size, cmp, ustack);
+            base += (store + 1) * size;
+            n = right;
+        } else {
+            user_qsort(base + (store + 1) * size, right, size, cmp, ustack);
+            n = left;
+        }
+    }
+}
+
+static uint32_t crt_qsort(win32_call_t* call) {
+    uint32_t base = ARG(0), n = ARG(1), size = ARG(2), cmp = ARG(3);
+    if (!base || !cmp || size == 0 || n < 2) return 0;
+    user_qsort(base, n, size, cmp, call->useresp);
+    return 0;
+}
+
+static uint32_t crt_bsearch(win32_call_t* call) {
+    uint32_t key = ARG(0), base = ARG(1), n = ARG(2), size = ARG(3),
+             cmp = ARG(4);
+    if (!base || !cmp || size == 0) return 0;
+
+    uint32_t lo = 0, hi = n;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        uint32_t elem = base + mid * size;
+        int r = user_compare(cmp, key, elem, call->useresp);
+        if (r == 0) return elem;
+        if (r < 0) hi = mid; else lo = mid + 1;
+    }
+    return 0; /* not found - bsearch returns NULL */
+}
+
+/* --- atexit ------------------------------------------------------------ */
+
+/* Registered handlers, in registration order; they run in reverse.
+ * 32 is what the C standard guarantees at minimum and comfortably more
+ * than anything the mingw CRT registers on its own behalf. */
+#define MAX_ATEXIT 32
+static uint32_t atexit_fns[MAX_ATEXIT];
+static uint32_t atexit_count = 0;
+static int      atexit_running = 0;
+
+static uint32_t register_atexit(uint32_t fn) {
+    if (!fn) return 0xFFFFFFFFu;
+    /* Once the handlers have started running, C says a newly registered
+     * one is not called. Refusing it outright is the honest answer. */
+    if (atexit_running) return 0xFFFFFFFFu;
+    if (atexit_count >= MAX_ATEXIT) return 0xFFFFFFFFu;
+    atexit_fns[atexit_count++] = fn;
+    return 0;
+}
+
+static uint32_t crt_atexit(win32_call_t* call) {
+    return register_atexit(ARG(0));
+}
+
+/* _onexit returns the function pointer on success rather than 0. */
+static uint32_t crt_onexit(win32_call_t* call) {
+    uint32_t fn = ARG(0);
+    return register_atexit(fn) == 0 ? fn : 0;
+}
+
+/* The UCRT spelling: _register_onexit_function(table, func). The table
+ * argument identifies which onexit list to use, and since we keep exactly
+ * one, it is ignored. */
+static uint32_t crt_register_onexit(win32_call_t* call) {
+    return register_atexit(ARG(1));
+}
+
+void w32_msvcrt_run_atexit(void) {
+    if (atexit_running) return; /* a handler called exit() */
+    atexit_running = 1;
+
+    uint32_t ustack = w32_current_user_esp();
+    if (ustack) {
+        while (atexit_count > 0) {
+            uint32_t fn = atexit_fns[--atexit_count];
+            win32_callback_call(fn, 0, 0, ustack, 0);
+        }
+    }
+
+    atexit_count = 0;
+    atexit_running = 0;
+}
+
 /* --- process, time, misc ----------------------------------------------- */
 
 static uint32_t crt_exit(win32_call_t* call) {
@@ -938,6 +1110,10 @@ void w32_msvcrt_reset(void) {
     locale_name = 0;
     strtok_state = 0;
     rand_state = 1;
+    /* atexit handlers belong to the program that registered them, and
+     * point into an image that is about to be unloaded. */
+    atexit_count = 0;
+    atexit_running = 0;
     if (errno_cell) *(uint32_t*)errno_cell = 0;
     if (doserrno_cell) *(uint32_t*)doserrno_cell = 0;
 }
@@ -1078,8 +1254,8 @@ static const win32_export_t msvcrt_exports[] = {
     WEXP_C("clock", crt_clock),
     WEXP_C("rand", crt_rand),
     WEXP_C("srand", crt_srand),
-    WSTUB_C("atexit", 0),
-    WSTUB_C("_onexit", 0),
+    WEXP_C("atexit", crt_atexit),
+    WEXP_C("_onexit", crt_onexit),
     WSTUB_C("__dllonexit", 0),
     WSTUB_C("signal", 0),
     WSTUB_C("raise", 0),
@@ -1106,8 +1282,8 @@ static const win32_export_t msvcrt_exports[] = {
     WSTUB_C("_beginthreadex", 0),
     WSTUB_C("_endthreadex", 0),
     WSTUB_C("__security_init_cookie", 0),
-    WSTUB_C("_crt_atexit", 0),
-    WSTUB_C("_register_onexit_function", 0),
+    WEXP_C("_crt_atexit", crt_atexit),
+    WEXP_C("_register_onexit_function", crt_register_onexit),
     WSTUB_C("_initialize_onexit_table", 0),
     WSTUB_C("_get_initial_narrow_environment", 0),
     WSTUB_C("_configure_narrow_argv", 0),
@@ -1120,14 +1296,14 @@ static const win32_export_t msvcrt_exports[] = {
     WSTUB_C("_setmode", 0),
     WSTUB_C("_seh_filter_exe", 0),
 
-    /* Deliberately absent: qsort, bsearch and atexit's callback list.
-     * Each takes a function pointer the C library is supposed to *call*,
-     * and the kernel cannot call into ring 3 from inside an interrupt
-     * (see the note on _initterm above - that one is solved by emitting
-     * ring-3 code, which doesn't generalize to an arbitrary signature).
-     * Stubbing them would mean qsort silently not sorting, which is far
-     * worse than the "unimplemented API called" report a missing import
-     * produces. See ROADMAP.md Milestone 10. */
+    /* Real implementations since Milestone 13. Through Milestone 12 these
+     * were deliberately absent - each one calls a function pointer
+     * belonging to the program, and the kernel had no way to do that from
+     * inside an interrupt, so an honest "unimplemented API called" report
+     * beat a stub that silently didn't sort. The int 0x82 callback
+     * mechanism (include/win32_callback.h) removed the obstacle. */
+    WEXP_C("qsort", crt_qsort),
+    WEXP_C("bsearch", crt_bsearch),
 
     /* native ring-3 implementations */
     WCODE("_initterm", code_initterm),
