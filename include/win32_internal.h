@@ -156,6 +156,67 @@ uint32_t w32_format_double(char* out, uint32_t out_size, uint64_t bits,
 uint32_t w32_format(char* out, uint32_t out_size, const char* fmt,
                     const uint32_t* argp);
 
+/* --- threads (Milestone 17) --------------------------------------------
+ *
+ * A Win32 program runs as one or more scheduler tasks in a single address
+ * space - which is precisely the definition of threads that Milestone 16
+ * built. These are the pieces the kernel32 implementations need. */
+
+/* Creates a thread of the running program: its own stack out of the Win32
+ * arena, its own TEB, and a scheduler task starting at `start` with
+ * `param` as its single stdcall argument. Returns a handle, or 0. The
+ * thread's id comes back through `out_tid` when that is non-null. */
+uint32_t w32_thread_create(uint32_t start, uint32_t param, uint32_t stack_size,
+                           uint32_t* out_tid);
+
+/* Ends the calling thread. If it was the last one the whole program ends.
+ *
+ * Returns normally to its caller, and must: the scheduler records the
+ * switch and isr.s's epilogue performs it as this call chain unwinds. The
+ * calling *thread* never resumes - its thunk's `ret` is never reached -
+ * but the C function does return, so this is deliberately not marked
+ * noreturn. */
+void w32_thread_exit(uint32_t exit_code);
+
+/* Makes the emulated call that is in flight re-execute from the top of
+ * its thunk next time this thread is scheduled, then gives up the rest of
+ * the slice.
+ *
+ * This is how waiting works without the scheduler being able to block a
+ * task in the middle of a syscall and resume its kernel stack later. The
+ * thunk is `mov eax, id / int 0x81 / ret n`, so rewinding eip by the 7
+ * bytes of the first two instructions makes the whole call happen again -
+ * including the `mov`, which is what puts the slot id back in eax. The
+ * API implementation returns normally in the meantime and its return
+ * value is discarded, so it must not have done anything it would mind
+ * doing again.
+ *
+ * Honest consequence: a waiting thread stays runnable and burns its
+ * slices retrying rather than sleeping. */
+void w32_retry_call_later(win32_call_t* call);
+
+/* The same, but only when another task is actually runnable; returns 1 if
+ * it rewound and yielded, 0 having changed nothing. Sleep() uses it: with
+ * no sibling to run there is nothing to gain by spinning, so it falls
+ * back to halting until the timer reaches its deadline. */
+int w32_yield_if_others(win32_call_t* call);
+
+/* Whether a thread handle names a thread that has not exited yet. When it
+ * has, its exit code comes back through `exit_code`. An unknown handle
+ * reads as finished, so waiting on a stale one returns rather than
+ * hanging forever. */
+int w32_thread_handle_alive(uint32_t handle, uint32_t* exit_code);
+
+/* The calling thread's id - the scheduler PID, which is unique within a
+ * run and is what GetCurrentThreadId hands out. */
+uint32_t w32_thread_id(void);
+
+/* How many times EnterCriticalSection found a lock already held by
+ * another thread during this run. Reported at exit, because "the guarded
+ * total came out right" only means something if the lock was contended
+ * while it did. */
+uint32_t w32_cs_contention_count(void);
+
 /* --- the running program ----------------------------------------------- */
 
 /* The image currently executing, or 0 outside a program. */

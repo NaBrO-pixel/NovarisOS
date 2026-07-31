@@ -1542,6 +1542,196 @@ Host tests: 38 + 30 + 52 checks, 0 failures.
 - [ ] Still no priorities, no blocking/sleeping, no I/O wait — a task that
       wants to wait busy-spins.
 
+## Milestone 17 — Real Win32 threads ✅ DONE
+
+Milestone 16 built threads for the kernel's own scheduler and was explicit
+that a Win32 program still could not use them: `CreateThread` was a stub
+returning 0. This closes that gap. A real mingw-compiled `.exe` now calls
+`CreateThread`, gets genuinely concurrent execution, joins with
+`WaitForSingleObject`, and is protected by a `CRITICAL_SECTION` that
+actually locks.
+
+### The main thread becomes a scheduler task
+
+The change that makes everything else possible is one substitution in
+`win32_run_pe()`:
+
+```c
+-   process_run_user_mode(start, esp);
++   int main_pid = scheduler_spawn_win32_thread("main", start, esp, teb_address);
++   scheduler_run_until_idle();
+```
+
+`scheduler_run_until_idle()` blocks its caller in exactly the way
+`process_run_user_mode()` did, so everything around it — the loader, the
+teardown, the address space, the fault path — is unchanged. But now the
+program is a *task*, and a second thread is just a second task in the same
+address space, which is precisely what Milestone 16 built.
+
+Thread stacks come from `w32_mem_alloc_pages()` rather than being mapped
+by the scheduler, so they are freed wholesale by `w32_mem_reset()` when
+the program exits — nothing for the reaper to double-free. Each thread
+gets its own TEB, and `switch_to()` repoints the TEB GDT descriptor on
+every switch; without that, two threads would share one `errno` and one
+SEH chain.
+
+### Waiting, without being able to block
+
+A thread that calls `WaitForSingleObject` or a contended
+`EnterCriticalSection` has to wait. The obvious implementation — mark the
+task blocked and switch away — does not work here, because the scheduler
+switches tasks by restoring a *trap frame*, and a task waiting inside a
+syscall has a live kernel-side C call chain that a trap frame cannot
+represent. Supporting that properly means a second, kernel-context switch
+path (what Linux's `__switch_to` does), which is a redesign.
+
+The trick used instead costs seven bytes of arithmetic. A thunk is:
+
+```
++0: B8 <id32>   mov eax, <slot id>     ; 5 bytes
++5: CD 81       int 0x81               ; 2 bytes
++7: C2 nn 00    ret n
+```
+
+so rewinding `regs->eip` by 7 makes the entire call happen again — the
+`mov` included, which is what puts the slot id back in `eax`. Rewind, give
+up the slice, and when this thread is next scheduled it re-executes the
+call and re-checks the condition. Other threads run in between. The API
+implementation returns normally in the meantime and its return value is
+discarded, so it must not have done anything it would mind doing again —
+which is why the "acquire" branch of `EnterCriticalSection` comes first
+and the retry only happens on the path that changed nothing.
+
+Honest consequence, stated plainly: **a waiting thread stays runnable and
+burns its time slices retrying rather than sleeping.** That is fine for
+three threads on one core and would not be fine for a real workload.
+
+### What became real
+
+- `CreateThread` / `ExitThread` / `GetExitCodeThread` — a start routine is
+  *called*, not jumped to, with a thread-exit trampoline as its return
+  address, so `return 0;` from a thread procedure ends the thread the same
+  way returning from `main` ends the program.
+- `WaitForSingleObject` on a thread handle, with a real join.
+- `GetCurrentThreadId` — was a hardcoded `0x104`, now the scheduler PID,
+  which is the entire point of the call.
+- `EnterCriticalSection` / `LeaveCriticalSection` /
+  `TryEnterCriticalSection` / `DeleteCriticalSection` — were no-ops
+  through Milestone 16, which was correct for one thread and exactly wrong
+  for several. State lives in the program's own `CRITICAL_SECTION` struct
+  at the documented offsets, because programs read `RecursionCount` and
+  `OwningThread` out of it directly.
+- `Sleep` no longer holds the CPU in `sti; hlt` for its whole duration,
+  which would have starved a program's other threads. It yields, and falls
+  back to halting only when nothing else is runnable.
+
+### Two bugs found on the way
+
+**`scheduler_tick` did not check the interrupted ring.** A timer landing
+while a task was inside a syscall would save a same-privilege interrupt
+frame — which has no `useresp`/`ss` on it at all — as though it were a
+`registers_t`, and resuming it would return to garbage. Latent until now:
+the only tasks the scheduler ran were demo programs whose syscalls never
+re-enabled interrupts, and `Sleep()` deliberately does. Fixed with
+`if ((regs->cs & 3) != 3) return;`.
+
+**`ExitThread` hung the machine.** The first version ended with
+`for (;;) hlt` on the theory that a function called ExitThread should not
+return. But `scheduler_exit_current()` does not switch stacks itself — it
+records the decision and lets the call chain unwind to isr.s's epilogue,
+which is the only place it is safe to repoint `esp`. Halting instead meant
+the switch never happened, with interrupts off inside an interrupt gate,
+forever. Symptom: worker 1 ran to completion and the machine froze. The
+function must return normally; the *thread* never resumes, but the C
+function does.
+
+### Verified
+
+`userland/pe_test/threads.c`, built with real `i686-w64-mingw32-gcc`
+against the real kernel32 import library — three workers, each doing an
+`InterlockedIncrement` and a deliberately non-atomic guarded increment:
+
+```
+novaris> run threads.exe
+[win32] running in its own address space, page directory 0x00cf1000
+Win32 threads test - real CreateThread on Novaris
+
+main thread GetCurrentThreadId() = 1
+
+created worker 1, thread id 2
+created worker 2, thread id 3
+created worker 3, thread id 4
+
+  worker 1 starting, GetCurrentThreadId() = 2
+  worker 2 starting, GetCurrentThreadId() = 3
+  worker 3 starting, GetCurrentThreadId() = 4
+  worker 1 done
+  worker 2 done
+  worker 3 done
+
+all 3 workers joined
+  worker 1 exit code 100
+  worker 2 exit code 200
+  worker 3 exit code 300
+
+interlocked counter: 60, expected 60  -> ok
+guarded counter:     60, expected 60  -> ok
+
+threads test done.
+[win32] threads this program ran 4
+[win32] times a critical section was found already held 2
+```
+
+All three workers start before any finishes, so they really are
+concurrent, and distinct thread ids come back from `GetCurrentThreadId`.
+
+**The decisive evidence is the negative control.** A passing lock test
+proves nothing if the threads never actually raced. Rebuilding with
+`EnterCriticalSection` reverted to the Milestone 16 no-op, and nothing
+else changed:
+
+```
+interlocked counter: 60, expected 60  -> ok
+guarded counter:     57, expected 60  -> WRONG (the lock did nothing)
+[win32] times a critical section was found already held 0
+```
+
+Three increments lost to a real read-modify-write race. So the race is
+genuine, the threads are genuinely concurrent, and the critical section is
+genuinely what prevents it. The contention counter is reported by the
+kernel for the same reason: "the total came out right" and "the total came
+out right *and* the lock was contended while it did" are different claims.
+
+The other 16 smoke cases are unchanged. Repeated runs cost **zero
+frames** — 29482 → 29417 (one-time arena high-water) → 29417 → 29417 —
+so multi-threaded programs release everything they take. `crash.exe`
+still faults, is still reported, and still returns to the shell, which
+now means the fault path unwinds correctly out of a *multi-threaded*
+program via `scheduler_terminate_all()`. Host tests: 38 + 30 + 52 checks,
+0 failures.
+
+### Honest scope
+
+- [x] Real preemptive threads in a real Win32 program, with working
+      joins and working mutual exclusion.
+- [ ] **Waiting is a retry loop, not a block.** A waiting thread is still
+      scheduled and still burns CPU. Real blocking needs a second switch
+      path that can suspend and resume a task's kernel stack — the piece
+      deliberately not built here.
+- [ ] `WaitForSingleObject` ignores finite timeouts (treats them as
+      `INFINITE`); only a 0 timeout is honoured, as a poll.
+      `WaitForMultipleObjects` is still a stub.
+- [ ] No `Event`, `Mutex` or `Semaphore` objects — `CreateEvent` and
+      friends still hand back inert handles. Only thread handles are
+      really waitable.
+- [ ] No thread-local storage per thread: `TlsAlloc`/`TlsSetValue` still
+      use one global slot table, so two threads share a TLS slot. The TEB
+      is per-thread, but its TLS array is not yet used.
+- [ ] `CREATE_SUSPENDED` is ignored (with a diagnostic); no
+      `SuspendThread`/`ResumeThread`, no priorities, no `TerminateThread`.
+- [ ] 8 threads per program, 8 tasks total, 8KB kernel stack each.
+- [ ] Still one *process* at a time.
+
 ## Path A — porting Wine (the current direction)
 
 Milestone 8 laid out two ways to run Windows binaries: port Wine (Path
@@ -1561,8 +1751,10 @@ are forced into an order:
    scheduler address-space-aware, which is really item 2's problem.
 2. **Real threads** — ✅ done for the kernel's own scheduler in Milestone
    16 (address-space-aware switching, multiple threads per address
-   space). Still to do: synchronisation primitives, thread-local storage,
-   and connecting Win32's `CreateThread` to any of it.
+   space), and for Win32 programs in Milestone 17 (`CreateThread`,
+   `WaitForSingleObject`, working critical sections). Still to do: real
+   blocking rather than retry loops, per-thread TLS, and event/mutex
+   objects.
 3. **A POSIX-ish syscall surface** — `mmap`/`munmap`/`mprotect`, file
    descriptors, `pthread_*`, something signal-shaped. This is what
    Wine's own build actually links against.

@@ -328,6 +328,13 @@ $(BUILD_DIR)/user/qsorttest.exe: userland/pe_test/qsort_test.c | $(BUILD_DIR)
 	mkdir -p $(BUILD_DIR)/user
 	$(MINGW_CC) $(MINGW_CFLAGS) -o $@ $<
 
+# Real Win32 threads: CreateThread, WaitForSingleObject, a CRITICAL_SECTION
+# and InterlockedIncrement (see include/win32_callback.h's sibling work in
+# ROADMAP.md Milestone 17).
+$(BUILD_DIR)/user/threads.exe: userland/pe_test/threads.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(MINGW_CC) $(MINGW_CFLAGS) -o $@ $<
+
 # A 64-bit PE, built purely so the "this is a 64-bit binary" diagnostic
 # has something real to fire on. -nostdlib keeps it to a couple of KB.
 $(BUILD_DIR)/user/hello64.exe: userland/pe_test/x64_marker.c | $(BUILD_DIR)
@@ -341,7 +348,8 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
         $(BUILD_DIR)/user/hellowin.exe $(BUILD_DIR)/user/winapi.exe \
         $(BUILD_DIR)/user/cppinit.exe $(BUILD_DIR)/user/guiapp.exe \
         $(BUILD_DIR)/user/hello64.exe $(BUILD_DIR)/user/lowbase.exe \
-        $(BUILD_DIR)/user/crash.exe $(BUILD_DIR)/user/qsorttest.exe
+        $(BUILD_DIR)/user/crash.exe $(BUILD_DIR)/user/qsorttest.exe \
+        $(BUILD_DIR)/user/threads.exe
 	mkdir -p $(BUILD_DIR)/initrd_staging
 	cp userland/initrd_files/* $(BUILD_DIR)/initrd_staging/
 	cp $(BUILD_DIR)/user/hello_c.bin $(BUILD_DIR)/initrd_staging/helloc.bin
@@ -355,6 +363,7 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
 	cp $(BUILD_DIR)/user/lowbase.exe $(BUILD_DIR)/initrd_staging/lowbase.exe
 	cp $(BUILD_DIR)/user/crash.exe $(BUILD_DIR)/initrd_staging/crash.exe
 	cp $(BUILD_DIR)/user/qsorttest.exe $(BUILD_DIR)/initrd_staging/qsorttest.exe
+	cp $(BUILD_DIR)/user/threads.exe $(BUILD_DIR)/initrd_staging/threads.exe
 
 $(BUILD_DIR)/initrd.img: $(BUILD_DIR)/initrd_staging/helloelf.elf userland/mkinitrd.py
 	python3 userland/mkinitrd.py $(BUILD_DIR)/initrd_staging $@
