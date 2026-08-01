@@ -2579,7 +2579,156 @@ of this was broken deliberately three ways:
 - [ ] Still no `sigaltstack`, so a handler cannot run on its own stack —
       which is how a real kernel survives a stack-overflow `SIGSEGV`, and
       which Wine uses.
+- [x] ~~**No FP state.** `uc_mcontext.fpstate` is null and `uc_flags` is
+      0.~~ Done in Milestone 24.
+- [ ] **`cs`, `ss`, `ds`, `es`, `fs` and `gs` are reported but not
+      restored.** A handler can read them; writing them back is ignored.
+      Wine does change `fs` in a sigcontext when it switches TEB
+      selectors, so this will have to be revisited — safely, which means
+      validating the selector rather than trusting it, and probably means
+      LDT support that does not exist yet.
 - [ ] Signal state is still per *process*, not per thread.
+
+## Milestone 24 — FP state in the signal frame ✅ DONE
+
+The one thing Milestone 23 left null. `sigcontext.fpstate` pointed
+nowhere, which had two consequences — one obvious and one that was a
+live bug nobody had noticed.
+
+The obvious one: a handler could not see the x87/SSE registers of the
+faulting instruction. Wine casts that pointer straight to a Windows
+`FLOATING_SAVE_AREA` and copies it into `CONTEXT.FloatSave`, so with a
+null pointer it has nothing to report and nothing to restore.
+
+The one that was a bug: because the FPU was neither saved nor reset
+around delivery, **a signal handler that did any arithmetic at all
+silently destroyed the interrupted computation's registers.** A handler
+that pushed three values onto the x87 stack left the interrupted code
+with three fewer, and its `st(0)` gone. Nothing in the suite caught it,
+because no handler had ever done floating-point work.
+
+### One structure in two shapes
+
+`struct _fpstate` has its history visible in it. The first 112 bytes are
+the legacy i387 environment — control, status and tag words, then eight
+10-byte x87 registers — which is byte for byte Windows'
+`FLOATING_SAVE_AREA`. Everything from offset 112 on is simply the
+512-byte FXSAVE image, unaltered, which is where XMM and MXCSR live. The
+`magic` field says whether that image is there: Wine tests it as
+`fpstate->status >> 16`, reading `status` and `magic` as one 32-bit word,
+which is why they are adjacent 16-bit fields rather than two ints.
+
+Novaris writes both halves, and honours both on return, in the same
+lopsided way Linux does: the FXSAVE image supplies XMM and MXCSR, and
+the legacy fields then overwrite the x87 part of it. Both directions
+matter because Wine writes both — `CONTEXT.FloatSave` into the legacy
+half, `CONTEXT.ExtendedRegisters` into the image — and honouring only
+one would leave half of a resumed thread's FP state stale.
+
+### The bug in the tag word, and how the host found it
+
+The two tag words are not the same thing. FXSAVE's is one bit per
+register, "in use" or not; the legacy i387 one is two bits, "valid" /
+"zero" / "special" / "empty", so building it means looking at each
+register the CPU marked in use and classifying its value.
+
+The first implementation did that and was still wrong, because **the two
+are indexed differently**: the abridged word is by *physical* register,
+while FXSAVE stores the registers in *stack* order with `ST(0)` first.
+Bit *i* is about physical register *i*, which is stack slot `(i - TOP) &
+7`. Without that rotation the conversion looks at the wrong registers
+and, with three values pushed, reports `0x57FF` — "three empty registers
+that hold zero" — where Linux reports `0x03FF`, "three registers holding
+valid numbers".
+
+This was invisible while `TOP` was 0 and would have been invisible
+forever without a host to compare against. The test now asserts the exact
+value `0xFFFF03FF` after a known `fninit` and three pushes, which is
+precisely the check that distinguishes the two.
+
+Two other fields were settled by asking the host rather than reasoning:
+the handler is entered on a **completely** clean unit (empty x87 stack,
+control word `0x037f`, **zeroed XMM registers**, MXCSR `0x1f80` — so
+`fninit` alone is not enough, since it leaves XMM and MXCSR untouched),
+and the legacy `cssel`/`datasel` come from the interrupted frame's `cs`
+and `ds` rather than from the FXSAVE image's own FCS/FDS.
+
+### The flags a handler is entered with
+
+Chasing the direction flag through the same probes turned up a third
+thing Novaris was not doing. Linux clears `DF`, `TF` and `RF` before
+entering a handler and keeps all three in the saved copy, so they come
+back on return. `DF` is the one that matters: the cdecl ABI lets a
+function assume the direction flag is clear on entry and compiled code
+does, so a program that legitimately had it set when the signal arrived
+was handing its handler a string library that ran backwards.
+
+### Verified
+
+```
+$ make test-posix
+ 41 lines compared, 20 checks, 0 failing, 0 unexpected difference(s)  posixtest.elf
+ 93 lines compared, 67 checks, 0 failing, 0 unexpected difference(s)  sigtest.elf
+ 26 lines compared,  8 checks, 0 failing, 0 unexpected difference(s)  pthtest.elf
+  5 lines compared,  0 checks, 0 failing, 0 unexpected difference(s)  glibc.elf
+  5 lines compared,  0 checks, 0 failing, 0 unexpected difference(s)  dyn.elf
+ 60 lines compared, 45 checks, 0 failing, 0 unexpected difference(s)  uctest.elf
+```
+
+Both signal transcripts remain byte-identical between the Linux host and
+Novaris. `uctest.elf` reads the state through glibc's `struct _fpstate`;
+`sigtest.elf` asserts the same behaviour through no structure at all, so
+it holds whatever the layout turns out to be:
+
+```
+11. state a handler must not be able to damage
+  [ok]   the handler was entered with the direction flag clear
+  [ok]   the handler was given an empty x87 stack
+  [ok]   the handler's own arithmetic gave the answer it should
+  [ok]   the interrupted x87 stack survived (TOP back to 7)
+  [ok]   and still holds the value pushed before the signal
+  [ok]   the direction flag came back set
+```
+
+Host tests 38 + 30 + 52, the 26-case smoke suite passes, and both
+binaries still cost zero frames on every run after the first.
+
+### The negative controls
+
+Four deliberate breaks, each failing a different, named set of checks:
+
+- **`fpstate` left null**, as Milestone 23 shipped it — 15 checks fail.
+- **No clean unit for the handler** — the handler sees the interrupted
+  x87 stack, XMM and MXCSR, and its own arithmetic eats them.
+- **`DF`/`TF`/`RF` not cleared** — the direction-flag checks fail in
+  both binaries.
+- **The tag conversion without the TOP rotation** — exactly one check
+  fails, `the tag word marks three registers valid (0x03FF)`, which is
+  the bug that was actually there.
+
+### Honest scope
+
+- [x] `sigcontext.fpstate` points at a real `struct _fpstate`: legacy
+      i387 environment, all eight x87 registers, and the full FXSAVE
+      image with XMM0–7 and MXCSR.
+- [x] Restored on `rt_sigreturn`, from both halves, so a handler can
+      edit FP state as well as read it.
+- [x] The handler runs on a clean FPU and with `DF`/`TF`/`RF` clear;
+      the interrupted thread gets all of it back.
+- [x] MXCSR is masked to its defined bits before `FXRSTOR`, so a program
+      cannot fault the kernel with a reserved bit set.
+- [ ] **No XSAVE / extended state.** `uc_flags` is 0 where Linux reports
+      `UC_FP_XSTATE`, and there is no xstate header past the FXSAVE
+      image, so AVX registers are neither saved nor reported. Novaris
+      does not enable AVX at all, so nothing can currently notice; a
+      program that used it would lose `ymm` state across a signal.
+- [ ] The FXSAVE image is copied through the user stack unvalidated
+      apart from MXCSR. `FXRSTOR` tolerates any other bit pattern, so
+      this is safe, but a program can put nonsense in its own x87
+      registers — which is true on Linux too.
+- [ ] `fpstate` is not shared with `sigaltstack`, which still does not
+      exist. The frame is 624 bytes larger than it was, all of it on the
+      user stack.
 
 ## Path A — porting Wine (the current direction)
 
@@ -2615,8 +2764,9 @@ are forced into an order:
    TLS — enough for what pthreads is made of. Milestone 23 filled in
    `ucontext_t` and `siginfo_t`, in both directions: a handler can read
    the faulting registers and write them back, which is the whole of
-   Wine's exception dispatch. Still to do: FP state in the sigcontext,
-   blocking (rather than retrying) futexes, and a writable filesystem.
+   Wine's exception dispatch. Milestone 24 added the x87/SSE half of the
+   same picture. Still to do: blocking (rather than retrying) futexes,
+   and a writable filesystem.
 4. **A dynamic linker** — ✅ done in Milestone 22. `ld-linux.so.2` loads
    `libc.so.6` at runtime and a dynamically linked glibc program runs,
    with output identical to Linux. The kernel's half is ET_DYN images,

@@ -324,6 +324,34 @@ static void on_segv_unwind(int signo, k_siginfo* si, k_ucontext* uc) {
  * looping for ever. Assembler labels sitting directly beside the
  * instruction they name cannot drift. */
 
+/* Milestone 24: a handler that does arithmetic. Before the FPU was saved
+ * and reset around delivery, these three pushes came off the interrupted
+ * thread's own x87 stack and its value never came back. */
+static volatile int fp_handler_ran = 0, fp_handler_df = -1, fp_handler_top = -1;
+static long double fp_handler_sum = 0;
+
+static void on_usr1_fp(int signo, k_siginfo* si, k_ucontext* uc) {
+    (void)signo; (void)si; (void)uc;
+    unsigned short sw;
+    unsigned long fl;
+    __asm__ __volatile__("fnstsw %0" : "=m"(sw));
+    __asm__ __volatile__("pushf; pop %0" : "=r"(fl));
+    fp_handler_ran++;
+    fp_handler_top = (sw >> 11) & 7;
+    fp_handler_df  = (int)((fl >> 10) & 1);
+
+    volatile double two = 2.0;
+    long double acc;
+    __asm__ __volatile__("fldl %1\n\t"
+                         "fldl %1\n\t"
+                         "fldl %1\n\t"
+                         "faddp\n\t"
+                         "faddp\n\t"
+                         "fstpt %0"
+                         : "=m"(acc) : "m"(two));
+    fp_handler_sum = acc;
+}
+
 extern char kill_probe_ret[];
 
 /* kill(pid, sig), with a label on the instruction the kernel should
@@ -584,6 +612,48 @@ int main_(void) {
                   sc3(SYS_mprotect, (long)unmapped_page, 4096,
                       PROT_READ | PROT_WRITE) < 0);
         }
+    }
+
+    /* 11. Milestone 24, without looking at any structure at all. The
+     *     checks above go through Novaris's transcription of Linux's
+     *     _fpstate; these only assert behaviour a program can feel, so
+     *     they hold whatever the layout turns out to be. Both were real
+     *     bugs until this milestone: a handler ran with whatever
+     *     direction flag it was interrupted with, and its arithmetic came
+     *     straight off the interrupted thread's x87 stack. */
+    out("\n11. state a handler must not be able to damage\n");
+    check("rt_sigaction(SIGUSR1, arithmetic handler) accepted",
+          install3(SIGUSR1, on_usr1_fp) == 0);
+    {
+        volatile double one_and_a_half = 1.5;
+        unsigned short sw_after;
+        long double st0_after;
+        unsigned long efl_after;
+
+        __asm__ __volatile__("fninit");
+        __asm__ __volatile__("fldl %0" :: "m"(one_and_a_half));
+        __asm__ __volatile__("std");
+
+        sc2(SYS_kill, pid, SIGUSR1);
+
+        __asm__ __volatile__("pushf; pop %0" : "=r"(efl_after));
+        __asm__ __volatile__("cld");
+        __asm__ __volatile__("fnstsw %0" : "=m"(sw_after));
+        __asm__ __volatile__("fstpt %0" : "=m"(st0_after));
+
+        check("the handler ran", fp_handler_ran == 1);
+        check("the handler was entered with the direction flag clear",
+              fp_handler_df == 0);
+        check("the handler was given an empty x87 stack",
+              fp_handler_top == 0);
+        check("the handler's own arithmetic gave the answer it should",
+              fp_handler_sum == 6.0L);
+        check("the interrupted x87 stack survived (TOP back to 7)",
+              ((sw_after >> 11) & 7) == 7);
+        check("and still holds the value pushed before the signal",
+              st0_after == 1.5L);
+        check("the direction flag came back set",
+              (efl_after & 0x400) != 0);
     }
 
     out("\nsignal test done.\n");
