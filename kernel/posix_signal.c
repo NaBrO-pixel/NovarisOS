@@ -37,7 +37,18 @@
  * are in play. Without it Linux builds the old sigframe and expects
  * sigreturn (119); with it, the rt_ frame and rt_sigreturn (173) go
  * together. Novaris implements the rt_ path, which is the one glibc and
- * Wine use. */
+ * Wine use.
+ *
+ * Milestone 23 fills in the two arguments an SA_SIGINFO handler gets
+ * besides the signal number: a real siginfo_t and a real ucontext_t, in
+ * Linux/i386's layout (see include/posix.h). Both directions matter. Wine
+ * reads the faulting registers out of the ucontext to build a Windows
+ * CONTEXT record, and then - having decided what the exception handler
+ * chain wants - writes the modified registers *back* into the same
+ * ucontext and returns, expecting the kernel to resume from those. So
+ * rt_sigreturn no longer restores from a private copy of the trap frame;
+ * it restores from uc_mcontext, which is the memory the handler was
+ * invited to edit. */
 
 #include "posix.h"
 #include "console.h"
@@ -52,6 +63,24 @@ static uint32_t pending = 0;
 static int      any_handler = 0; /* fast path: nothing installed, nothing to do */
 static int      in_delivery = 0; /* guards against recursion in the fault path */
 
+/* What to put in siginfo_t when each signal is finally delivered.
+ * `pending` is a bitmask rather than a queue, so this is one record per
+ * signal number rather than one per raise - which is the same shape as
+ * the delivery it feeds, and no worse. */
+typedef struct {
+    int32_t  code;
+    uint32_t addr;   /* si_addr, for the fault signals */
+    int32_t  pid;    /* si_pid, for kill/tgkill */
+} siginfo_rec_t;
+static siginfo_rec_t info_of[NSIG];
+
+/* The last CPU fault this process took. Linux keeps these in the thread
+ * struct and copies them into every sigcontext it builds, fault or not,
+ * so a signal delivered by kill() carries whatever the last real fault
+ * left behind. Matching that is free and avoids the same binary seeing
+ * different numbers on the two systems - even meaningless ones. */
+static uint32_t last_trapno = 0, last_err = 0, last_cr2 = 0;
+
 #define SIGBIT(n) (1u << ((n) - 1))
 
 /* SIGKILL and SIGSTOP can never be caught or blocked. */
@@ -65,37 +94,41 @@ void posix_signal_reset(void) {
         actions[i].mask[0] = 0;
         actions[i].mask[1] = 0;
     }
+    for (int i = 0; i < NSIG; i++) {
+        info_of[i].code = SI_USER;
+        info_of[i].addr = 0;
+        info_of[i].pid  = 0;
+    }
     blocked = 0;
     pending = 0;
     any_handler = 0;
     in_delivery = 0;
+    last_trapno = last_err = last_cr2 = 0;
 }
 
 /* --- the sigframe -------------------------------------------------------
  *
- * Novaris's own layout, not Linux's. That is fine and worth being clear
- * about: the program never looks inside it. It builds the frame, the
- * program's restorer issues rt_sigreturn without touching it, and the
- * same kernel consumes it. Only the *interface* - SA_RESTORER, the
- * handler's argument, rt_sigreturn's number - has to match Linux, and it
- * does. */
+ * The *ordering* is Novaris's, not Linux's, and that stays fine: the
+ * program never looks at the frame as a whole, only at the two pointers
+ * it is handed. What is no longer Novaris's own is the shape of the two
+ * things those pointers point at - `info` and `uc` are the real
+ * Linux/i386 siginfo_t and ucontext_t, because a handler compiled against
+ * glibc's headers reads them by offset.
+ *
+ * The interrupted register state is now kept only in uc.uc_mcontext -
+ * there is deliberately no second private copy. A handler is allowed to
+ * edit uc_mcontext, and rt_sigreturn has to honour the edit; keeping a
+ * shadow copy would silently discard it, which is exactly the bug that
+ * would make Wine's exception dispatch a no-op. */
 typedef struct {
-    uint32_t    magic;
-    uint32_t    saved_blocked;
-    registers_t saved;
-    /* siginfo_t's first three fields, which is all a handler that reads
-     * si_signo needs. SA_SIGINFO handlers get a pointer to this. */
-    uint32_t    si_signo, si_errno, si_code;
-    /* Stand-in for ucontext_t. Not populated - a handler that walks it
-     * for the faulting register state gets zeroes, which ROADMAP.md
-     * Milestone 19 says out loud. Present so the third argument is a
-     * readable pointer rather than null. */
-    uint32_t    ucontext[24];
+    uint32_t     magic;
+    k_siginfo_t  info;
+    k_ucontext_t uc;
     /* The trampoline the handler returns through when the program did not
      * supply one. Linux plants its own the same way, and it works for the
      * same reason: 32-bit x86 without PAE has no NX bit, so the user
      * stack is executable. */
-    uint8_t     trampoline[8];
+    uint8_t      trampoline[8];
 } sigframe_t;
 
 #define SIGFRAME_MAGIC 0x5347464Du /* "SGFM" */
@@ -104,6 +137,7 @@ typedef struct {
 
 static int deliver(registers_t* regs, int signo) {
     k_sigaction_t* sa = &actions[signo];
+    siginfo_rec_t* rec = &info_of[signo];
 
     /* Build the frame below the interrupted esp, 16-byte aligned so a
      * handler compiled with SSE in mind finds what it expects. */
@@ -114,13 +148,62 @@ static int deliver(registers_t* regs, int signo) {
     sp -= sizeof(sigframe_t);
     sigframe_t* frame = (sigframe_t*)sp;
     frame->magic = SIGFRAME_MAGIC;
-    frame->saved_blocked = blocked;
-    frame->saved = *regs;
 
-    frame->si_signo = (uint32_t)signo;
-    frame->si_errno = 0;
-    frame->si_code = 0;
-    for (int i = 0; i < 24; i++) frame->ucontext[i] = 0;
+    /* siginfo_t. Zero the whole thing first: the union is 116 bytes and
+     * a handler is entitled to read the member its si_code names, so the
+     * ones this signal does not use must read as zero rather than as
+     * whatever was on the stack. */
+    kmemset(&frame->info, 0, sizeof(frame->info));
+    frame->info.si_signo = signo;
+    frame->info.si_errno = 0;
+    frame->info.si_code  = rec->code;
+    if (signo == SIGSEGV || signo == SIGBUS || signo == SIGFPE ||
+        signo == SIGILL  || signo == SIGTRAP) {
+        frame->info._sifields._sigfault.si_addr = rec->addr;
+    } else if (rec->code == SI_USER || rec->code == SI_TKILL) {
+        frame->info._sifields._kill.si_pid = rec->pid;
+        frame->info._sifields._kill.si_uid = 0;
+    }
+
+    /* ucontext_t. uc_stack describes the alternate signal stack, and
+     * there isn't one: a current Linux reports that as all three fields
+     * zero (ss_flags carries the task's own SS_AUTODISARM-style flags,
+     * not sas_ss_flags(sp), which is what makes it 0 rather than
+     * SS_DISABLE - checked against the host rather than assumed).
+     *
+     * uc_flags stays 0 for the same reason fpstate does: Linux sets
+     * UC_FP_XSTATE there when it has attached extended FP state, and
+     * Novaris attaches none, so 0 and a null fpstate are consistent with
+     * each other. */
+    kmemset(&frame->uc, 0, sizeof(frame->uc));
+    frame->uc.uc_flags = 0;
+    frame->uc.uc_link  = 0;
+    frame->uc.uc_stack.ss_sp    = 0;
+    frame->uc.uc_stack.ss_flags = 0;
+    frame->uc.uc_stack.ss_size  = 0;
+
+    k_sigcontext_t* sc = &frame->uc.uc_mcontext;
+    sc->gs = regs->gs; sc->fs = regs->fs; sc->es = regs->es; sc->ds = regs->ds;
+    sc->edi = regs->edi; sc->esi = regs->esi; sc->ebp = regs->ebp;
+    sc->esp = regs->useresp;   /* the *user* esp, not pusha's kernel one */
+    sc->ebx = regs->ebx; sc->edx = regs->edx; sc->ecx = regs->ecx;
+    sc->eax = regs->eax;
+    /* Not regs->int_no/err_code: on the way out of a syscall or a timer
+     * IRQ those name the syscall gate or the IRQ, and Linux reports the
+     * last *fault* here regardless of what is delivering the signal. */
+    sc->trapno = last_trapno;
+    sc->err    = last_err;
+    sc->eip    = regs->eip;
+    sc->cs     = regs->cs;
+    sc->eflags = regs->eflags;
+    sc->esp_at_signal = regs->useresp;
+    sc->ss     = regs->ss;
+    sc->fpstate = 0;           /* no FP state is saved - see honest scope */
+    sc->oldmask = blocked;
+    sc->cr2     = last_cr2;
+
+    frame->uc.uc_sigmask[0] = blocked;
+    frame->uc.uc_sigmask[1] = 0;
 
     /* mov $173, %eax ; int $0x80  - rt_sigreturn. Only used when the
      * program supplied no restorer of its own; Linux is equally happy to
@@ -142,8 +225,8 @@ static int deliver(registers_t* regs, int signo) {
     /* cdecl arguments, pushed right to left, then the return address.
      * A plain handler reads only the first; an SA_SIGINFO one reads all
      * three, and passing them unconditionally is harmless to the first. */
-    sp -= 4; *(uint32_t*)sp = (uint32_t)&frame->ucontext;
-    sp -= 4; *(uint32_t*)sp = (uint32_t)&frame->si_signo;
+    sp -= 4; *(uint32_t*)sp = (uint32_t)&frame->uc;
+    sp -= 4; *(uint32_t*)sp = (uint32_t)&frame->info;
     sp -= 4; *(uint32_t*)sp = (uint32_t)signo;
     sp -= 4; *(uint32_t*)sp = ret_addr;
 
@@ -213,15 +296,39 @@ void posix_deliver_pending(registers_t* regs) {
 
 int posix_handle_fault_signal(registers_t* regs, uint32_t vector) {
     int signo;
+    int32_t code;
+    uint32_t addr;
+
+    /* cr2 holds the faulting address and is only meaningful for vector 14,
+     * but it has to be read before anything else can fault. */
+    uint32_t cr2;
+    __asm__ __volatile__("mov %%cr2, %0" : "=r"(cr2));
+
     switch (vector) {
-        case 0:  signo = SIGFPE;  break;  /* divide error */
-        case 4:  signo = SIGSEGV; break;  /* overflow */
-        case 5:  signo = SIGSEGV; break;  /* bound range */
-        case 6:  signo = SIGILL;  break;  /* invalid opcode */
-        case 13: signo = SIGSEGV; break;  /* general protection */
-        case 14: signo = SIGSEGV; break;  /* page fault */
+        case 0:  signo = SIGFPE;  code = FPE_INTDIV;  addr = regs->eip; break;
+        case 4:  signo = SIGSEGV; code = SI_KERNEL;   addr = 0; break;
+        case 5:  signo = SIGSEGV; code = SI_KERNEL;   addr = 0; break;
+        case 6:  signo = SIGILL;  code = ILL_ILLOPN;  addr = regs->eip; break;
+        case 13: signo = SIGSEGV; code = SI_KERNEL;   addr = 0; break;
+        case 14:
+            signo = SIGSEGV;
+            addr = cr2;
+            /* err_code bit 0 = the page was present, so the mapping
+             * existed and the *access* was refused; clear means there was
+             * no mapping at all. That is exactly Linux's MAPERR/ACCERR
+             * split, and Wine reads it to tell a guard-page hit from a
+             * genuinely bad pointer. */
+            code = (regs->err_code & 1) ? SEGV_ACCERR : SEGV_MAPERR;
+            break;
         default: return 0;
     }
+
+    /* Recorded whether or not a handler is installed and whether or not
+     * this fault is fatal, because the *next* signal's sigcontext reports
+     * it too - which is what Linux does. */
+    last_trapno = vector;
+    last_err    = regs->err_code;
+    last_cr2    = (vector == 14) ? cr2 : 0;
 
     if (!any_handler) return 0;
     uint32_t h = actions[signo].handler;
@@ -239,17 +346,29 @@ int posix_handle_fault_signal(registers_t* regs, uint32_t vector) {
     }
     if (in_delivery > 8) return 0;
 
+    info_of[signo].code = code;
+    info_of[signo].addr = addr;
+    info_of[signo].pid  = 0;
+
     in_delivery++;
     deliver(regs, signo);
     in_delivery--;
     return 1;
 }
 
+int posix_raise_from(int signo, int32_t code, int32_t pid) {
+    if (signo <= 0 || signo >= NSIG) return -EINVAL;
+    pending |= SIGBIT(signo);
+    info_of[signo].code = code;
+    info_of[signo].addr = 0;
+    info_of[signo].pid  = pid;
+    return 0;
+}
+
 int posix_raise(int signo) {
     if (signo <= 0 || signo >= NSIG) return -EINVAL;
     if (signo == 0) return 0; /* kill(pid, 0) is an existence check */
-    pending |= SIGBIT(signo);
-    return 0;
+    return posix_raise_from(signo, SI_USER, 0);
 }
 
 /* --- the syscalls -------------------------------------------------------- */
@@ -306,18 +425,27 @@ int32_t posix_sys_rt_sigreturn(registers_t* regs) {
         return -EFAULT;
     }
 
-    blocked = frame->saved_blocked;
+    /* The mask comes back from uc_sigmask rather than from a shadow copy,
+     * because a handler is allowed to change it - Linux reloads it from
+     * there too. SIGKILL can never end up blocked whatever was written. */
+    blocked = frame->uc.uc_sigmask[0] & ~UNMASKABLE;
 
-    /* Restore everything except the segment selectors and the fields the
-     * interrupt epilogue owns: putting back a user-supplied cs or ss
-     * would be a privilege-escalation hole, so those keep the values the
-     * kernel already trusts. */
-    registers_t* s = &frame->saved;
+    /* Everything else comes out of uc_mcontext, which is the memory the
+     * handler was given a pointer to and may have edited. That is the
+     * point of Milestone 23: a handler that rewrites gregs[REG_EIP] or
+     * gregs[REG_EAX] and returns gets what it asked for, which is how
+     * Wine turns a SIGSEGV into a Windows exception dispatch.
+     *
+     * The segment selectors and the fields the interrupt epilogue owns
+     * are still *not* taken from the frame: putting back a user-supplied
+     * cs or ss would be a privilege-escalation hole, so those keep the
+     * values the kernel already trusts. */
+    const k_sigcontext_t* s = &frame->uc.uc_mcontext;
     regs->edi = s->edi; regs->esi = s->esi; regs->ebp = s->ebp;
     regs->ebx = s->ebx; regs->edx = s->edx; regs->ecx = s->ecx;
     regs->eax = s->eax;
     regs->eip = s->eip;
-    regs->useresp = s->useresp;
+    regs->useresp = s->esp;
     /* eflags: keep the caller's arithmetic flags but never let it set
      * IOPL, IF or the trap flag from user data. */
     regs->eflags = (s->eflags & 0x00000CD5u) | 0x202u;

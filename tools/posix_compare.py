@@ -44,6 +44,15 @@ TESTS = {
         # baked in. Nothing may differ.
         "expected": [],
     },
+    "uctest.elf": {
+        "start": "ucontext test",
+        "end": "ucontext test done.",
+        # The Milestone 23 test, made through glibc's own headers rather
+        # than through this project's transcription of them: siginfo_t,
+        # ucontext_t and REG_EIP all come from /usr/include. Nothing may
+        # differ.
+        "expected": [],
+    },
     "glibc.elf": {
         "start": "hello from a real glibc-linked program",
         "end": "sorted:",
