@@ -14,6 +14,7 @@
 #include "win32.h"
 #include "kstring.h"
 #include "scheduler.h"
+#include "socket.h"
 #include "task_a.h"
 #include "task_b.h"
 #include "task_c.h"
@@ -552,6 +553,7 @@ static void run_command(char* line) {
         terminal_writestring("  meminfo - physical memory frame usage\n");
         terminal_writestring("  ls [dir] / cat / cp / rm / mkdir - the filesystem,\n");
         terminal_writestring("            writable since Milestone 26\n");
+        terminal_writestring("  sockinfo - Unix socket traffic (Milestone 28)\n");
         terminal_writestring("  futexinfo - futex waiting: how many waits blocked\n");
         terminal_writestring("            rather than spun (Milestone 25)\n");
         terminal_writestring("  threadtest - two threads sharing one address space,\n");
@@ -618,6 +620,14 @@ static void run_command(char* line) {
         print_uint((uint32_t)scheduler_blocked_count());
         terminal_writestring("\n");
         if (line[9]) posix_futex_stats_reset();
+    } else if (streq(line, "sockinfo")) {
+        terminal_writestring("Unix sockets open: ");
+        print_uint(socket_open_count());
+        terminal_writestring(", bytes carried: ");
+        print_uint(socket_bytes_moved());
+        terminal_writestring(", descriptors passed: ");
+        print_uint(socket_fds_passed());
+        terminal_writestring("\n");
     } else if (streq(line, "threadtest")) {
         cmd_threadtest();
     } else if (streq(line, "vmtest")) {

@@ -93,6 +93,15 @@
 #define SYS_pread64        180
 #define SYS_readlink        85
 #define SYS_prctl          172
+#define SYS_socketcall     102
+#define SYS_fork             2
+#define SYS_execve          11
+#define SYS_waitpid_         7
+#define SYS_wait4          114
+#define SYS_dup             41
+#define SYS_dup2            63
+#define SYS_pipe            42
+#define SYS_pipe2          331
 #define SYS_readlinkat     305
 #define SYS_set_robust_list 311
 #define SYS_getrandom      355
@@ -125,6 +134,16 @@
 #define ENOTDIR 20
 #define ENOTEMPTY 39
 #define EXDEV   18
+#define ENOTCONN 107
+#define EPIPE    32
+#define EAFNOSUPPORT 97
+#define EPROTONOSUPPORT 93
+#define EADDRINUSE 98
+#define ECONNREFUSED 111
+#define EISCONN  106
+#define ENOTSOCK 88
+#define ENFILE   23
+#define EMSGSIZE 90
 
 /* --- mmap / mprotect flags, as Linux defines them ----------------------- */
 #define PROT_NONE   0x0
@@ -321,6 +340,26 @@ void posix_process_begin(void);
 /* Records the path the running program was started from, so
  * readlink("/proc/self/exe") can answer. */
 void posix_set_exe_path(const char* path);
+
+/* --- the descriptor table, as the socket layer sees it (Milestone 28) ---
+ *
+ * kernel/socket.c owns sockets and kernel/posix.c owns descriptors, so
+ * these four are the seam between them. `export`/`import` are what
+ * SCM_RIGHTS is made of: a descriptor sent over a socket travels as an
+ * opaque token, because the *number* is the sender's and means nothing at
+ * the other end. */
+struct socket;
+int      posix_fd_install_socket(struct socket* s);
+struct socket* posix_fd_socket(int fd);
+uint32_t posix_fd_export(int fd);
+int      posix_fd_import(uint32_t token);
+
+/* "Do not return from this syscall yet - park the task on `addr` and run
+ * the whole call again when something wakes it." The retry is what makes
+ * this usable by an implementation that cannot resume mid-call, and the
+ * block is what stops it spinning. Milestone 25 built the second half;
+ * this is the first half asking for it. */
+void posix_request_block(uint32_t addr, registers_t* regs);
 void posix_process_end(void);
 
 /* --- signal delivery ----------------------------------------------------
@@ -388,6 +427,7 @@ void posix_thread_exiting(void);
  * being able to suspend a task mid-syscall. Consumed by posix_syscall(),
  * which restores eax, rewinds eip past the `int $0x80`, and yields. */
 int posix_retry_pending(void);
+void posix_request_retry(void);
 
 /* Syscall tracing, for comparing what a program does here against what
  * it does on Linux under strace. Milestone 22 needed it: a dynamic

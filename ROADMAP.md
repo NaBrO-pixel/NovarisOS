@@ -3247,6 +3247,165 @@ host:
       that a display backend "is the obvious one" was wrong only in
       ordering: IPC comes first.
 
+## Milestone 28 — Unix domain sockets ✅ DONE
+
+Milestone 27 ran real Wine as far as `wine --version` and found that what
+stopped it going further was not a missing syscall but a missing
+*subsystem*. Wine is a client/server system: ntdll talks to wineserver
+over a Unix domain socket, and every process, thread, handle and
+synchronisation object lives on the far side of it.
+
+So: `AF_UNIX`, `SOCK_STREAM`, and the one feature that makes it more than
+a pipe — `SCM_RIGHTS`.
+
+### One syscall, eighteen operations
+
+On i386 every socket operation comes through `socketcall` (102): the
+operation number in `ebx`, a pointer to *that operation's* argument block
+in `ecx`. A 1990s space saving that every i386 libc still speaks, and the
+reason a program cannot simply call `socket`.
+
+The shape of a stream socket underneath is two byte queues and a peer
+pointer — what you write goes into the peer's queue, what you read comes
+out of your own. `socketpair`, `bind`/`listen`/`connect`/`accept`,
+`shutdown` and end-of-stream are bookkeeping around that.
+
+**Waiting is real, and it reuses Milestone 25.** A receive with nothing
+to read parks the task and the sender wakes it. Getting there needed one
+new piece: an implementation that cannot resume mid-call needs its whole
+syscall re-executed on wake, and the retry path already rewinds `eip` for
+exactly that — so the two were joined. `scheduler_block_current_retry()`
+parks a task whose frame is already rewound, and waking such a task must
+*not* write a result into `eax`, because `eax` now holds the syscall
+number and overwriting it would send the re-executed `int $0x80` to
+whatever that value happened to name. That is Milestone 20's retry loop
+and Milestone 25's blocking finally being the same mechanism.
+
+### SCM_RIGHTS, which is the point
+
+A descriptor sent over a socket arrives at the other end as a descriptor.
+That is how wineserver hands a client the fd behind a Windows `HANDLE`,
+and a socket layer without it would look complete and be useless for the
+thing it was built for.
+
+What travels is the *object*, not the number — the number is the
+sender's and means nothing at the other end. `kernel/socket.c` owns
+sockets and `kernel/posix.c` owns descriptors, so the seam between them
+is four functions, of which `posix_fd_export`/`posix_fd_import` are the
+whole of SCM_RIGHTS.
+
+### Three error numbers, checked rather than guessed
+
+The first draft of the test got two of these wrong, and the host said so:
+
+- **Connecting to a name nobody bound is `ENOENT`, not `ECONNREFUSED`.**
+  The name is a filesystem path and there is no file. `ECONNREFUSED` is
+  for a name that *is* bound with nobody listening. Wine reads which one
+  it got to decide whether to start a wineserver of its own, so the
+  number matters and not just the failure.
+- **An unknown socket type is `EINVAL`; an unknown protocol is
+  `EPROTONOSUPPORT`.** Linux distinguishes them.
+- And `AF_INET` had to come out of the test entirely: on Linux it
+  succeeds, because Linux has networking. Novaris refuses it, which is
+  correct here and not comparable there.
+
+### Verified
+
+An eighth comparison binary, `userland/sock_test.c` → `socktest.elf`,
+raw `int $0x80` like the rest, working entirely under `/tmp` and cleaning
+up after itself:
+
+```
+$ make test-posix
+ 41 lines, 20 checks  posixtest.elf     60 lines, 45 checks  uctest.elf
+ 93 lines, 67 checks  sigtest.elf       67 lines, 45 checks  fstest.elf
+ 37 lines, 15 checks  pthtest.elf       34 lines, 23 checks  socktest.elf
+  5 lines,  0 checks  glibc.elf          5 lines,  0 checks  dyn.elf
+```
+
+23 checks across socketpair in both directions, end-of-stream after
+`shutdown`, bind/listen/connect/accept with a client that connects before
+the server accepts, passing a file descriptor and reading the file
+through the descriptor that arrived — byte-identical to the Linux host.
+Host tests 38 + 30 + 52, smoke suite 10 assertions.
+
+And real Wine uses it. With sockets present, ntdll's server connection
+attempt now runs:
+
+```
+[trace] socketcall(0x1, ...) = 0x00000003     <- socket(AF_UNIX, SOCK_STREAM)
+[trace] socketcall(0x3, ...) = -2             <- connect(): nothing bound
+[trace] close(0x3, ...)      = 0
+```
+
+which is exactly right: there is no wineserver, so there is nothing to
+connect to, and Wine gets the `ENOENT` it uses to decide to start one.
+
+### The negative controls
+
+- **SCM_RIGHTS accepted and the descriptor dropped** — two checks fail,
+  and precisely the two about the descriptor arriving and being readable.
+- **`connect` returning `ECONNREFUSED` for an unbound name** — one check
+  fails, the one written for it.
+- **The pair made one-directional, i.e. a pipe** — the test *hangs*, at
+  `it carries traffic the other way too`, because the reverse receive
+  blocks for data that can never come. Worth noting for what it proves
+  as well as what it breaks: the blocking receive genuinely blocks rather
+  than spinning or returning something wrong.
+
+### Honest scope
+
+- [x] `AF_UNIX`/`SOCK_STREAM`: `socket`, `socketpair`, `bind`, `listen`,
+      `connect`, `accept`, `accept4`, `send`, `recv`, `sendto`,
+      `recvfrom`, `sendmsg`, `recvmsg`, `shutdown`, `getsockname`,
+      `getpeername`, `setsockopt`, `getsockopt`.
+- [x] `SCM_RIGHTS`, and blocking receives that really block.
+- [x] Sockets are ordinary descriptors: `read`, `write` and `close` work
+      on them, and Wine uses them both ways.
+- [ ] **No `SOCK_DGRAM`**, no `MSG_OOB`, no `SO_PEERCRED`, no
+      `poll`/`select`/`epoll`. A program that multiplexes descriptors
+      rather than blocking on one has nothing to use yet, and Wine's
+      server loop does exactly that — this is the next piece.
+- [ ] **A descriptor passed by SCM_RIGHTS gets its own file offset**,
+      where Linux would have both refer to one open file description and
+      share it. There is no open-file-description layer here to share.
+- [ ] No networking of any kind. `AF_INET` is refused rather than faked.
+- [ ] 32 sockets, 8 bound names, 16 KB per direction, 8 descriptors in
+      flight — all fixed, all small, all deliberate.
+- [ ] A bound name lives in a table, not in the filesystem: nothing shows
+      it in `ls`, and `unlink` will not remove it.
+
+### fork/exec: not built, and why
+
+The other half of what was asked for is **not done**, and it is worth
+being exact about why rather than shipping something that looks like it.
+
+Wine's `start_server()` is `fork()`, then `execve(wineserver)`, then
+`waitpid()`. The fork is not the hard part — the scheduler has run
+multiple tasks in separate address spaces since Milestone 16, and copying
+an address space is mechanical. The hard part is that **Novaris's POSIX
+state is a set of globals**: one descriptor table, one mmap arena, one
+brk, one signal disposition table, one socket table, all file-scope in
+`kernel/posix.c` and its siblings, because until now there has only ever
+been one process at a time.
+
+Two concurrent processes would share all of it and corrupt each other
+immediately — and a `fork` that quietly shared its parent's descriptor
+table would pass a simple test and be wrong in exactly the way this
+project has spent twenty-eight milestones avoiding.
+
+So the real prerequisite is per-process POSIX state, keyed by address
+space so that threads still share it. That is a milestone, not an
+afternoon, and it is the next one:
+
+1. Move the globals into a per-address-space structure.
+2. `fork`: new address space, copy the user mappings, copy the state,
+   spawn a task with the parent's frame and `eax = 0`.
+3. `execve`: replace the current address space with a new image.
+4. `waitpid`, and process exit status.
+
+Nothing above is speculative — each is named by something Wine does.
+
 ## Path A — porting Wine (the current direction)
 
 Milestone 8 laid out two ways to run Windows binaries: port Wine (Path
@@ -3298,7 +3457,10 @@ are forced into an order:
    as far as `wine --version`; the thing that stops it is not a missing
    syscall but a missing *subsystem*, Unix domain sockets, because Wine
    is a client/server system and every handle lives in wineserver. A GDI
-   display backend was the guess; IPC is the answer.
+   display backend was the guess; IPC is the answer. Milestone 28 built
+   the sockets, and real Wine now uses them; what remains before a
+   wineserver can be started is per-process POSIX state, and then
+   fork/exec on top of it.
 
 Each is roughly milestone-sized. (3) and (4) are each comparable in scope
 to everything built so far combined. No Wine or ReactOS source gets
