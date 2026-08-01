@@ -11,6 +11,7 @@
 #include "kstring.h"
 #include "rtc.h"
 #include "pit.h"
+#include "socket.h"
 
 #define PAGE_SIZE 4096u
 /* Must match ELF_STACK_SIZE in kernel/process.c - reported through
@@ -29,6 +30,7 @@ typedef enum {
     FD_FREE = 0,
     FD_CONSOLE,
     FD_FILE,
+    FD_SOCKET,      /* Milestone 28 - see kernel/socket.c */
 } fd_kind_t;
 
 typedef struct {
@@ -38,6 +40,7 @@ typedef struct {
     int         writable;
     int         append;      /* O_APPEND: every write goes to the end */
     uint32_t    dir_index;   /* getdents64's position in a directory */
+    struct socket* sock;     /* FD_SOCKET only */
 } fd_entry_t;
 
 static fd_entry_t fds[MAX_FDS];
@@ -53,6 +56,76 @@ static fd_entry_t* fd_get(int fd) {
     if (fd < 0 || fd >= MAX_FDS) return 0;
     if (fds[fd].kind == FD_FREE) return 0;
     return &fds[fd];
+}
+
+/* --- the seam with kernel/socket.c (Milestone 28) ------------------------
+ *
+ * Sockets are objects the socket layer owns; descriptors are a table this
+ * file owns. These four functions are the whole of the boundary.
+ *
+ * `export`/`import` carry a descriptor over a socket for SCM_RIGHTS. The
+ * token is the index of a saved copy of the entry, because the *number*
+ * is the sender's and means nothing at the other end - what travels is
+ * the object, not the name for it. */
+
+#define MAX_IN_FLIGHT 8
+static fd_entry_t in_flight[MAX_IN_FLIGHT];
+
+/* The trap frame of the call being served. read() on a socket may have to
+ * park the task, and parking means saving the frame - but read()'s
+ * signature is Linux's and has nowhere to put one. */
+static registers_t* cur_regs = 0;
+
+/* An implementation asking to be run again later rather than returning
+ * now. `addr` is what it wants to be woken on. See posix.h. */
+static uint32_t block_addr = 0;
+
+void posix_request_block(uint32_t addr, registers_t* regs) {
+    block_addr = addr;
+    posix_request_retry();
+    (void)regs;
+}
+
+int posix_fd_install_socket(struct socket* s) {
+    int fd = fd_alloc();
+    if (fd < 0) return -EMFILE;
+    fds[fd].kind = FD_SOCKET;
+    fds[fd].sock = s;
+    fds[fd].node = 0;
+    fds[fd].offset = 0;
+    fds[fd].writable = 1;
+    fds[fd].append = 0;
+    fds[fd].dir_index = 0;
+    return fd;
+}
+
+struct socket* posix_fd_socket(int fd) {
+    fd_entry_t* e = fd_get(fd);
+    if (!e || e->kind != FD_SOCKET) return 0;
+    return e->sock;
+}
+
+uint32_t posix_fd_export(int fd) {
+    fd_entry_t* e = fd_get(fd);
+    if (!e) return 0;
+    for (int i = 0; i < MAX_IN_FLIGHT; i++) {
+        if (in_flight[i].kind == FD_FREE) {
+            in_flight[i] = *e;
+            return (uint32_t)(i + 1);   /* 0 means "nothing" */
+        }
+    }
+    return 0;
+}
+
+int posix_fd_import(uint32_t token) {
+    if (!token || token > MAX_IN_FLIGHT) return -EBADF;
+    fd_entry_t* src = &in_flight[token - 1];
+    if (src->kind == FD_FREE) return -EBADF;
+    int fd = fd_alloc();
+    if (fd < 0) return -EMFILE;
+    fds[fd] = *src;
+    src->kind = FD_FREE;
+    return fd;
 }
 
 /* --- the process's address space ----------------------------------------
@@ -115,6 +188,8 @@ void posix_exit_process(void) {
 
 void posix_process_begin(void) {
     posix_signal_reset();
+    socket_process_begin();
+    for (int i = 0; i < MAX_IN_FLIGHT; i++) in_flight[i].kind = FD_FREE;
     for (int i = 0; i < MAX_FDS; i++) fds[i].kind = FD_FREE;
     for (int i = 0; i < 3; i++) {
         fds[i].kind = FD_CONSOLE;
@@ -129,6 +204,7 @@ void posix_process_begin(void) {
 }
 
 void posix_process_end(void) {
+    socket_process_end();
     /* The mappings themselves need no teardown: they were made in the
      * process's own page directory, which is about to be destroyed. Only
      * the bookkeeping is reset, so the next program starts from a clean
@@ -379,8 +455,10 @@ static int32_t sys_close(int fd) {
     fd_entry_t* e = fd_get(fd);
     if (!e) return -EBADF;
     if (fd < 3) return 0; /* closing a standard stream is a no-op here */
+    if (e->kind == FD_SOCKET) socket_close(e->sock);
     e->kind = FD_FREE;
     e->node = 0;
+    e->sock = 0;
     return 0;
 }
 
@@ -407,6 +485,7 @@ static int32_t sys_read(int fd, char* buf, uint32_t count) {
         if (fd != 0) return -EBADF;
         return -ENOSYS;
     }
+    if (e->kind == FD_SOCKET) return socket_read(e->sock, buf, count, cur_regs);
 
     if (e->offset >= e->node->length) return 0; /* EOF */
     uint32_t left = e->node->length - e->offset;
@@ -420,6 +499,7 @@ static int32_t sys_write(int fd, const char* buf, uint32_t count) {
     fd_entry_t* e = fd_get(fd);
     if (!e) return -EBADF;
     if (!buf) return -EFAULT;
+    if (e->kind == FD_SOCKET) return socket_write(e->sock, buf, count);
     if (e->kind != FD_CONSOLE) {
         if (!e->writable) return -EBADF;
         /* O_APPEND is not "seek to the end when you open it" - it is
@@ -747,6 +827,7 @@ static const char* syscall_name(uint32_t n) {
         case SYS_getcwd: return "getcwd";
         case SYS__llseek: return "_llseek";
         case SYS_prctl: return "prctl";
+        case SYS_socketcall: return "socketcall";
         case SYS_unlink: return "unlink";
         case SYS_unlinkat: return "unlinkat";
         case SYS_mkdir: return "mkdir";
@@ -856,6 +937,7 @@ static void trace_exit(int32_t r) {
 }
 
 void posix_syscall(registers_t* regs) {
+    cur_regs = regs;
     uint32_t n = regs->eax;
     uint32_t a = regs->ebx, b = regs->ecx, c = regs->edx;
     uint32_t d = regs->esi, e = regs->edi, f = regs->ebp;
@@ -1071,6 +1153,12 @@ void posix_syscall(registers_t* regs) {
             r = 0;
             break;
         }
+        case SYS_socketcall:
+            /* i386 multiplexes every socket operation through one call:
+             * the operation in ebx, a pointer to its argument block in
+             * ecx. See kernel/socket.c. */
+            r = socket_syscall(a, (uint32_t*)b, regs);
+            break;
         case SYS_prctl:
             /* PR_SET_NAME and friends: accepted and ignored. Wine's
              * preloader sets its process name, and there is nowhere here
@@ -1165,6 +1253,16 @@ void posix_syscall(registers_t* regs) {
         if (trace_on) { terminal_writestring(" = <retry>\n"); }
         regs->eax = n;
         regs->eip -= 2;
+        /* An implementation that named something to wait on gets a real
+         * block rather than a spin: the frame above is already rewound to
+         * re-execute, so the task can simply be parked until whatever it
+         * is waiting for happens. Milestone 25 built the parking; this is
+         * the retry loop finally using it. Waking must not overwrite eax,
+         * which now holds the syscall number - see PROC_BLOCKED's
+         * wait_retry in the scheduler. */
+        uint32_t waiting_on = block_addr;
+        block_addr = 0;
+        if (waiting_on && scheduler_block_current_retry(regs, waiting_on)) return;
         scheduler_yield_from_trap(regs);
         return;
     }

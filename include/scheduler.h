@@ -110,6 +110,9 @@ typedef struct process {
      * the wait expires, or 0 for "no timeout". */
     uint32_t wait_addr;
     uint32_t wait_deadline;
+    /* 1 when this task's frame is rewound to re-run its syscall, so a
+     * wake must leave eax alone. */
+    int      wait_retry;
 } process_t;
 
 /* One-time init: clears the process table. Safe to call once at boot,
@@ -247,6 +250,13 @@ int scheduler_yield_from_trap(registers_t* regs);
  * nothing when there is no one else to give the CPU to. */
 int scheduler_block_current(registers_t* regs, uint32_t wait_addr,
                             uint32_t deadline);
+
+/* The same, for a caller whose trap frame is already rewound to
+ * re-execute the whole syscall (Milestone 28). Waking such a task must
+ * *not* write a result into eax - eax holds the syscall number, and
+ * overwriting it would send the re-executed `int $0x80` to whatever that
+ * value happened to name. */
+int scheduler_block_current_retry(registers_t* regs, uint32_t wait_addr);
 
 /* Wakes up to `max` tasks blocked on `addr`, in table order. Each one's
  * saved trap frame gets `result` in eax, so the syscall it blocked inside

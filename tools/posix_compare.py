@@ -53,6 +53,14 @@ TESTS = {
         # difference here would be a real one.
         "expected": [],
     },
+    "socktest.elf": {
+        "start": "unix socket test",
+        "end": "unix socket test done.",
+        # Milestone 28. Everything is under /tmp and cleaned up. Nothing
+        # may differ - a socket's error numbers are the part programs
+        # actually branch on.
+        "expected": [],
+    },
     "uctest.elf": {
         "start": "ucontext test",
         "end": "ucontext test done.",
