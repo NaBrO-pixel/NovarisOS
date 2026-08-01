@@ -34,6 +34,7 @@ run posixtest.elf
 run sigtest.elf
 run pthtest.elf
 run glibc.elf
+run dyn.elf
 run crashelf.elf
 multitask
 threadtest

@@ -425,6 +425,21 @@ static int handle_user_fault(registers_t* regs) {
     terminal_writestring(") at eip=0x");
     ku32_to_hex(regs->eip, buf, 0, 8);
     terminal_writestring(buf);
+
+    /* For a page fault, which address and what kind - without these the
+     * report says a fault happened and nothing about why, which is most
+     * of the work. err_code bit 0 = the page was present (a protection
+     * violation rather than a missing mapping), bit 1 = it was a write,
+     * bit 2 = from ring 3. */
+    if (regs->int_no == 14) {
+        uint32_t cr2;
+        __asm__ __volatile__("mov %%cr2, %0" : "=r"(cr2));
+        terminal_writestring(" accessing 0x");
+        ku32_to_hex(cr2, buf, 0, 8);
+        terminal_writestring(buf);
+        terminal_writestring(regs->err_code & 2 ? " (write" : " (read");
+        terminal_writestring(regs->err_code & 1 ? ", protection)" : ", not mapped)");
+    }
     terminal_writestring("\n         Terminating it and returning to the shell.\n");
 
     user_active = 0;

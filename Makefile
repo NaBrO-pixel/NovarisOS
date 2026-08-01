@@ -527,7 +527,8 @@ test: $(BUILD_DIR)/test/format_test $(BUILD_DIR)/test/pe_test \
 # See tools/posix_compare.py and ROADMAP.md Milestone 18.
 .PHONY: test-posix
 test-posix: $(ISO) $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf \
-           $(BUILD_DIR)/user/pthtest.elf $(BUILD_DIR)/user/glibc.elf
+           $(BUILD_DIR)/user/pthtest.elf $(BUILD_DIR)/user/glibc.elf \
+           $(BUILD_DIR)/user/dyn.elf
 	python3 tools/posix_compare.py --iso $(ISO) \
 	    --binary $(BUILD_DIR)/user/posixtest.elf --name posixtest.elf
 	python3 tools/posix_compare.py --iso $(ISO) \
@@ -536,6 +537,8 @@ test-posix: $(ISO) $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf
 	    --binary $(BUILD_DIR)/user/pthtest.elf --name pthtest.elf
 	python3 tools/posix_compare.py --iso $(ISO) \
 	    --binary $(BUILD_DIR)/user/glibc.elf --name glibc.elf
+	python3 tools/posix_compare.py --iso $(ISO) \
+	    --binary $(BUILD_DIR)/user/dyn.elf --name dyn.elf
 
 test-qemu: $(ISO)
 	python3 tools/qemu_test.py --iso $(ISO) --script tools/tests/win32_smoke.txt \

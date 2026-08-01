@@ -197,6 +197,21 @@ static int32_t sys_mmap2(uint32_t addr, uint32_t length, int prot,
         return -ENOMEM;
     }
 
+    if (!file_backed) {
+        /* Anonymous memory reads as zero - *always*, including when it
+         * lands on pages that were already mapped. map_range() only zeroes
+         * pages it newly allocates, which is not enough here: a dynamic
+         * linker maps a library's .bss with MAP_FIXED|MAP_ANONYMOUS
+         * directly over pages the file mapping already populated, and
+         * without this those pages keep the file's bytes.
+         *
+         * The symptom was a program that ran perfectly and then faulted on
+         * exit reading a garbage pointer - libc's exit-handler list lives
+         * in .bss, and it held whatever happened to be at that file
+         * offset instead of NULL. */
+        kmemset((void*)base, 0, bytes);
+    }
+
     if (file_backed) {
         fd_entry_t* e = fd_get(fd);
         if (!e || e->kind != FD_FILE) {
@@ -401,24 +416,70 @@ static int32_t sys_lseek(int fd, int32_t offset, int whence) {
 
 /* struct stat64's layout is fixed by the ABI. Only the fields a program
  * actually reads are filled in; the rest stay zero. */
-#define ST_SIZE_OFFSET  44   /* st_size, 64-bit, in i386's struct stat64 */
+/* i386's struct stat64, by byte offset. Only the fields something
+ * actually reads are filled in, but which ones those are is not
+ * obvious - see st_ino below. */
+#define ST_DEV_OFFSET    0   /* st_dev, 64-bit */
+#define ST_INO32_OFFSET 12   /* __st_ino, the 32-bit legacy field */
 #define ST_MODE_OFFSET  16
+#define ST_NLINK_OFFSET 20
+#define ST_SIZE_OFFSET  44   /* st_size, 64-bit */
+#define ST_BLKSIZE_OFFSET 52
+#define ST_BLOCKS_OFFSET  56 /* 64-bit, in 512-byte units */
+#define ST_INO_OFFSET   88   /* st_ino, the real 64-bit field */
 #define S_IFREG 0100000
 #define S_IFCHR 0020000
 
-static int32_t stat_common(uint8_t* st, uint32_t size, uint32_t mode) {
+/* The device every initrd file claims to be on. Any non-zero value does;
+ * it only has to be consistent and not collide with 0. */
+#define NOVARIS_INITRD_DEV 0x0701u
+
+/* `ino` is not decoration, and getting it wrong cost most of Milestone
+ * 22. glibc's _dl_map_object_from_fd, having opened a shared library,
+ * stats it and walks the list of already-loaded objects looking for one
+ * with the same st_ino and st_dev - that is how a library named two
+ * different ways gets loaded once rather than twice. With every file
+ * reporting st_ino = 0, libc.so.6 "matched" an object already in the
+ * list, so the linker closed the file and returned that map instead of
+ * loading libc at all.
+ *
+ * The symptom was nothing like the cause: five copies of "no version
+ * information available", then "undefined symbol: __libc_start_main".
+ * The syscall trace is what found it - the host maps libc with five
+ * mmap2 calls after the stat, and Novaris went straight from stat to
+ * close. */
+static int32_t stat_common(uint8_t* st, uint32_t size, uint32_t mode,
+                           uint32_t ino) {
     if (!st) return -EFAULT;
     kmemset(st, 0, 96);
-    *(uint32_t*)(st + ST_MODE_OFFSET) = mode | 0444;
+    *(uint32_t*)(st + ST_DEV_OFFSET) = NOVARIS_INITRD_DEV;
+    *(uint32_t*)(st + ST_INO32_OFFSET) = ino;
+    *(uint32_t*)(st + ST_MODE_OFFSET) = mode | 0555;
+    *(uint32_t*)(st + ST_NLINK_OFFSET) = 1;
     *(uint64_t*)(st + ST_SIZE_OFFSET) = size;
+    *(uint32_t*)(st + ST_BLKSIZE_OFFSET) = PAGE_SIZE;
+    *(uint64_t*)(st + ST_BLOCKS_OFFSET) = (size + 511u) / 512u;
+    *(uint64_t*)(st + ST_INO_OFFSET) = ino;
     return 0;
+}
+
+/* A stable, unique, non-zero inode per file. The VFS has no inode of its
+ * own, so the node's address stands in: distinct per file, constant for
+ * the life of the mount, and never 0. */
+static uint32_t node_ino(const vfs_node_t* node) {
+    uint32_t v = (uint32_t)node;
+    return v ? v : 1u;
 }
 
 static int32_t sys_fstat64(int fd, uint8_t* st) {
     fd_entry_t* e = fd_get(fd);
     if (!e) return -EBADF;
-    if (e->kind == FD_CONSOLE) return stat_common(st, 0, S_IFCHR);
-    return stat_common(st, e->node->length, S_IFREG);
+    if (e->kind == FD_CONSOLE) {
+        /* The three console descriptors are one character device, and
+         * distinct from every file. */
+        return stat_common(st, 0, S_IFCHR, 1u + (uint32_t)fd);
+    }
+    return stat_common(st, e->node->length, S_IFREG, node_ino(e->node));
 }
 
 static int32_t sys_stat64(const char* path, uint8_t* st) {
@@ -465,11 +526,121 @@ static void report_unimplemented(uint32_t number) {
     terminal_writestring(" -> -ENOSYS\n");
 }
 
+/* --- tracing ------------------------------------------------------------ */
+
+static int trace_on = 0;
+
+void posix_set_trace(int on) { trace_on = on; }
+int posix_trace_enabled(void) { return trace_on; }
+
+static const char* syscall_name(uint32_t n) {
+    switch (n) {
+        case SYS_exit: return "exit";
+        case SYS_read: return "read";
+        case SYS_write: return "write";
+        case SYS_open: return "open";
+        case SYS_close: return "close";
+        case SYS_lseek: return "lseek";
+        case SYS_getpid: return "getpid";
+        case SYS_access: return "access";
+        case SYS_kill: return "kill";
+        case SYS_brk: return "brk";
+        case SYS_ioctl: return "ioctl";
+        case SYS_munmap: return "munmap";
+        case SYS_uname: return "uname";
+        case SYS_mprotect: return "mprotect";
+        case SYS_writev: return "writev";
+        case SYS_pread64: return "pread64";
+        case SYS_rt_sigaction: return "rt_sigaction";
+        case SYS_rt_sigprocmask: return "rt_sigprocmask";
+        case SYS_rt_sigreturn: return "rt_sigreturn";
+        case SYS_mmap2: return "mmap2";
+        case SYS_stat64: return "stat64";
+        case SYS_fstat64: return "fstat64";
+        case SYS_fstatat64: return "fstatat64";
+        case SYS_openat: return "openat";
+        case SYS_faccessat: return "faccessat";
+        case SYS_faccessat2: return "faccessat2";
+        case SYS_readlinkat: return "readlinkat";
+        case SYS_set_thread_area: return "set_thread_area";
+        case SYS_clone: return "clone";
+        case SYS_futex: return "futex";
+        case SYS_gettid: return "gettid";
+        case SYS_exit_group: return "exit_group";
+        case SYS_set_tid_address: return "set_tid_address";
+        case SYS_set_robust_list: return "set_robust_list";
+        case SYS_getrandom: return "getrandom";
+        case SYS_ugetrlimit: return "ugetrlimit";
+        case SYS_statx: return "statx";
+        case SYS_rseq: return "rseq";
+        case SYS_clock_gettime: return "clock_gettime";
+        case SYS_clock_gettime64: return "clock_gettime64";
+        default: return 0;
+    }
+}
+
+static void trace_hex(uint32_t v) {
+    char b[12];
+    ku32_to_hex(v, b, 0, 8);
+    terminal_writestring("0x");
+    terminal_writestring(b);
+}
+
+static void trace_enter(uint32_t n, uint32_t a, uint32_t b, uint32_t c,
+                        uint32_t d, uint32_t e, uint32_t f) {
+    char buf[12];
+    terminal_writestring_color("[trace] ", VGA_COLOR_LIGHT_CYAN);
+    const char* name = syscall_name(n);
+    if (name) {
+        terminal_writestring(name);
+    } else {
+        terminal_writestring("syscall#");
+        ku32_to_dec(n, buf);
+        terminal_writestring(buf);
+    }
+    terminal_writestring("(");
+    trace_hex(a); terminal_writestring(", ");
+    trace_hex(b); terminal_writestring(", ");
+    trace_hex(c); terminal_writestring(", ");
+    trace_hex(d); terminal_writestring(", ");
+    trace_hex(e); terminal_writestring(", ");
+    trace_hex(f);
+    terminal_writestring(")");
+    /* The first argument of the path-taking calls is worth seeing
+     * literally - which library the linker is reaching for is usually the
+     * whole question. */
+    const char* path = 0;
+    if (n == SYS_open || n == SYS_access || n == SYS_stat64) path = (const char*)a;
+    if (n == SYS_openat || n == SYS_faccessat || n == SYS_faccessat2) {
+        path = (const char*)b;
+    }
+    if (path) {
+        terminal_writestring(" \"");
+        terminal_writestring(path);
+        terminal_writestring("\"");
+    }
+}
+
+static void trace_exit(int32_t r) {
+    char buf[12];
+    terminal_writestring(" = ");
+    if (r < 0 && r > -4096) {
+        terminal_writestring("-");
+        ku32_to_dec((uint32_t)(-r), buf);
+        terminal_writestring(buf);
+    } else {
+        trace_hex((uint32_t)r);
+    }
+    terminal_writestring("\n");
+}
+
 void posix_syscall(registers_t* regs) {
     uint32_t n = regs->eax;
     uint32_t a = regs->ebx, b = regs->ecx, c = regs->edx;
     uint32_t d = regs->esi, e = regs->edi, f = regs->ebp;
     int32_t r;
+
+    if (trace_on) trace_enter(n, a, b, c, d, e, f);
 
     switch (n) {
         case SYS_write:    r = sys_write((int)a, (const char*)b, c); break;
@@ -659,6 +830,7 @@ void posix_syscall(registers_t* regs) {
             break;
 
         case SYS_exit:
+            if (trace_on) trace_exit(0);
             /* A thread exiting has to clear the word its creator asked
              * for, or a joiner waits for ever. exit_group takes the whole
              * program with it, so it does not. */
@@ -686,11 +858,13 @@ void posix_syscall(registers_t* regs) {
      * call's result, so the re-executed `int $0x80` would dispatch to
      * whatever that value happened to name. `int $0x80` is two bytes. */
     if (posix_retry_pending()) {
+        if (trace_on) { terminal_writestring(" = <retry>\n"); }
         regs->eax = n;
         regs->eip -= 2;
         scheduler_yield_from_trap(regs);
         return;
     }
 
+    if (trace_on) trace_exit(r);
     regs->eax = (uint32_t)r;
 }

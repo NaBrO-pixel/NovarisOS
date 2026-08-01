@@ -246,6 +246,14 @@ void posix_thread_exiting(void);
  * which restores eax, rewinds eip past the `int $0x80`, and yields. */
 int posix_retry_pending(void);
 
+/* Syscall tracing, for comparing what a program does here against what
+ * it does on Linux under strace. Milestone 22 needed it: a dynamic
+ * linker makes a hundred-odd calls before main(), and reasoning about
+ * which one behaves differently is far harder than reading the two
+ * traces side by side. */
+void posix_set_trace(int on);
+int  posix_trace_enabled(void);
+
 /* How many syscalls this program made that Novaris does not implement,
  * for the same reason the Win32 layer counts missing APIs: a program that
  * quietly got -ENOSYS somewhere is worth telling the user about. */

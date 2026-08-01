@@ -2276,84 +2276,99 @@ left.
       (`CR0.TS`), so every context switch pays 512 bytes of FXSAVE
       whether the task used the FPU or not.
 
-## Milestone 22 — Dynamic loading ⏳ PARTIAL (does not work end to end)
+## Milestone 22 — Dynamic linking ✅ DONE
 
-Item 4 on the Path A list. **This one is not finished, and the honest
-summary is: the kernel's half works and is verified, but a dynamically
-linked program still does not run.** Recording where it stops, and what
-has been ruled out, is worth more than a vaguer claim of progress.
-
-### What works
-
-`ld-linux.so.2` loads, relocates itself, runs, finds `libc.so.6`, and
-maps it correctly. All of the kernel-side machinery that took:
-
-- **ET_DYN images.** A PIE program and the dynamic linker are both
-  position-independent and name no address; the loader now biases every
-  `p_vaddr` by a base of the kernel's choosing (`PIE_BASE 0x56000000`,
-  `INTERP_BASE 0x5A000000`, far apart so a mistake faults instead of one
-  quietly overwriting the other).
-- **`PT_INTERP`.** `process_run_elf()` reads the interpreter path, loads
-  that image too, and enters *it* rather than the program.
-- **`AT_BASE`,** which is how the linker finds itself in order to
-  relocate itself before it can execute anything meaningful.
-- **File-backed `MAP_PRIVATE` `mmap`,** which is essentially all a
-  dynamic linker does. With no page cache a private file mapping
-  degenerates to "allocate pages and read the bytes in", which is
-  behaviourally right: the mapping is a private copy and nothing writes
-  back. `MAP_SHARED` is refused rather than faked.
-- **`openat`, `pread64`, `access`/`faccessat`.** The linker probes with
-  `access()` before it opens, so without it no library is ever found.
-- **`MAP_FIXED` now applies its protection** to pages that are already
-  mapped. This is exactly what a linker does — reserve a library's whole
-  span with one `PROT_NONE` mapping, then map each segment over it — and
-  without the fix every segment kept the reservation's permissions.
-- **Path resolution on the last component.** The initrd is flat, so
-  `/lib/i386-linux-gnu/libc.so.6` and `libc.so.6` name the same file. A
-  simplification, not a filesystem, and the kernel says so.
-
-### Where it stops
+Item 4 on the Path A list. **A dynamically linked glibc program now runs
+on Novaris**, through the real `ld-linux.so.2` loading the real
+`libc.so.6` at runtime — the ordinary way a Linux program is built, and
+the way Wine is built.
 
 ```
 novaris> run dyn.elf
-program: program: no version information available (required by program)
-program: symbol lookup error: program: undefined symbol: __libc_start_main, version GLIBC_2.34
+hello from a real glibc-linked program
+malloc and strcpy work
+42 str 3.14
+strlen=43 strchr=quick brown fox jumps over the lazy dog strrchr=og
+sorted: -7 0 3 42 1000
 ```
 
-The linker gets as far as **symbol versioning** and fails there. (After
-the `MAP_FIXED` protection fix it instead faults inside the linker at
-`0x5a01e3c7`; the fix is right in principle, so it is kept, but it moved
-the failure earlier rather than past.)
+Byte-identical to the same binary on the Linux host.
 
-### What has been ruled out
+### The kernel's half
 
-Each of these was tested directly rather than assumed, which is the
-useful part of an unfinished milestone:
+Worth being clear about how little of dynamic linking is the kernel's
+job. No relocations, no symbol resolution, no `.so` loading — all of that
+is `ld-linux.so.2`'s. The kernel loads two images, hands the interpreter
+a correct auxiliary vector, and gets out of the way:
 
-- **The library is intact in the initrd** — 2,269,948 bytes, the exact
-  host size.
-- **File-backed `mmap` is byte-exact.** A dedicated probe mapped the
-  whole 2.27MB of `libc.so.6` and compared four offsets spread across it
-  (`0`, `0x1000`, `0x100000`, `0x200000`) against the host's bytes. All
-  four match, and `pread64` of the same range agrees with the mapping.
-  So the mapping layer is not the problem.
-- **`AT_PHDR` must be right,** because the linker read the executable's
-  `PT_DYNAMIC` to discover `DT_NEEDED` at all — it would not have known
-  to look for `libc.so.6` otherwise.
-- **No syscall is returning `-ENOSYS`** during the run any more.
+- **ET_DYN images** at a kernel-chosen bias (`PIE_BASE 0x56000000`,
+  `INTERP_BASE 0x5A000000`, far apart so a mistake faults rather than one
+  overwriting the other).
+- **`PT_INTERP`** — read the interpreter path, load that image too, enter
+  *it* rather than the program.
+- **`AT_BASE`**, which the linker uses to relocate itself before it can
+  execute anything meaningful.
+- **File-backed `MAP_PRIVATE` `mmap`.** With no page cache this
+  degenerates to "allocate pages and read the bytes in", which is
+  behaviourally right for a private mapping. `MAP_SHARED` is refused
+  rather than faked.
+- **`openat`, `pread64`, `access`/`faccessat`, `fstatat64`.** The linker
+  probes with `access()` before it opens.
+- **`MAP_FIXED` applies its protection** to pages already mapped — the
+  reserve-then-overlay pattern a linker uses.
+- Initrd paths resolve on their last component, so
+  `/lib/i386-linux-gnu/libc.so.6` and `libc.so.6` name the same file.
 
-The remaining suspects are inside the linker's view of the loaded
-objects: every object in the failing message prints with an empty
-`l_name`, which points at the link map rather than at the mapping.
+### The two bugs, and how each was found
 
-### Not a regression
+Neither was findable by reading code, and the tools that found them are
+the durable part of this milestone.
 
-Everything that worked before still does: the 25-case smoke suite passes,
-all four host-vs-Novaris transcript comparisons pass (including the
-**static** glibc binary, which is unaffected), and host tests are
-38 + 30 + 52 with no failures. `dyn.elf` is deliberately *not* in the
-smoke script - a test that is known to fail does not belong in a suite
-whose value is that it is green.
+**`st_ino` was 0 for every file.** The linker opened `libc.so.6`, read
+its header, stat'ed it — and closed it without mapping anything. glibc's
+`_dl_map_object_from_fd`, having opened a library, walks the list of
+already-loaded objects looking for one with the same `st_ino` and
+`st_dev`; that is how a library named two different ways gets loaded
+once. With every file reporting inode 0, `libc.so.6` "matched" an object
+already in the list, so the linker closed the file and returned *that*
+map instead.
+
+The symptom was nothing like the cause — five copies of `no version
+information available`, then `undefined symbol: __libc_start_main`. What
+found it was a **syscall tracer** (`strace <program>` in the shell, new
+in this milestone) run against the host's `strace` of the same binary:
+the host maps libc with five `mmap2` calls after the stat, and Novaris
+went straight from stat to `close`. Files now report a stable, unique,
+non-zero inode.
+
+**Anonymous `MAP_FIXED` did not zero pages that were already mapped.**
+With libc loading, the program ran perfectly and then faulted on exit
+reading a garbage pointer. A dynamic linker maps a library's `.bss` with
+`MAP_FIXED|MAP_ANONYMOUS` directly over pages the file mapping already
+populated — and `map_range()` only zeroed pages it newly allocated, so
+those kept the file's bytes. libc's exit-handler list lives in `.bss`, so
+it held whatever happened to be at that file offset instead of NULL.
+
+What found it was making the fault report say which address and what
+kind: `accessing 0x444c05a4 (read, not mapped)` rather than just "a fault
+happened". Anonymous memory now reads as zero unconditionally.
+
+### Verified
+
+`dyn.elf` joins the transcript comparison — five binaries now run on both
+the Linux host and Novaris with their output diffed:
+
+```
+$ make test-posix
+41 lines compared, 20 checks, 0 failing, 0 unexpected difference(s)  posixtest.elf
+29 lines compared, 17 checks, 0 failing, 0 unexpected difference(s)  sigtest.elf
+26 lines compared,  8 checks, 0 failing, 0 unexpected difference(s)  pthtest.elf
+ 5 lines compared,  0 checks, 0 failing, 0 unexpected difference(s)  glibc.elf
+ 5 lines compared,  0 checks, 0 failing, 0 unexpected difference(s)  dyn.elf
+```
+
+26-case smoke suite passes. `dyn.elf` costs 52 frames on its first run
+and **zero** on every run after. Host tests 38 + 30 + 52, no failures.
 
 `ld-linux.so.2` and `libc.so.6` are copied from the host toolchain by the
 Makefile rather than committed: they are build inputs, like mingw-w64's
@@ -2361,11 +2376,23 @@ import libraries, and vendoring megabytes of LGPL glibc into a hobby
 kernel's source tree would be bloat and a licensing question nobody
 needs.
 
-### Next
+### Honest scope
 
-The failure is specific enough to pick up cold: find why the linker's
-link map entries come out unnamed and without version information, given
-that the bytes underneath them are provably correct.
+- [x] A dynamically linked program runs, through the real interpreter and
+      the real shared C library.
+- [ ] **One shared library deep.** `dyn.elf` needs only `libc.so.6`.
+      Nothing has exercised a library that itself pulls in others, or
+      `dlopen`.
+- [ ] No `/etc/ld.so.cache`, so every lookup is a path search. Harmless
+      here; slow with many libraries.
+- [ ] The initrd is flat, so path resolution matches on the last
+      component only. Two files with the same basename in different
+      directories could not be told apart.
+- [ ] No `PT_GNU_RELRO` enforcement by the kernel - the linker's own
+      `mprotect` does it, which is where it belongs, but nothing checks.
+- [ ] `st_ino` is the VFS node's address. Unique and stable for a mount,
+      and not meaningful across boots.
+- [ ] Still no writable filesystem, so `open` for writing is `-EROFS`.
 
 ## Path A — porting Wine (the current direction)
 
@@ -2401,11 +2428,11 @@ are forced into an order:
    TLS — enough for what pthreads is made of. Still to do: `ucontext_t`,
    blocking (rather than retrying) futexes, file-backed `mmap`, and a
    writable filesystem.
-4. **A dynamic linker** — ⏳ in progress. Milestone 22 built the kernel's
-   half: ET_DYN images, `PT_INTERP`, `AT_BASE`, file-backed `mmap`,
-   `openat`/`pread64`/`access`. `ld-linux.so.2` runs and maps `libc.so.6`
-   correctly, but symbol resolution does not complete, so a dynamically
-   linked program still does not run.
+4. **A dynamic linker** — ✅ done in Milestone 22. `ld-linux.so.2` loads
+   `libc.so.6` at runtime and a dynamically linked glibc program runs,
+   with output identical to Linux. The kernel's half is ET_DYN images,
+   `PT_INTERP`, `AT_BASE`, file-backed `mmap` and the file syscalls; the
+   linking itself is the interpreter's job.
 5. **Pull in real Wine source**, cross-compile it against that surface,
    and find out what is still missing. Expect that to surface more gaps;
    a display backend for GDI is the obvious one.
