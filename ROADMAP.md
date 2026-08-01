@@ -2135,6 +2135,147 @@ threads and all), and host tests are 38 + 30 + 52 with no failures.
 - [ ] `gettid` returns the scheduler PID, and `getpid` is still a
       constant, so they disagree in a way real code could notice.
 
+## Milestone 21 — A real glibc program runs ✅ DONE
+
+Milestones 18–20 were verified with freestanding binaries: raw
+`int $0x80`, no library, nothing between the program and the kernel. That
+proves the ABI is right, and it quietly avoids the question of whether a
+*real* program works — because a freestanding test only exercises what it
+was written to exercise.
+
+So this milestone asked the harder question directly: take an ordinary
+`gcc -m32 -static` binary, linked against the host's production glibc,
+and run it. Hundreds of kilobytes of C library that has never heard of
+Novaris — its startup code, its allocator, its SSE2 string functions, its
+printf, its float formatting.
+
+It works now. Every obstacle below was **found by running it**, not
+predicted from a list.
+
+### Obstacle 1: no initial process stack
+
+It faulted on the *second instruction* of `_start`:
+
+```
+xor %ebp, %ebp
+pop %esi          <- argc, and the first instruction to touch the stack
+```
+
+The System V i386 ABI says a program is entered with `esp` pointing at
+`argc`, then `argv`, a NULL, `envp`, a NULL, and the auxiliary vector.
+Novaris had never built any of it, and had got away with it because every
+ELF program in the tree was freestanding and never looked. The esp handed
+over was the top of the mapping, with nothing at it.
+
+`build_initial_stack()` in `process.c` now lays out the whole thing,
+including the auxv entries glibc actually reads: `AT_PHDR`/`AT_PHENT`/
+`AT_PHNUM` (how it finds its own program headers, and thence `PT_TLS`),
+`AT_PAGESZ`, `AT_ENTRY`, `AT_CLKTCK`, `AT_SECURE`, and `AT_RANDOM` — the
+sixteen bytes glibc reads to seed its stack guard and pointer mangling.
+
+### Obstacle 2: SSE was never enabled
+
+Next it hit an invalid opcode at `__strrchr_sse2_bsf`:
+
+```
+movd 0x8(%esp),%xmm1
+```
+
+glibc's string functions are SSE2. With `CR4.OSFXSR` clear, every one of
+them is an illegal instruction. Novaris had ignored the FPU for twenty
+milestones because the kernel never used it and one program at a time
+meant nobody's state could be clobbered.
+
+Enabling it (`CR0.MP` set, `CR0.EM` clear, `CR4.OSFXSR|OSXMMEXCPT`) is
+three lines. The consequence is not: **once SSE is on, the XMM registers
+are live state that preemption can corrupt**, and Novaris has had
+preemptive threads since Milestone 16. Two threads inside glibc's `memcpy`
+would quietly destroy each other's registers. So `kernel/fpu.c` also gives
+every task a 16-byte-aligned 512-byte `FXSAVE` area, saved and restored in
+`switch_to()` — enabling SSE and saving its state are one job, not two.
+
+### Obstacle 3: eight missing syscalls
+
+Read straight off the kernel's own `-ENOSYS` reports, rather than guessed:
+`ugetrlimit`, `getrandom`, `clock_gettime`, `clock_gettime64`,
+`set_robust_list`, `rseq`, `readlinkat`, `statx`, `fstatat64`. Most are
+now implemented; `rseq` and `statx` are answered with `-ENOSYS`
+deliberately, because glibc treats both as optional and falls back
+cleanly — which is a different thing from not knowing about them.
+
+### A real bug the probe exposed
+
+Running a program that faults early revealed that Milestone 20 had broken
+the fault path. Moving ELF programs onto the scheduler left
+`handle_user_fault()` unwinding through `process_exit_to_kernel()`, whose
+`kernel_resume_esp` by then held a stale value from whatever last used the
+blocking path — so a faulting ELF program printed its diagnostic and then
+**panicked the kernel**.
+
+Nothing in the suite caught it, because no ELF test program had ever
+faulted. `userland/crash_test.c` now does, and the fix routes through
+`posix_exit_process()`, which picks the right unwind for how the program
+was started.
+
+The same probe also found that `elf_load()` mapped a fresh frame for a
+page a previous segment had already populated, silently discarding the
+earlier segment's bytes. Harmless for two-segment binaries; wrong for
+anything with a `GNU_RELRO` tail, which is every real one.
+
+### Verified
+
+`glibc.elf` joins the transcript comparison, and it is the strictest of
+the four — **nothing at all may differ**:
+
+```
+$ make test-posix
+41 lines compared, 20 checks, 0 failing, 0 unexpected difference(s)
+PASS: posixtest.elf behaves identically on Linux and Novaris
+29 lines compared, 17 checks, 0 failing, 0 unexpected difference(s)
+PASS: sigtest.elf behaves identically on Linux and Novaris
+26 lines compared,  8 checks, 0 failing, 0 unexpected difference(s)
+PASS: pthtest.elf behaves identically on Linux and Novaris
+ 5 lines compared,  0 checks, 0 failing, 0 unexpected difference(s)
+PASS: glibc.elf behaves identically on Linux and Novaris
+```
+
+```
+novaris> run glibc.elf
+hello from a real glibc-linked program
+malloc and strcpy work
+42 str 3.14
+strlen=43 strchr=quick brown fox jumps over the lazy dog strrchr=og
+sorted: -7 0 3 42 1000
+```
+
+That is glibc's allocator on Novaris's `brk`/`mmap`, glibc's `printf` and
+float formatting on the x87 unit, glibc's SSE2 `strchr`/`strrchr`, and
+glibc's `qsort` calling back into the program — with no `-ENOSYS` report
+left.
+
+25-case smoke suite passes. The first `glibc.elf` run costs 173 frames
+(it is a 707KB image), and every run after it costs **zero**. Host tests
+38 + 30 + 52, no failures.
+
+### Honest scope — and what this does *not* mean
+
+- [x] A statically linked, real-glibc C program runs correctly.
+- [ ] **Static only.** There is still no dynamic linker, so a normally
+      linked binary — anything needing `ld-linux.so.2` — does not run.
+      That is item 4 on the Path A list and is untouched.
+- [ ] `AT_BASE` is 0 and `PT_INTERP` is ignored, because there is no
+      interpreter to load.
+- [ ] No environment: `envp` is an empty vector, so `getenv` returns NULL
+      for everything.
+- [ ] `argv` is one entry, the literal string `"program"` — the shell does
+      not pass a command line through to ELF programs yet.
+- [ ] `getrandom` and `AT_RANDOM` are seeded from the PIT tick. They are
+      *different* per run and nowhere near unguessable, which matters
+      because glibc seeds pointer mangling from them.
+- [ ] FPU state is saved per task, but there is no lazy switching
+      (`CR0.TS`), so every context switch pays 512 bytes of FXSAVE
+      whether the task used the FPU or not.
+
 ## Path A — porting Wine (the current direction)
 
 Milestone 8 laid out two ways to run Windows binaries: port Wine (Path

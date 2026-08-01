@@ -72,6 +72,14 @@
 #define SYS_clone          120
 #define SYS_futex          240
 #define SYS_set_tid_address 258
+#define SYS_ugetrlimit     191
+#define SYS_fstatat64      300
+#define SYS_readlinkat     305
+#define SYS_set_robust_list 311
+#define SYS_getrandom      355
+#define SYS_statx          383
+#define SYS_rseq           386
+#define SYS_clock_gettime64 403
 #define SYS_clock_gettime  265
 
 /* --- errno values, negated on return ------------------------------------ */
@@ -89,6 +97,8 @@
 #define EROFS   30
 #define ENOSYS  38
 #define EAGAIN  11
+#define ERANGE  34
+#define EOPNOTSUPP 95
 
 /* --- mmap / mprotect flags, as Linux defines them ----------------------- */
 #define PROT_NONE   0x0

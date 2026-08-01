@@ -36,6 +36,7 @@
 #include "kheap.h"
 #include "gdt.h"
 #include "console.h"
+#include "fpu.h"
 
 #define MAX_PROCESSES 8
 /* 8KB, not 4KB. Milestone 17 runs Win32 programs as scheduler tasks, and
@@ -124,6 +125,14 @@ static int spawn_common(const char* name, uint32_t entry, uint32_t load_vaddr,
     if (!kstack_base) return -1;
     uint32_t kstack_top = (uint32_t)kstack_base + PROC_KSTACK_SIZE;
 
+    /* FXSAVE needs 16-byte alignment, which kmalloc does not promise, so
+     * over-allocate and align by hand. The unaligned base is what gets
+     * freed. */
+    uint8_t* fpu_raw = (uint8_t*)kmalloc(sizeof(fpu_state_t) + 16);
+    if (!fpu_raw) { kfree(kstack_base); return -1; }
+    fpu_state_t* fpu = (fpu_state_t*)(((uint32_t)fpu_raw + 15u) & ~15u);
+    fpu_state_init(fpu);
+
     /* Build the synthetic initial trap frame - see the file-level
      * comment for why this makes a never-run process look, to the
      * switch code, just like one that was preempted mid-flight. */
@@ -158,6 +167,8 @@ static int spawn_common(const char* name, uint32_t entry, uint32_t load_vaddr,
     copy_name(p, name);
     p->esp = (uint32_t)frame;
     p->kernel_stack_base = (uint32_t)kstack_base;
+    p->fpu_base = (uint32_t)fpu_raw;
+    p->fpu = fpu;
     p->kernel_stack_top = kstack_top;
     p->load_vaddr = load_vaddr;
     p->load_pages = load_pages;
@@ -368,6 +379,12 @@ void scheduler_tick(registers_t* regs) {
  * optimisation - it is what makes switching between two threads of one
  * process cheap, since a CR3 write flushes the whole TLB. */
 static void switch_to(process_t* next) {
+    /* x87 and SSE are per-thread state exactly as the general registers
+     * are, and unlike them the interrupt stub does not touch them - so
+     * they are saved and restored here or not at all. */
+    if (current && current->fpu) fpu_save(current->fpu);
+    if (next->fpu) fpu_restore(next->fpu);
+
     if (next->page_directory != current->page_directory) {
         paging_switch_address_space(next->page_directory);
     }
@@ -416,6 +433,7 @@ static void reap_all(void) {
         }
         if (p->owns_stack) free_user_page(p->stack_top - PAGE_SIZE);
         kfree((void*)p->kernel_stack_base);
+        kfree((void*)p->fpu_base);
     }
 
     paging_switch_address_space(caller_as);
@@ -523,6 +541,7 @@ void scheduler_run_until_idle(void) {
     current = &process_table[0];
     current->state = PROC_RUNNING;
     gdt_set_kernel_stack(current->kernel_stack_top);
+    if (current->fpu) fpu_restore(current->fpu);
     /* The first task is entered directly rather than through switch_to(),
      * so its address space has to be loaded by hand here. */
     paging_switch_address_space(current->page_directory);

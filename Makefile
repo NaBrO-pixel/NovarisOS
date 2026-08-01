@@ -37,7 +37,7 @@ OBJS = $(BUILD_DIR)/boot.o $(BUILD_DIR)/kernel.o \
        $(BUILD_DIR)/pit.o $(BUILD_DIR)/keyboard.o $(BUILD_DIR)/shell.o \
        $(BUILD_DIR)/serial.o \
        $(BUILD_DIR)/pmm.o $(BUILD_DIR)/paging.o $(BUILD_DIR)/kheap.o \
-       $(BUILD_DIR)/syscall.o $(BUILD_DIR)/posix.o $(BUILD_DIR)/posix_signal.o $(BUILD_DIR)/posix_thread.o \
+       $(BUILD_DIR)/syscall.o $(BUILD_DIR)/fpu.o $(BUILD_DIR)/posix.o $(BUILD_DIR)/posix_signal.o $(BUILD_DIR)/posix_thread.o \
        $(BUILD_DIR)/process.o $(BUILD_DIR)/process_asm.o \
        $(BUILD_DIR)/user_hello_blob.o $(BUILD_DIR)/vfs.o $(BUILD_DIR)/initrd.o \
        $(BUILD_DIR)/elf.o $(BUILD_DIR)/pe.o $(BUILD_DIR)/kstring.o \
@@ -124,6 +124,9 @@ $(BUILD_DIR)/syscall.o: kernel/syscall.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/posix.o: kernel/posix.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fpu.o: kernel/fpu.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/posix_signal.o: kernel/posix_signal.c $(HEADERS) | $(BUILD_DIR)
@@ -283,6 +286,19 @@ $(BUILD_DIR)/user/posixtest.elf: userland/posix_test.c | $(BUILD_DIR)
 	$(CC) -m32 -static -nostdlib -ffreestanding -fno-builtin -O2 -Wall \
 	    -o $@ $<
 
+# The only test here built against a real C library rather than
+# freestanding: plain `gcc -m32 -static`, so what runs on Novaris is
+# hundreds of KB of production glibc that has never heard of it. See
+# ROADMAP.md Milestone 21.
+$(BUILD_DIR)/user/glibc.elf: userland/glibc_hello.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(CC) -m32 -static -O2 -o $@ $<
+
+$(BUILD_DIR)/user/crashelf.elf: userland/crash_test.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(CC) -m32 -static -nostdlib -ffreestanding -fno-builtin -O2 -Wall \
+	    -o $@ $<
+
 $(BUILD_DIR)/user/pthtest.elf: userland/thread_posix_test.c | $(BUILD_DIR)
 	mkdir -p $(BUILD_DIR)/user
 	$(CC) -m32 -static -nostdlib -ffreestanding -fno-builtin -O2 -Wall \
@@ -380,7 +396,8 @@ $(BUILD_DIR)/user/hello64.exe: userland/pe_test/x64_marker.c | $(BUILD_DIR)
 # userland/initrd_files/ plus the compiled demo programs.
 $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
         $(BUILD_DIR)/user/hello_elf.elf $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf \
-        $(BUILD_DIR)/user/pthtest.elf \
+        $(BUILD_DIR)/user/pthtest.elf $(BUILD_DIR)/user/crashelf.elf \
+        $(BUILD_DIR)/user/glibc.elf \
         $(BUILD_DIR)/user/hello_pe.exe \
         $(BUILD_DIR)/user/hellowin.exe $(BUILD_DIR)/user/winapi.exe \
         $(BUILD_DIR)/user/cppinit.exe $(BUILD_DIR)/user/guiapp.exe \
@@ -394,6 +411,8 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
 	cp $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/initrd_staging/posixtest.elf
 	cp $(BUILD_DIR)/user/sigtest.elf $(BUILD_DIR)/initrd_staging/sigtest.elf
 	cp $(BUILD_DIR)/user/pthtest.elf $(BUILD_DIR)/initrd_staging/pthtest.elf
+	cp $(BUILD_DIR)/user/crashelf.elf $(BUILD_DIR)/initrd_staging/crashelf.elf
+	cp $(BUILD_DIR)/user/glibc.elf $(BUILD_DIR)/initrd_staging/glibc.elf
 	cp $(BUILD_DIR)/user/hello_pe.exe $(BUILD_DIR)/initrd_staging/hellope.exe
 	cp $(BUILD_DIR)/user/hellowin.exe $(BUILD_DIR)/initrd_staging/hellowin.exe
 	cp $(BUILD_DIR)/user/winapi.exe $(BUILD_DIR)/initrd_staging/winapi.exe
@@ -483,13 +502,15 @@ test: $(BUILD_DIR)/test/format_test $(BUILD_DIR)/test/pe_test \
 # See tools/posix_compare.py and ROADMAP.md Milestone 18.
 .PHONY: test-posix
 test-posix: $(ISO) $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf \
-           $(BUILD_DIR)/user/pthtest.elf
+           $(BUILD_DIR)/user/pthtest.elf $(BUILD_DIR)/user/glibc.elf
 	python3 tools/posix_compare.py --iso $(ISO) \
 	    --binary $(BUILD_DIR)/user/posixtest.elf --name posixtest.elf
 	python3 tools/posix_compare.py --iso $(ISO) \
 	    --binary $(BUILD_DIR)/user/sigtest.elf --name sigtest.elf
 	python3 tools/posix_compare.py --iso $(ISO) \
 	    --binary $(BUILD_DIR)/user/pthtest.elf --name pthtest.elf
+	python3 tools/posix_compare.py --iso $(ISO) \
+	    --binary $(BUILD_DIR)/user/glibc.elf --name glibc.elf
 
 test-qemu: $(ISO)
 	python3 tools/qemu_test.py --iso $(ISO) --script tools/tests/win32_smoke.txt \

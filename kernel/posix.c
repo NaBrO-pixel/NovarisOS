@@ -13,6 +13,9 @@
 #include "pit.h"
 
 #define PAGE_SIZE 4096u
+/* Must match ELF_STACK_SIZE in kernel/process.c - reported through
+ * ugetrlimit(RLIMIT_STACK), which glibc uses to size its guard pages. */
+#define ELF_STACK_BYTES (16u * PAGE_SIZE)
 
 /* --- file descriptors ---------------------------------------------------
  *
@@ -434,6 +437,88 @@ void posix_syscall(registers_t* regs) {
         case SYS_getgid32: case SYS_getegid32: r = 0; break;
 
         case SYS_uname:    r = sys_uname((uint8_t*)a); break;
+
+        /* --- what a real glibc asks for on the way to main() ------------
+         * Every one of these was found by running an actual
+         * glibc-linked binary and reading the -ENOSYS reports it
+         * provoked, rather than guessed at from a list. */
+
+        case SYS_ugetrlimit: {
+            /* struct rlimit { rlim_cur, rlim_max }. glibc reads RLIMIT_STACK
+             * (resource 3) to size its own guard pages. */
+            uint32_t* lim = (uint32_t*)b;
+            if (!lim) { r = -EFAULT; break; }
+            lim[0] = (a == 3) ? ELF_STACK_BYTES : 0xFFFFFFFFu;
+            lim[1] = lim[0];
+            r = 0;
+            break;
+        }
+
+        case SYS_getrandom: {
+            /* Not cryptographic - the PIT tick is the only entropy here -
+             * and saying so matters, because glibc seeds pointer mangling
+             * from it. Enough to be *different* per call, not enough to be
+             * unguessable. */
+            uint8_t* buf = (uint8_t*)a;
+            if (!buf) { r = -EFAULT; break; }
+            static uint32_t seed = 0;
+            if (!seed) seed = pit_get_ticks() | 1u;
+            for (uint32_t i = 0; i < b; i++) {
+                seed = seed * 1103515245u + 12345u;
+                buf[i] = (uint8_t)(seed >> 16);
+            }
+            r = (int32_t)b;
+            break;
+        }
+
+        case SYS_clock_gettime: {
+            /* struct timespec { tv_sec, tv_nsec }, 100Hz resolution. */
+            uint32_t* ts = (uint32_t*)b;
+            if (!ts) { r = -EFAULT; break; }
+            uint32_t ticks = pit_get_ticks();
+            ts[0] = rtc_unix_time();
+            ts[1] = (ticks % 100u) * 10000000u;
+            r = 0;
+            break;
+        }
+
+        case SYS_clock_gettime64: {
+            /* Same, with a 64-bit tv_sec - what a 32-bit glibc built past
+             * the 2038 transition calls first. */
+            uint32_t* ts = (uint32_t*)b;
+            if (!ts) { r = -EFAULT; break; }
+            uint32_t ticks = pit_get_ticks();
+            ts[0] = rtc_unix_time();
+            ts[1] = 0;
+            ts[2] = (ticks % 100u) * 10000000u;
+            ts[3] = 0;
+            r = 0;
+            break;
+        }
+
+        /* Accepted and ignored: robust-futex bookkeeping for a process
+         * that never dies holding one, and restartable sequences, which
+         * glibc treats as optional and falls back from cleanly. */
+        case SYS_set_robust_list: r = 0; break;
+        case SYS_rseq:            r = -ENOSYS; break;
+
+        /* Genuinely absent, and answered rather than reported: there are
+         * no symlinks and no statx, and glibc falls back to fstat64. */
+        case SYS_fstatat64:
+            /* (dirfd, path, statbuf, flags). AT_EMPTY_PATH (0x1000) means
+             * "stat the descriptor itself", which is how glibc's fstat is
+             * routed on a kernel new enough to have this; otherwise the
+             * path is relative to a directory, and the initrd is flat so
+             * there is only one. */
+            if (d & 0x1000u) {
+                r = sys_fstat64((int)a, (uint8_t*)c);
+            } else {
+                r = sys_stat64((const char*)b, (uint8_t*)c);
+            }
+            break;
+
+        case SYS_readlinkat: r = -EINVAL; break;
+        case SYS_statx:      r = -ENOSYS; break;
         case SYS_time:     r = (int32_t)rtc_unix_time(); break;
         case SYS_nanosleep: r = sys_nanosleep((const uint32_t*)a); break;
 

@@ -36,6 +36,11 @@ TESTS = {
         # Novaris rather than from a stale host run.
         "expected": [("sysname = Linux", "sysname = Novaris")],
     },
+    "glibc.elf": {
+        "start": "hello from a real glibc-linked program",
+        "end": "sorted:",
+        "expected": [],   # a real C library, and nothing may differ
+    },
     "pthtest.elf": {
         "start": "posix thread test",
         "end": "posix thread test done.",
