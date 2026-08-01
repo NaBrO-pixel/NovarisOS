@@ -209,6 +209,31 @@ typedef struct {
     uint32_t cr2;          /* the faulting address, for a page fault */
 } k_sigcontext_t;          /* 88 bytes; mcontext_t is exactly this */
 
+/* struct _fpstate - the x87/SSE state a signal handler is shown, pointed
+ * at by sigcontext.fpstate (Milestone 24).
+ *
+ * The layout has a history in it. The first 112 bytes are the *legacy*
+ * i387 environment: a 386's worth of control/status/tag words and eight
+ * 10-byte x87 registers, which is also exactly Windows' FLOATING_SAVE_AREA
+ * - Wine casts this pointer straight to one. Everything from offset 112
+ * on is simply the 512-byte FXSAVE image, unaltered, which is where the
+ * XMM registers and MXCSR live. Linux writes both halves and so does
+ * Novaris; a handler reading either finds what it expects.
+ *
+ * `magic` is how a program knows whether the FXSAVE half is there at all:
+ * 0xffff means legacy x87 only, 0 (X86_FXSR_MAGIC) means the image
+ * follows. Wine tests it as `fpstate->status >> 16`, reading status and
+ * magic as one 32-bit word, which is why they are adjacent 16-bit fields
+ * and not two ints. */
+#define X86_FXSR_MAGIC 0x0000
+
+typedef struct {
+    uint32_t cw, sw, tag, ipoff, cssel, dataoff, datasel;  /* 0   .. 27 */
+    uint8_t  st[8][10];                                    /* 28  .. 107 */
+    uint16_t status, magic;                                /* 108 .. 111 */
+    uint8_t  fxsave[512];                                  /* 112 .. 623 */
+} __attribute__((aligned(16))) k_fpstate_t;                /* 624 bytes */
+
 typedef struct {
     uint32_t ss_sp;
     int32_t  ss_flags;
