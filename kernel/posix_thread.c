@@ -66,6 +66,8 @@ typedef struct {
  * later; consumed by posix_syscall(). See posix_retry_pending(). */
 static int retry_wanted = 0;
 
+void posix_request_retry(void) { retry_wanted = 1; }
+
 int posix_retry_pending(void) {
     int r = retry_wanted;
     retry_wanted = 0;

@@ -184,6 +184,7 @@ static int spawn_common(const char* name, uint32_t entry, uint32_t load_vaddr,
     p->clear_child_tid = 0;
     p->wait_addr = 0;
     p->wait_deadline = 0;
+    p->wait_retry = 0;
     p->state = PROC_READY;
     return p->pid;
 }
@@ -531,9 +532,10 @@ int scheduler_task_alive(int pid) {
  * there *is* writing the syscall's return value - the same frame the
  * isr epilogue will iret from when the task next runs. */
 static void wake_one(process_t* p, int32_t result) {
-    ((registers_t*)p->esp)->eax = (uint32_t)result;
+    if (!p->wait_retry) ((registers_t*)p->esp)->eax = (uint32_t)result;
     p->wait_addr = 0;
     p->wait_deadline = 0;
+    p->wait_retry = 0;
     p->state = PROC_READY;
 }
 
@@ -561,9 +563,16 @@ int scheduler_block_current(registers_t* regs, uint32_t wait_addr,
     current->esp = (uint32_t)regs;
     current->wait_addr = wait_addr;
     current->wait_deadline = deadline;
+    current->wait_retry = 0;
     current->state = PROC_BLOCKED;
     tick_countdown = SCHED_TICKS_PER_SLICE;
     switch_to(next);
+    return 1;
+}
+
+int scheduler_block_current_retry(registers_t* regs, uint32_t wait_addr) {
+    if (!scheduler_block_current(regs, wait_addr, 0)) return 0;
+    current->wait_retry = 1;
     return 1;
 }
 
