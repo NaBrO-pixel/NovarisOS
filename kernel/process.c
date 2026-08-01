@@ -215,17 +215,35 @@ uint8_t* process_read_file(const char* path, uint32_t* out_size) {
 #define AT_RANDOM 25
 #define AT_EXECFN 31
 
-static uint32_t build_initial_stack(uint32_t stack_top, const char* name,
+/* argv is real since Milestone 27, and it had to become real for a
+ * concrete reason: Wine's own loader takes the thing it is loading as
+ * argv[1]. Until then every ELF program on Novaris was entered with one
+ * hardcoded argument, "program", and nothing had ever looked - so nothing
+ * had noticed. The first real Wine binary noticed immediately, and said
+ * so in its usage message. */
+#define MAX_ARGS 16
+
+static uint32_t build_initial_stack(uint32_t stack_top, int argc,
+                                    const char* const* argv,
                                     const elf_info_t* info,
                                     uint32_t interp_base) {
     uint32_t sp = stack_top;
 
+    if (argc < 1) argc = 1;
+    if (argc > MAX_ARGS) argc = MAX_ARGS;
+
     /* Strings and blobs first, at the very top, so the vector below them
-     * can point at fixed addresses. */
-    uint32_t namelen = kstrlen(name) + 1;
-    sp -= namelen;
-    uint32_t argv0 = sp;
-    for (uint32_t i = 0; i < namelen; i++) ((char*)argv0)[i] = name[i];
+     * can point at fixed addresses. Copied downward in reverse so that
+     * argv[0] ends up highest, which is the order a real stack has them
+     * and the order /proc/self/cmdline would report. */
+    uint32_t argp[MAX_ARGS];
+    for (int i = argc - 1; i >= 0; i--) {
+        uint32_t len = kstrlen(argv[i]) + 1;
+        sp -= len;
+        argp[i] = sp;
+        for (uint32_t j = 0; j < len; j++) ((char*)sp)[j] = argv[i][j];
+    }
+    uint32_t argv0 = argp[0];
 
     static const char platform[] = "i686";
     sp -= sizeof(platform);
@@ -275,23 +293,24 @@ static uint32_t build_initial_stack(uint32_t stack_top, const char* name,
     };
     uint32_t aux_words = sizeof(aux) / sizeof(aux[0]);
 
-    /* argc, argv[0], NULL, envp NULL, then the aux pairs. */
-    uint32_t words = 1 + 1 + 1 + 1 + aux_words;
+    /* argc, the argv pointers, NULL, envp NULL, then the aux pairs. */
+    uint32_t words = 1 + (uint32_t)argc + 1 + 1 + aux_words;
     sp -= words * 4;
     sp &= ~15u;   /* esp must be 16-byte aligned at entry */
 
     uint32_t* v = (uint32_t*)sp;
     uint32_t k = 0;
-    v[k++] = 1;        /* argc */
-    v[k++] = argv0;    /* argv[0] */
+    v[k++] = (uint32_t)argc;
+    for (int i = 0; i < argc; i++) v[k++] = argp[i];
     v[k++] = 0;        /* argv terminator */
-    v[k++] = 0;        /* envp terminator - no environment yet */
+    v[k++] = 0;        /* envp terminator - still no environment */
     for (uint32_t i = 0; i < aux_words; i++) v[k++] = aux[i];
 
     return sp;
 }
 
-int process_run_elf(const uint8_t* image, uint32_t size) {
+int process_run_elf(const uint8_t* image, uint32_t size,
+                    int argc, const char* const* argv) {
     /* Validated before the address space is created, so a file that isn't
      * an ELF doesn't cost a page directory. `image` itself is a kernel
      * heap buffer, which is mapped identically either side of the switch. */
@@ -367,7 +386,9 @@ int process_run_elf(const uint8_t* image, uint32_t size) {
      * is simply a second task in this same address space, and
      * scheduler_run_single() blocks its caller exactly the way
      * process_run_user_mode() did. */
-    uint32_t esp = build_initial_stack(USER_STACK_TOP, "program", &info,
+    static const char* default_argv[1] = { "program" };
+    if (argc < 1 || !argv) { argc = 1; argv = default_argv; }
+    uint32_t esp = build_initial_stack(USER_STACK_TOP, argc, argv, &info,
                                        interp_base);
 
     user_active = 1;

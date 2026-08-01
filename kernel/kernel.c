@@ -133,6 +133,20 @@ void kernel_main(uint32_t magic, multiboot_info_t* mbi) {
     }
 
     paging_init(kstart, kend);
+
+    /* The first 4MB is identity-mapped so the BIOS area, the Multiboot
+     * info and the kernel's own image stay reachable at their physical
+     * addresses - and that mapping is shared into every process address
+     * space. Which means a ring-3 mmap(MAP_FIXED) landing there replaces
+     * it, and the kernel loses its own view of itself.
+     *
+     * That is not theoretical. Wine's preloader reserves the DOS area on
+     * startup, and its second reservation - 0x10000..0x110000 - overlaps
+     * the kernel's load address at 0x100000. It hung the machine. Six
+     * lines of C reproduce it with no Wine involved, which is how it was
+     * isolated. Registering the range is what lets sys_mmap2 refuse it.
+     * See ROADMAP.md Milestone 27. */
+    paging_reserve_region(0x00000000u, 0x00400000u, "identity-mapped low memory");
     terminal_writestring_color("[OK] ", VGA_COLOR_LIGHT_GREEN);
     terminal_writestring("Paging enabled: kernel now running higher-half at 0xC0000000+\n");
 

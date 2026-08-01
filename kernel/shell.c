@@ -205,13 +205,45 @@ static void cmd_winapi(const char* argument) {
     terminal_writestring("\n(run 'winapi' with no argument for the list)\n");
 }
 
-static void cmd_run(const char* fname) {
+/* Splits "prog a b c" into argv. The storage is static because the
+ * pointers have to outlive this function - build_initial_stack() copies
+ * the strings onto the program's own stack, but not until later. */
+#define SHELL_MAX_ARGS 16
+static char argv_store[256];
+static const char* argv_ptr[SHELL_MAX_ARGS];
+
+static int split_args(const char* line, const char** argv_out[]) {
+    int argc = 0;
+    uint32_t w = 0;
+    const char* p = line;
+    while (*p && argc < SHELL_MAX_ARGS && w < sizeof(argv_store) - 1) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        argv_ptr[argc++] = &argv_store[w];
+        while (*p && *p != ' ' && w < sizeof(argv_store) - 1) {
+            argv_store[w++] = *p++;
+        }
+        argv_store[w++] = '\0';
+    }
+    *argv_out = argv_ptr;
+    return argc;
+}
+
+static void cmd_run(const char* line) {
+    const char** argv = 0;
+    int argc = split_args(line, &argv);
+    if (argc < 1) return;
+    const char* fname = argv[0];
+
     uint32_t size = 0;
     uint8_t* buffer = read_file(fname, &size);
     if (!buffer) return;
 
     if (elf_is_valid(buffer, size)) {
-        if (!process_run_elf(buffer, size)) {
+        /* So readlink("/proc/self/exe") can answer - which is how Wine's
+         * loader works out where it was installed. */
+        posix_set_exe_path(fname);
+        if (!process_run_elf(buffer, size, argc, argv)) {
             terminal_writestring_color("Failed to load ELF: ", VGA_COLOR_LIGHT_RED);
             terminal_writestring(fname);
             terminal_writestring("\n");
@@ -524,7 +556,8 @@ static void run_command(char* line) {
         terminal_writestring("            rather than spun (Milestone 25)\n");
         terminal_writestring("  threadtest - two threads sharing one address space,\n");
         terminal_writestring("            incrementing one shared counter (Milestone 16)\n");
-        terminal_writestring("  strace  - run a program with every syscall logged\n");
+        terminal_writestring("  run <file> [args] - run a program, with a real argv\n");
+        terminal_writestring("  strace  - the same, with every syscall logged\n");
         terminal_writestring("  vmtest  - prove per-process address spaces work:\n");
         terminal_writestring("            two page directories, one virtual address,\n");
         terminal_writestring("            two different contents (ROADMAP Milestone 14)\n");
@@ -730,7 +763,7 @@ static void run_command(char* line) {
         const char* fname = line + 6;
         while (*fname == ' ') fname++;
         if (*fname == '\0') {
-            terminal_writestring("usage: strace <filename>\n");
+            terminal_writestring("usage: strace <filename> [args]\n");
         } else {
             posix_set_trace(1);
             cmd_run(fname);
@@ -740,7 +773,7 @@ static void run_command(char* line) {
         const char* fname = line + 3;
         while (*fname == ' ') fname++;
         if (*fname == '\0') {
-            terminal_writestring("usage: run <filename>\n");
+            terminal_writestring("usage: run <filename> [args]\n");
         } else {
             cmd_run(fname);
         }
