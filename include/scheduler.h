@@ -115,6 +115,12 @@ typedef struct process {
     int      wait_retry;
 } process_t;
 
+/* Milestone 29: a task that is a forked child rather than a thread. The
+ * scheduler already knew how to run several address spaces at once; what
+ * it did not have was a way to *start* one from a running task's own
+ * register state, which is the whole of what fork is. */
+
+
 /* One-time init: clears the process table. Safe to call once at boot,
  * before any process is spawned. */
 void scheduler_init(void);
@@ -165,6 +171,41 @@ int scheduler_spawn_win32_thread(const char* name, uint32_t entry,
 int scheduler_spawn_posix_thread(const char* name, uint32_t entry,
                                  uint32_t esp, uint32_t tls_base,
                                  uint32_t tls_limit, uint32_t clear_child_tid);
+
+/* A forked child: a task in `child_pd` (which the caller has already
+ * filled with a copy of this address space) whose initial register state
+ * is the caller's own trap frame with eax = 0. That single difference is
+ * what makes fork return twice.
+ *
+ * The child owns `child_pd` and the scheduler destroys it when the batch
+ * is reaped. It owns no image and no stack of its own: every page it has
+ * is a copy that lives in that directory. Returns the new task's pid, or
+ * -1 if the table is full or a kernel stack could not be allocated. */
+int scheduler_fork_current(registers_t* regs, uint32_t child_pd,
+                           const char* name);
+
+/* Points a just-forked task's initial stack somewhere other than where
+ * its parent's was. A plain fork resumes the child on its own copy of the
+ * parent's stack; a clone that supplied one - glibc's posix_spawn does -
+ * runs it on that instead. `tid` is what scheduler_fork_current()
+ * returned. */
+void scheduler_fork_set_stack(int tid, uint32_t esp);
+
+/* Adopts `pd` as the current task's address space - what execve does
+ * after replacing the image in place. The task keeps its identity; only
+ * the contents of the space it runs in changed, so this only exists to
+ * clear the TLS and TEB descriptors the old image had. */
+void scheduler_exec_current(void);
+
+/* How many tasks other than the current one are still alive in address
+ * space `pd`. Zero means the caller is the last thread of that process,
+ * which is when its memory can be released and its exit status recorded. */
+int scheduler_as_sibling_count(uint32_t pd);
+
+/* The address space of the running task, or 0. Same value as
+ * paging_current_address_space() while a task is running, and the honest
+ * answer rather than CR3 when the kernel has switched away. */
+uint32_t scheduler_current_address_space(void);
 
 /* Records the current task's TLS block, so a switch away and back
  * reprograms the descriptor with this thread's values rather than
@@ -255,8 +296,13 @@ int scheduler_block_current(registers_t* regs, uint32_t wait_addr,
  * re-execute the whole syscall (Milestone 28). Waking such a task must
  * *not* write a result into eax - eax holds the syscall number, and
  * overwriting it would send the re-executed `int $0x80` to whatever that
- * value happened to name. */
-int scheduler_block_current_retry(registers_t* regs, uint32_t wait_addr);
+ * value happened to name.
+ *
+ * `deadline` is an absolute PIT tick count, or 0 for an indefinite wait -
+ * poll() needs both halves at once, since it is waiting on several
+ * descriptors and can only name one of them. */
+int scheduler_block_current_retry(registers_t* regs, uint32_t wait_addr,
+                                  uint32_t deadline);
 
 /* Wakes up to `max` tasks blocked on `addr`, in table order. Each one's
  * saved trap frame gets `result` in eax, so the syscall it blocked inside

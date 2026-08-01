@@ -82,6 +82,18 @@ int elf_load_at(const uint8_t* image, uint32_t size, uint32_t bias,
             uint32_t phys = pmm_alloc_frame();
             if (!phys) return 0; /* out of memory */
             paging_map_page(va, phys, PAGE_PRESENT | PAGE_RW | PAGE_USER);
+            /* A frame straight from the allocator holds whatever the last
+             * program to own it left there, and a segment does not cover
+             * every byte of every page it touches - the tail past p_memsz
+             * is nobody's. Linux guarantees that memory reads as zero, and
+             * a dynamic linker depends on it: ld-linux.so.2 loaded after a
+             * previous program had run would otherwise relocate itself
+             * through whatever pointers happened to be lying in that tail,
+             * and jump into the middle of the kernel. That is exactly the
+             * failure this fixes, and it only ever showed up on the
+             * *second* program of a session - the first one gets memory
+             * the machine zeroed at reset. */
+            for (uint32_t b = 0; b < 4096; b++) ((uint8_t*)va)[b] = 0;
         }
 
         /* Zero only the part no file bytes cover - the memsz-filesz .bss

@@ -25,6 +25,7 @@
 #include "kstring.h"
 #include "scheduler.h"
 #include "console.h"
+#include "vfs.h"
 
 #define MAX_SOCKETS   32
 #define SOCK_BUF_SIZE 16384      /* per direction */
@@ -45,11 +46,28 @@ typedef enum {
  * the *sender's* and means nothing to the receiver. */
 typedef struct {
     uint32_t token;
+    /* The byte offset in the receiver's stream at which the message
+     * carrying this descriptor begins. Milestone 29 found out why that
+     * has to be recorded: on a real Unix socket ancillary data belongs to
+     * a *message*, and a receive never merges the control data of two
+     * messages or reads past the point where the next message's begins.
+     * Novaris attached it to the socket instead, so wineserver - which
+     * receives with a 256-byte control buffer - collected both of the
+     * client's passed descriptors in one call, used the first and
+     * discarded the second. It then killed the client for failing to
+     * send a descriptor it had in fact sent. */
+    uint32_t at;
 } passed_fd_t;
 
 struct socket {
     sock_state_t state;
     int          type;           /* SOCK_STREAM only */
+
+    /* How many descriptors name this socket. One at creation; dup() and
+     * fork() add more, and close() only tears the socket down when the
+     * last one goes. Milestone 28 had no need for this because a
+     * descriptor and a socket were the same thing. */
+    int          refs;
 
     socket_t*    peer;           /* the other end, or 0 */
     int          peer_closed;    /* peer is gone: reads drain then EOF */
@@ -60,6 +78,10 @@ struct socket {
      * buffer; a stream socket has no message boundaries to preserve. */
     uint8_t*     buf;
     uint32_t     head, tail, count;
+    /* Monotonic byte counters, so a descriptor can name a position in the
+     * stream rather than a place in the ring. */
+    uint32_t     rx_written;   /* bytes ever queued into this socket */
+    uint32_t     rx_read;      /* bytes ever taken out of it */
 
     /* Descriptors the peer sent with SCM_RIGHTS, in arrival order. */
     passed_fd_t  passed[MAX_PASSED_FDS];
@@ -95,6 +117,7 @@ static socket_t* sock_alloc(void) {
             if (!s->buf) return 0;
             s->state = SS_UNBOUND;
             s->type = SOCK_STREAM;
+            s->refs = 1;
             return s;
         }
     }
@@ -135,17 +158,33 @@ static uint32_t q_put(socket_t* s, const uint8_t* src, uint32_t n) {
         s->tail = (s->tail + 1) % SOCK_BUF_SIZE;
     }
     s->count += n;
+    s->rx_written += n;
     return n;
 }
 
+/* How many bytes a read may take before it would cross into a message
+ * that carries its own descriptors. Linux stops a receive there rather
+ * than merging the two, and so does this. All of `count` when no
+ * descriptor is waiting further along the stream. */
+static uint32_t q_limit(const socket_t* s) {
+    uint32_t limit = s->count;
+    for (uint32_t i = 0; i < s->passed_count; i++) {
+        if (s->passed[i].at <= s->rx_read) continue;   /* already reachable */
+        uint32_t until = s->passed[i].at - s->rx_read;
+        if (until < limit) limit = until;
+    }
+    return limit;
+}
+
 static uint32_t q_get(socket_t* s, uint8_t* dst, uint32_t n, int peek) {
-    if (n > s->count) n = s->count;
+    uint32_t limit = q_limit(s);
+    if (n > limit) n = limit;
     uint32_t head = s->head;
     for (uint32_t i = 0; i < n; i++) {
         dst[i] = s->buf[head];
         head = (head + 1) % SOCK_BUF_SIZE;
     }
-    if (!peek) { s->head = head; s->count -= n; }
+    if (!peek) { s->head = head; s->count -= n; s->rx_read += n; }
     return n;
 }
 
@@ -171,6 +210,22 @@ int32_t socket_read(socket_t* s, void* buf, uint32_t len, registers_t* regs) {
     if (s->shut_rd) return 0;
     if (len == 0) return 0;
 
+    /* read(2) has nowhere to put ancillary data, so Linux discards it
+     * rather than letting it block the stream. Without this a plain read
+     * on a socket whose next message carries a descriptor would be
+     * stopped at that boundary for ever, since only recvmsg can clear
+     * it. */
+    if (s->count && s->passed_count) {
+        uint32_t drop = 0;
+        while (drop < s->passed_count && s->passed[drop].at <= s->rx_read) drop++;
+        if (drop) {
+            for (uint32_t i = drop; i < s->passed_count; i++) {
+                s->passed[i - drop] = s->passed[i];
+            }
+            s->passed_count -= drop;
+        }
+    }
+
     if (s->count == 0) {
         /* Nothing buffered. If the peer has gone this is end of stream,
          * which is 0 and not an error - the distinction every protocol
@@ -187,8 +242,17 @@ int32_t socket_read(socket_t* s, void* buf, uint32_t len, registers_t* regs) {
     return (int32_t)n;
 }
 
+void socket_ref(socket_t* s) {
+    if (s && s->state != SS_FREE) s->refs++;
+}
+
 void socket_close(socket_t* s) {
     if (!s) return;
+    /* Another descriptor still names it - a dup, or the same descriptor
+     * in a forked child. Nothing happens to the socket, and in
+     * particular the peer is *not* told about an end of stream that has
+     * not happened. */
+    if (s->refs > 1) { s->refs--; return; }
     if (s->peer) {
         s->peer->peer_closed = 1;
         s->peer->peer = 0;
@@ -251,22 +315,55 @@ static int32_t do_socketpair(int domain, int type, int protocol, int* sv) {
     return 0;
 }
 
+/* A bound name is matched as an absolute path, because two processes can
+ * bind and connect from different working directories and mean the same
+ * socket - which is exactly what Wine's client and server do, both having
+ * chdir'd into the config directory first. */
+static const char* sock_abs(const char* path, char* buf, uint32_t size) {
+    return posix_resolve_path(path, buf, size);
+}
+
 static int32_t do_bind(socket_t* s, const sockaddr_un_t* addr, uint32_t len) {
     if (!s || !addr) return -EFAULT;
     if (len < 3 || addr->sun_family != AF_UNIX) return -EINVAL;
     if (s->state != SS_UNBOUND) return -EINVAL;
-    if (find_bound(addr->sun_path)) return -EADDRINUSE;
+
+    char abs[128];
+    const char* name = sock_abs(addr->sun_path, abs, sizeof(abs));
+    if (find_bound(name)) return -EADDRINUSE;
 
     for (int i = 0; i < MAX_BOUND; i++) {
-        if (!bound[i].sock) {
-            kstrlcpy(bound[i].path, addr->sun_path, sizeof(bound[i].path));
-            bound[i].sock = s;
-            kstrlcpy(s->path, addr->sun_path, sizeof(s->path));
-            s->state = SS_BOUND;
-            return 0;
-        }
+        if (bound[i].sock) continue;
+
+        /* The name goes into the filesystem as well as into this table.
+         * A client that stats the path before connecting - Wine does,
+         * to find out whether the server it started is ready yet - has
+         * to be able to see it. */
+        const char* leaf = 0;
+        vfs_node_t* dir = vfs_resolve_parent(name, &leaf);
+        if (!dir) return -ENOENT;
+        if (vfs_finddir(dir, leaf)) return -EADDRINUSE;
+        vfs_node_t* node = vfs_create(dir, leaf, VFS_SOCKET);
+        if (!node) return -ENOSPC;
+        node->mode = 0777;
+
+        kstrlcpy(bound[i].path, name, sizeof(bound[i].path));
+        bound[i].sock = s;
+        kstrlcpy(s->path, name, sizeof(s->path));
+        s->state = SS_BOUND;
+        return 0;
     }
     return -ENOSPC;
+}
+
+void socket_unbind_path(const char* path) {
+    for (int i = 0; i < MAX_BOUND; i++) {
+        if (bound[i].sock && path_eq(bound[i].path, path)) {
+            bound[i].sock->state = SS_UNBOUND;
+            bound[i].sock = 0;
+            bound[i].path[0] = '\0';
+        }
+    }
 }
 
 static int32_t do_listen(socket_t* s, int backlog) {
@@ -282,7 +379,8 @@ static int32_t do_connect(socket_t* s, const sockaddr_un_t* addr, uint32_t len) 
     if (len < 3 || addr->sun_family != AF_UNIX) return -EINVAL;
     if (s->state == SS_CONNECTED) return -EISCONN;
 
-    socket_t* listener = find_bound(addr->sun_path);
+    char abs[128];
+    socket_t* listener = find_bound(sock_abs(addr->sun_path, abs, sizeof(abs)));
     /* The two failures are different and both matter. Nothing bound to
      * that name at all is ENOENT, because the name is a filesystem path
      * and there is no file - checked against the host, which is how the
@@ -354,7 +452,13 @@ static int32_t send_control(socket_t* s, const uint8_t* ctl, uint32_t len) {
                 if (s->peer->passed_count >= MAX_PASSED_FDS) return -EMSGSIZE;
                 uint32_t token = posix_fd_export(fdv[i]);
                 if (!token) return -EBADF;
-                s->peer->passed[s->peer->passed_count++].token = token;
+                /* Attached at the offset where this message's bytes are
+                 * about to be written - send_control() runs before the
+                 * payload, which is what makes rx_written the right
+                 * number here. */
+                s->peer->passed[s->peer->passed_count].token = token;
+                s->peer->passed[s->peer->passed_count].at = s->peer->rx_written;
+                s->peer->passed_count++;
                 stat_fds++;
             }
         }
@@ -366,8 +470,17 @@ static int32_t send_control(socket_t* s, const uint8_t* ctl, uint32_t len) {
 static uint32_t recv_control(socket_t* s, uint8_t* ctl, uint32_t len) {
     if (!s->passed_count || len < sizeof(k_cmsghdr_t) + 4) return 0;
 
+    /* Only the descriptors belonging to the message the reader is at.
+     * Anything attached further along the stream belongs to a later
+     * recvmsg, however much room the caller offered - which is the whole
+     * point, since wineserver offers 256 bytes and would otherwise
+     * collect every descriptor the client had sent so far. */
+    uint32_t here = 0;
+    while (here < s->passed_count && s->passed[here].at <= s->rx_read) here++;
+    if (!here) return 0;
+
     uint32_t room = (len - sizeof(k_cmsghdr_t)) / 4;
-    uint32_t n = s->passed_count < room ? s->passed_count : room;
+    uint32_t n = here < room ? here : room;
 
     k_cmsghdr_t* c = (k_cmsghdr_t*)ctl;
     c->cmsg_len = sizeof(k_cmsghdr_t) + n * 4;
@@ -415,10 +528,26 @@ static int32_t do_recvmsg(socket_t* s, k_msghdr_t* m, int flags,
 
     /* Control data first, and *without* requiring payload bytes: a
      * descriptor can legitimately arrive with a zero-length message, and
-     * a receiver that waited for bytes first would hang. */
+     * a receiver that waited for bytes first would hang.
+     *
+     * `room` is remembered because msg_controllen is both an input (how
+     * much space the caller has) and an output (how much was used), and a
+     * receive that has to wait runs this function *again* from the top -
+     * the block below rewinds the whole syscall. Writing the output value
+     * before the wait therefore told the second attempt that the caller
+     * had no room for control data at all, and the descriptor was
+     * silently dropped.
+     *
+     * That is not hypothetical: it is why Wine's client connected to
+     * wineserver, got its four bytes of greeting, and then wrote to
+     * descriptor -1 - the request descriptor the server passed it arrived
+     * on the attempt that blocked and was thrown away on the one that
+     * succeeded. Milestone 28's test never saw it because nothing there
+     * ever had to wait for control data. */
+    uint32_t room = m->msg_controllen;
     uint32_t ctl_len = 0;
-    if (m->msg_control && m->msg_controllen) {
-        ctl_len = recv_control(s, (uint8_t*)m->msg_control, m->msg_controllen);
+    if (m->msg_control && room) {
+        ctl_len = recv_control(s, (uint8_t*)m->msg_control, room);
     }
     m->msg_controllen = ctl_len;
     m->msg_flags = 0;
@@ -430,7 +559,13 @@ static int32_t do_recvmsg(socket_t* s, k_msghdr_t* m, int flags,
         if (s->count == 0) {
             if (total || ctl_len) break;     /* got something; do not wait */
             if (s->peer_closed || !s->peer) return 0;
-            if (s->nonblock || (flags & MSG_DONTWAIT)) return -EAGAIN;
+            if (s->nonblock || (flags & MSG_DONTWAIT)) {
+                m->msg_controllen = room;
+                return -EAGAIN;
+            }
+            /* Put the caller's header back the way it was: this call is
+             * about to happen again from the beginning. */
+            m->msg_controllen = room;
             posix_request_block((uint32_t)s, regs);
             return 0;
         }
@@ -550,6 +685,72 @@ int32_t socket_syscall(uint32_t call, uint32_t* a, registers_t* regs) {
         default:
             return -ENOSYS;
     }
+}
+
+/* --- pipes and readiness (Milestone 29) ----------------------------------
+ *
+ * A pipe is a connected pair with each end shut in one direction, which
+ * is what a pipe *is* - the byte queue, the blocking read and the
+ * end-of-stream when the writer closes are all the socket machinery
+ * unchanged. Building it here rather than beside it is the whole reason
+ * Milestone 28's queue was written as a queue and not as a socket detail.
+ *
+ * Wine needs pipes for the same reason every Unix program does: its
+ * loader hands a child a descriptor to report back through, and
+ * wineserver's own startup handshake is a pipe the parent reads until the
+ * server says it is ready. */
+int socket_pipe(socket_t** read_end, socket_t** write_end) {
+    socket_t* r = sock_alloc();
+    socket_t* w = r ? sock_alloc() : 0;
+    if (!r || !w) { sock_free(r); sock_free(w); return -ENFILE; }
+
+    link_pair(r, w);
+    r->shut_wr = 1;   /* writing to the read end is EPIPE */
+    w->shut_rd = 1;   /* reading the write end is end-of-stream */
+
+    *read_end = r;
+    *write_end = w;
+    return 0;
+}
+
+void socket_set_nonblock(socket_t* s, int on) {
+    if (s) s->nonblock = on ? 1 : 0;
+}
+
+int socket_get_nonblock(socket_t* s) {
+    return s ? s->nonblock : 0;
+}
+
+int socket_readable(socket_t* s) {
+    if (!s) return 0;
+    if (s->state == SS_LISTENING) return s->backlog_count > 0;
+    if (s->shut_rd) return 1;                  /* read returns 0 at once */
+    if (s->count) return 1;
+    return s->peer_closed || !s->peer;         /* end of stream is readable */
+}
+
+uint32_t socket_poll_mask(socket_t* s) {
+    uint32_t mask = 0;
+    if (!s) return POLLNVAL;
+
+    if (s->state == SS_LISTENING) {
+        /* An incoming connection is what "readable" means on a listening
+         * socket, which is what makes poll() and accept() compose. */
+        if (s->backlog_count) mask |= POLLIN;
+        return mask;
+    }
+
+    if (s->count || s->shut_rd) mask |= POLLIN;
+
+    if (s->peer_closed || !s->peer) {
+        /* The peer is gone. Both bits, and both matter: POLLHUP is how a
+         * server loop learns a client went away, and POLLIN is how the
+         * read that returns 0 gets a chance to happen. */
+        mask |= POLLHUP | POLLIN;
+    } else if (s->state == SS_CONNECTED && !s->shut_wr && q_space(s->peer)) {
+        mask |= POLLOUT;
+    }
+    return mask;
 }
 
 /* --- lifecycle ------------------------------------------------------------ */

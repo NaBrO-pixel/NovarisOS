@@ -104,9 +104,20 @@ uint32_t pmm_alloc_frame(void) {
     return 0; /* out of memory */
 }
 
+/* Freeing a frame that is already free is the one memory bug this
+ * allocator cannot survive quietly: the bit is simply cleared, and if the
+ * frame was handed out again in between, two owners now share it and the
+ * damage shows up somewhere else entirely, one program later. Counting
+ * them turns "the next thing that runs behaves oddly" into a number the
+ * shell can print. Milestone 29 added it while chasing exactly that. */
+static uint32_t double_frees = 0;
+
+uint32_t pmm_double_frees(void) { return double_frees; }
+
 void pmm_free_frame(uint32_t phys_addr) {
     uint32_t frame = phys_addr / PMM_FRAME_SIZE;
     if (frame < MAX_FRAMES) {
+        if (!bitmap_test(frame)) { double_frees++; return; }
         bitmap_clear(frame);
     }
 }

@@ -33,6 +33,24 @@ void process_run_demo_user_program(void);
 int process_run_elf(const uint8_t* image, uint32_t size,
                     int argc, const char* const* argv);
 
+/* --- loading, without running (Milestone 29) ----------------------------
+ *
+ * execve is "empty this address space, put a different program in it, and
+ * resume at its entry point" - the same loading process_run_elf() does,
+ * minus the running. Splitting it out is what lets one implementation
+ * serve both, so a program started by `run` and one started by execve
+ * cannot drift apart in how their stack or auxiliary vector is built.
+ *
+ * Maps every PT_LOAD segment into the *current* address space, loads a
+ * PT_INTERP interpreter alongside it if the image names one, maps the
+ * stack, and builds the initial process stack (argc/argv/envp/auxv).
+ * Writes the entry point and the initial esp, and returns 1 - or 0 if the
+ * image is not a loadable ELF or memory ran out. `envp` may be null. */
+int process_load_elf_image(const uint8_t* image, uint32_t size,
+                           int argc, const char* const* argv,
+                           int envc, const char* const* envp,
+                           uint32_t* out_entry, uint32_t* out_esp);
+
 /* Loads a PE32 (.exe) image and runs it under the Win32 emulation layer.
  * A thin wrapper over win32_run_pe() - see include/win32.h, which is
  * where the interesting parts live. Returns a pe_load_result_t (PE_OK
@@ -40,6 +58,23 @@ int process_run_elf(const uint8_t* image, uint32_t size,
  * in *exit_code. */
 int process_run_pe(const uint8_t* image, uint32_t size, const char* name,
                    uint32_t* exit_code);
+
+/* --- the environment handed to a program (Milestone 29) -----------------
+ *
+ * A Unix program reads its configuration out of the environment before it
+ * reads anything else, and Wine reads more of it than most: WINEPREFIX,
+ * WINEDEBUG, WINESERVER and WINELOADER all change what it does and where
+ * it looks. Until there was an execve there was nothing to carry an
+ * environment *through*, so there was no point having one; now there is.
+ *
+ * The shell owns the table (`setenv` and `env`), and every program it
+ * starts is handed it. execve then passes whatever the caller gives it,
+ * which is how a program changes its child's environment. */
+#define PROCESS_MAX_ENV 16
+int  process_env_set(const char* assignment);   /* "NAME=VALUE" */
+int  process_env_count(void);
+const char* process_env_at(int i);
+void process_env_reset(void);
 
 /* Selects the segment loaded into fs on the way into ring 3. Defaults to
  * 0x23 (the flat user data selector); the Win32 layer sets 0x33 so a

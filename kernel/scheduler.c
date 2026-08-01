@@ -40,7 +40,11 @@
 #include "pit.h"
 #include "posix.h"   /* EAGAIN, ETIMEDOUT - the values a woken waiter gets */
 
-#define MAX_PROCESSES 8
+/* Sixteen since Milestone 29. A forked child is a task like any other, so
+ * a program that forks a helper which forks in turn - which is exactly
+ * what Wine's loader does to reach wineserver - needs headroom the old
+ * eight (chosen for three demo tasks plus threads) did not leave. */
+#define MAX_PROCESSES 16
 /* 8KB, not 4KB. Milestone 17 runs Win32 programs as scheduler tasks, and
  * their kernel-side call chains are far deeper than a demo task's
  * sys_write: int 0x81 -> win32_dispatch -> printf -> the format engine ->
@@ -268,6 +272,73 @@ int scheduler_spawn_posix_thread(const char* name, uint32_t entry,
     frame->eax = 0;
     if (tls_base) frame->gs = 0x3B; /* GDT entry 7 | RPL 3 */
     return pid;
+}
+
+int scheduler_fork_current(registers_t* regs, uint32_t child_pd,
+                           const char* name) {
+    if (process_count >= MAX_PROCESSES) return -1;
+    if (!current || !child_pd) return -1;
+
+    /* map_stack 0 and load_pages 0: the child's stack and image are
+     * already in `child_pd`, page for page, because the caller copied the
+     * whole address space. There is nothing here left to allocate for it
+     * except a kernel stack and an FPU save area. */
+    int pid = spawn_common(name, regs->eip, 0, 0, regs->useresp, 1, 0, 0);
+    if (pid < 0) return -1;
+
+    process_t* p = &process_table[process_count - 1];
+    /* spawn_common recorded the *parent's* directory, because everything
+     * it maps goes into whatever is current. Nothing was mapped, and the
+     * child runs somewhere else. */
+    p->page_directory = child_pd;
+    p->tls_base = current->tls_base;
+    p->tls_limit = current->tls_limit;
+    p->teb = current->teb;
+
+    /* The child's entire initial state is the parent's, one register
+     * different. Copying the frame rather than synthesising one is what
+     * makes the child resume at the instruction after the parent's
+     * `int $0x80` with every register it had. */
+    registers_t* frame = (registers_t*)p->esp;
+    *frame = *regs;
+    frame->eax = 0;
+    return pid;
+}
+
+void scheduler_fork_set_stack(int tid, uint32_t esp) {
+    for (int i = 0; i < process_count; i++) {
+        if (process_table[i].pid != tid) continue;
+        registers_t* frame = (registers_t*)process_table[i].esp;
+        frame->useresp = esp;
+        process_table[i].stack_top = esp;
+        return;
+    }
+}
+
+void scheduler_exec_current(void) {
+    if (!current) return;
+    /* The image that owned these is gone. Leaving them set would point
+     * fs and gs at addresses in an address space that no longer has
+     * anything there. */
+    current->tls_base = 0;
+    current->tls_limit = 0;
+    current->teb = 0;
+    current->clear_child_tid = 0;
+}
+
+int scheduler_as_sibling_count(uint32_t pd) {
+    int n = 0;
+    for (int i = 0; i < process_count; i++) {
+        process_t* p = &process_table[i];
+        if (p == current) continue;
+        if (p->state == PROC_ZOMBIE) continue;
+        if (p->page_directory == pd) n++;
+    }
+    return n;
+}
+
+uint32_t scheduler_current_address_space(void) {
+    return current ? current->page_directory : 0;
 }
 
 void scheduler_set_current_tls(uint32_t base, uint32_t limit) {
@@ -550,8 +621,8 @@ static int wake_every_blocked(int32_t result) {
     return n;
 }
 
-int scheduler_block_current(registers_t* regs, uint32_t wait_addr,
-                            uint32_t deadline) {
+static int block_common(registers_t* regs, uint32_t wait_addr,
+                        uint32_t deadline, int retry) {
     if (!active || !current) return 0;
 
     /* Decide *before* changing anything: pick_next_ready() would
@@ -560,20 +631,38 @@ int scheduler_block_current(registers_t* regs, uint32_t wait_addr,
     process_t* next = pick_next_ready();
     if (!next || next == current) return 0;
 
-    current->esp = (uint32_t)regs;
-    current->wait_addr = wait_addr;
-    current->wait_deadline = deadline;
-    current->wait_retry = 0;
-    current->state = PROC_BLOCKED;
+    /* Held in a local, because switch_to() below makes `current` mean the
+     * *other* task. Setting the retry flag after the switch - which is
+     * what scheduler_block_current_retry() used to do - set it on
+     * whichever task was picked instead, so the task that actually
+     * blocked was woken with a result written into eax. eax held its
+     * syscall number, so the re-executed `int $0x80` dispatched to
+     * syscall 0 and got -ENOSYS.
+     *
+     * Milestone 28 could not see this: the retry path only blocks when
+     * some *other* task can run, and until fork existed there never was
+     * one, so every retry fell through to the spin instead. It surfaced
+     * the first time a forked child wrote to a pipe its parent was
+     * blocked on. */
+    process_t* me = current;
+    me->esp = (uint32_t)regs;
+    me->wait_addr = wait_addr;
+    me->wait_deadline = deadline;
+    me->wait_retry = retry;
+    me->state = PROC_BLOCKED;
     tick_countdown = SCHED_TICKS_PER_SLICE;
     switch_to(next);
     return 1;
 }
 
-int scheduler_block_current_retry(registers_t* regs, uint32_t wait_addr) {
-    if (!scheduler_block_current(regs, wait_addr, 0)) return 0;
-    current->wait_retry = 1;
-    return 1;
+int scheduler_block_current(registers_t* regs, uint32_t wait_addr,
+                            uint32_t deadline) {
+    return block_common(regs, wait_addr, deadline, 0);
+}
+
+int scheduler_block_current_retry(registers_t* regs, uint32_t wait_addr,
+                                  uint32_t deadline) {
+    return block_common(regs, wait_addr, deadline, 1);
 }
 
 int scheduler_wake_on(uint32_t addr, int max, int32_t result) {

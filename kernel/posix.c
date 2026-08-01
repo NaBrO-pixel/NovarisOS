@@ -2,6 +2,7 @@
  * this exists and what it is for. */
 
 #include "posix.h"
+#include "posix_proc.h"
 #include "console.h"
 #include "process.h"
 #include "paging.h"
@@ -12,6 +13,8 @@
 #include "rtc.h"
 #include "pit.h"
 #include "socket.h"
+#include "kheap.h"
+#include "elf.h"
 
 #define PAGE_SIZE 4096u
 /* Must match ELF_STACK_SIZE in kernel/process.c - reported through
@@ -20,42 +23,31 @@
 
 /* --- file descriptors ---------------------------------------------------
  *
- * A real table, per process. Descriptors 0/1/2 are the console; the rest
- * are open initrd files. The initrd is read-only (ROADMAP.md Milestone 6),
- * so open() for writing fails with -EROFS rather than pretending. */
+ * A real table, per process, and since Milestone 29 that is true rather
+ * than aspirational: the table lives in the process structure keyed by
+ * address space (include/posix_proc.h), so a forked child gets a copy and
+ * a thread gets the same one. Descriptors 0/1/2 are the console; the rest
+ * are open files, sockets and pipe ends. */
 
-#define MAX_FDS 32
+#define MAX_FDS POSIX_MAX_FDS
 
-typedef enum {
-    FD_FREE = 0,
-    FD_CONSOLE,
-    FD_FILE,
-    FD_SOCKET,      /* Milestone 28 - see kernel/socket.c */
-} fd_kind_t;
-
-typedef struct {
-    fd_kind_t   kind;
-    vfs_node_t* node;
-    uint32_t    offset;
-    int         writable;
-    int         append;      /* O_APPEND: every write goes to the end */
-    uint32_t    dir_index;   /* getdents64's position in a directory */
-    struct socket* sock;     /* FD_SOCKET only */
-} fd_entry_t;
-
-static fd_entry_t fds[MAX_FDS];
-
-static int fd_alloc(void) {
-    for (int i = 0; i < MAX_FDS; i++) {
-        if (fds[i].kind == FD_FREE) return i;
+static int fd_alloc_from(posix_proc_t* p, int lowest) {
+    if (lowest < 0) lowest = 0;
+    for (int i = lowest; i < MAX_FDS; i++) {
+        if (p->fds[i].kind == FD_FREE) return i;
     }
     return -1;
 }
 
+static int fd_alloc(void) {
+    return fd_alloc_from(posix_current(), 0);
+}
+
 static fd_entry_t* fd_get(int fd) {
+    posix_proc_t* p = posix_current();
     if (fd < 0 || fd >= MAX_FDS) return 0;
-    if (fds[fd].kind == FD_FREE) return 0;
-    return &fds[fd];
+    if (p->fds[fd].kind == FD_FREE) return 0;
+    return &p->fds[fd];
 }
 
 /* --- the seam with kernel/socket.c (Milestone 28) ------------------------
@@ -77,25 +69,38 @@ static fd_entry_t in_flight[MAX_IN_FLIGHT];
 static registers_t* cur_regs = 0;
 
 /* An implementation asking to be run again later rather than returning
- * now. `addr` is what it wants to be woken on. See posix.h. */
+ * now. `addr` is what it wants to be woken on, `deadline` an absolute PIT
+ * tick after which it wants to be woken anyway. See posix.h. */
 static uint32_t block_addr = 0;
+static uint32_t block_deadline = 0;
 
 void posix_request_block(uint32_t addr, registers_t* regs) {
     block_addr = addr;
+    block_deadline = 0;
+    posix_request_retry();
+    (void)regs;
+}
+
+void posix_request_block_until(uint32_t addr, uint32_t deadline,
+                               registers_t* regs) {
+    block_addr = addr;
+    block_deadline = deadline;
     posix_request_retry();
     (void)regs;
 }
 
 int posix_fd_install_socket(struct socket* s) {
+    posix_proc_t* p = posix_current();
     int fd = fd_alloc();
     if (fd < 0) return -EMFILE;
-    fds[fd].kind = FD_SOCKET;
-    fds[fd].sock = s;
-    fds[fd].node = 0;
-    fds[fd].offset = 0;
-    fds[fd].writable = 1;
-    fds[fd].append = 0;
-    fds[fd].dir_index = 0;
+    p->fds[fd].kind = FD_SOCKET;
+    p->fds[fd].sock = s;
+    p->fds[fd].node = 0;
+    p->fds[fd].offset = 0;
+    p->fds[fd].writable = 1;
+    p->fds[fd].append = 0;
+    p->fds[fd].dir_index = 0;
+    p->fds[fd].cloexec = 0;
     return fd;
 }
 
@@ -111,6 +116,11 @@ uint32_t posix_fd_export(int fd) {
     for (int i = 0; i < MAX_IN_FLIGHT; i++) {
         if (in_flight[i].kind == FD_FREE) {
             in_flight[i] = *e;
+            /* The sender keeps its descriptor, so the object is now named
+             * twice: once by the sender and once by the message. The
+             * reference travels with the message and is handed to the
+             * receiver by posix_fd_import(). */
+            if (e->kind == FD_SOCKET) socket_ref(e->sock);
             return (uint32_t)(i + 1);   /* 0 means "nothing" */
         }
     }
@@ -118,12 +128,13 @@ uint32_t posix_fd_export(int fd) {
 }
 
 int posix_fd_import(uint32_t token) {
+    posix_proc_t* p = posix_current();
     if (!token || token > MAX_IN_FLIGHT) return -EBADF;
     fd_entry_t* src = &in_flight[token - 1];
     if (src->kind == FD_FREE) return -EBADF;
     int fd = fd_alloc();
     if (fd < 0) return -EMFILE;
-    fds[fd] = *src;
+    p->fds[fd] = *src;
     src->kind = FD_FREE;
     return fd;
 }
@@ -141,25 +152,21 @@ int posix_fd_import(uint32_t token) {
 #define BRK_ARENA_START  0x48000000u
 #define BRK_ARENA_END    0x49000000u
 
-static uint32_t mmap_next = MMAP_ARENA_START;
-static uint32_t brk_current = BRK_ARENA_START;
-static uint32_t brk_mapped = BRK_ARENA_START;
-
-static uint32_t unimplemented = 0;
-
 /* The path the running program was started from. Wine's loader finds its
  * own installation by reading /proc/self/exe, and without an answer it
  * cannot locate ntdll.so - which is exactly where it stopped the first
  * time it ran here. See ROADMAP.md Milestone 27. */
-static char exe_path[64] = "/program";
-
 void posix_set_exe_path(const char* path) {
-    if (!path || !*path) { kstrlcpy(exe_path, "/program", sizeof(exe_path)); return; }
+    posix_proc_t* p = posix_current();
+    if (!path || !*path) {
+        kstrlcpy(p->exe_path, "/program", sizeof(p->exe_path));
+        return;
+    }
     if (path[0] == '/') {
-        kstrlcpy(exe_path, path, sizeof(exe_path));
+        kstrlcpy(p->exe_path, path, sizeof(p->exe_path));
     } else {
-        exe_path[0] = '/';
-        kstrlcpy(exe_path + 1, path, sizeof(exe_path) - 1);
+        p->exe_path[0] = '/';
+        kstrlcpy(p->exe_path + 1, path, sizeof(p->exe_path) - 1);
     }
 }
 
@@ -175,7 +182,56 @@ static uint32_t prot_to_pte(int prot) {
     return flags;
 }
 
-void posix_exit_process(void) {
+/* Wakes a parent suspended in vfork - defined with the fork machinery
+ * below, declared here because the exit path is one of the two things it
+ * waits for. */
+static void vfork_release(posix_proc_t* child);
+
+/* Ends the *process*, not just the task: releases its user memory, records
+ * its exit status where a waiting parent can find it, and wakes that
+ * parent. Called when the last task of an address space exits, and by the
+ * fault path when a program dies of a signal.
+ *
+ * Releasing the memory here rather than leaving it to the end of the batch
+ * is what makes a fork/exec loop possible at all: a forked child is a full
+ * eager copy of its parent, so a shell-shaped program that forked a dozen
+ * times would otherwise hold a dozen copies until every one of them had
+ * finished. */
+static void process_teardown(int status) {
+    posix_proc_t* p = posix_current();
+
+    /* Only the last thread of the process ends it - the others are still
+     * running in this address space, and its pages are still theirs. */
+    uint32_t pd = scheduler_current_address_space();
+    if (pd && scheduler_as_sibling_count(pd) > 0) return;
+
+    /* Every descriptor this process still holds. A socket's peer has to
+     * find out, or a reader on the far side waits for a writer that has
+     * gone - which is precisely how a pipe reports end of file. */
+    for (int i = 3; i < MAX_FDS; i++) {
+        if (p->fds[i].kind == FD_SOCKET) socket_close(p->fds[i].sock);
+        p->fds[i].kind = FD_FREE;
+    }
+
+    /* Only if these pages are this process's to release - see
+     * posix_proc_t::owns_memory. A task the POSIX layer merely met is
+     * running in somebody else's address space. */
+    if (pd && p->owns_memory) paging_release_user_pages();
+
+    /* A parent suspended in vfork is waiting for exactly this. */
+    vfork_release(p);
+
+    int ppid = p->ppid;
+    posix_proc_exit(p, status);
+
+    /* A parent parked in wait4 is waiting on its own structure's address.
+     * Waking it costs nothing when there is no such parent. */
+    posix_proc_t* parent = posix_proc_by_pid(ppid);
+    if (parent) scheduler_wake_on((uint32_t)parent, 1, 0);
+}
+
+void posix_exit_status(int status) {
+    process_teardown(status);
     if (scheduler_is_active()) {
         scheduler_exit_current();
         /* Returns normally; isr.s's epilogue performs the switch as this
@@ -186,37 +242,37 @@ void posix_exit_process(void) {
     process_exit_to_kernel(); /* does not return */
 }
 
+void posix_exit_process(void) {
+    posix_exit_status(0);
+}
+
 void posix_process_begin(void) {
-    posix_signal_reset();
     socket_process_begin();
+    posix_proc_reset_all();
     for (int i = 0; i < MAX_IN_FLIGHT; i++) in_flight[i].kind = FD_FREE;
-    for (int i = 0; i < MAX_FDS; i++) fds[i].kind = FD_FREE;
+
+    posix_proc_t* p = posix_proc_create(0);
+    if (!p) return;
     for (int i = 0; i < 3; i++) {
-        fds[i].kind = FD_CONSOLE;
-        fds[i].node = 0;
-        fds[i].offset = 0;
-        fds[i].writable = (i != 0);
+        p->fds[i].kind = FD_CONSOLE;
+        p->fds[i].node = 0;
+        p->fds[i].offset = 0;
+        p->fds[i].writable = (i != 0);
     }
-    mmap_next = MMAP_ARENA_START;
-    brk_current = BRK_ARENA_START;
-    brk_mapped = BRK_ARENA_START;
-    unimplemented = 0;
 }
 
 void posix_process_end(void) {
     socket_process_end();
     /* The mappings themselves need no teardown: they were made in the
      * process's own page directory, which is about to be destroyed. Only
-     * the bookkeeping is reset, so the next program starts from a clean
-     * arena rather than inheriting a high-water mark. */
-    for (int i = 0; i < MAX_FDS; i++) fds[i].kind = FD_FREE;
-    mmap_next = MMAP_ARENA_START;
-    brk_current = BRK_ARENA_START;
-    brk_mapped = BRK_ARENA_START;
+     * the bookkeeping goes, so the next program starts from a clean table
+     * rather than inheriting a high-water mark - or a child nobody
+     * collected. */
+    posix_proc_reset_all();
 }
 
 uint32_t posix_unimplemented_count(void) {
-    return unimplemented;
+    return posix_current()->unimplemented;
 }
 
 /* --- memory ------------------------------------------------------------- */
@@ -271,6 +327,7 @@ static int32_t sys_mmap2(uint32_t addr, uint32_t length, int prot,
     if (file_backed && (flags & MAP_SHARED)) return -ENODEV;
     if (!file_backed && fd >= 0 && !(flags & MAP_ANONYMOUS)) return -ENOSYS;
 
+    posix_proc_t* P = posix_current();
     uint32_t bytes = (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     uint32_t base;
 
@@ -289,9 +346,9 @@ static int32_t sys_mmap2(uint32_t addr, uint32_t length, int prot,
         if (paging_region_conflict(addr, addr + bytes)) return -ENOMEM;
         base = addr;
     } else {
-        if (mmap_next + bytes > MMAP_ARENA_END) return -ENOMEM;
-        base = mmap_next;
-        mmap_next += bytes;
+        if (P->mmap_next + bytes > MMAP_ARENA_END) return -ENOMEM;
+        base = P->mmap_next;
+        P->mmap_next += bytes;
     }
 
     uint32_t pte_flags = prot_to_pte(prot);
@@ -361,24 +418,25 @@ static int32_t sys_mprotect(uint32_t addr, uint32_t length, int prot) {
 /* brk(0) reports the break; brk(addr) moves it. Growing maps pages,
  * shrinking unmaps them. */
 static int32_t sys_brk(uint32_t addr) {
-    if (addr == 0) return (int32_t)brk_current;
+    posix_proc_t* P = posix_current();
+    if (addr == 0) return (int32_t)P->brk_current;
     if (addr < BRK_ARENA_START || addr > BRK_ARENA_END) {
-        return (int32_t)brk_current; /* Linux returns the unchanged break */
+        return (int32_t)P->brk_current; /* Linux returns the unchanged break */
     }
 
     uint32_t want = (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    if (want > brk_mapped) {
-        if (!map_range(brk_mapped, want - brk_mapped,
+    if (want > P->brk_mapped) {
+        if (!map_range(P->brk_mapped, want - P->brk_mapped,
                        PAGE_PRESENT | PAGE_RW | PAGE_USER)) {
-            return (int32_t)brk_current;
+            return (int32_t)P->brk_current;
         }
-        brk_mapped = want;
-    } else if (want < brk_mapped) {
-        unmap_range(want, brk_mapped - want);
-        brk_mapped = want;
+        P->brk_mapped = want;
+    } else if (want < P->brk_mapped) {
+        unmap_range(want, P->brk_mapped - want);
+        P->brk_mapped = want;
     }
-    brk_current = addr;
-    return (int32_t)brk_current;
+    P->brk_current = addr;
+    return (int32_t)P->brk_current;
 }
 
 /* --- files -------------------------------------------------------------- */
@@ -399,7 +457,52 @@ static int32_t sys_brk(uint32_t addr) {
  * opening it would find the root's hello.txt and report success, which
  * is exactly the kind of quiet wrongness this fallback could have
  * introduced. */
+/* A relative path is resolved against the process's working directory,
+ * which is real since Milestone 29 - Wine builds its prefix path out of
+ * getcwd(), and a kernel that answers "/" to every process makes two
+ * processes disagree about where they are.
+ *
+ * The joined result lives in a static buffer, which is safe for exactly
+ * the reason the rest of this file's user-pointer dereferencing is: a
+ * syscall runs to completion in the address space that made it, and the
+ * kernel does not re-enter itself. */
+#define PATH_JOIN_MAX (POSIX_PATH_MAX * 2)
+static char path_buf[PATH_JOIN_MAX];
+
+static const char* abs_into(const char* path, char* out, uint32_t size) {
+    if (!path) return 0;
+    if (path[0] == '/') return path;
+
+    posix_proc_t* p = posix_current();
+    uint32_t n = 0;
+    for (const char* c = p->cwd; *c && n < size - 2; c++) out[n++] = *c;
+    if (n == 0 || out[n - 1] != '/') out[n++] = '/';
+    /* "." and "./x" are the two forms a program actually writes; anything
+     * else with a dot component is left alone, because this filesystem has
+     * no ".." to resolve against and pretending otherwise would be worse
+     * than not trying. */
+    if (path[0] == '.' && path[1] == '/') path += 2;
+    else if (path[0] == '.' && path[1] == '\0') path += 1;
+    for (const char* c = path; *c && n < size - 1; c++) out[n++] = *c;
+    /* "/x/" and "/x" name the same thing, and lookup wants the second
+     * form. A bare "/" keeps its slash. */
+    while (n > 1 && out[n - 1] == '/') n--;
+    out[n] = '\0';
+    return out;
+}
+
+static const char* absolute(const char* path) {
+    return abs_into(path, path_buf, sizeof(path_buf));
+}
+
+const char* posix_resolve_path(const char* path, char* buf, uint32_t size) {
+    return abs_into(path, buf, size);
+}
+
 static vfs_node_t* resolve_for_read(const char* path) {
+    path = absolute(path);
+    if (!path) return 0;
+
     vfs_node_t* n = vfs_lookup(path);
     if (n) return n;
 
@@ -412,11 +515,15 @@ static vfs_node_t* resolve_for_read(const char* path) {
     return vfs_root ? vfs_finddir(vfs_root, base) : 0;
 }
 
+#define O_CLOEXEC 0x80000
+
 static int32_t sys_open(const char* path, int flags, uint32_t mode) {
-    (void)mode;
     if (!path) return -EFAULT;
 
+    posix_proc_t* P = posix_current();
     int want_write = (flags & (O_WRONLY | O_RDWR)) != 0;
+    char joined[PATH_JOIN_MAX];
+    path = abs_into(path, joined, sizeof(joined));
     vfs_node_t* node = resolve_for_read(path);
 
     if (!node) {
@@ -427,6 +534,7 @@ static int32_t sys_open(const char* path, int flags, uint32_t mode) {
         if (!dir) return -ENOENT;
         node = vfs_create(dir, leaf, VFS_FILE);
         if (!node) return -ENOSPC;
+        node->mode = mode & 07777;
     } else if ((flags & O_CREAT) && (flags & O_EXCL)) {
         return -EEXIST;
     }
@@ -442,12 +550,13 @@ static int32_t sys_open(const char* path, int flags, uint32_t mode) {
     int fd = fd_alloc();
     if (fd < 0) return -EMFILE;
 
-    fds[fd].kind = FD_FILE;
-    fds[fd].node = node;
-    fds[fd].offset = (want_write && (flags & O_APPEND)) ? node->length : 0;
-    fds[fd].writable = want_write;
-    fds[fd].append = (flags & O_APPEND) != 0;
-    fds[fd].dir_index = 0;
+    P->fds[fd].kind = FD_FILE;
+    P->fds[fd].node = node;
+    P->fds[fd].offset = (want_write && (flags & O_APPEND)) ? node->length : 0;
+    P->fds[fd].writable = want_write;
+    P->fds[fd].append = (flags & O_APPEND) != 0;
+    P->fds[fd].dir_index = 0;
+    P->fds[fd].cloexec = (flags & O_CLOEXEC) != 0;
     return fd;
 }
 
@@ -459,6 +568,64 @@ static int32_t sys_close(int fd) {
     e->kind = FD_FREE;
     e->node = 0;
     e->sock = 0;
+    return 0;
+}
+
+/* --- descriptor duplication (Milestone 29) -------------------------------
+ *
+ * dup2 is how a program wires a pipe onto a child's stdout before exec,
+ * and Wine's loader does exactly that. It is also the first thing in this
+ * kernel to make two descriptors name one object, which is why sockets
+ * grew a reference count in the same milestone. */
+static int32_t fd_dup_to(int oldfd, int newfd, int cloexec) {
+    posix_proc_t* P = posix_current();
+    fd_entry_t* e = fd_get(oldfd);
+    if (!e) return -EBADF;
+    if (newfd < 0 || newfd >= MAX_FDS) return -EBADF;
+    if (newfd == oldfd) return newfd;
+
+    if (P->fds[newfd].kind != FD_FREE) sys_close(newfd);
+    P->fds[newfd] = *e;
+    P->fds[newfd].cloexec = cloexec;
+    if (e->kind == FD_SOCKET) socket_ref(e->sock);
+    return newfd;
+}
+
+static int32_t sys_dup(int oldfd) {
+    if (!fd_get(oldfd)) return -EBADF;
+    int fd = fd_alloc();
+    if (fd < 0) return -EMFILE;
+    return fd_dup_to(oldfd, fd, 0);
+}
+
+/* --- pipes ---------------------------------------------------------------
+ *
+ * Two descriptors onto one connected pair; see socket_pipe(). O_CLOEXEC
+ * is the only flag pipe2 is asked for in practice and it is honoured,
+ * because the whole point of a pipe across an exec is that exactly one
+ * end survives it. */
+static int32_t sys_pipe(int32_t* fdv, int flags) {
+    posix_proc_t* P = posix_current();
+    if (!fdv) return -EFAULT;
+
+    socket_t *r = 0, *w = 0;
+    int32_t e = socket_pipe(&r, &w);
+    if (e < 0) return e;
+
+    int rfd = posix_fd_install_socket(r);
+    int wfd = rfd >= 0 ? posix_fd_install_socket(w) : -EMFILE;
+    if (rfd < 0 || wfd < 0) {
+        if (rfd >= 0) sys_close(rfd);
+        else socket_close(r);
+        socket_close(w);
+        return -EMFILE;
+    }
+
+    P->fds[rfd].writable = 0;
+    P->fds[rfd].cloexec = (flags & O_CLOEXEC) != 0;
+    P->fds[wfd].cloexec = (flags & O_CLOEXEC) != 0;
+    fdv[0] = rfd;
+    fdv[1] = wfd;
     return 0;
 }
 
@@ -581,6 +748,7 @@ static int32_t sys_lseek(int fd, int32_t offset, int whence) {
 #define S_IFREG 0100000
 #define S_IFCHR 0020000
 #define S_IFDIR 0040000
+#define S_IFSOCK 0140000
 
 /* The device every initrd file claims to be on. Any non-zero value does;
  * it only has to be consistent and not collide with 0. */
@@ -606,11 +774,13 @@ static int32_t stat_common(uint8_t* st, uint32_t size, uint32_t mode,
     kmemset(st, 0, 96);
     *(uint32_t*)(st + ST_DEV_OFFSET) = NOVARIS_INITRD_DEV;
     *(uint32_t*)(st + ST_INO32_OFFSET) = ino;
-    /* 0755 rather than 0555: the filesystem is writable now, and a
-     * program that checks the mode before trying should be told the
-     * truth. There are no permissions to enforce, so every file is
-     * everybody's. */
-    *(uint32_t*)(st + ST_MODE_OFFSET) = mode | 0755;
+    /* `mode` arrives with both halves already in it: the file type from
+     * the caller and the permission bits the node was created with. The
+     * permissions are recorded rather than enforced - there is nobody to
+     * enforce them against - but they are the program's own numbers, and
+     * a program that checks them (wineserver checks that its directory is
+     * private) is entitled to see what it asked for. */
+    *(uint32_t*)(st + ST_MODE_OFFSET) = mode;
     *(uint32_t*)(st + ST_NLINK_OFFSET) = 1;
     *(uint64_t*)(st + ST_SIZE_OFFSET) = size;
     *(uint32_t*)(st + ST_BLKSIZE_OFFSET) = PAGE_SIZE;
@@ -633,10 +803,13 @@ static int32_t sys_fstat64(int fd, uint8_t* st) {
     if (e->kind == FD_CONSOLE) {
         /* The three console descriptors are one character device, and
          * distinct from every file. */
-        return stat_common(st, 0, S_IFCHR, 1u + (uint32_t)fd);
+        return stat_common(st, 0, S_IFCHR | 0620, 1u + (uint32_t)fd);
     }
-    uint32_t mode = (e->node->flags & VFS_DIRECTORY) ? S_IFDIR : S_IFREG;
-    return stat_common(st, e->node->length, mode, node_ino(e->node));
+    uint32_t mode = (e->node->flags & VFS_DIRECTORY) ? S_IFDIR
+                  : (e->node->flags & VFS_SOCKET)    ? S_IFSOCK
+                                                     : S_IFREG;
+    return stat_common(st, e->node->length, mode | (e->node->mode & 07777),
+                       node_ino(e->node));
 }
 
 static int32_t sys_stat64(const char* path, uint8_t* st) {
@@ -647,16 +820,30 @@ static int32_t sys_stat64(const char* path, uint8_t* st) {
     return r;
 }
 
-/* getcwd. There is no per-process working directory, so the answer is
- * always the root - which is at least true rather than absent, and is
- * what every path in this kernel already resolves against. Linux returns
- * the length including the NUL and writes the string into the buffer. */
+/* getcwd. Real since Milestone 29: the working directory is per process,
+ * survives fork and exec, and is what a relative path resolves against.
+ * Linux returns the length including the NUL and writes the string into
+ * the buffer. */
 static int32_t sys_getcwd(char* buf, uint32_t size) {
+    posix_proc_t* P = posix_current();
     if (!buf) return -EFAULT;
-    if (size < 2) return -ERANGE;
-    buf[0] = '/';
-    buf[1] = '\0';
-    return 2;
+    uint32_t n = kstrlen(P->cwd) + 1;
+    if (size < n) return -ERANGE;
+    kmemcpy(buf, P->cwd, n);
+    return (int32_t)n;
+}
+
+static int32_t sys_chdir(const char* path) {
+    posix_proc_t* P = posix_current();
+    if (!path) return -EFAULT;
+    char joined[PATH_JOIN_MAX];
+    const char* abs = abs_into(path, joined, sizeof(joined));
+
+    vfs_node_t* n = vfs_lookup(abs);
+    if (!n) return -ENOENT;
+    if (!(n->flags & VFS_DIRECTORY)) return -ENOTDIR;
+    kstrlcpy(P->cwd, abs, sizeof(P->cwd));
+    return 0;
 }
 
 /* readlink. There are no symlinks, so the only link that resolves is the
@@ -673,11 +860,12 @@ static int32_t sys_readlink(const char* path, char* buf, uint32_t size) {
     int is_self_exe =
         path_is(path, "/proc/self/exe") || path_is(path, "/proc/curproc/file");
     if (!is_self_exe) {
-        return vfs_lookup(path) ? -EINVAL : -ENOENT;
+        return resolve_for_read(path) ? -EINVAL : -ENOENT;
     }
-    uint32_t n = kstrlen(exe_path);
+    const char* exe = posix_current()->exe_path;
+    uint32_t n = kstrlen(exe);
     if (n > size) n = size;
-    kmemcpy(buf, exe_path, n);
+    kmemcpy(buf, exe, n);
     return (int32_t)n;   /* not NUL-terminated, exactly as Linux leaves it */
 }
 
@@ -691,19 +879,46 @@ static int32_t sys_readlink(const char* path, char* buf, uint32_t size) {
 
 static int32_t sys_unlink(const char* path, int want_dir) {
     if (!path) return -EFAULT;
+    char joined[PATH_JOIN_MAX];
+    path = abs_into(path, joined, sizeof(joined));
     const char* leaf = 0;
     vfs_node_t* dir = vfs_resolve_parent(path, &leaf);
     if (!dir) return -ENOENT;
-    return vfs_unlink(dir, leaf, want_dir);
+    int32_t r = vfs_unlink(dir, leaf, want_dir);
+    /* Removing a socket's file removes the binding with it. */
+    if (r == 0) socket_unbind_path(path);
+    return r;
 }
 
-static int32_t sys_mkdir(const char* path) {
+static int32_t sys_mkdir(const char* path, uint32_t mode) {
     if (!path) return -EFAULT;
+    char joined[PATH_JOIN_MAX];
+    path = abs_into(path, joined, sizeof(joined));
     const char* leaf = 0;
     vfs_node_t* dir = vfs_resolve_parent(path, &leaf);
     if (!dir) return -ENOENT;
     if (vfs_finddir(dir, leaf)) return -EEXIST;
-    return vfs_create(dir, leaf, VFS_DIRECTORY) ? 0 : -ENOSPC;
+    vfs_node_t* n = vfs_create(dir, leaf, VFS_DIRECTORY);
+    if (!n) return -ENOSPC;
+    n->mode = mode & 07777;
+    return 0;
+}
+
+/* chmod. Recorded, not enforced, for the same reason the mode is: a
+ * program that sets a mode and reads it back must see what it set. */
+static int32_t sys_chmod(const char* path, uint32_t mode) {
+    vfs_node_t* n = resolve_for_read(path);
+    if (!n) return -ENOENT;
+    n->mode = mode & 07777;
+    return 0;
+}
+
+static int32_t sys_rename(const char* from, const char* to) {
+    if (!from || !to) return -EFAULT;
+    /* Two joined paths at once, so two buffers - the shared one would
+     * have the second call overwrite the first. */
+    char a[PATH_JOIN_MAX], b[PATH_JOIN_MAX];
+    return vfs_rename(abs_into(from, a, sizeof(a)), abs_into(to, b, sizeof(b)));
 }
 
 static int32_t sys_ftruncate(int fd, uint32_t length) {
@@ -774,6 +989,534 @@ static int32_t sys_getdents64(int fd, uint8_t* buf, uint32_t count) {
     return (int32_t)written;
 }
 
+/* --- two processes at once (Milestone 29) --------------------------------
+ *
+ * Wine's start_server() is fork(), then execve(wineserver), then
+ * waitpid() - three calls, and until now none of them could exist,
+ * because every piece of POSIX state in this kernel was a global and two
+ * processes would have shared it. include/posix_proc.h is what changed;
+ * these are what it was for.
+ *
+ * There is no copy-on-write here, and there is no fault machinery to
+ * build it on: a page fault in this kernel means a signal or a dead
+ * program, not a mapping to be filled in. So fork copies every page the
+ * parent has, eagerly. That is the honest cost of the design, and it is
+ * why a process's memory is released the moment it exits rather than at
+ * the end of the batch - a fork/exec pair holds two copies for exactly as
+ * long as it takes the child to exec. */
+
+/* Wakes a parent suspended in vfork. Called when the child execs into a
+ * different image and when it exits - the two ways a vfork child stops
+ * being the thing its parent is waiting on. The result written into the
+ * parent's frame is the child's pid, which is what clone returns. */
+static void vfork_release(posix_proc_t* child) {
+    if (!child || !child->vfork_parent) return;
+    child->vfork_parent = 0;
+    scheduler_wake_on((uint32_t)child, 1, child->pid);
+}
+
+/* fork, and the two shapes of clone that are really fork.
+ *
+ * `child_stack` is 0 for a plain fork - the child resumes on its own copy
+ * of the parent's stack - and an address for a clone that supplied one,
+ * which is how glibc's posix_spawn hands its child a scratch stack.
+ *
+ * `vfork` suspends the caller until the child execs or exits. Linux does
+ * that by sharing the address space, so the child's writes are the
+ * parent's; Novaris copies instead, and the honest consequence is written
+ * down in ROADMAP.md - a vfork child here can report back through its exit
+ * status but not through memory. What it preserves is the part that
+ * matters to a spawn: the parent does not resume, and therefore does not
+ * free the stack the child is standing on, until the child is gone. */
+static int32_t fork_common(registers_t* regs, uint32_t child_stack, int vfork) {
+    posix_proc_t* parent = posix_current();
+
+    /* fork needs somewhere to put the child, and the older
+     * "one program, blocking the shell" path in process.c has no queue to
+     * put it in. Every ELF program has run as a scheduler task since
+     * Milestone 20, so this is a real restriction only for flat binaries,
+     * which have no libc to call fork from. */
+    if (!scheduler_is_active()) return -ENOSYS;
+
+    uint32_t child_pd = paging_create_address_space();
+    if (!child_pd) return -ENOMEM;
+
+    if (!paging_copy_user_space(child_pd)) {
+        paging_destroy_address_space(child_pd);
+        return -ENOMEM;
+    }
+
+    posix_proc_t* child = posix_proc_clone(parent, child_pd);
+    if (!child) {
+        paging_destroy_address_space(child_pd);
+        return -EAGAIN;   /* what Linux says when the table is full */
+    }
+
+    int tid = scheduler_fork_current(regs, child_pd, vfork ? "vfork" : "fork");
+    if (tid < 0) {
+        posix_proc_reap(child);
+        paging_destroy_address_space(child_pd);
+        return -EAGAIN;
+    }
+
+    /* A clone that supplied a stack runs the child there instead of on
+     * its copy of the parent's. The copy is still made - the child needs
+     * everything else the parent had - but its first instruction runs on
+     * the stack it was given. */
+    if (child_stack) scheduler_fork_set_stack(tid, child_stack);
+
+    if (vfork) {
+        child->vfork_parent = parent->pid;
+        /* Park on the child's structure until it execs or exits. The
+         * result written into this frame when that happens is the child's
+         * pid, which is the same value returned below - so a caller that
+         * could not be blocked (nothing else runnable, which cannot
+         * happen here since the child is ready) gets the same answer. */
+        scheduler_block_current(regs, (uint32_t)child, 0);
+    }
+    return child->pid;
+}
+
+static int32_t sys_fork(registers_t* regs) {
+    return fork_common(regs, 0, 0);
+}
+
+/* execve's arguments live in the address space that is about to be
+ * destroyed, so they have to be copied out of it first - into the kernel
+ * heap, which is the same memory at the same address on both sides of the
+ * change. Getting this wrong is not subtle: the strings would be read
+ * back out of pages that had been handed to the physical allocator. */
+#define EXEC_MAX_ARGS 32
+#define EXEC_ARG_BYTES 4096
+
+typedef struct {
+    char  store[EXEC_ARG_BYTES];
+    const char* v[EXEC_MAX_ARGS];
+    int   n;
+} exec_vec_t;
+
+static void exec_vec_copy(exec_vec_t* out, uint32_t user_vec) {
+    out->n = 0;
+    uint32_t w = 0;
+    if (!user_vec) return;
+
+    const char* const* v = (const char* const*)user_vec;
+    for (int i = 0; i < EXEC_MAX_ARGS && v[i]; i++) {
+        const char* s = v[i];
+        if (w >= EXEC_ARG_BYTES - 1) break;
+        out->v[out->n++] = &out->store[w];
+        while (*s && w < EXEC_ARG_BYTES - 1) out->store[w++] = *s++;
+        out->store[w++] = '\0';
+    }
+}
+
+static int32_t sys_execve(const char* path, uint32_t uargv, uint32_t uenvp,
+                          registers_t* regs) {
+    posix_proc_t* P = posix_current();
+    if (!path) return -EFAULT;
+
+    /* Everything that has to survive the address space comes out of it
+     * now: the path, the arguments, the environment, and the image
+     * itself. After this the user half is gone. */
+    char joined[PATH_JOIN_MAX];
+    char exec_path[POSIX_PATH_MAX];
+    /* A program that wants to re-execute itself has no other way to name
+     * itself: it was started by a path it never saw. Linux answers this
+     * one, so this does too - and it is the only symlink either kernel has
+     * here. */
+    if (path_is(path, "/proc/self/exe")) {
+        kstrlcpy(exec_path, P->exe_path, sizeof(exec_path));
+    } else {
+        kstrlcpy(exec_path, abs_into(path, joined, sizeof(joined)),
+                 sizeof(exec_path));
+    }
+
+    vfs_node_t* node = resolve_for_read(exec_path);
+    if (!node) return -ENOENT;
+    if (node->flags & VFS_DIRECTORY) return -EACCES;
+
+    static exec_vec_t argv_copy, envp_copy;   /* too big for a kernel stack */
+    exec_vec_copy(&argv_copy, uargv);
+    exec_vec_copy(&envp_copy, uenvp);
+    if (argv_copy.n == 0) {
+        argv_copy.v[0] = exec_path;
+        argv_copy.n = 1;
+    }
+
+    /* The image is read *in place* where the filesystem already holds it,
+     * rather than copied into the kernel heap first. That is not a
+     * micro-optimisation: wineserver is four megabytes, and a copy of it
+     * has to be found on a heap that is also holding everything the
+     * process being replaced allocated - the first attempt at this failed
+     * with -ENOMEM at exactly that point, and Wine reported "could not
+     * exec wineserver". An initrd file's bytes are already in memory and
+     * identity-mapped into every address space, so there is nothing to
+     * copy. A file the program wrote itself lives on the kernel heap,
+     * which is equally reachable.
+     *
+     * Both survive the teardown below for the same reason: neither is in
+     * the half of the address space that is about to be emptied. */
+    uint8_t* image = node->data;
+    uint32_t size = node->length;
+    uint8_t* owned = 0;
+    if (!image) {
+        owned = (uint8_t*)kmalloc(size ? size : 1);
+        if (!owned) return -ENOMEM;
+        size = vfs_read(node, 0, size, owned);
+        image = owned;
+    }
+
+    if (!elf_is_valid(image, size)) {
+        if (owned) kfree(owned);
+        return -ENOEXEC;
+    }
+
+    /* The point of no return. From here a failure cannot be reported to
+     * the caller - there is no caller left to report it to - so
+     * everything that could fail has been done above. */
+    paging_release_user_pages();
+    scheduler_exec_current();
+
+    uint32_t entry = 0, esp = 0;
+    int ok = process_load_elf_image(image, size, argv_copy.n, argv_copy.v,
+                                    envp_copy.n, envp_copy.v, &entry, &esp);
+    if (owned) kfree(owned);
+    if (!ok) {
+        /* An ELF that passed validation and then would not load leaves a
+         * process with no image at all. Killing it is the only honest
+         * outcome, and it is what Linux does too. */
+        posix_exit_status(127);
+        return 0;
+    }
+
+    /* Descriptors survive an exec, which is the whole reason a shell can
+     * redirect a child's output - except the ones the program asked to be
+     * closed. */
+    for (int i = 0; i < MAX_FDS; i++) {
+        if (P->fds[i].kind != FD_FREE && P->fds[i].cloexec) sys_close(i);
+    }
+
+    /* Handlers do not: their addresses belonged to an image that no
+     * longer exists. The *mask* does survive, which is Linux's rule and
+     * matters to a program that blocked a signal before exec'ing. */
+    uint32_t keep_mask = P->blocked;
+    posix_signal_reset();
+    P->blocked = keep_mask;
+
+    P->mmap_next = MMAP_ARENA_START;
+    P->brk_current = BRK_ARENA_START;
+    P->brk_mapped = BRK_ARENA_START;
+    posix_set_exe_path(exec_path);
+
+    /* This process has become something else, which is the other half of
+     * what a vfork parent is waiting for. */
+    vfork_release(P);
+
+    /* And the trap frame *is* the new program's initial state: rewriting
+     * it and returning is the whole of "start executing something else".
+     * The general registers are cleared rather than inherited, because a
+     * fresh process on i386 is entered with them undefined and glibc's
+     * _start assumes as much (it zeroes ebp itself and reads argc off the
+     * stack). */
+    regs->eip = entry;
+    regs->useresp = esp;
+    regs->eax = 0; regs->ebx = 0; regs->ecx = 0; regs->edx = 0;
+    regs->esi = 0; regs->edi = 0; regs->ebp = 0;
+    regs->ds = regs->es = regs->fs = regs->gs = 0x23;
+    regs->cs = 0x1B;
+    regs->ss = 0x23;
+    regs->eflags = 0x202;
+    return 0;
+}
+
+/* --- wait4 ---------------------------------------------------------------
+ *
+ * The status word is Linux's encoding, and a program reads it through
+ * WIFEXITED/WEXITSTATUS rather than directly: a normal exit is the low
+ * byte of the code shifted up eight, and death by a signal is the signal
+ * number in the low seven bits. Both are produced here because a program
+ * that forks is entitled to know which happened. */
+#define WNOHANG 1
+
+static int32_t sys_wait4(int pid, int32_t* status, int options,
+                         registers_t* regs) {
+    posix_proc_t* P = posix_current();
+
+    int have_child = 0;
+    for (int i = 0; ; i++) {
+        posix_proc_t* c = posix_proc_at(i);
+        if (!c) {
+            if (i >= POSIX_MAX_PROCS) break;
+            continue;
+        }
+        if (c->ppid != P->pid) continue;
+        if (pid > 0 && c->pid != pid) continue;
+        have_child = 1;
+        if (!c->exited) continue;
+
+        int collected = c->pid;
+        if (status) *status = c->exit_status;
+        posix_proc_reap(c);
+        return collected;
+    }
+
+    if (!have_child) return -ECHILD;
+    if (options & WNOHANG) return 0;
+
+    /* Park on this process's own structure. A child that exits wakes
+     * exactly its parent, by that address - see process_teardown(). */
+    posix_request_block((uint32_t)P, regs);
+    return 0;   /* not used: the call is going to happen again */
+}
+
+/* --- poll and select -----------------------------------------------------
+ *
+ * Wine's server loop waits on every descriptor it holds at once rather
+ * than blocking on one, so a socket layer without this is a socket layer
+ * wineserver cannot use. Milestone 28 said so and this is the answer.
+ *
+ * Waiting is the interesting part, and it is a compromise stated openly.
+ * The blocking path can park a task on exactly one address, and poll is
+ * by definition interested in several - so a waiting poll registers on
+ * the first socket in its set *and* takes a one-tick deadline. The first
+ * gives an immediate wake for the common single-descriptor case; the
+ * second means nothing in the set can go unnoticed for longer than 10ms.
+ * A wake-on-any-of-N would need a wait queue per object, which is a
+ * bigger change than this milestone is. */
+
+static uint32_t fd_ready_mask(int fd) {
+    fd_entry_t* e = fd_get(fd);
+    if (!e) return POLLNVAL;
+    switch (e->kind) {
+        case FD_CONSOLE:
+            /* stdout and stderr are always writable; there is no
+             * character-at-a-time path into the console, so stdin never
+             * reports readable rather than reporting a read that would
+             * then fail. */
+            return (fd == 0) ? 0u : (uint32_t)POLLOUT;
+        case FD_FILE:
+            /* A regular file is always ready, both ways - which is what
+             * Linux reports, because a read from one never blocks. */
+            return POLLIN | POLLOUT;
+        case FD_SOCKET:
+            return socket_poll_mask(e->sock);
+        default:
+            return POLLNVAL;
+    }
+}
+
+/* The deadline a waiting poll is working to, remembered across the
+ * retries that implement the wait - a relative timeout recomputed every
+ * retry would never expire. 0 means "no timeout given". */
+static uint32_t poll_deadline_for(posix_proc_t* P, uint32_t key,
+                                  int timeout_ms, int* expired) {
+    *expired = 0;
+    if (timeout_ms < 0) return 0;              /* wait forever */
+    if (timeout_ms == 0) { *expired = 1; return 0; }
+
+    if (P->poll_key != key || !P->poll_deadline) {
+        uint32_t ticks = ((uint32_t)timeout_ms + 9u) / 10u;   /* 100Hz PIT */
+        P->poll_key = key;
+        P->poll_deadline = pit_get_ticks() + (ticks ? ticks : 1u);
+        if (!P->poll_deadline) P->poll_deadline = 1;
+    }
+    if ((int32_t)(pit_get_ticks() - P->poll_deadline) >= 0) {
+        P->poll_key = 0;
+        P->poll_deadline = 0;
+        *expired = 1;
+        return 0;
+    }
+    return P->poll_deadline;
+}
+
+/* One tick from now, so a poll waiting on several descriptors re-tests
+ * them promptly even though it could only register on one. */
+static uint32_t poll_next_wake(uint32_t deadline) {
+    uint32_t tick = pit_get_ticks() + 1u;
+    if (!tick) tick = 1u;
+    if (deadline && (int32_t)(deadline - tick) < 0) return deadline;
+    return tick;
+}
+
+static int32_t sys_poll(k_pollfd_t* fds_u, uint32_t nfds, int timeout_ms,
+                        registers_t* regs) {
+    posix_proc_t* P = posix_current();
+    if (nfds && !fds_u) return -EFAULT;
+    if (nfds > MAX_FDS * 2) return -EINVAL;
+
+    int ready = 0;
+    uint32_t first_sock = 0;
+    for (uint32_t i = 0; i < nfds; i++) {
+        if (fds_u[i].fd < 0) { fds_u[i].revents = 0; continue; }
+        uint32_t want = (uint32_t)(uint16_t)fds_u[i].events;
+        uint32_t got = fd_ready_mask(fds_u[i].fd);
+        /* POLLERR, POLLHUP and POLLNVAL are always reported, whether or
+         * not the caller asked for them - Linux's rule, and the reason a
+         * server loop can find out a client vanished without having
+         * subscribed to the possibility. */
+        uint32_t rev = (got & (want | POLLERR | POLLHUP | POLLNVAL));
+        fds_u[i].revents = (int16_t)rev;
+        if (rev) ready++;
+        if (!first_sock) {
+            fd_entry_t* e = fd_get(fds_u[i].fd);
+            if (e && e->kind == FD_SOCKET) first_sock = (uint32_t)e->sock;
+        }
+    }
+
+    if (ready) {
+        P->poll_key = 0;
+        P->poll_deadline = 0;
+        return ready;
+    }
+
+    int expired = 0;
+    uint32_t deadline = poll_deadline_for(P, (uint32_t)fds_u, timeout_ms,
+                                          &expired);
+    if (expired) return 0;
+
+    posix_request_block_until(first_sock, poll_next_wake(deadline), regs);
+    return 0;   /* not used: the call is going to happen again */
+}
+
+/* select's fd_set is a bitmap; only the words covering `nfds` descriptors
+ * are read or written, because the caller's set may be far wider than
+ * this kernel's table (glibc's is 1024 bits). */
+static uint32_t fdset_get(const uint32_t* set, int fd) {
+    return set ? ((set[fd / 32] >> (fd % 32)) & 1u) : 0u;
+}
+
+static int32_t sys_select(int nfds, uint32_t* rd, uint32_t* wr, uint32_t* ex,
+                          uint32_t* tv, registers_t* regs) {
+    posix_proc_t* P = posix_current();
+    if (nfds < 0 || nfds > MAX_FDS) {
+        if (nfds < 0) return -EINVAL;
+        nfds = MAX_FDS;
+    }
+
+    uint32_t rout = 0, wout = 0, eout = 0;
+    int ready = 0;
+    uint32_t first_sock = 0;
+
+    for (int fd = 0; fd < nfds; fd++) {
+        int want_r = fdset_get(rd, fd), want_w = fdset_get(wr, fd);
+        int want_e = fdset_get(ex, fd);
+        if (!want_r && !want_w && !want_e) continue;
+
+        uint32_t got = fd_ready_mask(fd);
+        if (got & POLLNVAL) return -EBADF;
+        if (want_r && (got & (POLLIN | POLLHUP))) { rout |= 1u << fd; ready++; }
+        if (want_w && (got & POLLOUT))            { wout |= 1u << fd; ready++; }
+        if (want_e && (got & POLLPRI))            { eout |= 1u << fd; ready++; }
+
+        if (!first_sock) {
+            fd_entry_t* e = fd_get(fd);
+            if (e && e->kind == FD_SOCKET) first_sock = (uint32_t)e->sock;
+        }
+    }
+
+    /* Only the words that cover `nfds` descriptors are written back. The
+     * caller's fd_set may be much wider (glibc's is 1024 bits) or much
+     * narrower (a program using raw syscalls declares what it needs), and
+     * writing a fixed 128 bytes would corrupt the second kind. */
+    int words = (nfds + 31) / 32;
+    if (words < 1) words = 1;
+
+    if (ready) {
+        if (rd) { rd[0] = rout; for (int i = 1; i < words; i++) rd[i] = 0; }
+        if (wr) { wr[0] = wout; for (int i = 1; i < words; i++) wr[i] = 0; }
+        if (ex) { ex[0] = eout; for (int i = 1; i < words; i++) ex[i] = 0; }
+        P->poll_key = 0;
+        P->poll_deadline = 0;
+        return ready;
+    }
+
+    /* struct timeval { tv_sec, tv_usec }, and a null pointer means "wait
+     * forever" - not "do not wait", which is what a zeroed one means. */
+    int timeout_ms = -1;
+    if (tv) {
+        uint32_t ms = tv[0] * 1000u + tv[1] / 1000u;
+        timeout_ms = (int)ms;
+        if (timeout_ms == 0 && (tv[0] || tv[1])) timeout_ms = 1;
+    }
+
+    int expired = 0;
+    uint32_t deadline = poll_deadline_for(P, (uint32_t)rd + (uint32_t)wr + 1u,
+                                          timeout_ms, &expired);
+    if (expired) {
+        if (rd) for (int i = 0; i < K_FDSET_WORDS; i++) rd[i] = 0;
+        if (wr) for (int i = 0; i < K_FDSET_WORDS; i++) wr[i] = 0;
+        if (ex) for (int i = 0; i < K_FDSET_WORDS; i++) ex[i] = 0;
+        return 0;
+    }
+
+    posix_request_block_until(first_sock, poll_next_wake(deadline), regs);
+    return 0;   /* not used: the call is going to happen again */
+}
+
+/* --- fcntl ---------------------------------------------------------------
+ *
+ * Every one of these came out of running real Wine: it duplicates
+ * descriptors onto known numbers before exec, marks the ones the child
+ * must not inherit, and switches its server socket between blocking and
+ * not. There is no file locking behind F_SETLK - a single machine with one
+ * process tree has nothing to lock against - and saying "granted" is what
+ * Linux would say for an uncontended lock anyway. */
+#define F_DUPFD          0
+#define F_GETFD          1
+#define F_SETFD          2
+#define F_GETFL          3
+#define F_SETFL          4
+#define F_GETLK          5
+#define F_SETLK          6
+#define F_SETLKW         7
+#define F_SETOWN         8
+#define F_GETOWN         9
+#define F_GETLK64       12
+#define F_SETLK64       13
+#define F_SETLKW64      14
+#define F_DUPFD_CLOEXEC 1030
+#define FD_CLOEXEC       1
+#define O_NONBLOCK  0x800
+
+static int32_t sys_fcntl(int fd, int cmd, uint32_t arg) {
+    fd_entry_t* e = fd_get(fd);
+    if (!e) return -EBADF;
+
+    switch (cmd) {
+        case F_DUPFD:
+        case F_DUPFD_CLOEXEC: {
+            int newfd = fd_alloc_from(posix_current(), (int)arg);
+            if (newfd < 0) return -EMFILE;
+            return fd_dup_to(fd, newfd, cmd == F_DUPFD_CLOEXEC);
+        }
+        case F_GETFD: return e->cloexec ? FD_CLOEXEC : 0;
+        case F_SETFD: e->cloexec = (arg & FD_CLOEXEC) ? 1 : 0; return 0;
+        case F_GETFL: {
+            int32_t fl = e->writable ? O_RDWR : O_RDONLY;
+            if (e->append) fl |= O_APPEND;
+            if (e->kind == FD_SOCKET && socket_get_nonblock(e->sock)) {
+                fl |= O_NONBLOCK;
+            }
+            return fl;
+        }
+        case F_SETFL:
+            /* Only the two bits that can be changed after the fact are;
+             * the access mode is fixed at open time and Linux ignores an
+             * attempt to change it rather than refusing. */
+            e->append = (arg & O_APPEND) ? 1 : 0;
+            if (e->kind == FD_SOCKET) {
+                socket_set_nonblock(e->sock, (arg & O_NONBLOCK) ? 1 : 0);
+            }
+            return 0;
+        case F_GETLK: case F_SETLK: case F_SETLKW:
+        case F_GETLK64: case F_SETLK64: case F_SETLKW64:
+            return 0;    /* granted: there is nobody to contend with */
+        case F_SETOWN: return 0;
+        case F_GETOWN: return posix_current()->pid;
+        default: return -EINVAL;
+    }
+}
+
 /* --- everything else ---------------------------------------------------- */
 
 static int32_t sys_uname(uint8_t* buf) {
@@ -800,8 +1543,9 @@ static int32_t sys_nanosleep(const uint32_t* req) {
 }
 
 static void report_unimplemented(uint32_t number) {
-    unimplemented++;
-    if (unimplemented > 8) return; /* one screenful is plenty */
+    posix_proc_t* P = posix_current();
+    P->unimplemented++;
+    if (P->unimplemented > 8) return; /* one screenful is plenty */
     char buf[12];
     terminal_writestring_color("[posix] ", VGA_COLOR_LIGHT_BROWN);
     terminal_writestring("unimplemented syscall ");
@@ -855,6 +1599,7 @@ static const char* syscall_name(uint32_t n) {
         case SYS_pread64: return "pread64";
         case SYS_rt_sigaction: return "rt_sigaction";
         case SYS_rt_sigprocmask: return "rt_sigprocmask";
+        case SYS_sigaltstack: return "sigaltstack";
         case SYS_rt_sigreturn: return "rt_sigreturn";
         case SYS_mmap2: return "mmap2";
         case SYS_stat64: return "stat64";
@@ -973,22 +1718,31 @@ void posix_syscall(registers_t* regs) {
         /* --- the writable half (Milestone 26) ------------------------- */
         case SYS_unlink:   r = sys_unlink((const char*)a, 0); break;
         case SYS_rmdir:    r = sys_unlink((const char*)a, 1); break;
-        case SYS_mkdir:    r = sys_mkdir((const char*)a); break;
+        case SYS_mkdir:    r = sys_mkdir((const char*)a, b); break;
         case SYS_unlinkat:
             /* (dirfd, path, flags). AT_REMOVEDIR is 0x200 and is how
              * glibc's rmdir() reaches this. */
             r = sys_unlink((const char*)b, (c & 0x200) ? 1 : 0);
             break;
-        case SYS_mkdirat:  r = sys_mkdir((const char*)b); break;
-        case SYS_rename:   r = vfs_rename((const char*)a, (const char*)b); break;
-        case SYS_renameat: r = vfs_rename((const char*)b, (const char*)d); break;
+        case SYS_mkdirat:  r = sys_mkdir((const char*)b, c); break;
+        case SYS_chmod:    r = sys_chmod((const char*)a, b); break;
+        case SYS_fchmodat: r = sys_chmod((const char*)b, c); break;
+        case SYS_fchmod: {
+            fd_entry_t* fe = fd_get((int)a);
+            if (!fe || fe->kind != FD_FILE) { r = -EBADF; break; }
+            fe->node->mode = b & 07777;
+            r = 0;
+            break;
+        }
+        case SYS_rename:   r = sys_rename((const char*)a, (const char*)b); break;
+        case SYS_renameat: r = sys_rename((const char*)b, (const char*)d); break;
         case SYS_renameat2:
             /* (olddirfd, old, newdirfd, new, flags). glibc's rename()
              * uses this with flags 0; the RENAME_NOREPLACE/EXCHANGE forms
              * are refused rather than silently treated as a plain rename,
              * and glibc falls back cleanly. */
             if (e) { r = -EINVAL; break; }
-            r = vfs_rename((const char*)b, (const char*)d);
+            r = sys_rename((const char*)b, (const char*)d);
             break;
         case SYS_ftruncate64:
             /* (fd, length_lo, length_hi) - the 64-bit length arrives as a
@@ -1011,11 +1765,9 @@ void posix_syscall(registers_t* regs) {
             r = fd_get((int)a) ? 0 : -EBADF;
             break;
         case SYS_chdir:
-            /* Accepted for a directory that exists, and then ignored:
-             * paths resolve from the root, so honouring it would take a
-             * per-process cwd this does not have. Reporting success for a
-             * directory that is not there would be worse. */
-            r = vfs_lookup((const char*)a) ? 0 : -ENOENT;
+            /* Honoured since Milestone 29: the working directory is per
+             * process and every relative path resolves against it. */
+            r = sys_chdir((const char*)a);
             break;
         case SYS_pread64: {
             /* (fd, buf, count, offset_lo, offset_hi) - a positioned read
@@ -1030,6 +1782,37 @@ void posix_syscall(registers_t* regs) {
             r = (int32_t)vfs_read(e->node, off, n, (uint8_t*)b);
             break;
         }
+        case SYS_pwrite64: {
+            /* (fd, buf, count, offset_lo, offset_hi) - a positioned write
+             * that leaves the descriptor's own offset alone. wineserver
+             * writes its registry and its lock file this way, and the
+             * three -ENOSYS reports it produced without this were the
+             * "file_set_error() can't map error" messages it printed
+             * back. */
+            fd_entry_t* fe = fd_get((int)a);
+            if (!fe || fe->kind != FD_FILE) { r = -EBADF; break; }
+            if (!fe->writable) { r = -EBADF; break; }
+            if (e) { r = -EINVAL; break; }   /* the high half of the offset */
+            r = vfs_write(fe->node, d, c, (const uint8_t*)b);
+            break;
+        }
+        case SYS_statfs64:
+        case SYS_fstatfs64: {
+            /* struct statfs64, 84 bytes on i386. There is one filesystem,
+             * it is in RAM, and the fields a program reads are the block
+             * size and how much of it there is. */
+            uint32_t* sf = (uint32_t*)((n == SYS_statfs64) ? c : c);
+            if (!sf) { r = -EFAULT; break; }
+            kmemset(sf, 0, 84);
+            sf[0] = 0x858458F6u;                  /* f_type: RAMFS_MAGIC */
+            sf[1] = PAGE_SIZE;                    /* f_bsize */
+            ((uint64_t*)(sf + 2))[0] = pmm_total_frames();   /* f_blocks */
+            ((uint64_t*)(sf + 4))[0] = pmm_free_frames();    /* f_bfree */
+            ((uint64_t*)(sf + 6))[0] = pmm_free_frames();    /* f_bavail */
+            sf[19] = 255;                         /* f_namelen */
+            r = 0;
+            break;
+        }
         case SYS_close:    r = sys_close((int)a); break;
         case SYS_lseek:    r = sys_lseek((int)a, (int32_t)b, (int)c); break;
         case SYS_fstat64:  r = sys_fstat64((int)a, (uint8_t*)b); break;
@@ -1040,11 +1823,121 @@ void posix_syscall(registers_t* regs) {
         case SYS_mprotect: r = sys_mprotect(a, b, (int)c); break;
         case SYS_brk:      r = sys_brk(a); break;
 
-        case SYS_getpid:   r = 0x100; break;
+        case SYS_getpid:   r = posix_current()->pid; break;
+        case SYS_getppid:  r = posix_current()->ppid; break;
         case SYS_gettid:   r = scheduler_current_pid() ? scheduler_current_pid()
-                                                       : 0x100; break;
+                                                       : posix_current()->pid;
+                           break;
         case SYS_getuid32: case SYS_geteuid32:
         case SYS_getgid32: case SYS_getegid32: r = 0; break;
+        /* There are no sessions, process groups or file-mode masks here.
+         * Answering rather than reporting is what Linux effectively does
+         * for a process that is already its own group leader, and umask's
+         * previous value is the 022 every shell starts with. */
+        case SYS_getpgrp:  r = posix_current()->pid; break;
+        case SYS_setpgid:  r = 0; break;
+        case SYS_setsid:   r = posix_current()->pid; break;
+        case SYS_umask:    r = 022; break;
+
+        /* --- two processes at once (Milestone 29) --------------------- */
+        case SYS_fork:
+            r = sys_fork(regs);
+            break;
+        case SYS_clone:
+            /* Three shapes reach one syscall, and CLONE_THREAD is what
+             * separates them - not CLONE_VM, which was the obvious guess
+             * and the wrong one.
+             *
+             *   - no CLONE_VM at all: fork. glibc's fork() arrives this
+             *     way rather than through syscall 2.
+             *   - CLONE_VM without CLONE_THREAD: a *child process* that
+             *     Linux lets share its parent's memory - glibc's
+             *     posix_spawn, which is how Wine starts wineserver. Almost
+             *     always with CLONE_VFORK, meaning the parent must not run
+             *     until the child has exec'd.
+             *   - CLONE_VM with CLONE_THREAD: a thread.
+             */
+            if (!(a & 0x00000100u /* CLONE_VM */)) { r = sys_fork(regs); break; }
+            if (!(a & 0x00010000u /* CLONE_THREAD */)) {
+                r = fork_common(regs, b, (a & 0x00004000u /* CLONE_VFORK */) != 0);
+                if (r > 0 && (a & 0x00100000u /* CLONE_PARENT_SETTID */) && c) {
+                    *(uint32_t*)c = (uint32_t)r;
+                }
+                break;
+            }
+            r = posix_sys_clone(a, b, (uint32_t*)c, d, (uint32_t*)e, regs);
+            break;
+        case SYS_vfork:
+            r = fork_common(regs, 0, 1);
+            break;
+        case SYS_execve: {
+            /* On success this rewrites the trap frame to be the new
+             * program's initial state, so returning through the tail of
+             * this function would overwrite its eax with a result nobody
+             * is waiting for. On failure it changed nothing and the errno
+             * goes back to the caller as usual. */
+            int32_t rc = sys_execve((const char*)a, b, c, regs);
+            if (rc == 0) return;
+            r = rc;
+            break;
+        }
+        case SYS_waitpid:
+            r = sys_wait4((int)a, (int32_t*)b, (int)c, regs);
+            break;
+        case SYS_wait4:
+            r = sys_wait4((int)a, (int32_t*)b, (int)c, regs);
+            break;
+
+        case SYS_dup:      r = sys_dup((int)a); break;
+        case SYS_dup2:     r = fd_dup_to((int)a, (int)b, 0); break;
+        case SYS_dup3:
+            /* dup2 with flags, and the one flag is O_CLOEXEC. Duplicating
+             * a descriptor onto itself is an error here where dup2 makes
+             * it a no-op - Linux draws exactly that distinction. */
+            if (a == b) { r = -EINVAL; break; }
+            r = fd_dup_to((int)a, (int)b, (c & O_CLOEXEC) ? 1 : 0);
+            break;
+        case SYS_pipe:     r = sys_pipe((int32_t*)a, 0); break;
+        case SYS_pipe2:    r = sys_pipe((int32_t*)a, (int)b); break;
+
+        case SYS_poll:
+            r = sys_poll((k_pollfd_t*)a, b, (int)c, regs);
+            break;
+        case SYS_ppoll: {
+            /* (fds, nfds, timespec*, sigmask, sigsetsize). The mask is
+             * ignored: it exists to close a race between unblocking a
+             * signal and waiting, and this kernel delivers signals only on
+             * the way back to ring 3, so the race it closes cannot happen
+             * here. Saying so beats refusing the call glibc's poll()
+             * actually makes. */
+            int ms = -1;
+            if (c) {
+                const int32_t* ts = (const int32_t*)c;
+                ms = ts[0] * 1000 + ts[1] / 1000000;
+            }
+            r = sys_poll((k_pollfd_t*)a, b, ms, regs);
+            break;
+        }
+        case SYS__newselect:
+            r = sys_select((int)a, (uint32_t*)b, (uint32_t*)c, (uint32_t*)d,
+                           (uint32_t*)e, regs);
+            break;
+        case SYS_pselect6: {
+            /* Same five sets, but the timeout is a timespec and there is a
+             * sixth argument nobody here needs. glibc's select() uses this
+             * on a current kernel. */
+            uint32_t tv[2];
+            uint32_t* tvp = 0;
+            if (e) {
+                const uint32_t* ts = (const uint32_t*)e;
+                tv[0] = ts[0];
+                tv[1] = ts[1] / 1000u;
+                tvp = tv;
+            }
+            r = sys_select((int)a, (uint32_t*)b, (uint32_t*)c, (uint32_t*)d,
+                           tvp, regs);
+            break;
+        }
 
         case SYS_uname:    r = sys_uname((uint8_t*)a); break;
 
@@ -1166,8 +2059,154 @@ void posix_syscall(registers_t* regs) {
             r = 0;
             break;
         case SYS_statx:      r = -ENOSYS; break;
+
+        /* --- what real Wine asked for next (Milestone 29) ---------------
+         * Every one of these was found the way the rest of this file's
+         * entries were: by running Wine and reading the -ENOSYS reports it
+         * provoked on the way to starting a wineserver. */
+        case SYS_fcntl:
+        case SYS_fcntl64:
+            r = sys_fcntl((int)a, (int)b, c);
+            break;
+
+        case SYS_getrlimit:
+        case SYS_prlimit64: {
+            /* prlimit64 is (pid, resource, new*, old*) with 64-bit
+             * values; getrlimit is (resource, rlimit*) with 32-bit ones.
+             * Nothing here enforces a limit, so a new one is accepted and
+             * dropped and the old one is reported. */
+            if (n == SYS_prlimit64) {
+                if (a && a != (uint32_t)posix_current()->pid) { r = -ESRCH; break; }
+                uint32_t* old = (uint32_t*)d;
+                if (old) {
+                    uint64_t v = (b == 3) ? ELF_STACK_BYTES : 0xFFFFFFFFFFFFFFFFull;
+                    ((uint64_t*)old)[0] = v;
+                    ((uint64_t*)old)[1] = v;
+                }
+            } else {
+                uint32_t* lim = (uint32_t*)b;
+                if (!lim) { r = -EFAULT; break; }
+                lim[0] = (a == 3) ? ELF_STACK_BYTES : 0xFFFFFFFFu;
+                lim[1] = lim[0];
+            }
+            r = 0;
+            break;
+        }
+        case SYS_setrlimit: r = 0; break;
+
+        case SYS_getrusage:
+            /* struct rusage is 72 bytes on i386 and there is no per-process
+             * accounting to fill it from. Zeroed is honest; refusing would
+             * fail programs that only report it. */
+            if (!b) { r = -EFAULT; break; }
+            kmemset((void*)b, 0, 72);
+            r = 0;
+            break;
+
+        case SYS_gettimeofday: {
+            /* struct timeval { tv_sec, tv_usec }, 100Hz resolution - the
+             * PIT tick is all there is. A null timezone pointer is the
+             * only kind anything passes any more. */
+            uint32_t* tv = (uint32_t*)a;
+            if (tv) {
+                tv[0] = rtc_unix_time();
+                tv[1] = (pit_get_ticks() % 100u) * 10000u;
+            }
+            if (b) { ((uint32_t*)b)[0] = 0; ((uint32_t*)b)[1] = 0; }
+            r = 0;
+            break;
+        }
+
+        case SYS_clock_getres: {
+            /* 10ms, which is the PIT rate and therefore the truth. */
+            uint32_t* ts = (uint32_t*)b;
+            if (ts) { ts[0] = 0; ts[1] = 10000000u; }
+            r = 0;
+            break;
+        }
+
+        case SYS_symlink:
+        case SYS_symlinkat:
+            /* There are no symlinks in this filesystem and there is no
+             * honest way to fake one. Wine makes them inside its prefix
+             * (the dosdevices drive letters) and carries on when they
+             * fail, which is why -EPERM rather than -ENOSYS: the operation
+             * is understood and refused, not unknown. */
+            r = -EPERM;
+            break;
+
+        case SYS_lstat64:
+            /* No symlinks, so lstat and stat cannot differ. */
+            r = sys_stat64((const char*)a, (uint8_t*)b);
+            break;
+
+        case SYS_fchdir: {
+            /* Real, because wineserver opens its config directory and
+             * then moves into it by descriptor rather than by name -
+             * which is the safe way to do it on a real system, and was
+             * the last thing standing between it and starting. The path
+             * is rebuilt from the tree, since no node stores one. */
+            fd_entry_t* fe = fd_get((int)a);
+            if (!fe || fe->kind != FD_FILE) { r = -EBADF; break; }
+            if (!(fe->node->flags & VFS_DIRECTORY)) { r = -ENOTDIR; break; }
+            char here[POSIX_PATH_MAX];
+            if (!vfs_path_of(fe->node, here, sizeof(here))) { r = -ENAMETOOLONG; break; }
+            kstrlcpy(posix_current()->cwd, here, POSIX_PATH_MAX);
+            r = 0;
+            break;
+        }
+        case SYS_setpriority:
+        case SYS_getpriority:
+            /* One priority, and it is the only one. Round-robin with a
+             * fixed slice has nothing to raise or lower. */
+            r = 0;
+            break;
+
+        case SYS_sched_yield:
+            /* A real yield: the caller is telling the scheduler it has
+             * nothing to do, and there is a scheduler to tell. */
+            scheduler_yield_from_trap(regs);
+            r = 0;
+            break;
+
+        case SYS_madvise:
+            /* Advice, and this kernel has no paging policy to advise. */
+            r = 0;
+            break;
+
+        case SYS_epoll_create:
+        case SYS_epoll_create1:
+            /* Refused deliberately rather than half-built. wineserver asks
+             * for an epoll descriptor once at startup and falls back to
+             * poll() for the whole of its main loop if it does not get
+             * one - which is the path Novaris implements properly. A
+             * half-working epoll would be chosen over a working poll. */
+            r = -ENOSYS;
+            break;
+
+        case SYS_sysinfo:
+            /* struct sysinfo, 64 bytes on i386. Uptime and memory are the
+             * two fields anything reads and both are known. */
+            if (!a) { r = -EFAULT; break; }
+            kmemset((void*)a, 0, 64);
+            ((uint32_t*)a)[0] = pit_get_ticks() / 100u;          /* uptime */
+            ((uint32_t*)a)[4] = pmm_total_frames() * PAGE_SIZE;  /* totalram */
+            ((uint32_t*)a)[5] = pmm_free_frames() * PAGE_SIZE;   /* freeram */
+            ((uint32_t*)a)[13] = 1;                              /* procs */
+            ((uint32_t*)a)[14] = PAGE_SIZE;                      /* mem_unit */
+            r = 0;
+            break;
+
         case SYS_time:     r = (int32_t)rtc_unix_time(); break;
         case SYS_nanosleep: r = sys_nanosleep((const uint32_t*)a); break;
+        case SYS_clock_nanosleep:
+            /* (clockid, flags, request, remain). TIMER_ABSTIME (1) would
+             * mean the timespec is a deadline rather than a duration;
+             * nothing here asks for it, and treating one as the other
+             * would sleep for fifty-odd years. */
+            if (b & 1) { r = -ENOSYS; break; }
+            r = sys_nanosleep((const uint32_t*)c);
+            break;
 
         /* Real since Milestone 19 - see kernel/posix_signal.c. */
         case SYS_rt_sigaction:
@@ -1178,6 +2217,9 @@ void posix_syscall(registers_t* regs) {
             r = posix_sys_rt_sigprocmask((int)a, (const uint32_t*)b,
                                          (uint32_t*)c, d);
             break;
+        case SYS_sigaltstack:
+            r = posix_sys_sigaltstack((const k_stack_t*)a, (k_stack_t*)b);
+            break;
         case SYS_rt_sigreturn:
             /* Restores the interrupted context wholesale, so eax is set
              * by the restore rather than by the usual `regs->eax = r`
@@ -1186,24 +2228,29 @@ void posix_syscall(registers_t* regs) {
             return;
 
         case SYS_kill:
-        case SYS_tgkill:
-            /* One process, so the pid is only checked for sanity; the
-             * signal number is the last argument in both. The two differ
-             * in the si_code an SA_SIGINFO handler sees, which is how a
-             * program tells a targeted thread signal from a process one. */
-            if (n == SYS_kill) {
+            /* Since Milestone 29 the pid is real and a signal can cross
+             * between processes: a program can kill its own child, which
+             * is how a parent that gives up waiting ends one. A pid that
+             * is this process's own still takes the local path, so
+             * raise() behaves exactly as it did. */
+            if ((int)a == posix_current()->pid || (int)a == 0) {
                 r = posix_raise_from((int)b, SI_USER, (int32_t)a);
             } else {
-                r = posix_raise_from((int)c, SI_TKILL, (int32_t)a);
+                r = posix_raise_pid((int)a, (int)b, SI_USER,
+                                    posix_current()->pid);
             }
+            break;
+        case SYS_tgkill:
+            /* Targets a *thread*, and threads share this process's
+             * structure - so this is always the local path. It differs
+             * from kill only in the si_code an SA_SIGINFO handler sees,
+             * which is how a program tells the two apart. */
+            r = posix_raise_from((int)c, SI_TKILL, (int32_t)a);
             break;
 
         /* Real since Milestone 20 - see kernel/posix_thread.c. */
         case SYS_set_thread_area:
             r = posix_sys_set_thread_area(a);
-            break;
-        case SYS_clone:
-            r = posix_sys_clone(a, b, (uint32_t*)c, d, (uint32_t*)e, regs);
             break;
         case SYS_futex:
             r = posix_sys_futex(a, (int)b, c, d, regs);
@@ -1229,13 +2276,11 @@ void posix_syscall(registers_t* regs) {
             posix_thread_exiting();
             /* fall through */
         case SYS_exit_group:
-            /* Same two paths sys_exit always had: into the scheduler's
-             * ready queue when one is running, or back to the kernel. */
-            if (scheduler_is_active()) {
-                scheduler_exit_current();
-            } else {
-                process_exit_to_kernel(); /* does not return */
-            }
+            /* The status is real since Milestone 29, and in Linux's
+             * encoding rather than raw: a normal exit is the low byte of
+             * the code shifted up eight, which is what WIFEXITED and
+             * WEXITSTATUS read. A parent in wait4 is woken by this. */
+            posix_exit_status((int)((a & 0xFFu) << 8));
             return; /* eax is not written: this task is finished */
 
         default:
@@ -1261,8 +2306,28 @@ void posix_syscall(registers_t* regs) {
          * which now holds the syscall number - see PROC_BLOCKED's
          * wait_retry in the scheduler. */
         uint32_t waiting_on = block_addr;
+        uint32_t until = block_deadline;
         block_addr = 0;
-        if (waiting_on && scheduler_block_current_retry(regs, waiting_on)) return;
+        block_deadline = 0;
+        if ((waiting_on || until) &&
+            scheduler_block_current_retry(regs, waiting_on, until)) {
+            return;
+        }
+        /* Nothing else could run, so parking would leave the machine with
+         * nobody to wake anyone. With a deadline there is still something
+         * to wait *for* - the clock - and idling in the kernel is far
+         * cheaper than returning to ring 3 only to re-enter this syscall.
+         * The syscall gate is an interrupt gate, so IF has to be set by
+         * hand before hlt or the timer that ends the wait never arrives.
+         * (posix_sys_futex takes the same path, for the same reason.) */
+        if (until) {
+            __asm__ __volatile__("sti");
+            while ((int32_t)(pit_get_ticks() - until) < 0) {
+                __asm__ __volatile__("hlt");
+            }
+            __asm__ __volatile__("cli");
+            return;
+        }
         scheduler_yield_from_trap(regs);
         return;
     }

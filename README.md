@@ -14,7 +14,7 @@ bootloader hands off to a kernel, and the kernel grows from there. Over time
 you can shape it to *feel* like whichever OS inspires you (windowing system,
 shell conventions, UI style) without copying anyone's code.
 
-## Current status: Milestone 22 complete ✅
+## Current status: Milestone 29 complete ✅
 
 - [x] Multiboot bootloader handoff (via GRUB), 32-bit protected mode
 - [x] Freestanding C kernel — no libc, we own the whole stack
@@ -58,6 +58,19 @@ shell conventions, UI style) without copying anyone's code.
       directory, with its image, stack and heap invisible to the kernel's
       own address space (one process at a time; the scheduler does not
       switch CR3 yet)
+- [x] **Real signals with real context** — `ucontext_t` and `siginfo_t` in
+      Linux's exact layout, in both directions: a handler can read the
+      faulting registers *and write them back*, which is the whole of
+      Wine's exception dispatch. The x87/SSE half too, so a handler that
+      does arithmetic cannot corrupt the interrupted computation.
+- [x] **Futexes that really block**, and a writable, hierarchical
+      filesystem
+- [x] **Unix domain sockets** — `AF_UNIX`/`SOCK_STREAM` with `SCM_RIGHTS`,
+      so a descriptor sent over a socket arrives as a descriptor
+- [x] **Two processes at once** — `fork`, `vfork`, `execve`, `wait4`,
+      pipes, `dup2`, `poll`/`select`, and a POSIX state that is genuinely
+      per process rather than a set of globals
+- [x] **Real Wine runs, and starts a real wineserver** — see below
 - [x] **A real windowing desktop**: a compositing window manager with
       draggable, resizable, overlapping windows, a taskbar, a Start menu
       and built-in apps — see below
@@ -174,13 +187,16 @@ across kernel32, msvcrt, ntdll and user32, reached through generated
 ring-3 thunks that trap into the kernel on `int 0x81`. `include/win32.h`
 explains the mechanism.
 
-Three shell commands drive it:
+Six shell commands drive it:
 
 | Command | What it does |
 | --- | --- |
 | `run prog.exe` | Loads and runs a program (also handles ELF and flat binaries) |
 | `peinfo prog.exe` | Dumps a PE's headers and shows, per symbol, which imports resolve |
 | `winapi [module]` | Lists the emulated DLLs, or one module's exports |
+| `strace prog [args]` | The same as `run`, with every syscall logged |
+| `ps` | The process table — `fork` gave it more than one row |
+| `setenv NAME=VALUE`, `env` | The environment programs are started with |
 
 `multitask` runs three tasks from the same virtual address in three
 different address spaces, and `threadtest` runs two threads in one
@@ -189,22 +205,45 @@ underlying Milestone 14 paging work: two page
 directories with different contents at the same virtual address, an
 identical kernel half in both, and the kernel still running throughout.
 
-**What this is not**: a Windows clone, a Wine port, or a general-purpose
-compatibility layer. There is a window manager now, but no path from
-`CreateWindowEx` into it — that needs the ability to call a ring-3 window
-procedure, which doesn't exist yet. There is no registry, no networking
-and no threads. `ROADMAP.md` Milestone 10 is precise about where
-the boundary is and why.
+**What this is not**: a Windows clone or a general-purpose compatibility
+layer. There is a window manager, but no path from `CreateWindowEx` into
+it — that needs the ability to call a ring-3 window procedure.
+`ROADMAP.md` Milestone 10 is precise about where the boundary is and why.
 
-The project has since committed to **Path A** — porting real Wine on top
-of Novaris rather than hand-writing more Win32 forever. That is a long
-road with forced prerequisites (address spaces, threads, a POSIX-ish
-syscall surface, a dynamic linker) and no Wine or ReactOS source is
-vendored in until the last of them is done. `ROADMAP.md` has the plan and
-is honest about the scope. A GUI program gets an honest failure from
-`CreateWindowEx` rather than a blank screen; a 64-bit binary is told it's
-64-bit; a program that calls an API Novaris doesn't have prints exactly
-which one.
+## Running real Wine
+
+The project committed to **Path A** — porting real Wine on top of Novaris
+rather than hand-writing more Win32 forever. That road has forced
+prerequisites, and they are now built: per-process address spaces, real
+threads, the Linux/i386 syscall ABI, signals with a writable `ucontext`,
+a dynamic linker, Unix sockets with `SCM_RIGHTS`, and — since Milestone
+29 — `fork`, `execve`, `wait4` and `poll`.
+
+Wine 11.0, unmodified, built with stock `gcc -m32`, now runs far enough
+to **start a wineserver of its own and talk to it**:
+
+```
+novaris> setenv WINEDEBUG=+server
+novaris> run wine-preloader wine hellowin.exe
+wine: created the configuration directory '/.wine'
+wineserver: starting (pid=258)
+0024: init_first_thread( unix_pid=256, unix_tid=1, reply_fd=7, wait_fd=9 )
+0024: init_first_thread() = 0 { pid=0020, tid=0024, session_id=00000001 }
+0024: open_mapping( name=L"\KernelObjects\__wine_user_shared_data" )
+0024: get_handle_fd() = 0 { type=1, cacheable=1, access=000f001f }
+```
+
+That is wineserver's own trace: two Novaris processes, one of them 4MB of
+real Wine, exchanging requests, replies and file descriptors over a Unix
+socket. The Wine prefix and its registry (`system.reg`, `user.reg`,
+`userdef.reg`) are written by wineserver itself.
+
+**No Windows program has run under Wine yet.** It stops at
+`virtual_map_user_shared_data`, which needs `MAP_SHARED` — two processes
+mapping the same physical frames of a file, which needs a page cache this
+kernel does not have. That is the next milestone, and `ROADMAP.md`
+Milestone 29 is precise about it. Wine is not vendored; it is a build
+input, fetched and built separately and pointed at with `WINE_BUILD`.
 
 ## Project layout
 
@@ -234,6 +273,11 @@ novaris/
 │   ├── pmm.c / paging.c / kheap.c   # Memory management
 │   ├── vfs.c / initrd.c       # Filesystem layer
 │   ├── syscall.c              # int 0x80 syscalls
+│   ├── posix.c                # the Linux/i386 syscall ABI
+│   ├── posix_proc.c           # the process table, keyed by address space
+│   ├── posix_signal.c         # signal delivery, sigframes, ucontext
+│   ├── posix_thread.c         # clone, futex, TLS
+│   ├── socket.c               # Unix domain sockets, SCM_RIGHTS, pipes
 │   ├── process.c / process_asm.s    # Ring 0 <-> ring 3
 │   ├── scheduler.c / scheduler_asm.s # Preemptive multitasking
 │   ├── elf.c                  # ELF32 loader
@@ -303,7 +347,16 @@ qemu-system-i386 -cdrom novaris.iso -display none -serial stdio
 ```bash
 make test        # host-side tests: the printf engine and the PE loader
 make test-qemu   # boots the ISO, drives the shell, asserts on the output
+make test-posix  # runs nine binaries on Linux AND Novaris, diffs the two
 ```
+
+`make test-posix` is the strongest of the three, and the one the POSIX
+work is held to: nine programs written for Linux (raw `int $0x80`, built
+with plain `gcc -m32 -static -nostdlib`, linked against nothing that has
+heard of Novaris) are executed on the build host *and* inside QEMU, and
+the transcripts must match line for line. Exactly one line is allowed to
+differ — `uname`'s sysname — and its differing is what proves the QEMU
+transcript really came from Novaris.
 
 `make test` links the *actual* kernel sources into a host binary and
 drives them directly — the format engine is checked conversion by

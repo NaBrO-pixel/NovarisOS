@@ -9,6 +9,7 @@
 #include "kheap.h"
 #include "paging.h"
 #include "posix.h"
+#include "posix_proc.h"
 #include "elf.h"
 #include "pe.h"
 #include "win32.h"
@@ -241,9 +242,9 @@ static void cmd_run(const char* line) {
     if (!buffer) return;
 
     if (elf_is_valid(buffer, size)) {
-        /* So readlink("/proc/self/exe") can answer - which is how Wine's
+        /* process_run_elf() records argv[0] as the program's own path, so
+         * readlink("/proc/self/exe") can answer it - which is how Wine's
          * loader works out where it was installed. */
-        posix_set_exe_path(fname);
         if (!process_run_elf(buffer, size, argc, argv)) {
             terminal_writestring_color("Failed to load ELF: ", VGA_COLOR_LIGHT_RED);
             terminal_writestring(fname);
@@ -560,6 +561,8 @@ static void run_command(char* line) {
         terminal_writestring("            incrementing one shared counter (Milestone 16)\n");
         terminal_writestring("  run <file> [args] - run a program, with a real argv\n");
         terminal_writestring("  strace  - the same, with every syscall logged\n");
+        terminal_writestring("  setenv NAME=VALUE, env - the environment programs are given\n");
+        terminal_writestring("  ps      - the process table (fork gave it more than one row)\n");
         terminal_writestring("  vmtest  - prove per-process address spaces work:\n");
         terminal_writestring("            two page directories, one virtual address,\n");
         terminal_writestring("            two different contents (ROADMAP Milestone 14)\n");
@@ -589,6 +592,50 @@ static void run_command(char* line) {
         terminal_writestring("Ticks since boot: ");
         print_uint(pit_get_ticks());
         terminal_writestring("\n");
+    } else if (streq(line, "ps")) {
+        /* What Milestone 29 made possible to ask: there is more than one
+         * process now, and they outlive each other. A zombie is listed
+         * with its status because that is a real state - a child nobody
+         * has waited for is still in the table. */
+        terminal_writestring("  PID  PPID  STATE     PROGRAM\n");
+        for (int i = 0; ; i++) {
+            if (i >= 8) break;
+            posix_proc_t* p = posix_proc_at(i);
+            if (!p) continue;
+            terminal_writestring("  ");
+            print_uint((uint32_t)p->pid);
+            terminal_writestring("   ");
+            print_uint((uint32_t)p->ppid);
+            terminal_writestring("    ");
+            if (p->exited) {
+                terminal_writestring("zombie(");
+                print_uint((uint32_t)((p->exit_status >> 8) & 0xff));
+                terminal_writestring(")  ");
+            } else {
+                terminal_writestring("running   ");
+            }
+            terminal_writestring(p->exe_path);
+            terminal_writestring("\n");
+        }
+        if (posix_proc_count() == 0) {
+            terminal_writestring("  (nothing running - `run` a program)\n");
+        }
+    } else if (starts_with(line, "setenv ")) {
+        /* The environment every program started from here is handed.
+         * Wine reads more of it than most - WINEDEBUG turns on its own
+         * tracing, WINEPREFIX says where its installation is - so being
+         * able to set one is the difference between guessing at what it
+         * is doing and being told. */
+        if (!process_env_set(line + 7)) {
+            terminal_writestring_color("Environment full or malformed.\n",
+                                       VGA_COLOR_LIGHT_RED);
+        }
+    } else if (streq(line, "env")) {
+        for (int i = 0; i < process_env_count(); i++) {
+            terminal_writestring("  ");
+            terminal_writestring(process_env_at(i));
+            terminal_writestring("\n");
+        }
     } else if (streq(line, "meminfo")) {
         terminal_writestring("Physical frames: ");
         print_uint(pmm_free_frames());
@@ -597,6 +644,14 @@ static void run_command(char* line) {
         terminal_writestring(" total (");
         print_uint(pmm_free_frames() * 4);
         terminal_writestring("KB free)\n");
+        if (pmm_double_frees()) {
+            /* Never expected, and worth shouting about: a frame freed
+             * twice may already belong to somebody else, and the damage
+             * surfaces in whatever runs next rather than here. */
+            terminal_writestring_color("  double frees: ", VGA_COLOR_LIGHT_RED);
+            print_uint(pmm_double_frees());
+            terminal_writestring("\n");
+        }
     } else if (streq(line, "futexinfo") || streq(line, "futexinfo reset")) {
         /* Waiting getting cheaper is not visible in any program's output,
          * so the kernel has to be asked. `waits` counts FUTEX_WAIT calls

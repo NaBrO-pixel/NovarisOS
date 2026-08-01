@@ -51,36 +51,30 @@
  * invited to edit. */
 
 #include "posix.h"
+#include "posix_proc.h"
 #include "console.h"
 #include "fpu.h"
 #include "kstring.h"
 #include "process.h"
 
-/* --- per-process signal state ------------------------------------------- */
-
-static k_sigaction_t actions[NSIG];
-static uint32_t blocked = 0;   /* bit (signo-1) set = blocked */
-static uint32_t pending = 0;
-static int      any_handler = 0; /* fast path: nothing installed, nothing to do */
-static int      in_delivery = 0; /* guards against recursion in the fault path */
-
-/* What to put in siginfo_t when each signal is finally delivered.
- * `pending` is a bitmask rather than a queue, so this is one record per
- * signal number rather than one per raise - which is the same shape as
- * the delivery it feeds, and no worse. */
-typedef struct {
-    int32_t  code;
-    uint32_t addr;   /* si_addr, for the fault signals */
-    int32_t  pid;    /* si_pid, for kill/tgkill */
-} siginfo_rec_t;
-static siginfo_rec_t info_of[NSIG];
-
-/* The last CPU fault this process took. Linux keeps these in the thread
- * struct and copies them into every sigcontext it builds, fault or not,
- * so a signal delivered by kill() carries whatever the last real fault
- * left behind. Matching that is free and avoids the same binary seeing
- * different numbers on the two systems - even meaningless ones. */
-static uint32_t last_trapno = 0, last_err = 0, last_cr2 = 0;
+/* --- per-process signal state -------------------------------------------
+ *
+ * Every one of these was a file-scope global until Milestone 29, which
+ * was correct while there was only ever one program running and wrong the
+ * moment fork existed: a child that installs a SIGSEGV handler must not
+ * install its parent's. They now live in the process structure keyed by
+ * address space (include/posix_proc.h), so threads share them - which is
+ * what POSIX says - and processes do not.
+ *
+ * The accessors below are what keeps the rest of this file looking the
+ * way it did: `S->blocked` rather than `blocked`, and nothing else moved.
+ *
+ * `last_trapno`/`last_err`/`last_cr2` are the last CPU fault this process
+ * took. Linux keeps them in the thread struct and copies them into every
+ * sigcontext it builds, fault or not, so a signal delivered by kill()
+ * carries whatever the last real fault left behind. Matching that is free
+ * and avoids the same binary seeing different numbers on the two systems -
+ * even meaningless ones. */
 
 #define SIGBIT(n) (1u << ((n) - 1))
 
@@ -88,23 +82,24 @@ static uint32_t last_trapno = 0, last_err = 0, last_cr2 = 0;
 #define UNMASKABLE (SIGBIT(SIGKILL))
 
 void posix_signal_reset(void) {
+    posix_proc_t* S = posix_current();
     for (int i = 0; i < NSIG; i++) {
-        actions[i].handler = SIG_DFL;
-        actions[i].flags = 0;
-        actions[i].restorer = 0;
-        actions[i].mask[0] = 0;
-        actions[i].mask[1] = 0;
+        S->actions[i].handler = SIG_DFL;
+        S->actions[i].flags = 0;
+        S->actions[i].restorer = 0;
+        S->actions[i].mask[0] = 0;
+        S->actions[i].mask[1] = 0;
     }
     for (int i = 0; i < NSIG; i++) {
-        info_of[i].code = SI_USER;
-        info_of[i].addr = 0;
-        info_of[i].pid  = 0;
+        S->info_of[i].code = SI_USER;
+        S->info_of[i].addr = 0;
+        S->info_of[i].pid  = 0;
     }
-    blocked = 0;
-    pending = 0;
-    any_handler = 0;
-    in_delivery = 0;
-    last_trapno = last_err = last_cr2 = 0;
+    S->blocked = 0;
+    S->pending = 0;
+    S->any_handler = 0;
+    S->in_delivery = 0;
+    S->last_trapno = S->last_err = S->last_cr2 = 0;
 }
 
 /* --- the sigframe -------------------------------------------------------
@@ -246,12 +241,24 @@ static void capture_clean_fpu(fpu_state_t* out) {
 /* --- delivery ------------------------------------------------------------ */
 
 static int deliver(registers_t* regs, int signo) {
-    k_sigaction_t* sa = &actions[signo];
-    siginfo_rec_t* rec = &info_of[signo];
+    posix_proc_t* S = posix_current();
+    k_sigaction_t* sa = &S->actions[signo];
+    siginfo_rec_t* rec = &S->info_of[signo];
 
     /* Build the frame below the interrupted esp, 16-byte aligned so a
-     * handler compiled with SSE in mind finds what it expects. */
+     * handler compiled with SSE in mind finds what it expects.
+     *
+     * Unless the handler asked for the alternate stack and the thread is
+     * not already on it, which is the whole point of having one: a
+     * SIGSEGV caused by running out of stack cannot be reported on that
+     * same stack. Wine installs its exception handler this way. */
     uint32_t sp = regs->useresp;
+    int use_alt = (sa->flags & SA_ONSTACK) && S->altstack_sp &&
+                  S->altstack_size && !S->altstack_on;
+    if (use_alt) {
+        sp = S->altstack_sp + S->altstack_size;
+        S->altstack_on = 1;
+    }
     sp -= 128;                       /* red zone / breathing room */
     sp &= ~15u;
 
@@ -291,9 +298,13 @@ static int deliver(registers_t* regs, int signo) {
     kmemset(&frame->uc, 0, sizeof(frame->uc));
     frame->uc.uc_flags = 0;
     frame->uc.uc_link  = 0;
-    frame->uc.uc_stack.ss_sp    = 0;
-    frame->uc.uc_stack.ss_flags = 0;
-    frame->uc.uc_stack.ss_size  = 0;
+    /* uc_stack describes the alternate signal stack. Zero when there is
+     * none - which is what a current Linux reports, ss_flags carrying the
+     * task's own flags rather than sas_ss_flags(sp), checked against the
+     * host rather than assumed. */
+    frame->uc.uc_stack.ss_sp    = S->altstack_sp;
+    frame->uc.uc_stack.ss_flags = use_alt ? 1 /* SS_ONSTACK */ : 0;
+    frame->uc.uc_stack.ss_size  = S->altstack_size;
 
     k_sigcontext_t* sc = &frame->uc.uc_mcontext;
     sc->gs = regs->gs; sc->fs = regs->fs; sc->es = regs->es; sc->ds = regs->ds;
@@ -304,17 +315,17 @@ static int deliver(registers_t* regs, int signo) {
     /* Not regs->int_no/err_code: on the way out of a syscall or a timer
      * IRQ those name the syscall gate or the IRQ, and Linux reports the
      * last *fault* here regardless of what is delivering the signal. */
-    sc->trapno = last_trapno;
-    sc->err    = last_err;
+    sc->trapno = S->last_trapno;
+    sc->err    = S->last_err;
     sc->eip    = regs->eip;
     sc->cs     = regs->cs;
     sc->eflags = regs->eflags;
     sc->esp_at_signal = regs->useresp;
     sc->ss     = regs->ss;
-    sc->oldmask = blocked;
-    sc->cr2     = last_cr2;
+    sc->oldmask = S->blocked;
+    sc->cr2     = S->last_cr2;
 
-    frame->uc.uc_sigmask[0] = blocked;
+    frame->uc.uc_sigmask[0] = S->blocked;
     frame->uc.uc_sigmask[1] = 0;
 
     /* --- the x87/SSE state (Milestone 24) -------------------------------
@@ -384,9 +395,9 @@ static int deliver(registers_t* regs, int signo) {
     /* While the handler runs, this signal is blocked (unless the program
      * asked otherwise), plus whatever else its sa_mask names - which is
      * what stops a SIGSEGV handler that faults from recursing forever. */
-    blocked |= sa->mask[0];
-    if (!(sa->flags & SA_NODEFER)) blocked |= SIGBIT(signo);
-    blocked &= ~UNMASKABLE;
+    S->blocked |= sa->mask[0];
+    if (!(sa->flags & SA_NODEFER)) S->blocked |= SIGBIT(signo);
+    S->blocked &= ~UNMASKABLE;
 
     uint32_t handler = sa->handler;
     if (sa->flags & SA_RESETHAND) {
@@ -433,27 +444,30 @@ static const char* signal_name(int signo) {
     }
 }
 
-/* The default action for everything Novaris raises is to terminate. */
+/* The default action for everything Novaris raises is to terminate. The
+ * exit status carries the signal number in Linux's encoding, so a parent
+ * in wait4 can tell a program that died from one that exited. */
 static void default_action(int signo) {
     terminal_writestring_color("[posix] ", VGA_COLOR_LIGHT_RED);
     terminal_writestring("terminated by ");
     terminal_writestring(signal_name(signo));
     terminal_writestring(" (no handler installed)\n");
-    posix_exit_process();
+    posix_exit_status(signo);
 }
 
 void posix_deliver_pending(registers_t* regs) {
-    if (!any_handler && !pending) return;
+    posix_proc_t* S = posix_current();
+    if (!S->any_handler && !S->pending) return;
     if ((regs->cs & 3) != 3) return;  /* only ever into ring 3 */
 
-    uint32_t ready = pending & ~blocked;
+    uint32_t ready = S->pending & ~S->blocked;
     if (!ready) return;
 
     for (int signo = 1; signo < NSIG; signo++) {
         if (!(ready & SIGBIT(signo))) continue;
-        pending &= ~SIGBIT(signo);
+        S->pending &= ~SIGBIT(signo);
 
-        uint32_t h = actions[signo].handler;
+        uint32_t h = S->actions[signo].handler;
         if (h == SIG_IGN) continue;
         if (h == SIG_DFL) {
             default_action(signo); /* does not return */
@@ -465,6 +479,7 @@ void posix_deliver_pending(registers_t* regs) {
 }
 
 int posix_handle_fault_signal(registers_t* regs, uint32_t vector) {
+    posix_proc_t* S = posix_current();
     int signo;
     int32_t code;
     uint32_t addr;
@@ -496,42 +511,91 @@ int posix_handle_fault_signal(registers_t* regs, uint32_t vector) {
     /* Recorded whether or not a handler is installed and whether or not
      * this fault is fatal, because the *next* signal's sigcontext reports
      * it too - which is what Linux does. */
-    last_trapno = vector;
-    last_err    = regs->err_code;
-    last_cr2    = (vector == 14) ? cr2 : 0;
+    S->last_trapno = vector;
+    S->last_err    = regs->err_code;
+    S->last_cr2    = (vector == 14) ? cr2 : 0;
 
-    if (!any_handler) return 0;
-    uint32_t h = actions[signo].handler;
+    if (!S->any_handler) return 0;
+    uint32_t h = S->actions[signo].handler;
     if (h == SIG_DFL || h == SIG_IGN) return 0;
 
     /* A fault *inside* the handler for that same fault would loop for
      * ever. The signal is blocked during its own handler (see deliver),
      * so this catches the case where the program cleared that with
      * SA_NODEFER and then faulted again. */
-    if (blocked & SIGBIT(signo)) {
+    if (S->blocked & SIGBIT(signo)) {
         terminal_writestring_color("[posix] ", VGA_COLOR_LIGHT_RED);
         terminal_writestring("fault inside its own signal handler - "
                              "terminating rather than looping\n");
         return 0;
     }
-    if (in_delivery > 8) return 0;
+    if (S->in_delivery > 8) return 0;
 
-    info_of[signo].code = code;
-    info_of[signo].addr = addr;
-    info_of[signo].pid  = 0;
+    S->info_of[signo].code = code;
+    S->info_of[signo].addr = addr;
+    S->info_of[signo].pid  = 0;
 
-    in_delivery++;
+    S->in_delivery++;
     deliver(regs, signo);
-    in_delivery--;
+    S->in_delivery--;
     return 1;
 }
 
 int posix_raise_from(int signo, int32_t code, int32_t pid) {
+    posix_proc_t* S = posix_current();
     if (signo <= 0 || signo >= NSIG) return -EINVAL;
-    pending |= SIGBIT(signo);
-    info_of[signo].code = code;
-    info_of[signo].addr = 0;
-    info_of[signo].pid  = pid;
+    S->pending |= SIGBIT(signo);
+    S->info_of[signo].code = code;
+    S->info_of[signo].addr = 0;
+    S->info_of[signo].pid  = pid;
+    return 0;
+}
+
+/* Raises a signal against *another* process, which is what kill() means
+ * now that there is more than one. The target's own pending mask is set,
+ * and it finds out on its next return to ring 3 - the only moment a
+ * signal can be delivered here. */
+/* sigaltstack(new, old). Registering one is all this does; deliver()
+ * above is where it is used, and only for a handler that asked with
+ * SA_ONSTACK. */
+int32_t posix_sys_sigaltstack(const k_stack_t* ss, k_stack_t* old) {
+    posix_proc_t* S = posix_current();
+
+    if (old) {
+        old->ss_sp = S->altstack_sp;
+        old->ss_size = S->altstack_size;
+        old->ss_flags = S->altstack_on ? 1 /* SS_ONSTACK */
+                      : (S->altstack_sp ? 0 : SS_DISABLE);
+    }
+    if (!ss) return 0;
+    /* Changing it while a handler is running on it would move the ground
+     * out from under that handler. */
+    if (S->altstack_on) return -EPERM;
+
+    if (ss->ss_flags & SS_DISABLE) {
+        S->altstack_sp = 0;
+        S->altstack_size = 0;
+        return 0;
+    }
+    if (ss->ss_flags) return -EINVAL;
+    /* MINSIGSTKSZ on i386. A stack too small to hold the frame this
+     * kernel builds would fault inside delivery, which is the one place
+     * a fault cannot be reported. */
+    if (ss->ss_size < 2048) return -ENOMEM;
+    S->altstack_sp = ss->ss_sp;
+    S->altstack_size = ss->ss_size;
+    return 0;
+}
+
+int posix_raise_pid(int pid, int signo, int32_t code, int32_t from) {
+    if (signo < 0 || signo >= NSIG) return -EINVAL;
+    posix_proc_t* t = posix_proc_by_pid(pid);
+    if (!t || t->exited) return -ESRCH;
+    if (signo == 0) return 0;   /* kill(pid, 0) is an existence check */
+    t->pending |= SIGBIT(signo);
+    t->info_of[signo].code = code;
+    t->info_of[signo].addr = 0;
+    t->info_of[signo].pid  = from;
     return 0;
 }
 
@@ -545,20 +609,21 @@ int posix_raise(int signo) {
 
 int32_t posix_sys_rt_sigaction(int signo, const k_sigaction_t* act,
                                k_sigaction_t* old, uint32_t sigsetsize) {
+    posix_proc_t* S = posix_current();
     if (signo <= 0 || signo >= NSIG) return -EINVAL;
     if (sigsetsize != 8) return -EINVAL; /* i386 rt_ sigsets are 8 bytes */
     if (signo == SIGKILL) return -EINVAL;
 
-    if (old) *old = actions[signo];
+    if (old) *old = S->actions[signo];
     if (act) {
-        actions[signo] = *act;
+        S->actions[signo] = *act;
         if (act->handler != SIG_DFL && act->handler != SIG_IGN) {
             /* A missing SA_RESTORER is accepted, because Linux accepts it:
              * the kernel plants a trampoline in the signal frame instead.
              * Being stricter here would have been defensible in isolation
              * and would have made a program behave differently on the two
              * systems, which is the one thing this ABI must not do. */
-            any_handler = 1;
+            S->any_handler = 1;
         }
     }
     return 0;
@@ -566,21 +631,23 @@ int32_t posix_sys_rt_sigaction(int signo, const k_sigaction_t* act,
 
 int32_t posix_sys_rt_sigprocmask(int how, const uint32_t* set, uint32_t* old,
                                  uint32_t sigsetsize) {
+    posix_proc_t* S = posix_current();
     if (sigsetsize != 8) return -EINVAL;
-    if (old) { old[0] = blocked; old[1] = 0; }
+    if (old) { old[0] = S->blocked; old[1] = 0; }
     if (!set) return 0;
 
     switch (how) {
-        case SIG_BLOCK:   blocked |= set[0]; break;
-        case SIG_UNBLOCK: blocked &= ~set[0]; break;
-        case SIG_SETMASK: blocked = set[0]; break;
+        case SIG_BLOCK:   S->blocked |= set[0]; break;
+        case SIG_UNBLOCK: S->blocked &= ~set[0]; break;
+        case SIG_SETMASK: S->blocked = set[0]; break;
         default: return -EINVAL;
     }
-    blocked &= ~UNMASKABLE;
+    S->blocked &= ~UNMASKABLE;
     return 0;
 }
 
 int32_t posix_sys_rt_sigreturn(registers_t* regs) {
+    posix_proc_t* S = posix_current();
     /* The handler's `ret` popped the return address, leaving its three
      * cdecl arguments on the stack, and the frame sits immediately above
      * them. */
@@ -598,7 +665,9 @@ int32_t posix_sys_rt_sigreturn(registers_t* regs) {
     /* The mask comes back from uc_sigmask rather than from a shadow copy,
      * because a handler is allowed to change it - Linux reloads it from
      * there too. SIGKILL can never end up blocked whatever was written. */
-    blocked = frame->uc.uc_sigmask[0] & ~UNMASKABLE;
+    S->blocked = frame->uc.uc_sigmask[0] & ~UNMASKABLE;
+    /* Off the alternate stack again, if that is where the handler ran. */
+    if (frame->uc.uc_stack.ss_flags & 1) S->altstack_on = 0;
 
     /* Everything else comes out of uc_mcontext, which is the memory the
      * handler was given a pointer to and may have edited. That is the

@@ -95,6 +95,7 @@
 #define SYS_prctl          172
 #define SYS_socketcall     102
 #define SYS_fork             2
+#define SYS_vfork          190
 #define SYS_execve          11
 #define SYS_waitpid_         7
 #define SYS_wait4          114
@@ -109,6 +110,47 @@
 #define SYS_rseq           386
 #define SYS_clock_gettime64 403
 #define SYS_clock_gettime  265
+/* Milestone 29 - two processes at once. Wine's start_server() is fork(),
+ * execve(wineserver), waitpid(); its server loop multiplexes descriptors
+ * rather than blocking on one; and its loader hands a child a pipe to
+ * report back through. */
+#define SYS__newselect     142
+#define SYS_poll           168
+#define SYS_ppoll          309
+#define SYS_pselect6       308
+#define SYS_dup3           330
+#define SYS_getppid         64
+#define SYS_fcntl           55
+#define SYS_fcntl64        221
+#define SYS_prlimit64      340
+#define SYS_setrlimit       75
+#define SYS_getrlimit       76
+#define SYS_getrusage       77
+#define SYS_gettimeofday    78
+#define SYS_symlink         83
+#define SYS_symlinkat      304
+#define SYS_sched_yield    158
+#define SYS_madvise        219
+#define SYS_lstat64        196
+#define SYS_fchdir         133
+#define SYS_epoll_create   254
+#define SYS_epoll_create1  329
+#define SYS_clock_getres   266
+#define SYS_sysinfo        116
+#define SYS_setsid          66
+#define SYS_getpgrp         65
+#define SYS_setpgid         57
+#define SYS_umask           60
+#define SYS_chmod           15
+#define SYS_fchmod          94
+#define SYS_fchmodat       306
+#define SYS_clock_nanosleep 267
+#define SYS_pwrite64       181
+#define SYS_statfs64       268
+#define SYS_fstatfs64      269
+#define SYS_getpriority     96
+#define SYS_setpriority     97
+#define SYS_sigaltstack    186
 
 /* --- errno values, negated on return ------------------------------------ */
 #define EPERM    1
@@ -144,6 +186,37 @@
 #define ENOTSOCK 88
 #define ENFILE   23
 #define EMSGSIZE 90
+#define ECHILD   10
+#define ESRCH     3
+#define ENOEXEC   8
+#define ELOOP    40
+#define ENAMETOOLONG 36
+#define E2BIG     7
+
+/* --- poll / select (Milestone 29) ---------------------------------------
+ *
+ * Wine's server loop does not block on one descriptor, it waits on all of
+ * them at once - so a socket layer without this is a socket layer
+ * wineserver cannot use. The bit values are Linux's. */
+#define POLLIN   0x001
+#define POLLPRI  0x002
+#define POLLOUT  0x004
+#define POLLERR  0x008
+#define POLLHUP  0x010
+#define POLLNVAL 0x020
+
+typedef struct {
+    int32_t fd;
+    int16_t events;
+    int16_t revents;
+} k_pollfd_t;
+
+/* select's fd_set is a bitmap of `nfds` bits, and the syscall's first
+ * argument says how many of them to look at. 32 descriptors is the whole
+ * table, so one word is genuinely enough - but the caller's set may be
+ * wider (glibc's fd_set is 1024 bits), so only the words that matter are
+ * read and written. */
+#define K_FDSET_WORDS 32
 
 /* --- mmap / mprotect flags, as Linux defines them ----------------------- */
 #define PROT_NONE   0x0
@@ -195,6 +268,7 @@
 #define SA_NOCLDSTOP 0x00000001u
 #define SA_SIGINFO   0x00000004u
 #define SA_RESTORER  0x04000000u
+#define SA_ONSTACK   0x08000000u
 #define SA_NODEFER   0x40000000u
 #define SA_RESETHAND 0x80000000u
 
@@ -334,7 +408,11 @@ void posix_syscall(registers_t* regs);
 
 /* Per-process state: the file descriptor table and the mmap/brk
  * bookkeeping. Called when a program starts and when it exits, because
- * descriptors and mappings belong to the process, not to the kernel. */
+ * descriptors and mappings belong to the process, not to the kernel.
+ *
+ * Since Milestone 29 these bracket a whole *run* - one program and every
+ * process it forks - rather than a single process. The per-process half
+ * lives in kernel/posix_proc.c. */
 void posix_process_begin(void);
 
 /* Records the path the running program was started from, so
@@ -348,6 +426,12 @@ void posix_set_exe_path(const char* path);
  * SCM_RIGHTS is made of: a descriptor sent over a socket travels as an
  * opaque token, because the *number* is the sender's and means nothing at
  * the other end. */
+/* Turns a possibly-relative path into an absolute one, against the
+ * calling process's working directory. Exported for kernel/socket.c,
+ * which has to match bound names as absolute paths - two processes can
+ * bind and connect from different directories and mean the same socket. */
+const char* posix_resolve_path(const char* path, char* buf, uint32_t size);
+
 struct socket;
 int      posix_fd_install_socket(struct socket* s);
 struct socket* posix_fd_socket(int fd);
@@ -360,7 +444,21 @@ int      posix_fd_import(uint32_t token);
  * block is what stops it spinning. Milestone 25 built the second half;
  * this is the first half asking for it. */
 void posix_request_block(uint32_t addr, registers_t* regs);
+
+/* The same, with a deadline: "wake me when `addr` is signalled *or* when
+ * tick `deadline` arrives, whichever comes first". poll() needs both,
+ * because it is waiting on several descriptors and can only name one of
+ * them - the deadline is what stops the others going unnoticed. */
+void posix_request_block_until(uint32_t addr, uint32_t deadline,
+                               registers_t* regs);
 void posix_process_end(void);
+
+/* Ends the running process with `wstatus` - already in Linux's wait
+ * encoding, because both callers know which kind they mean: the exit
+ * syscall shifts its code up eight, and the signal layer passes a bare
+ * signal number for a program killed by one. Releases the process's
+ * memory and wakes a parent waiting in wait4. Does not return. */
+void posix_exit_status(int wstatus);
 
 /* --- signal delivery ----------------------------------------------------
  *
@@ -387,6 +485,11 @@ int posix_handle_fault_signal(registers_t* regs, uint32_t vector);
 int posix_raise(int signo);
 int posix_raise_from(int signo, int32_t code, int32_t pid);
 
+/* Raises a signal against *another* process - which is what kill() means
+ * now that there is more than one. Returns -ESRCH for a pid nothing
+ * answers to; signal 0 is the existence check and raises nothing. */
+int posix_raise_pid(int pid, int signo, int32_t code, int32_t from);
+
 /* Clears every handler and mask. Called when a program starts, since
  * signal dispositions belong to the process. */
 void posix_signal_reset(void);
@@ -403,6 +506,7 @@ int32_t posix_sys_rt_sigaction(int signo, const k_sigaction_t* act,
 int32_t posix_sys_rt_sigprocmask(int how, const uint32_t* set, uint32_t* old,
                                  uint32_t sigsetsize);
 int32_t posix_sys_rt_sigreturn(registers_t* regs);
+int32_t posix_sys_sigaltstack(const k_stack_t* ss, k_stack_t* old);
 
 /* --- threads (kernel/posix_thread.c, Milestone 20) ---------------------- */
 int32_t posix_sys_clone(uint32_t flags, uint32_t child_stack, uint32_t* ptid,

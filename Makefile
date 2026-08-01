@@ -38,6 +38,7 @@ OBJS = $(BUILD_DIR)/boot.o $(BUILD_DIR)/kernel.o \
        $(BUILD_DIR)/serial.o \
        $(BUILD_DIR)/pmm.o $(BUILD_DIR)/paging.o $(BUILD_DIR)/kheap.o \
        $(BUILD_DIR)/syscall.o $(BUILD_DIR)/fpu.o $(BUILD_DIR)/posix.o $(BUILD_DIR)/posix_signal.o $(BUILD_DIR)/posix_thread.o \
+       $(BUILD_DIR)/posix_proc.o \
        $(BUILD_DIR)/process.o $(BUILD_DIR)/process_asm.o \
        $(BUILD_DIR)/user_hello_blob.o $(BUILD_DIR)/vfs.o $(BUILD_DIR)/ramfs.o $(BUILD_DIR)/socket.o \
        $(BUILD_DIR)/elf.o $(BUILD_DIR)/pe.o $(BUILD_DIR)/kstring.o \
@@ -133,6 +134,9 @@ $(BUILD_DIR)/posix_signal.o: kernel/posix_signal.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/posix_thread.o: kernel/posix_thread.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/posix_proc.o: kernel/posix_proc.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/process.o: kernel/process.c $(HEADERS) | $(BUILD_DIR)
@@ -376,6 +380,14 @@ $(BUILD_DIR)/user/socktest.elf: userland/sock_test.c | $(BUILD_DIR)
 	$(CC) -m32 -static -nostdlib -ffreestanding -fno-builtin -O2 -Wall \
 	    -o $@ $<
 
+# Milestone 29: fork, execve, waitpid, pipes, dup2 and poll. It re-executes
+# itself through /proc/self/exe to test execve, so the binary is both the
+# test and its own exec target.
+$(BUILD_DIR)/user/forktest.elf: userland/fork_test.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(CC) -m32 -static -nostdlib -ffreestanding -fno-builtin -O2 -Wall \
+	    -o $@ $<
+
 $(BUILD_DIR)/user/sigtest.elf: userland/signal_test.c | $(BUILD_DIR)
 	mkdir -p $(BUILD_DIR)/user
 	$(CC) -m32 -static -nostdlib -ffreestanding -fno-builtin -O2 -Wall \
@@ -470,7 +482,7 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
         $(BUILD_DIR)/user/hello_elf.elf $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf \
         $(BUILD_DIR)/user/pthtest.elf $(BUILD_DIR)/user/crashelf.elf \
         $(BUILD_DIR)/user/fstest.elf $(BUILD_DIR)/user/kmaptest.elf \
-        $(BUILD_DIR)/user/socktest.elf \
+        $(BUILD_DIR)/user/socktest.elf $(BUILD_DIR)/user/forktest.elf \
         $(BUILD_DIR)/user/glibc.elf $(BUILD_DIR)/user/dyn.elf \
         $(BUILD_DIR)/user/uctest.elf \
         $(BUILD_DIR)/user/ld-linux.so.2 $(BUILD_DIR)/user/libc.so.6 \
@@ -490,6 +502,7 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
 	cp $(BUILD_DIR)/user/fstest.elf $(BUILD_DIR)/initrd_staging/fstest.elf
 	cp $(BUILD_DIR)/user/kmaptest.elf $(BUILD_DIR)/initrd_staging/kmaptest.elf
 	cp $(BUILD_DIR)/user/socktest.elf $(BUILD_DIR)/initrd_staging/socktest.elf
+	cp $(BUILD_DIR)/user/forktest.elf $(BUILD_DIR)/initrd_staging/forktest.elf
 	cp $(BUILD_DIR)/user/crashelf.elf $(BUILD_DIR)/initrd_staging/crashelf.elf
 	cp $(BUILD_DIR)/user/glibc.elf $(BUILD_DIR)/initrd_staging/glibc.elf
 	cp $(BUILD_DIR)/user/dyn.elf $(BUILD_DIR)/initrd_staging/dyn.elf
@@ -587,7 +600,8 @@ test: $(BUILD_DIR)/test/format_test $(BUILD_DIR)/test/pe_test \
 test-posix: $(ISO) $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf \
            $(BUILD_DIR)/user/pthtest.elf $(BUILD_DIR)/user/glibc.elf \
            $(BUILD_DIR)/user/dyn.elf $(BUILD_DIR)/user/uctest.elf \
-           $(BUILD_DIR)/user/fstest.elf $(BUILD_DIR)/user/socktest.elf
+           $(BUILD_DIR)/user/fstest.elf $(BUILD_DIR)/user/socktest.elf \
+           $(BUILD_DIR)/user/forktest.elf
 	python3 tools/posix_compare.py --iso $(ISO) \
 	    --binary $(BUILD_DIR)/user/posixtest.elf --name posixtest.elf
 	python3 tools/posix_compare.py --iso $(ISO) \
@@ -604,6 +618,8 @@ test-posix: $(ISO) $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf
 	    --binary $(BUILD_DIR)/user/fstest.elf --name fstest.elf
 	python3 tools/posix_compare.py --iso $(ISO) \
 	    --binary $(BUILD_DIR)/user/socktest.elf --name socktest.elf
+	python3 tools/posix_compare.py --iso $(ISO) \
+	    --binary $(BUILD_DIR)/user/forktest.elf --name forktest.elf
 
 test-qemu: $(ISO)
 	python3 tools/qemu_test.py --iso $(ISO) --script tools/tests/win32_smoke.txt \
@@ -616,6 +632,10 @@ test-qemu: $(ISO)
 	    --expect "64-bit \(PE32\+\) binary" \
 	    --expect "53 of 53 imports resolve" \
 	    --expect "MAP_FIXED across the kernel's identity map is refused" \
+	    --expect "the parent's copy is untouched" \
+	    --expect "the exec'd image kept the descriptor it was given" \
+	    --expect "poll waits, and a write from another process wakes it" \
+	    --expect "fork test done" \
 	    --expect "the kernel is still running" \
 	    --reject "KERNEL PANIC"
 
@@ -641,6 +661,26 @@ wine-initrd: $(BUILD_DIR)/initrd.img $(KERNEL)
 	cp $(WINE_BUILD)/loader/wine-preloader $(BUILD_DIR)/wine_staging/preload.elf
 	cp $(WINE_BUILD)/loader/wine $(BUILD_DIR)/wine_staging/wineldr.elf
 	cp $(WINE_BUILD)/dlls/ntdll/ntdll.so $(BUILD_DIR)/wine_staging/ntdll.so
+	# Milestone 29: wineserver, which is the process Wine forks and execs
+	# before it can do anything with a handle. Until fork/execve/waitpid
+	# existed there was no point carrying it.
+	cp $(WINE_BUILD)/server/wineserver $(BUILD_DIR)/wine_staging/wineserver
+	# Also under the names Wine's own path logic derives. init_paths()
+	# takes the directory ntdll.so was loaded from and looks for "wine"
+	# and "wine-preloader" beside it, and the initrd is flat - so those
+	# are the names re-exec finds. Both sets ship: the documented
+	# `run preload.elf wineldr.elf --version` still works, and Wine
+	# re-execing itself finds what it expects without being told.
+	cp $(WINE_BUILD)/loader/wine $(BUILD_DIR)/wine_staging/wine
+	cp $(WINE_BUILD)/loader/wine-preloader $(BUILD_DIR)/wine_staging/wine-preloader
+	# The NLS tables. wineserver calls fatal_error() if it cannot load
+	# l_intl.nls, so this is not decoration - without it the server exits
+	# before it binds its socket and the client reports that it cannot
+	# connect. Only the handful Wine actually opens are shipped; the full
+	# set is 11MB and the initrd is read into RAM.
+	for f in l_intl.nls locale.nls c_20127.nls c_1252.nls c_437.nls c_850.nls; do \
+	    cp $(WINE_BUILD)/nls/$$f $(BUILD_DIR)/wine_staging/$$f; \
+	done
 	# glibc's getpwuid() needs these, and Wine dereferences its result
 	# without checking. The initrd is flat, so they land at the root and
 	# the last-component fallback resolves /etc/passwd to them.

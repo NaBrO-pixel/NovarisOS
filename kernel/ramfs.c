@@ -133,6 +133,9 @@ vfs_node_t* vfs_create(vfs_node_t* dir, const char* name, uint32_t flags) {
     kstrlcpy(n->name, name, VFS_NAME_MAX);
     n->flags = flags;
     n->length = 0;
+    /* What the shell's own `mkdir` and an open() that did not name a mode
+     * get; posix.c overwrites it with the caller's when there is one. */
+    n->mode = (flags & VFS_DIRECTORY) ? 0755u : 0644u;
     n->read = ramfs_read;
     n->readdir = (flags & VFS_DIRECTORY) ? ramfs_readdir : 0;
     n->finddir = (flags & VFS_DIRECTORY) ? ramfs_finddir : 0;
@@ -145,6 +148,35 @@ vfs_node_t* vfs_create(vfs_node_t* dir, const char* name, uint32_t flags) {
     while (*tail) tail = &(*tail)->next_sibling;
     *tail = n;
     return n;
+}
+
+/* Walks up to the root collecting names, then writes them out forwards.
+ * The depth bound is the tree's, not a guess: a node cannot be its own
+ * ancestor, so a chain longer than the node table is a corrupted tree
+ * rather than a deep directory. */
+#define VFS_MAX_DEPTH 32
+
+uint32_t vfs_path_of(const vfs_node_t* node, char* buf, uint32_t size) {
+    if (!node || !buf || size < 2) return 0;
+
+    const vfs_node_t* chain[VFS_MAX_DEPTH];
+    uint32_t depth = 0;
+    for (const vfs_node_t* n = node; n && n->parent; n = n->parent) {
+        if (depth >= VFS_MAX_DEPTH) return 0;
+        chain[depth++] = n;
+    }
+
+    if (depth == 0) { buf[0] = '/'; buf[1] = '\0'; return 1; }
+
+    uint32_t w = 0;
+    while (depth--) {
+        uint32_t len = kstrlen(chain[depth]->name);
+        if (w + 1 + len + 1 > size) return 0;
+        buf[w++] = '/';
+        for (uint32_t i = 0; i < len; i++) buf[w++] = chain[depth]->name[i];
+    }
+    buf[w] = '\0';
+    return w;
 }
 
 int32_t vfs_unlink(vfs_node_t* dir, const char* name, int want_dir) {

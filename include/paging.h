@@ -135,4 +135,34 @@ int      paging_map_page_in(uint32_t pd_phys, uint32_t virt_addr,
                             uint32_t phys_addr, uint32_t flags);
 uint32_t paging_get_entry_in(uint32_t pd_phys, uint32_t virt_addr);
 
+/* --- whole-address-space operations (Milestone 29) -----------------------
+ *
+ * fork and execve are both "do something to every page a process owns",
+ * and both need to walk the private half of a page directory rather than
+ * one address at a time. Keeping the walk here keeps the recursive-mapping
+ * knowledge in one file: what a caller says is "copy this process" or
+ * "empty this process", not "index 1022 is the foreign window".
+ *
+ * "Private" means a directory entry that is not part of the frozen kernel
+ * set - so the identity-mapped low 4MB, the kernel image, the heap, the
+ * framebuffer and the Win32 arenas are all excluded automatically, and no
+ * list of them has to be maintained here. */
+
+/* Copies every private mapping of the *current* address space into
+ * `dest_pd`, allocating a fresh frame per page and copying the bytes -
+ * fork without copy-on-write, which this kernel has no fault machinery
+ * for. Returns 1, or 0 if physical memory ran out partway (the caller is
+ * expected to destroy `dest_pd`, which reclaims what was allocated). */
+int paging_copy_user_space(uint32_t dest_pd);
+
+/* Unmaps and frees every private page of the current address space, and
+ * the page tables holding them. What execve does before loading a new
+ * image, and what a process exit does so its frames come back
+ * immediately rather than at the end of the batch. Returns the number of
+ * frames handed back to the PMM.
+ *
+ * The caller must not touch user memory afterwards - which for both of
+ * its callers is the point rather than a caveat. */
+uint32_t paging_release_user_pages(void);
+
 #endif

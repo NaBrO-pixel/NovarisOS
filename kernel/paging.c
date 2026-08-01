@@ -399,6 +399,119 @@ int paging_map_page_in(uint32_t pd_phys, uint32_t virt_addr,
     return 1;
 }
 
+/* --- whole-address-space operations (Milestone 29) -----------------------
+ *
+ * A scratch page, for the one thing neither recursion answers on its own:
+ * writing into a *frame* that is mapped in neither address space. fork
+ * allocates the child's copy of a page from the PMM, and the only way to
+ * put bytes in it is to give it a virtual address here first.
+ *
+ * The address is deliberately in the private half and deliberately
+ * nowhere any loader places anything (the mmap arena starts at
+ * 0x42000000, the program at 0x40000000, a PIE at 0x56000000), so the
+ * page table it needs is this process's own and goes away with it. The
+ * copy loop skips its directory entry, which is why it has to be a fixed
+ * address rather than one taken from anywhere. */
+#define SCRATCH_VA      0x3F000000u
+#define SCRATCH_PD_IDX  PD_INDEX(SCRATCH_VA)
+
+static void* scratch_map(uint32_t phys) {
+    paging_map_page(SCRATCH_VA, phys, PAGE_PRESENT | PAGE_RW);
+    return (void*)SCRATCH_VA;
+}
+
+static void scratch_unmap(void) {
+    paging_unmap_page(SCRATCH_VA);
+}
+
+/* True for a directory entry this process owns outright: present, not one
+ * of the two recursion slots, not part of the shared kernel set, and not
+ * the scratch window above. */
+static int pde_is_own(uint32_t i) {
+    if (i == RECURSIVE_PD_INDEX || i == FOREIGN_PD_INDEX) return 0;
+    if (i == SCRATCH_PD_IDX) return 0;
+    if (pde_is_global(i)) return 0;
+    return (PAGE_DIRECTORY[i] & PAGE_PRESENT) != 0;
+}
+
+int paging_copy_user_space(uint32_t dest_pd) {
+    if (!dest_pd || dest_pd == paging_current_address_space()) return 0;
+
+    /* Attached once for the whole walk rather than per page: every attach
+     * and detach flushes the entire TLB, and a process with a few thousand
+     * pages would otherwise spend the copy doing that. Safe because
+     * nothing in the loop reads through the foreign window except the
+     * tables being built, and the source pages are read through the
+     * ordinary mapping, which the window does not disturb. */
+    foreign_attach(dest_pd);
+    uint32_t* fpd = FOREIGN_PD;
+
+    for (uint32_t i = 0; i < ENTRIES_PER_TABLE; i++) {
+        if (!pde_is_own(i)) continue;
+        uint32_t* pt = PAGE_TABLE(i);
+
+        for (uint32_t j = 0; j < ENTRIES_PER_TABLE; j++) {
+            uint32_t pte = pt[j];
+            if (!(pte & PAGE_PRESENT)) continue;
+
+            if (!(fpd[i] & PAGE_PRESENT)) {
+                uint32_t pt_phys = pmm_alloc_frame();
+                if (!pt_phys) { foreign_detach(); return 0; }
+                fpd[i] = pt_phys | PAGE_PRESENT | PAGE_RW | PAGE_USER;
+                invlpg((uint32_t)FOREIGN_TABLE(i));
+                uint32_t* ft = FOREIGN_TABLE(i);
+                for (uint32_t k = 0; k < ENTRIES_PER_TABLE; k++) ft[k] = 0;
+            }
+
+            uint32_t frame = pmm_alloc_frame();
+            if (!frame) { foreign_detach(); return 0; }
+
+            /* The child's frame is mapped nowhere yet, so it gets the
+             * scratch address for exactly as long as the copy takes. */
+            uint8_t* dst = (uint8_t*)scratch_map(frame);
+            const uint8_t* src = (const uint8_t*)((i << 22) | (j << 12));
+            for (uint32_t b = 0; b < PAGE_SIZE; b++) dst[b] = src[b];
+            scratch_unmap();
+
+            /* Same protection bits as the parent's page, including a
+             * PROT_NONE reservation's, which the child must inherit as a
+             * reservation rather than as usable memory. */
+            FOREIGN_TABLE(i)[j] = frame | (pte & 0xFFFu);
+        }
+    }
+
+    foreign_detach();
+    return 1;
+}
+
+uint32_t paging_release_user_pages(void) {
+    uint32_t freed = 0;
+
+    for (uint32_t i = 0; i < ENTRIES_PER_TABLE; i++) {
+        /* The scratch entry is included here on purpose: it is this
+         * process's page table like any other, and nothing is mapped
+         * through it outside a copy. */
+        if (i == RECURSIVE_PD_INDEX || i == FOREIGN_PD_INDEX) continue;
+        if (pde_is_global(i)) continue;
+        if (!(PAGE_DIRECTORY[i] & PAGE_PRESENT)) continue;
+
+        uint32_t* pt = PAGE_TABLE(i);
+        for (uint32_t j = 0; j < ENTRIES_PER_TABLE; j++) {
+            if (!(pt[j] & PAGE_PRESENT)) continue;
+            pmm_free_frame(pt[j] & ~0xFFFu);
+            pt[j] = 0;
+            freed++;
+        }
+        pmm_free_frame(PAGE_DIRECTORY[i] & ~0xFFFu);
+        PAGE_DIRECTORY[i] = 0;
+    }
+
+    /* A whole half of the address space just changed meaning; page-by-page
+     * invalidation would be a million invlpgs. */
+    flush_tlb();
+    return freed;
+}
+
 uint32_t paging_get_entry_in(uint32_t pd_phys, uint32_t virt_addr) {
     if (!pd_phys || pd_phys == paging_current_address_space()) {
         return paging_get_entry(virt_addr);
