@@ -129,7 +129,19 @@ uint32_t posix_unimplemented_count(void) {
 
 static int map_range(uint32_t base, uint32_t bytes, uint32_t flags) {
     for (uint32_t va = base; va < base + bytes; va += PAGE_SIZE) {
-        if (paging_get_entry(va) & PAGE_PRESENT) continue; /* already there */
+        uint32_t pte = paging_get_entry(va);
+        if (pte & PAGE_PRESENT) {
+            /* Already mapped - which is the normal case for MAP_FIXED, and
+             * exactly what a dynamic linker does: reserve the whole span
+             * of a library with one PROT_NONE anonymous mapping, then map
+             * each segment over it with MAP_FIXED and the protection that
+             * segment actually wants. Keeping the frame but *not* applying
+             * the new flags would leave every one of those segments with
+             * the reservation's permissions, so a write to the GOT would
+             * fault. Keep the page, take the new protection. */
+            paging_map_page(va, pte & ~0xFFFu, flags);
+            continue;
+        }
         uint32_t phys = pmm_alloc_frame();
         if (!phys) return 0;
         paging_map_page(va, phys, flags);
@@ -154,11 +166,16 @@ static int32_t sys_mmap2(uint32_t addr, uint32_t length, int prot,
                          int flags, int fd, uint32_t pgoff) {
     (void)pgoff;
     if (length == 0) return -EINVAL;
-    if (!(flags & MAP_ANONYMOUS) || fd >= 0) {
-        /* A file-backed request is refused rather than quietly returning
-         * zeroed memory, which would corrupt whatever read it. */
-        return -ENOSYS;
-    }
+    /* File-backed MAP_PRIVATE is real since Milestone 22, because it is
+     * how a dynamic linker maps a shared library - ld-linux.so.2 does
+     * essentially nothing else. With no page cache, a private file
+     * mapping degenerates to "allocate pages and read the bytes in",
+     * which is behaviourally correct for MAP_PRIVATE: the mapping is a
+     * private copy, and nothing here ever writes it back. MAP_SHARED
+     * would be a lie and is refused. */
+    int file_backed = !(flags & MAP_ANONYMOUS) && fd >= 0;
+    if (file_backed && (flags & MAP_SHARED)) return -ENODEV;
+    if (!file_backed && fd >= 0 && !(flags & MAP_ANONYMOUS)) return -ENOSYS;
 
     uint32_t bytes = (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     uint32_t base;
@@ -178,6 +195,23 @@ static int32_t sys_mmap2(uint32_t addr, uint32_t length, int prot,
     if (!map_range(base, bytes, pte_flags)) {
         unmap_range(base, bytes);
         return -ENOMEM;
+    }
+
+    if (file_backed) {
+        fd_entry_t* e = fd_get(fd);
+        if (!e || e->kind != FD_FILE) {
+            unmap_range(base, bytes);
+            return -EBADF;
+        }
+        /* pgoff is in pages, as mmap2's name promises - the whole reason
+         * mmap2 exists is to express a file offset beyond 4GB/4096 in a
+         * 32-bit argument. */
+        uint32_t off = pgoff * PAGE_SIZE;
+        uint32_t avail = (off < e->node->length) ? e->node->length - off : 0;
+        uint32_t want = length < avail ? length : avail;
+        if (want) vfs_read(e->node, off, want, (uint8_t*)base);
+        /* Anything past the end of the file stays zero, which is what the
+         * bss tail of a shared library's data segment needs. */
     }
     return (int32_t)base;
 }
@@ -235,11 +269,20 @@ static int32_t sys_open(const char* path, int flags) {
         return -EROFS; /* the initrd is read-only */
     }
 
-    /* Leading "./" and "/" are both accepted, since the initrd is flat and
-     * a program written for Linux will happily pass either. */
+    /* The initrd is a flat archive with no directories, so a path is
+     * matched on its last component only: "/lib/i386-linux-gnu/libc.so.6"
+     * and "libc.so.6" name the same file. That is a simplification the
+     * kernel is honest about rather than a filesystem - two files with
+     * the same basename could not be told apart, and there are none.
+     *
+     * It is also what makes dynamic linking work at all here: the dynamic
+     * linker searches a list of directories, and every one of its
+     * candidate paths has to be able to resolve. */
     const char* name = path;
-    if (name[0] == '/') name++;
-    if (name[0] == '.' && name[1] == '/') name += 2;
+    for (const char* p = path; *p; p++) {
+        if (*p == '/') name = p + 1;
+    }
+    if (!*name) return -ENOENT;
 
     vfs_node_t* node = vfs_root ? vfs_finddir(vfs_root, name) : 0;
     if (!node) return -ENOENT;
@@ -260,6 +303,19 @@ static int32_t sys_close(int fd) {
     if (fd < 3) return 0; /* closing a standard stream is a no-op here */
     e->kind = FD_FREE;
     e->node = 0;
+    return 0;
+}
+
+/* access(path, mode). W_OK fails because the initrd is read-only; R_OK,
+ * X_OK and F_OK succeed for anything present. The dynamic linker probes
+ * with this before it opens, so answering it is what lets it find a
+ * library at all. */
+static int32_t sys_access(const char* path, int mode) {
+    if (!path) return -EFAULT;
+    if (mode & 2) return -EROFS;   /* W_OK */
+    int fd = sys_open(path, O_RDONLY);
+    if (fd < 0) return fd;
+    sys_close(fd);
     return 0;
 }
 
@@ -420,6 +476,40 @@ void posix_syscall(registers_t* regs) {
         case SYS_read:     r = sys_read((int)a, (char*)b, c); break;
         case SYS_writev:   r = sys_writev((int)a, (const iovec_t*)b, (int)c); break;
         case SYS_open:     r = sys_open((const char*)a, (int)b); break;
+        case SYS_access:
+            /* The dynamic linker probes with access() before it opens, so
+             * answering this is what lets it find a library at all. Any
+             * file that can be opened is readable and executable; nothing
+             * is writable. */
+            r = sys_access((const char*)a, (int)b);
+            break;
+        case SYS_faccessat:
+            r = sys_access((const char*)b, (int)c);
+            break;
+        case SYS_faccessat2:
+            r = sys_access((const char*)b, (int)c);
+            break;
+
+        case SYS_openat:
+            /* (dirfd, path, flags, mode). The initrd is flat and there is
+             * one directory, so a relative path resolves the same way an
+             * absolute one does and dirfd carries no information. glibc
+             * calls this rather than open(). */
+            r = sys_open((const char*)b, (int)c);
+            break;
+        case SYS_pread64: {
+            /* (fd, buf, count, offset_lo, offset_hi) - a positioned read
+             * that does not disturb the descriptor's own offset. The
+             * dynamic linker reads ELF headers this way. */
+            fd_entry_t* e = fd_get((int)a);
+            if (!e || e->kind != FD_FILE) { r = -EBADF; break; }
+            uint32_t off = d;
+            if (off >= e->node->length) { r = 0; break; }
+            uint32_t left = e->node->length - off;
+            uint32_t n = c < left ? c : left;
+            r = (int32_t)vfs_read(e->node, off, n, (uint8_t*)b);
+            break;
+        }
         case SYS_close:    r = sys_close((int)a); break;
         case SYS_lseek:    r = sys_lseek((int)a, (int32_t)b, (int)c); break;
         case SYS_fstat64:  r = sys_fstat64((int)a, (uint8_t*)b); break;

@@ -73,7 +73,11 @@
 #define SYS_futex          240
 #define SYS_set_tid_address 258
 #define SYS_ugetrlimit     191
+#define SYS_openat         295
+#define SYS_faccessat      307
+#define SYS_faccessat2     439
 #define SYS_fstatat64      300
+#define SYS_pread64        180
 #define SYS_readlinkat     305
 #define SYS_set_robust_list 311
 #define SYS_getrandom      355
@@ -99,6 +103,7 @@
 #define EAGAIN  11
 #define ERANGE  34
 #define EOPNOTSUPP 95
+#define ENODEV  19
 
 /* --- mmap / mprotect flags, as Linux defines them ----------------------- */
 #define PROT_NONE   0x0
