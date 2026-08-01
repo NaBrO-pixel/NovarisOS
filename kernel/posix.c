@@ -802,8 +802,14 @@ void posix_syscall(registers_t* regs) {
         case SYS_kill:
         case SYS_tgkill:
             /* One process, so the pid is only checked for sanity; the
-             * signal number is the last argument in both. */
-            r = posix_raise((int)(n == SYS_kill ? b : c));
+             * signal number is the last argument in both. The two differ
+             * in the si_code an SA_SIGINFO handler sees, which is how a
+             * program tells a targeted thread signal from a process one. */
+            if (n == SYS_kill) {
+                r = posix_raise_from((int)b, SI_USER, (int32_t)a);
+            } else {
+                r = posix_raise_from((int)c, SI_TKILL, (int32_t)a);
+            }
             break;
 
         /* Real since Milestone 20 - see kernel/posix_thread.c. */

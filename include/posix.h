@@ -167,6 +167,86 @@ typedef struct {
     uint32_t mask[2];   /* 64-bit sigset; only the low word is used */
 } k_sigaction_t;
 
+/* si_code values. The generic ones are negative or >= 0x80 and say who
+ * raised the signal; the small positive ones are per-signal and say what
+ * kind of fault it was. Only the ones Novaris can actually produce are
+ * listed. */
+#define SI_USER      0        /* kill() */
+#define SI_KERNEL    0x80     /* a fault with no more specific cause */
+#define SI_TKILL     (-6)     /* tgkill() */
+#define SEGV_MAPERR  1        /* address not mapped */
+#define SEGV_ACCERR  2        /* mapped, but the access was not permitted */
+#define FPE_INTDIV   1
+#define ILL_ILLOPN   2
+#define TRAP_BRKPT   1
+
+/* --- the SA_SIGINFO handler's second and third arguments (Milestone 23)
+ *
+ * A three-argument handler is called as
+ *
+ *     void handler(int signo, siginfo_t* info, void* ucontext);
+ *
+ * and Wine's whole exception machinery is built on reading - and writing
+ * back - the register state in that third argument. These are the
+ * Linux/i386 layouts of both, field for field, because a handler compiled
+ * against glibc's headers indexes them by offset and does not care what
+ * the kernel calls them.
+ *
+ * struct sigcontext is written so every member is four bytes: on Linux
+ * the selectors are declared as a 16-bit value plus a 16-bit pad, which
+ * is what lets glibc's gregset_t treat the whole thing as an array of 19
+ * longs indexed by REG_GS(0) ... REG_SS(18). Keeping them uint32_t here
+ * is the same bytes with less ceremony. */
+typedef struct {
+    uint32_t gs, fs, es, ds;                    /* REG_GS  .. REG_DS   0-3 */
+    uint32_t edi, esi, ebp, esp;                /* REG_EDI .. REG_ESP  4-7 */
+    uint32_t ebx, edx, ecx, eax;                /* REG_EBX .. REG_EAX  8-11 */
+    uint32_t trapno, err;                       /* REG_TRAPNO, REG_ERR 12-13 */
+    uint32_t eip, cs, eflags;                   /* REG_EIP .. REG_EFL 14-16 */
+    uint32_t esp_at_signal, ss;                 /* REG_UESP, REG_SS   17-18 */
+    uint32_t fpstate;      /* struct _fpstate*; NULL - no FP state saved */
+    uint32_t oldmask;
+    uint32_t cr2;          /* the faulting address, for a page fault */
+} k_sigcontext_t;          /* 88 bytes; mcontext_t is exactly this */
+
+typedef struct {
+    uint32_t ss_sp;
+    int32_t  ss_flags;
+    uint32_t ss_size;
+} k_stack_t;
+
+#define SS_DISABLE 2
+
+/* The kernel's struct ucontext is uc_flags/uc_link/uc_stack/uc_mcontext
+ * and an 8-byte sigmask, and stops there. glibc's ucontext_t declares a
+ * 128-byte sigmask and a trailing __fpregs_mem (and, on a current glibc,
+ * a shadow-stack field after that - the host measures sizeof at 364), so
+ * a handler that reads or copies the whole struct would run off the end
+ * of the kernel's. The tail below makes the frame comfortably larger than
+ * glibc thinks the struct is - cheap insurance, and it is the program's
+ * own stack either way. */
+typedef struct {
+    uint32_t       uc_flags;
+    uint32_t       uc_link;
+    k_stack_t      uc_stack;
+    k_sigcontext_t uc_mcontext;   /* at offset 20 */
+    uint32_t       uc_sigmask[2]; /* at offset 108; the kernel's 8 bytes */
+    uint8_t        uc_tail[276];  /* glibc's wider sigmask + __fpregs_mem */
+} k_ucontext_t;                   /* 392 bytes, >= glibc's 364 */
+
+/* siginfo_t. The union after the first three ints is 128 bytes wide in
+ * total, and which member is live depends on si_code. */
+typedef struct {
+    int32_t si_signo;
+    int32_t si_errno;
+    int32_t si_code;
+    union {
+        uint32_t _pad[29];
+        struct { int32_t si_pid; uint32_t si_uid; } _kill;
+        struct { uint32_t si_addr; } _sigfault;
+    } _sifields;
+} k_siginfo_t;                    /* 128 bytes */
+
 /* --- open flags --------------------------------------------------------- */
 #define O_RDONLY   0x0000
 #define O_WRONLY   0x0001
@@ -210,8 +290,11 @@ void posix_deliver_pending(registers_t* regs);
  * the process should die instead. */
 int posix_handle_fault_signal(registers_t* regs, uint32_t vector);
 
-/* Raises a signal against the running process. */
+/* Raises a signal against the running process. si_code is SI_USER and
+ * si_pid zero; posix_raise_from() names both, which is what separates a
+ * tgkill (SI_TKILL) from a kill in the siginfo_t the handler sees. */
 int posix_raise(int signo);
+int posix_raise_from(int signo, int32_t code, int32_t pid);
 
 /* Clears every handler and mask. Called when a program starts, since
  * signal dispositions belong to the process. */

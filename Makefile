@@ -301,6 +301,14 @@ $(BUILD_DIR)/user/dyn.elf: userland/glibc_hello.c | $(BUILD_DIR)
 	mkdir -p $(BUILD_DIR)/user
 	$(CC) -m32 -O2 -o $@ $<
 
+# Also dynamically linked, and for the same reason: this one reads
+# siginfo_t and ucontext_t out of a signal handler using glibc's own
+# headers, so what it checks is the layout glibc says exists rather than
+# the layout this project believes Linux has. See ROADMAP.md Milestone 23.
+$(BUILD_DIR)/user/uctest.elf: userland/ucontext_test.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(CC) -m32 -O2 -Wall -o $@ $<
+
 # The dynamic linker and the C library are *copied from the host
 # toolchain* rather than committed to this repository: they are build
 # inputs, like mingw-w64's import libraries, and vendoring several
@@ -419,6 +427,7 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
         $(BUILD_DIR)/user/hello_elf.elf $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf \
         $(BUILD_DIR)/user/pthtest.elf $(BUILD_DIR)/user/crashelf.elf \
         $(BUILD_DIR)/user/glibc.elf $(BUILD_DIR)/user/dyn.elf \
+        $(BUILD_DIR)/user/uctest.elf \
         $(BUILD_DIR)/user/ld-linux.so.2 $(BUILD_DIR)/user/libc.so.6 \
         $(BUILD_DIR)/user/hello_pe.exe \
         $(BUILD_DIR)/user/hellowin.exe $(BUILD_DIR)/user/winapi.exe \
@@ -436,6 +445,7 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
 	cp $(BUILD_DIR)/user/crashelf.elf $(BUILD_DIR)/initrd_staging/crashelf.elf
 	cp $(BUILD_DIR)/user/glibc.elf $(BUILD_DIR)/initrd_staging/glibc.elf
 	cp $(BUILD_DIR)/user/dyn.elf $(BUILD_DIR)/initrd_staging/dyn.elf
+	cp $(BUILD_DIR)/user/uctest.elf $(BUILD_DIR)/initrd_staging/uctest.elf
 	cp $(BUILD_DIR)/user/ld-linux.so.2 $(BUILD_DIR)/initrd_staging/ld-linux.so.2
 	cp $(BUILD_DIR)/user/libc.so.6 $(BUILD_DIR)/initrd_staging/libc.so.6
 	cp $(BUILD_DIR)/user/hello_pe.exe $(BUILD_DIR)/initrd_staging/hellope.exe
@@ -528,7 +538,7 @@ test: $(BUILD_DIR)/test/format_test $(BUILD_DIR)/test/pe_test \
 .PHONY: test-posix
 test-posix: $(ISO) $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf \
            $(BUILD_DIR)/user/pthtest.elf $(BUILD_DIR)/user/glibc.elf \
-           $(BUILD_DIR)/user/dyn.elf
+           $(BUILD_DIR)/user/dyn.elf $(BUILD_DIR)/user/uctest.elf
 	python3 tools/posix_compare.py --iso $(ISO) \
 	    --binary $(BUILD_DIR)/user/posixtest.elf --name posixtest.elf
 	python3 tools/posix_compare.py --iso $(ISO) \
@@ -539,6 +549,8 @@ test-posix: $(ISO) $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf
 	    --binary $(BUILD_DIR)/user/glibc.elf --name glibc.elf
 	python3 tools/posix_compare.py --iso $(ISO) \
 	    --binary $(BUILD_DIR)/user/dyn.elf --name dyn.elf
+	python3 tools/posix_compare.py --iso $(ISO) \
+	    --binary $(BUILD_DIR)/user/uctest.elf --name uctest.elf
 
 test-qemu: $(ISO)
 	python3 tools/qemu_test.py --iso $(ISO) --script tools/tests/win32_smoke.txt \
