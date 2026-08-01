@@ -52,6 +52,7 @@
 
 #include "posix.h"
 #include "console.h"
+#include "fpu.h"
 #include "kstring.h"
 #include "process.h"
 
@@ -121,6 +122,11 @@ void posix_signal_reset(void) {
  * shadow copy would silently discard it, which is exactly the bug that
  * would make Wine's exception dispatch a no-op. */
 typedef struct {
+    /* First, because FXSAVE needs 16-byte alignment and this member's
+     * image half sits at offset 112 within it - a multiple of 16 only if
+     * the struct itself starts on one. The frame address is aligned down
+     * to 16 in deliver() to guarantee that. */
+    k_fpstate_t  fpstate;
     uint32_t     magic;
     k_siginfo_t  info;
     k_ucontext_t uc;
@@ -132,6 +138,110 @@ typedef struct {
 } sigframe_t;
 
 #define SIGFRAME_MAGIC 0x5347464Du /* "SGFM" */
+
+/* --- x87 state, in two shapes at once (Milestone 24) --------------------
+ *
+ * FXSAVE's tag word is one bit per register ("in use" / "empty"); the
+ * legacy i387 one is two bits ("valid" / "zero" / "special" / "empty"),
+ * and reconstructing it means looking at each register the CPU says is in
+ * use and classifying its value. Linux does exactly this, and a program
+ * that reads the tag word - Wine copies it into CONTEXT.FloatSave.TagWord
+ * - would otherwise see something the x87 never produces.
+ *
+ * Offsets into the FXSAVE image are architectural: FCW at 0, FSW at 2,
+ * the abridged tag byte at 4, FIP at 8, FDP at 16, and ST(i) in 16-byte
+ * slots from 32 with only the first 10 bytes meaningful. */
+#define FX_CW   0
+#define FX_SW   2
+#define FX_TW   4
+#define FX_OP   6
+#define FX_IP   8
+#define FX_CS  12
+#define FX_DP  16
+#define FX_DS  20
+#define FX_ST(i) (32 + (i) * 16)
+
+static uint32_t tag_fxsr_to_i387(const uint8_t* fx) {
+    uint32_t abridged = fx[FX_TW];
+    uint32_t sw  = (uint32_t)(fx[FX_SW] | (fx[FX_SW + 1] << 8));
+    uint32_t tos = (sw >> 11) & 7;
+    uint32_t ret = 0xFFFF0000u;
+
+    /* The two tag words are indexed differently and this is the whole
+     * subtlety of the conversion: the abridged one is by *physical*
+     * register, while FXSAVE stores the registers in *stack* order with
+     * ST(0) first. So bit i, which is about physical register i, has to
+     * be answered by looking at stack slot (i - TOP) & 7.
+     *
+     * Getting this wrong is invisible until TOP is non-zero, and then it
+     * is very visible: with three values pushed the tag word reads 0x57FF
+     * ("three empty registers hold zero") instead of 0x03FF ("three
+     * registers hold valid numbers"). That is how it was found - the
+     * first version had no rotation and disagreed with the host. */
+    for (int i = 0; i < 8; i++) {
+        uint32_t tag;
+        if (!(abridged & (1u << i))) {
+            tag = 3;                       /* empty */
+        } else {
+            const uint8_t* st = fx + FX_ST((i - tos) & 7u);
+            uint32_t exp = (uint32_t)(st[8] | (st[9] << 8)) & 0x7FFFu;
+            if (exp == 0x7FFF) {
+                tag = 2;                   /* infinity or NaN */
+            } else if (exp == 0) {
+                int zero = 1;
+                for (int b = 0; b < 8; b++) if (st[b]) { zero = 0; break; }
+                tag = zero ? 1 : 2;        /* zero, or a denormal */
+            } else {
+                /* The explicit integer bit: set means an ordinary value,
+                 * clear means unnormal, which the x87 calls special. */
+                tag = (st[7] & 0x80) ? 0 : 2;
+            }
+        }
+        ret |= tag << (2 * i);
+    }
+    return ret;
+}
+
+/* The inverse, for the restore path: two bits per register down to one,
+ * "not empty" becoming "in use". */
+static uint8_t tag_i387_to_fxsr(uint32_t twd) {
+    uint8_t ret = 0;
+    for (int i = 0; i < 8; i++) {
+        if (((twd >> (2 * i)) & 3u) != 3u) ret |= (uint8_t)(1u << i);
+    }
+    return ret;
+}
+
+/* A clean unit, captured once, to hand to a handler. Linux enters a
+ * signal handler with the FPU reset - control word 0x37f, an empty x87
+ * stack, zeroed XMM registers, MXCSR 0x1f80 - so a handler that does
+ * arithmetic cannot see or corrupt the interrupted computation's
+ * registers. Checked against the host, not assumed. */
+static fpu_state_t clean_fpu;
+static int clean_fpu_ready = 0;
+
+/* fninit resets the x87 half and leaves MXCSR and the XMM registers
+ * exactly as they were, so capturing after it alone would bake whatever
+ * happened to be in XMM0-7 into every signal handler's starting state.
+ * The registers are zeroed and MXCSR set explicitly, and the CPU is then
+ * asked what that looks like rather than 512 bytes of layout being
+ * written out by hand. Destroys the live FPU state, so the caller must
+ * have saved anything it wants. */
+static void capture_clean_fpu(fpu_state_t* out) {
+    static const uint32_t default_mxcsr = 0x1F80;
+    __asm__ __volatile__("fninit\n\t"
+                         "ldmxcsr %1\n\t"
+                         "xorps %%xmm0, %%xmm0\n\t"
+                         "xorps %%xmm1, %%xmm1\n\t"
+                         "xorps %%xmm2, %%xmm2\n\t"
+                         "xorps %%xmm3, %%xmm3\n\t"
+                         "xorps %%xmm4, %%xmm4\n\t"
+                         "xorps %%xmm5, %%xmm5\n\t"
+                         "xorps %%xmm6, %%xmm6\n\t"
+                         "xorps %%xmm7, %%xmm7\n\t"
+                         "fxsave (%0)\n\t"
+                         : : "r"(out->data), "m"(default_mxcsr) : "memory");
+}
 
 /* --- delivery ------------------------------------------------------------ */
 
@@ -146,6 +256,7 @@ static int deliver(registers_t* regs, int signo) {
     sp &= ~15u;
 
     sp -= sizeof(sigframe_t);
+    sp &= ~15u;                      /* FXSAVE's alignment, not a nicety */
     sigframe_t* frame = (sigframe_t*)sp;
     frame->magic = SIGFRAME_MAGIC;
 
@@ -174,7 +285,9 @@ static int deliver(registers_t* regs, int signo) {
      * uc_flags stays 0 for the same reason fpstate does: Linux sets
      * UC_FP_XSTATE there when it has attached extended FP state, and
      * Novaris attaches none, so 0 and a null fpstate are consistent with
-     * each other. */
+     * each other - Linux with an XSAVE machine reports uc_flags = 1
+     * (UC_FP_XSTATE) and attaches an xstate header past the FXSAVE image;
+     * Novaris saves plain FXSAVE and says so. */
     kmemset(&frame->uc, 0, sizeof(frame->uc));
     frame->uc.uc_flags = 0;
     frame->uc.uc_link  = 0;
@@ -198,12 +311,50 @@ static int deliver(registers_t* regs, int signo) {
     sc->eflags = regs->eflags;
     sc->esp_at_signal = regs->useresp;
     sc->ss     = regs->ss;
-    sc->fpstate = 0;           /* no FP state is saved - see honest scope */
     sc->oldmask = blocked;
     sc->cr2     = last_cr2;
 
     frame->uc.uc_sigmask[0] = blocked;
     frame->uc.uc_sigmask[1] = 0;
+
+    /* --- the x87/SSE state (Milestone 24) -------------------------------
+     *
+     * The live FPU registers *are* the interrupted thread's at this point:
+     * delivery happens on the way back to ring 3, in that thread's
+     * context, and the kernel does not use the FPU in between. So FXSAVE
+     * straight into the frame. */
+    k_fpstate_t* fp = &frame->fpstate;
+    __asm__ __volatile__("fxsave (%0)" : : "r"(fp->fxsave) : "memory");
+
+    /* Then the legacy half, derived from that image. The 0xffff0000 in
+     * the top halves is Linux's, and is what a 16-bit-wide x87 field
+     * widened to 32 bits has looked like since the 386. */
+    const uint8_t* fx = fp->fxsave;
+    fp->cw      = 0xFFFF0000u | (uint32_t)(fx[FX_CW] | (fx[FX_CW + 1] << 8));
+    fp->sw      = 0xFFFF0000u | (uint32_t)(fx[FX_SW] | (fx[FX_SW + 1] << 8));
+    fp->tag     = tag_fxsr_to_i387(fx);
+    fp->ipoff   = *(const uint32_t*)(fx + FX_IP);
+    /* Not the image's FCS/FDS: on 32-bit Linux these come from the
+     * interrupted frame's cs and ds instead, which is a deliberate quirk
+     * rather than an oversight - checked against the host. */
+    fp->cssel   = regs->cs;
+    fp->dataoff = *(const uint32_t*)(fx + FX_DP);
+    fp->datasel = 0xFFFF0000u | (regs->ds & 0xFFFFu);
+    for (int i = 0; i < 8; i++) {
+        for (int b = 0; b < 10; b++) fp->st[i][b] = fx[FX_ST(i) + b];
+    }
+    fp->status = (uint16_t)(fx[FX_SW] | (fx[FX_SW + 1] << 8));
+    fp->magic  = X86_FXSR_MAGIC;   /* the FXSAVE image above is present */
+
+    sc->fpstate = (uint32_t)fp;
+
+    /* The handler starts on a clean unit, exactly as it would on Linux:
+     * an empty x87 stack, control word 0x37f, zeroed XMM registers and
+     * MXCSR 0x1f80. Without this a handler that does any arithmetic at
+     * all silently destroys the interrupted computation's registers -
+     * which is what Novaris did until this milestone. */
+    if (!clean_fpu_ready) { capture_clean_fpu(&clean_fpu); clean_fpu_ready = 1; }
+    fpu_restore(&clean_fpu);
 
     /* mov $173, %eax ; int $0x80  - rt_sigreturn. Only used when the
      * program supplied no restorer of its own; Linux is equally happy to
@@ -244,6 +395,25 @@ static int deliver(registers_t* regs, int signo) {
 
     regs->eip = handler;
     regs->useresp = sp;
+
+    /* The flags a handler is *entered* with are not the interrupted
+     * thread's. Linux clears three, and each has a reason:
+     *
+     *   DF - the cdecl ABI says a function may assume the direction flag
+     *        is clear on entry, and compiled code does: `rep movsb` in an
+     *        inlined memcpy walks backwards otherwise. A program that
+     *        legitimately had DF set when the signal arrived would
+     *        otherwise hand its handler a broken string library.
+     *   TF - or a single-stepping debugger would trap on the handler's
+     *        first instruction, and the trap would raise another signal.
+     *   RF - it suppresses one instruction-breakpoint fault, and the
+     *        instruction it was suppressing is not the one about to run.
+     *
+     * The saved copy in uc_mcontext keeps all three, so rt_sigreturn puts
+     * the interrupted thread's flags back exactly. */
+    regs->eflags &= ~(0x400u   /* DF */
+                    | 0x100u   /* TF */
+                    | 0x10000u /* RF */);
     return 1;
 }
 
@@ -447,8 +617,60 @@ int32_t posix_sys_rt_sigreturn(registers_t* regs) {
     regs->eip = s->eip;
     regs->useresp = s->esp;
     /* eflags: keep the caller's arithmetic flags but never let it set
-     * IOPL, IF or the trap flag from user data. */
+     * IOPL, IF or the trap flag from user data. DF is in that mask, so
+     * a thread that had the direction flag set when the signal arrived
+     * gets it back, having been given a handler that ran with it clear. */
     regs->eflags = (s->eflags & 0x00000CD5u) | 0x202u;
+
+    /* --- and the x87/SSE state (Milestone 24) ---------------------------
+     *
+     * Restored, not merely reported, and from both halves of the fpstate
+     * the way Linux does it: the FXSAVE image carries the XMM registers
+     * and MXCSR, and the legacy fields then overwrite the x87 half of it.
+     * Both matter because Wine writes both - CONTEXT.FloatSave into the
+     * legacy half, CONTEXT.ExtendedRegisters into the image - and a
+     * handler that edited only the one it knows about would otherwise
+     * find the edit ignored.
+     *
+     * A null fpstate is accepted rather than treated as an error: a
+     * handler is entitled to clear the pointer, and Linux reads that as
+     * "leave the FPU alone". */
+    if (s->fpstate) {
+        k_fpstate_t* fp = (k_fpstate_t*)s->fpstate;
+        uint8_t* fx = fp->fxsave;
+
+        /* FXRSTOR faults if MXCSR has any reserved bit set, and this
+         * buffer has been in the program's hands. Masking to the defined
+         * bits turns a would-be #GP in the kernel into a value the CPU
+         * will accept. */
+        uint32_t* mxcsr = (uint32_t*)(fx + 24);
+        *mxcsr &= 0x0000FFBFu;
+
+        if (fp->magic == X86_FXSR_MAGIC) {
+            /* The legacy fields win for the x87 half, exactly as Linux's
+             * convert_to_fxsr does. fop is packed into the top half of
+             * cssel on this path and nowhere else - an asymmetry with the
+             * save side that is Linux's, not a mistake here. */
+            fx[FX_CW]     = (uint8_t)(fp->cw & 0xFF);
+            fx[FX_CW + 1] = (uint8_t)((fp->cw >> 8) & 0xFF);
+            fx[FX_SW]     = (uint8_t)(fp->sw & 0xFF);
+            fx[FX_SW + 1] = (uint8_t)((fp->sw >> 8) & 0xFF);
+            fx[FX_TW]     = tag_i387_to_fxsr(fp->tag);
+            fx[FX_TW + 1] = 0;
+            fx[FX_OP]     = (uint8_t)((fp->cssel >> 16) & 0xFF);
+            fx[FX_OP + 1] = (uint8_t)((fp->cssel >> 24) & 0xFF);
+            *(uint32_t*)(fx + FX_IP) = fp->ipoff;
+            fx[FX_CS]     = (uint8_t)(fp->cssel & 0xFF);
+            fx[FX_CS + 1] = (uint8_t)((fp->cssel >> 8) & 0xFF);
+            *(uint32_t*)(fx + FX_DP) = fp->dataoff;
+            fx[FX_DS]     = (uint8_t)(fp->datasel & 0xFF);
+            fx[FX_DS + 1] = (uint8_t)((fp->datasel >> 8) & 0xFF);
+            for (int i = 0; i < 8; i++) {
+                for (int b = 0; b < 10; b++) fx[FX_ST(i) + b] = fp->st[i][b];
+            }
+        }
+        __asm__ __volatile__("fxrstor (%0)" : : "r"(fx) : "memory");
+    }
 
     return (int32_t)regs->eax;
 }
