@@ -26,7 +26,12 @@ void process_run_demo_user_program(void);
 /* Loads a real ELF32 executable (PT_LOAD segments mapped at their own
  * ELF-specified addresses - see elf.c) and runs it the same way. Returns
  * 0 without running anything if `image` isn't a loadable ELF. */
-int process_run_elf(const uint8_t* image, uint32_t size);
+/* Runs an ELF image with a real argv. `argc`/`argv` may be 0/NULL, which
+ * gives the single hardcoded argument every ELF program got before
+ * Milestone 27 - kept so the callers that have nothing to say do not have
+ * to invent it. */
+int process_run_elf(const uint8_t* image, uint32_t size,
+                    int argc, const char* const* argv);
 
 /* Loads a PE32 (.exe) image and runs it under the Win32 emulation layer.
  * A thin wrapper over win32_run_pe() - see include/win32.h, which is

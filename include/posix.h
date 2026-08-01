@@ -56,6 +56,7 @@
 #define SYS_renameat2      353
 #define SYS_time            13
 #define SYS_lseek           19
+#define SYS__llseek        140
 #define SYS_getpid          20
 #define SYS_access          33
 #define SYS_kill            37
@@ -90,6 +91,8 @@
 #define SYS_faccessat2     439
 #define SYS_fstatat64      300
 #define SYS_pread64        180
+#define SYS_readlink        85
+#define SYS_prctl          172
 #define SYS_readlinkat     305
 #define SYS_set_robust_list 311
 #define SYS_getrandom      355
@@ -314,6 +317,10 @@ void posix_syscall(registers_t* regs);
  * bookkeeping. Called when a program starts and when it exits, because
  * descriptors and mappings belong to the process, not to the kernel. */
 void posix_process_begin(void);
+
+/* Records the path the running program was started from, so
+ * readlink("/proc/self/exe") can answer. */
+void posix_set_exe_path(const char* path);
 void posix_process_end(void);
 
 /* --- signal delivery ----------------------------------------------------

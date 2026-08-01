@@ -7,3 +7,4 @@ screenshot.png
 
 # -fstack-usage output, produced when profiling kernel stack depth.
 *.su
+novaris-wine.iso

@@ -53,7 +53,7 @@ OBJS = $(BUILD_DIR)/boot.o $(BUILD_DIR)/kernel.o \
 KERNEL = $(BUILD_DIR)/novaris.bin
 ISO = novaris.iso
 
-.PHONY: all clean run run-nographic iso test test-qemu test-posix zip
+.PHONY: all clean run run-nographic iso test test-qemu test-posix zip wine-initrd
 
 all: $(ISO)
 
@@ -316,6 +316,26 @@ $(BUILD_DIR)/user/uctest.elf: userland/ucontext_test.c | $(BUILD_DIR)
 # bloat and a licensing question nobody needs. The paths are where a
 # Debian/Ubuntu multilib install puts them.
 HOST_LIB32 ?= /lib32
+
+# --- Wine (Milestone 27, Path A step 5) ----------------------------------
+#
+# Wine is *not* vendored. It is fetched and built separately and pointed
+# at with WINE_BUILD, exactly the way ld-linux.so.2 and libc.so.6 are
+# copied from the host toolchain rather than committed: they are build
+# inputs, and several hundred megabytes of LGPL source in a hobby
+# kernel's tree would be both bloat and a licensing question nobody
+# needs. Wine's own code stays behind that boundary and Novaris's stays
+# in front of it.
+#
+#   git clone --depth 1 -b stable https://github.com/wine-mirror/wine
+#   cd wine && CC="gcc -m32" ./configure --enable-archs=i386 #       --disable-tests --without-x --without-freetype ...
+#   make -j4
+#   cd ../NovarisOS && make WINE_BUILD=../wine wine-initrd
+#
+# With WINE_BUILD set, `make wine-initrd` builds an ISO carrying Wine's
+# loader, ntdll.so and the two files glibc's getpwuid needs. See
+# ROADMAP.md Milestone 27 for exactly how far that gets.
+WINE_BUILD ?=
 $(BUILD_DIR)/user/ld-linux.so.2: | $(BUILD_DIR)
 	mkdir -p $(BUILD_DIR)/user
 	cp $(HOST_LIB32)/ld-linux.so.2 $@
@@ -337,6 +357,13 @@ $(BUILD_DIR)/user/pthtest.elf: userland/thread_posix_test.c | $(BUILD_DIR)
 # works entirely inside a directory it creates and removes under /tmp, so
 # the host run leaves nothing behind.
 $(BUILD_DIR)/user/fstest.elf: userland/fs_test.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(CC) -m32 -static -nostdlib -ffreestanding -fno-builtin -O2 -Wall \
+	    -o $@ $<
+
+# Milestone 27's kernel-integrity regression. Deliberately not part of
+# test-posix: on Linux the mapping it asks for succeeds, and it must not.
+$(BUILD_DIR)/user/kmaptest.elf: userland/kmap_test.c | $(BUILD_DIR)
 	mkdir -p $(BUILD_DIR)/user
 	$(CC) -m32 -static -nostdlib -ffreestanding -fno-builtin -O2 -Wall \
 	    -o $@ $<
@@ -434,7 +461,7 @@ $(BUILD_DIR)/user/hello64.exe: userland/pe_test/x64_marker.c | $(BUILD_DIR)
 $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
         $(BUILD_DIR)/user/hello_elf.elf $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf \
         $(BUILD_DIR)/user/pthtest.elf $(BUILD_DIR)/user/crashelf.elf \
-        $(BUILD_DIR)/user/fstest.elf \
+        $(BUILD_DIR)/user/fstest.elf $(BUILD_DIR)/user/kmaptest.elf \
         $(BUILD_DIR)/user/glibc.elf $(BUILD_DIR)/user/dyn.elf \
         $(BUILD_DIR)/user/uctest.elf \
         $(BUILD_DIR)/user/ld-linux.so.2 $(BUILD_DIR)/user/libc.so.6 \
@@ -452,6 +479,7 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
 	cp $(BUILD_DIR)/user/sigtest.elf $(BUILD_DIR)/initrd_staging/sigtest.elf
 	cp $(BUILD_DIR)/user/pthtest.elf $(BUILD_DIR)/initrd_staging/pthtest.elf
 	cp $(BUILD_DIR)/user/fstest.elf $(BUILD_DIR)/initrd_staging/fstest.elf
+	cp $(BUILD_DIR)/user/kmaptest.elf $(BUILD_DIR)/initrd_staging/kmaptest.elf
 	cp $(BUILD_DIR)/user/crashelf.elf $(BUILD_DIR)/initrd_staging/crashelf.elf
 	cp $(BUILD_DIR)/user/glibc.elf $(BUILD_DIR)/initrd_staging/glibc.elf
 	cp $(BUILD_DIR)/user/dyn.elf $(BUILD_DIR)/initrd_staging/dyn.elf
@@ -575,6 +603,8 @@ test-qemu: $(ISO)
 	    --expect "HeapAlloc round-trip" \
 	    --expect "64-bit \(PE32\+\) binary" \
 	    --expect "53 of 53 imports resolve" \
+	    --expect "MAP_FIXED across the kernel's identity map is refused" \
+	    --expect "the kernel is still running" \
 	    --reject "KERNEL PANIC"
 
 # Repackages the source tree as novaris.zip, which is how this project
@@ -584,6 +614,32 @@ test-qemu: $(ISO)
 ZIP_CONTENTS = boot include kernel tests tools userland Makefile linker.ld \
                grub.cfg README.md ROADMAP.md .gitignore \
                docs-proof-of-boot.png docs-desktop.png
+
+# Builds a *separate* ISO carrying Wine on top of the ordinary initrd.
+# Separate on purpose: novaris.iso must stay reproducible from this tree
+# alone, and Wine is not in this tree.
+wine-initrd: $(BUILD_DIR)/initrd.img $(KERNEL)
+	@test -n "$(WINE_BUILD)" || \
+	    { echo "set WINE_BUILD=/path/to/a/built/wine (see the comment in the Makefile)"; exit 1; }
+	@test -f "$(WINE_BUILD)/loader/wine-preloader" || \
+	    { echo "$(WINE_BUILD) does not look like a built Wine tree"; exit 1; }
+	rm -rf $(BUILD_DIR)/wine_staging $(BUILD_DIR)/wine_iso
+	mkdir -p $(BUILD_DIR)/wine_staging $(BUILD_DIR)/wine_iso/boot/grub
+	cp $(BUILD_DIR)/initrd_staging/* $(BUILD_DIR)/wine_staging/
+	cp $(WINE_BUILD)/loader/wine-preloader $(BUILD_DIR)/wine_staging/preload.elf
+	cp $(WINE_BUILD)/loader/wine $(BUILD_DIR)/wine_staging/wineldr.elf
+	cp $(WINE_BUILD)/dlls/ntdll/ntdll.so $(BUILD_DIR)/wine_staging/ntdll.so
+	# glibc's getpwuid() needs these, and Wine dereferences its result
+	# without checking. The initrd is flat, so they land at the root and
+	# the last-component fallback resolves /etc/passwd to them.
+	printf 'root:x:0:0:root:/:/bin/sh\n' > $(BUILD_DIR)/wine_staging/passwd
+	printf 'passwd: files\ngroup: files\n' > $(BUILD_DIR)/wine_staging/nsswitch.conf
+	python3 userland/mkinitrd.py $(BUILD_DIR)/wine_staging \
+	    $(BUILD_DIR)/wine_iso/boot/initrd.img
+	cp $(BUILD_DIR)/novaris.bin $(BUILD_DIR)/wine_iso/boot/novaris.bin
+	cp grub.cfg $(BUILD_DIR)/wine_iso/boot/grub/grub.cfg
+	grub-mkrescue -o novaris-wine.iso $(BUILD_DIR)/wine_iso 2>/dev/null
+	@echo "Wrote novaris-wine.iso - try: run preload.elf wineldr.elf --version"
 
 zip:
 	rm -rf $(BUILD_DIR)/pkg novaris.zip
