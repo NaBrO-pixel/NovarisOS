@@ -37,6 +37,8 @@
 #include "gdt.h"
 #include "console.h"
 #include "fpu.h"
+#include "pit.h"
+#include "posix.h"   /* EAGAIN, ETIMEDOUT - the values a woken waiter gets */
 
 #define MAX_PROCESSES 8
 /* 8KB, not 4KB. Milestone 17 runs Win32 programs as scheduler tasks, and
@@ -180,6 +182,8 @@ static int spawn_common(const char* name, uint32_t entry, uint32_t load_vaddr,
     p->tls_base = 0;
     p->tls_limit = 0;
     p->clear_child_tid = 0;
+    p->wait_addr = 0;
+    p->wait_deadline = 0;
     p->state = PROC_READY;
     return p->pid;
 }
@@ -304,10 +308,34 @@ int scheduler_spawn_thread(const char* name, uint32_t entry,
 }
 
 /* Round robin: scans forward from just after `current`'s slot, wrapping,
- * returning the first non-zombie process found (which may be `current`
+ * returning the first runnable process found (which may be `current`
  * itself, if it's the only one left - callers that just marked `current`
  * a zombie rely on that state already being set before this runs, so it
- * can't be picked again). Returns 0 if every slot is a zombie. */
+ * can't be picked again). Returns 0 if nothing at all can run.
+ *
+ * Since Milestone 25 a task can also be PROC_BLOCKED, which is skipped
+ * the same way a zombie is. That introduces a case that could not happen
+ * before: every remaining task alive but parked, with nobody left to wake
+ * anyone. That is a deadlock in the *program*, and the kernel's job is to
+ * not make it a deadlock in the machine - so rather than returning 0 and
+ * letting a caller unwind past tasks that are still alive, every blocked
+ * task is woken with -EAGAIN. Every futex caller already handles that
+ * (it means "the word changed under you, look again"), so the program
+ * degrades to the spin it would have done before this milestone instead
+ * of vanishing. */
+static int wake_every_blocked(int32_t result);
+
+static process_t* scan_runnable(int cur_idx) {
+    for (int off = 1; off <= process_count; off++) {
+        int idx = (cur_idx + off) % process_count;
+        process_state_t st = process_table[idx].state;
+        if (st != PROC_ZOMBIE && st != PROC_BLOCKED) {
+            return &process_table[idx];
+        }
+    }
+    return 0;
+}
+
 static process_t* pick_next_ready(void) {
     if (process_count == 0) return 0;
 
@@ -319,12 +347,12 @@ static process_t* pick_next_ready(void) {
         }
     }
 
-    for (int off = 1; off <= process_count; off++) {
-        int idx = (cur_idx + off) % process_count;
-        if (process_table[idx].state != PROC_ZOMBIE) {
-            return &process_table[idx];
-        }
-    }
+    process_t* next = scan_runnable(cur_idx);
+    if (next) return next;
+
+    /* Nothing runnable. If anything is merely blocked, this is the
+     * deadlock case above rather than the end of the batch. */
+    if (wake_every_blocked(-EAGAIN) > 0) return scan_runnable(cur_idx);
     return 0;
 }
 
@@ -332,6 +360,12 @@ static void switch_to(process_t* next);
 
 void scheduler_tick(registers_t* regs) {
     if (!active || !current) return;
+
+    /* Timed futex waits expire here, and deliberately before the
+     * ring-3 check below: a task whose deadline has passed has to become
+     * runnable again whether or not this particular tick is allowed to
+     * preempt anything. */
+    scheduler_expire_waits(pit_get_ticks(), -ETIMEDOUT);
 
     /* Only preempt ring-3 code. A timer that lands while this task is
      * inside a syscall must not switch away: `regs` would be a same-
@@ -487,6 +521,87 @@ int scheduler_task_alive(int pid) {
         }
     }
     return 0; /* unknown pid: treat as finished, not as never-finishing */
+}
+
+/* --- blocking (Milestone 25) --------------------------------------------
+ *
+ * Waking means two things: making the task a candidate again, and telling
+ * the syscall it was parked inside what to return. The second is possible
+ * because `esp` points at that task's saved trap frame, so writing eax
+ * there *is* writing the syscall's return value - the same frame the
+ * isr epilogue will iret from when the task next runs. */
+static void wake_one(process_t* p, int32_t result) {
+    ((registers_t*)p->esp)->eax = (uint32_t)result;
+    p->wait_addr = 0;
+    p->wait_deadline = 0;
+    p->state = PROC_READY;
+}
+
+static int wake_every_blocked(int32_t result) {
+    int n = 0;
+    for (int i = 0; i < process_count; i++) {
+        if (process_table[i].state == PROC_BLOCKED) {
+            wake_one(&process_table[i], result);
+            n++;
+        }
+    }
+    return n;
+}
+
+int scheduler_block_current(registers_t* regs, uint32_t wait_addr,
+                            uint32_t deadline) {
+    if (!active || !current) return 0;
+
+    /* Decide *before* changing anything: pick_next_ready() would
+     * otherwise see this task as blocked, find nothing else, and trip the
+     * deadlock escape on a task that was about to park legitimately. */
+    process_t* next = pick_next_ready();
+    if (!next || next == current) return 0;
+
+    current->esp = (uint32_t)regs;
+    current->wait_addr = wait_addr;
+    current->wait_deadline = deadline;
+    current->state = PROC_BLOCKED;
+    tick_countdown = SCHED_TICKS_PER_SLICE;
+    switch_to(next);
+    return 1;
+}
+
+int scheduler_wake_on(uint32_t addr, int max, int32_t result) {
+    int n = 0;
+    if (!addr) return 0;
+    for (int i = 0; i < process_count && n < max; i++) {
+        process_t* p = &process_table[i];
+        if (p->state == PROC_BLOCKED && p->wait_addr == addr) {
+            wake_one(p, result);
+            n++;
+        }
+    }
+    return n;
+}
+
+int scheduler_expire_waits(uint32_t now, int32_t result) {
+    int n = 0;
+    for (int i = 0; i < process_count; i++) {
+        process_t* p = &process_table[i];
+        /* Unsigned subtraction rather than `now >= deadline`, so a tick
+         * counter that wraps does not turn every wait into an immediate
+         * timeout for the rest of the boot. */
+        if (p->state == PROC_BLOCKED && p->wait_deadline &&
+            (int32_t)(now - p->wait_deadline) >= 0) {
+            wake_one(p, result);
+            n++;
+        }
+    }
+    return n;
+}
+
+int scheduler_blocked_count(void) {
+    int n = 0;
+    for (int i = 0; i < process_count; i++) {
+        if (process_table[i].state == PROC_BLOCKED) n++;
+    }
+    return n;
 }
 
 int scheduler_yield_would_switch(void) {

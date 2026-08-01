@@ -32,6 +32,11 @@
 typedef enum {
     PROC_READY,
     PROC_RUNNING,
+    /* Milestone 25: waiting on a futex word, and *not* a candidate for the
+     * CPU until somebody wakes it or its deadline passes. Until then a
+     * waiter stayed READY and re-tested its word every slice, which was
+     * correct and wasted every one of them. */
+    PROC_BLOCKED,
     PROC_ZOMBIE
 } process_state_t;
 
@@ -98,6 +103,13 @@ typedef struct process {
     int owns_page_directory;
 
     process_state_t state;
+
+    /* Only meaningful while state == PROC_BLOCKED. `wait_addr` is the
+     * futex word this task is parked on, which is what a FUTEX_WAKE
+     * matches against; `wait_deadline` is a PIT tick count after which
+     * the wait expires, or 0 for "no timeout". */
+    uint32_t wait_addr;
+    uint32_t wait_deadline;
 } process_t;
 
 /* One-time init: clears the process table. Safe to call once at boot,
@@ -211,9 +223,44 @@ int scheduler_task_alive(int pid);
  * running in between - which is how Milestone 17 implements waiting
  * (WaitForSingleObject, EnterCriticalSection) without needing the
  * scheduler to be able to block a task mid-syscall and resume its kernel
- * stack later. Honest consequence: a waiting thread stays runnable and
- * burns its slices retrying rather than sleeping. */
+ * stack later. Milestone 17 used it for waiting, and Milestone 25's
+ * blocking futex is built on the same observation - see
+ * scheduler_block_current(). */
 int scheduler_yield_from_trap(registers_t* regs);
+
+/* --- blocking (Milestone 25) --------------------------------------------
+ *
+ * The roadmap said real blocking needed "a second switch path that can
+ * suspend and resume a task's kernel stack". It does not. The trap frame
+ * a task is about to iret from is already a complete, resumable snapshot
+ * of it - which is exactly why yield_from_trap works - so blocking is
+ * that same save plus a state the scheduler declines to pick.
+ *
+ * Parks the current task on `wait_addr` with `regs` as its resume point,
+ * and switches away. `deadline` is an absolute PIT tick count, or 0 for
+ * an indefinite wait.
+ *
+ * Returns 1 if it blocked. Returns 0 - having changed nothing - when no
+ * other task could run, because parking the only runnable task would
+ * wedge the machine with nobody left to wake it. The caller falls back to
+ * retrying, which is what every waiter did before this existed and costs
+ * nothing when there is no one else to give the CPU to. */
+int scheduler_block_current(registers_t* regs, uint32_t wait_addr,
+                            uint32_t deadline);
+
+/* Wakes up to `max` tasks blocked on `addr`, in table order. Each one's
+ * saved trap frame gets `result` in eax, so the syscall it blocked inside
+ * returns that. Returns how many were woken - which is what FUTEX_WAKE
+ * reports, and callers do use it. */
+int scheduler_wake_on(uint32_t addr, int max, int32_t result);
+
+/* Called from the timer. Wakes any blocked task whose deadline has
+ * passed, with `result` in eax (-ETIMEDOUT). Returns how many. */
+int scheduler_expire_waits(uint32_t now, int32_t result);
+
+/* How many tasks are blocked right now. Used by the shell's `futexinfo`
+ * to show the state rather than only the counters. */
+int scheduler_blocked_count(void);
 
 /* Whether scheduler_yield_from_trap() would actually switch - i.e.
  * whether any task other than the current one is runnable. Lets a caller

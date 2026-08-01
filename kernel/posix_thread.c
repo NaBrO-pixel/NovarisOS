@@ -11,18 +11,23 @@
  * lands on scheduler_spawn_posix_thread(), and the scheduler that already
  * switches CR3 and the TEB descriptor now switches the TLS descriptor too.
  *
- * The one genuinely new thing is futex. Waiting works the way Milestone
- * 17 made WaitForSingleObject work - rewind the trap frame so the whole
- * syscall re-executes, and yield - because the scheduler resumes tasks
- * from a trap frame and cannot suspend one mid-syscall. The honest cost
- * is unchanged and worth repeating: a waiting thread stays runnable and
- * burns its slices retrying rather than sleeping. */
+ * The one genuinely new thing is futex. Milestone 20 made waiting work
+ * the way Milestone 17 made WaitForSingleObject work - rewind the trap
+ * frame so the whole syscall re-executes, and yield - and said the honest
+ * cost out loud: a waiting thread stayed runnable and burned its slices.
+ * Milestone 25 makes it a real block, which turned out to need no new
+ * machinery at all, only a task state the scheduler declines to pick. */
 
 #include "posix.h"
 #include "scheduler.h"
 #include "gdt.h"
 #include "console.h"
 #include "kstring.h"
+#include "pit.h"
+
+/* One task cannot have more joiners than there are tasks, so this is
+ * "everybody", spelled without a magic INT_MAX. */
+#define MAX_JOINERS 64
 
 /* --- clone flags, as Linux defines them --------------------------------- */
 #define CLONE_VM              0x00000100u
@@ -124,8 +129,11 @@ void posix_thread_exiting(void) {
     uint32_t ctid = scheduler_current_clear_child_tid();
     if (!ctid) return;
     *(uint32_t*)ctid = 0;
-    /* No explicit wake is needed: every futex waiter is on the run queue
-     * re-testing its word, so zeroing it is the wake. */
+    /* And an explicit wake, which Milestone 20 did not need: a waiter
+     * used to be on the run queue re-testing its word, so zeroing it was
+     * the wake. A waiter that really sleeps has to be told. This is the
+     * whole of pthread_join's kernel side. */
+    scheduler_wake_on(ctid, MAX_JOINERS, 0);
 }
 
 /* --- futex ---------------------------------------------------------------
@@ -133,34 +141,154 @@ void posix_thread_exiting(void) {
  * The contract is small and exact. FUTEX_WAIT sleeps only if the word
  * still holds the value the caller expected, which is what closes the
  * race between "I tested the lock" and "I went to sleep"; FUTEX_WAKE
- * wakes up to `val` waiters.
+ * wakes up to `val` waiters and reports how many it woke.
  *
- * Retry-based waiting means there is no wait queue: a waiter re-tests the
- * word every time it is scheduled. So FUTEX_WAKE has nothing to wake - it
- * only has to report a plausible count, which callers do use. */
+ * Milestone 20 implemented waiting as a retry loop, because the scheduler
+ * was believed to need "a second switch path that can suspend and resume
+ * a task's kernel stack" before a task could really block. It does not.
+ * The trap frame a task is about to iret from is a complete, resumable
+ * snapshot of it - which is exactly why the retry loop worked - so
+ * blocking is that same save plus a state the scheduler declines to pick.
+ * See scheduler_block_current().
+ *
+ * That is not only cheaper, it is more *correct*, and in a way the old
+ * tests could not see. Three things a program can observe changed:
+ *
+ *   - FUTEX_WAIT now returns 0 when it is woken. Under retry the syscall
+ *     re-executed until the word changed and then returned -EAGAIN, so
+ *     the same binary got a different answer on Linux and on Novaris.
+ *   - FUTEX_WAKE returns the number of waiters it actually woke, not 0.
+ *   - A timeout works. It used to be ignored, which turned a bounded wait
+ *     into an unbounded one.
+ *
+ * The counters exist because none of the above proves the *cost* changed,
+ * and the cost is the point. `futexinfo` in the shell reports them. */
 
-static uint32_t futex_waiters = 0;
+static uint32_t futex_waits = 0;    /* FUTEX_WAIT calls that had to wait */
+static uint32_t futex_blocks = 0;   /* ... of those, ones that really slept */
+static uint32_t futex_retries = 0;  /* ... and ones that fell back to spinning */
+static uint32_t futex_idles = 0;    /* ... and timed ones that idled in-kernel */
+static uint32_t futex_wakes = 0;    /* tasks woken by FUTEX_WAKE */
 
-int32_t posix_sys_futex(uint32_t uaddr_v, int op, uint32_t val) {
+void posix_futex_stats(uint32_t* waits, uint32_t* blocks, uint32_t* retries,
+                       uint32_t* idles, uint32_t* wakes) {
+    *waits = futex_waits; *blocks = futex_blocks;
+    *retries = futex_retries; *idles = futex_idles; *wakes = futex_wakes;
+}
+
+void posix_futex_stats_reset(void) {
+    futex_waits = futex_blocks = futex_retries = futex_idles = futex_wakes = 0;
+}
+
+/* i386 struct timespec, which is what FUTEX_WAIT's fourth argument points
+ * at: a *relative* timeout for this operation. */
+typedef struct { int32_t tv_sec; int32_t tv_nsec; } k_timespec_t;
+
+/* The PIT runs at 100Hz (kernel_main's pit_install(100)), so a tick is
+ * 10ms. Rounded up, and never to zero: a caller that asks for 1ns wants
+ * "give up almost immediately", not "wait forever". */
+/* The deadline of a timed wait that is spinning rather than blocked, so
+ * re-executing the syscall does not restart its own timeout. */
+static uint32_t spin_addr = 0, spin_deadline = 0;
+
+static uint32_t timeout_to_ticks(const k_timespec_t* ts) {
+    uint32_t ms = (uint32_t)ts->tv_sec * 1000u + (uint32_t)(ts->tv_nsec / 1000000);
+    uint32_t ticks = (ms + 9u) / 10u;
+    return ticks ? ticks : 1u;
+}
+
+int32_t posix_sys_futex(uint32_t uaddr_v, int op, uint32_t val,
+                        uint32_t timeout_v, registers_t* regs) {
     uint32_t* uaddr = (uint32_t*)uaddr_v;
     if (!uaddr) return -EFAULT;
 
     switch (op & FUTEX_CMD_MASK) {
-        case FUTEX_WAIT:
+        case FUTEX_WAIT: {
             if (*uaddr != val) {
                 /* Changed between the caller's test and this call, which
                  * is the entire reason the expected value is passed. */
                 return -EAGAIN;
             }
-            /* Re-execute the whole call when next scheduled, and re-test
-             * the word then. Nothing above has been modified, so running
-             * it again is harmless. */
+            uint32_t deadline = 0;
+            if (timeout_v) {
+                const k_timespec_t* ts = (const k_timespec_t*)timeout_v;
+                if (ts->tv_sec < 0 || ts->tv_nsec < 0 ||
+                    ts->tv_nsec >= 1000000000) {
+                    return -EINVAL;
+                }
+                /* The timeout is relative, so a naive implementation
+                 * recomputes it from "now" - which on the spin path below
+                 * means recomputing it every retry and never expiring.
+                 * The deadline is therefore remembered across retries of
+                 * the same wait. One slot is enough: the spin path only
+                 * happens when this is the *only* runnable task. */
+                if (spin_addr == uaddr_v && spin_deadline) {
+                    deadline = spin_deadline;
+                } else {
+                    deadline = pit_get_ticks() + timeout_to_ticks(ts);
+                    if (!deadline) deadline = 1;  /* 0 means "no deadline" */
+                    spin_addr = uaddr_v;
+                    spin_deadline = deadline;
+                }
+                if ((int32_t)(pit_get_ticks() - deadline) >= 0) {
+                    spin_addr = 0; spin_deadline = 0;
+                    return -ETIMEDOUT;
+                }
+            }
+            futex_waits++;
+
+            /* Park. The return value is written into this task's saved
+             * frame by whoever wakes it - 0 for a FUTEX_WAKE, -ETIMEDOUT
+             * for the timer - so the 0 returned here is only what the
+             * frame carries until then. */
+            if (scheduler_block_current(regs, uaddr_v, deadline)) {
+                futex_blocks++;
+                spin_addr = 0; spin_deadline = 0;
+                return 0;
+            }
+
+            /* Nothing else could run: no other task exists, or every
+             * other one is itself blocked. There is nobody to hand the
+             * CPU to, so parking would only leave the machine with
+             * nothing to do and nobody to wake anyone.
+             *
+             * With a deadline that is still worth doing cheaply. Idle in
+             * the kernel until the time runs out or the word changes,
+             * exactly as sys_nanosleep does - the syscall gate is an
+             * interrupt gate, so IF has to be set by hand before hlt or
+             * the timer that ends the wait can never arrive. Measured on
+             * the alternative: returning to ring 3 to re-enter this
+             * syscall took 1 248 002 round trips for one 1.5-second wait.
+             *
+             * Without a deadline there is nothing to wait *for* - no
+             * other task can change the word - so this is a deadlock in
+             * the program either way, and retrying keeps the old
+             * behaviour rather than inventing a new way to hang. */
+            if (deadline) {
+                futex_idles++;
+                __asm__ __volatile__("sti");
+                while ((int32_t)(pit_get_ticks() - deadline) < 0) {
+                    if (*uaddr != val) {
+                        __asm__ __volatile__("cli");
+                        spin_addr = 0; spin_deadline = 0;
+                        return -EAGAIN;
+                    }
+                    __asm__ __volatile__("hlt");
+                }
+                __asm__ __volatile__("cli");
+                spin_addr = 0; spin_deadline = 0;
+                return -ETIMEDOUT;
+            }
+
+            futex_retries++;
             retry_wanted = 1;
             return 0;
+        }
 
         case FUTEX_WAKE: {
-            uint32_t woken = futex_waiters < val ? futex_waiters : val;
-            return (int32_t)woken;
+            int n = scheduler_wake_on(uaddr_v, (int)val, 0);
+            futex_wakes += (uint32_t)n;
+            return (int32_t)n;
         }
 
         default:
