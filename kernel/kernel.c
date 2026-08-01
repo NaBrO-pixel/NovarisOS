@@ -14,7 +14,7 @@
 #include "process.h"
 #include "scheduler.h"
 #include "vfs.h"
-#include "initrd.h"
+#include "vfs.h"
 #include "mouse.h"
 #include "serial.h"
 #include "win32.h"
@@ -197,9 +197,9 @@ void kernel_main(uint32_t magic, multiboot_info_t* mbi) {
          * loader must not place an image over them. GRUB is free to put
          * modules anywhere, including inside a typical 0x400000 ImageBase. */
         paging_reserve_region(start, end, "initrd");
-        initrd_init(initrd_mod->mod_start, initrd_mod->mod_end - initrd_mod->mod_start);
+        ramfs_init(initrd_mod->mod_start, initrd_mod->mod_end - initrd_mod->mod_start);
         terminal_writestring_color("[OK] ", VGA_COLOR_LIGHT_GREEN);
-        terminal_writestring("Initrd mounted (try 'ls' in the shell)\n");
+        terminal_writestring("Filesystem mounted from initrd (try 'ls' in the shell)\n");
     } else {
         terminal_writestring_color("[--] ", VGA_COLOR_LIGHT_RED);
         terminal_writestring("No initrd module found - filesystem commands won't have files\n");

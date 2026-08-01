@@ -2,11 +2,13 @@ Welcome to the Novaris initrd!
 
 This file was loaded from a custom archive format (see
 userland/mkinitrd.py) via a GRUB multiboot module, parsed by
-kernel/initrd.c, and is being read right now through the generic VFS
-layer in kernel/vfs.c.
+kernel/ramfs.c, and is being read right now through the generic VFS
+layer in kernel/vfs.c. Since Milestone 26 that filesystem is writable
+and has real directories - try `mkdir /tmp/d`, `cp readme.txt /tmp/d/x`,
+`ls /tmp/d`, `rm /tmp/d/x`.
 
 Native Novaris programs:
-  ls               - list every file in here
+  ls [dir]         - list a directory
   cat hello.txt    - print a file to the screen
   run helloc.bin   - load and execute a flat-binary ring-3 program
   run helloelf.elf - load and execute a *real ELF executable*, which

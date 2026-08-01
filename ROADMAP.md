@@ -1858,8 +1858,9 @@ This is the memory-and-files half of item 3. The rest is not here.
 - [ ] **No file-backed `mmap`.** `MAP_ANONYMOUS` only; a file-backed
       request is refused with `-ENOSYS` rather than quietly returning
       zeroed memory. A dynamic linker will need this.
-- [ ] The initrd is read-only, so `open` for writing returns `-EROFS` and
-      there is no `unlink`, `mkdir`, `rename` or `creat`.
+- [x] ~~The initrd is read-only, so `open` for writing returns `-EROFS`
+      and there is no `unlink`, `mkdir`, `rename` or `creat`.~~ Done in
+      Milestone 26.
 - [ ] `PROT_EXEC` is accepted and ignored — 32-bit x86 without PAE has no
       NX bit, so "readable but not executable" cannot be expressed.
 - [ ] No `dup`/`dup2`/`pipe`, no `poll`/`select`, no sockets.
@@ -2389,14 +2390,16 @@ needs.
       `dlopen`.
 - [ ] No `/etc/ld.so.cache`, so every lookup is a path search. Harmless
       here; slow with many libraries.
-- [ ] The initrd is flat, so path resolution matches on the last
-      component only. Two files with the same basename in different
-      directories could not be told apart.
+- [x] ~~The initrd is flat, so path resolution matches on the last
+      component only.~~ Done in Milestone 26 — resolution is real, with
+      the fallback kept only for paths whose directory does not exist,
+      which is what the linker's search needs.
 - [ ] No `PT_GNU_RELRO` enforcement by the kernel - the linker's own
       `mprotect` does it, which is where it belongs, but nothing checks.
 - [ ] `st_ino` is the VFS node's address. Unique and stable for a mount,
       and not meaningful across boots.
-- [ ] Still no writable filesystem, so `open` for writing is `-EROFS`.
+- [x] ~~Still no writable filesystem, so `open` for writing is
+      `-EROFS`.~~ Done in Milestone 26.
 
 ## Milestone 23 — `ucontext_t` and `siginfo_t` ✅ DONE
 
@@ -2903,6 +2906,168 @@ could take, and it is why the section is written that way.
       Milestone 17's retry loop. They could be moved onto this, and
       should be.
 
+## Milestone 26 — a writable filesystem ✅ DONE
+
+The last item on Path A's "still to do" list before pulling in Wine
+itself. `open` for writing returned `-EROFS`, there was no `unlink`,
+`mkdir` or `rename`, and a path resolved on its last component alone — so
+`/lib/i386-linux-gnu/libc.so.6` and `libc.so.6` named the same file.
+
+Those look like two problems and are one. Wine does not merely want to
+write files, it wants a *tree*: a prefix directory it creates, a registry
+it rewrites, directories it makes and removes. A flat read-only archive
+is not a filesystem with writing missing — it is a different thing.
+
+So the initrd stops being the filesystem and becomes what it always
+actually was: a source of initial contents. `kernel/initrd.c` is gone and
+`kernel/ramfs.c` replaces it — a hierarchical, writable in-memory
+filesystem, populated from the archive at boot.
+
+### What did not change, which is the point
+
+Every existing consumer — the shell, the desktop's file browser, the ELF
+loader, the PE loader, `win32_kernel32.c` — needed **no changes at all**.
+`vfs_node_t` kept its `read`/`readdir`/`finddir` hooks and grew tree
+links beside them, so `vfs_readdir(vfs_root, i)` still walks the root's
+children and `vfs_finddir(vfs_root, name)` still finds one. The
+Milestone 6 VFS abstraction earned its keep twenty milestones later.
+
+### Copy-on-write, and the number that justifies it
+
+An initrd-backed file's bytes are **not** copied at mount. `data` points
+into the initrd image and `from_initrd` says so; the copy happens on the
+first write to that file, and only to that file.
+
+That is not a micro-optimisation, and the control measures it. Copying
+everything at boot instead:
+
+```
+--- no copy-on-write, at boot ---
+Physical frames: 26760 free / 32736 total     (with copy-on-write: 28663)
+```
+
+**1903 frames — 7.4 MB — spent at boot to duplicate an archive already in
+memory**, most of it `libc.so.6`. With copy-on-write the whole filesystem
+costs the node pool and nothing else, and `meminfo` before and after a
+`fstest.elf` that creates, writes, renames and removes a dozen files is
+unchanged.
+
+Verified end to end from the shell, which is also the only place the
+copy-on-write is directly observable:
+
+```
+novaris> cp readme.txt hello.txt
+copied 2110 bytes to hello.txt
+novaris> cat hello.txt
+Welcome to the Novaris initrd!  ...     <- readme's bytes
+novaris> cat readme.txt
+Welcome to the Novaris initrd!  ...     <- and the archive is intact
+```
+
+### The fallback that had to be conditional
+
+Real path resolution breaks dynamic linking, because `ld-linux.so.2`
+searches a list of directories: it probes `/lib/i386-linux-gnu/libc.so.6`,
+`/usr/lib/libc.so.6` and several more, and none of those directories
+exist. So a path whose *directory part does not resolve* still falls back
+to matching the last component at the root.
+
+The condition is the whole of it. Applied unconditionally — which is what
+a flat archive effectively does — unlinking `/tmp/x/hello.txt` and then
+opening it would find the root's `hello.txt` and report success. The test
+checks exactly this, and the control confirms it is the only thing
+standing between the two behaviours:
+
+```
+--- basename fallback applied unconditionally ---
+  [FAIL] a name that exists elsewhere does not shadow a miss here
+```
+
+That is one check, failing for one reason. A fallback that quietly finds
+the wrong file is worse than no fallback at all.
+
+### Verified
+
+A seventh comparison binary, `userland/fs_test.c` → `fstest.elf`, raw
+`int $0x80` and linked against nothing like the rest. Everything happens
+under `/tmp/novaris_fstest`, which it creates and removes, so the host run
+owns everything it touches and leaves nothing behind.
+
+File semantics are unusually good material for this, because they are
+*precise*. `rmdir` on a non-empty directory is `ENOTEMPTY` and not
+`ENOENT`; `unlink` on a directory is `EISDIR` and not `EPERM`; `O_APPEND`
+re-evaluates the end on every write rather than seeking once. Each is a
+specific number the two systems either agree on or do not.
+
+```
+$ make test-posix
+ 41 lines compared, 20 checks, 0 failing, 0 unexpected difference(s)  posixtest.elf
+ 93 lines compared, 67 checks, 0 failing, 0 unexpected difference(s)  sigtest.elf
+ 37 lines compared, 15 checks, 0 failing, 0 unexpected difference(s)  pthtest.elf
+  5 lines compared,  0 checks, 0 failing, 0 unexpected difference(s)  glibc.elf
+  5 lines compared,  0 checks, 0 failing, 0 unexpected difference(s)  dyn.elf
+ 60 lines compared, 45 checks, 0 failing, 0 unexpected difference(s)  uctest.elf
+ 67 lines compared, 45 checks, 0 failing, 0 unexpected difference(s)  fstest.elf
+```
+
+45 checks across `mkdir`/`rmdir`, create/write/read-back, `O_APPEND`,
+`lseek`, `ftruncate` and `O_TRUNC`, `rename`, `getdents64` (including the
+synthesised `.` and `..`), and eight distinct error cases — byte-identical
+to the Linux host. Host tests 38 + 30 + 52, the 26-case smoke suite
+passes, and repeated runs cost zero frames.
+
+`dyn.elf` still runs, which is the other thing this milestone could
+plausibly have broken: real path resolution plus the conditional fallback
+still lets `ld-linux.so.2` find `libc.so.6` through paths that do not
+exist.
+
+### The negative controls
+
+- **The basename fallback made unconditional** — one check fails, the one
+  written for it.
+- **Writes accepted and discarded** — three checks fail, and exactly the
+  three about *content* rather than size, since `length` is still
+  updated. Precisely attributable is the point.
+- **Copy-on-write removed** — nothing fails, and 1903 frames disappear at
+  boot. A control does not have to break a test to be worth running.
+
+### The shell got a filesystem too
+
+`ls [dir]` takes a path and marks directories; `mkdir`, `rm` and `cp` are
+new. They are what make the feature usable by hand rather than only by a
+test, and `cp` is how the copy-on-write above was demonstrated.
+
+### Honest scope
+
+- [x] A hierarchical, writable filesystem: `open` with
+      `O_CREAT`/`O_TRUNC`/`O_APPEND`/`O_EXCL`, `write`, `ftruncate64`,
+      `truncate64`, `unlink`, `unlinkat`, `mkdir`, `mkdirat`, `rmdir`,
+      `rename`, `renameat`, `renameat2`, `getdents64`, `fsync`, `chdir`,
+      and `stat` that knows what a directory is.
+- [x] Real path resolution, `.` and `..`, and directories that nest.
+- [ ] **Nothing persists.** It is a RAM filesystem: every boot starts
+      from the initrd again. Persistence needs a block driver and a real
+      on-disk format, which is a milestone of its own.
+- [ ] **No per-process working directory.** `chdir` is accepted for a
+      directory that exists and then ignored, and every relative path
+      resolves from the root. `getcwd` always says `/`. That is wrong for
+      any program that relies on it, and is the next thing to fix here.
+- [ ] No permissions, ownership or timestamps. Everything is mode 0755
+      and `access()` says yes to anything that exists — which is a
+      simplification in the direction that does not break programs, but
+      is a simplification.
+- [ ] No hard links, symlinks, or `O_DIRECTORY` enforcement. `st_nlink`
+      is always 1.
+- [ ] 256 nodes, fixed. Files grow by doubling and are one contiguous
+      heap block each, so a very large file needs a very large
+      allocation.
+- [ ] `rename` will not move a directory onto an existing name, and there
+      is no cross-directory loop check — there is no way to make a cycle
+      without directory renames, so nothing can currently trip it.
+- [ ] The initrd is still capped (64 entries), still packed by
+      `userland/mkinitrd.py`, and still has no directories of its own -
+      everything it carries lands at the root.
+
 ## Path A — porting Wine (the current direction)
 
 Milestone 8 laid out two ways to run Windows binaries: port Wine (Path
@@ -2939,8 +3104,10 @@ are forced into an order:
    `ucontext_t` and `siginfo_t`, in both directions: a handler can read
    the faulting registers and write them back, which is the whole of
    Wine's exception dispatch. Milestone 24 added the x87/SSE half of the
-   same picture, and Milestone 25 made futexes really block. Still to do:
-   a writable filesystem.
+   same picture, Milestone 25 made futexes really block, and Milestone 26
+   made the filesystem writable and hierarchical. This item is now
+   substantially done; what is left will be found by step 5 rather than
+   guessed at.
 4. **A dynamic linker** — ✅ done in Milestone 22. `ld-linux.so.2` loads
    `libc.so.6` at runtime and a dynamically linked glibc program runs,
    with output identical to Linux. The kernel's half is ET_DYN images,

@@ -518,6 +518,8 @@ static void run_command(char* line) {
         terminal_writestring("  about   - about Novaris\n");
         terminal_writestring("  uptime  - timer ticks since boot\n");
         terminal_writestring("  meminfo - physical memory frame usage\n");
+        terminal_writestring("  ls [dir] / cat / cp / rm / mkdir - the filesystem,\n");
+        terminal_writestring("            writable since Milestone 26\n");
         terminal_writestring("  futexinfo - futex waiting: how many waits blocked\n");
         terminal_writestring("            rather than spun (Milestone 25)\n");
         terminal_writestring("  threadtest - two threads sharing one address space,\n");
@@ -587,26 +589,110 @@ static void run_command(char* line) {
         cmd_threadtest();
     } else if (streq(line, "vmtest")) {
         cmd_vmtest();
-    } else if (streq(line, "ls")) {
+    } else if (streq(line, "ls") || starts_with(line, "ls ")) {
+        /* Since Milestone 26 the tree has real directories, so `ls` takes
+         * a path and marks them. */
+        const char* where = line + 2;
+        while (*where == ' ') where++;
+        vfs_node_t* dir = *where ? vfs_lookup(where) : vfs_root;
         if (!vfs_root) {
             terminal_writestring("No filesystem mounted.\n");
+        } else if (!dir) {
+            terminal_writestring_color("Not found: ", VGA_COLOR_LIGHT_RED);
+            terminal_writestring(where);
+            terminal_writestring("\n");
+        } else if (!(dir->flags & VFS_DIRECTORY)) {
+            terminal_writestring_color("Not a directory: ", VGA_COLOR_LIGHT_RED);
+            terminal_writestring(where);
+            terminal_writestring("\n");
         } else {
             uint32_t idx = 0;
             vfs_node_t* n;
-            while ((n = vfs_readdir(vfs_root, idx))) {
+            while ((n = vfs_readdir(dir, idx))) {
                 terminal_writestring("  ");
                 terminal_writestring(n->name);
-                terminal_writestring("  (");
-                print_uint(n->length);
-                terminal_writestring(" bytes)\n");
+                if (n->flags & VFS_DIRECTORY) {
+                    terminal_writestring("/  (directory)\n");
+                } else {
+                    terminal_writestring("  (");
+                    print_uint(n->length);
+                    terminal_writestring(" bytes)\n");
+                }
                 idx++;
             }
-            if (idx == 0) terminal_writestring("(no files)\n");
+            if (idx == 0) terminal_writestring("(empty)\n");
+        }
+    } else if (starts_with(line, "mkdir")) {
+        const char* p = line + 5;
+        while (*p == ' ') p++;
+        const char* leaf = 0;
+        vfs_node_t* dir = *p ? vfs_resolve_parent(p, &leaf) : 0;
+        if (!*p) {
+            terminal_writestring("usage: mkdir <path>\n");
+        } else if (!dir || !vfs_create(dir, leaf, VFS_DIRECTORY)) {
+            terminal_writestring_color("mkdir failed: ", VGA_COLOR_LIGHT_RED);
+            terminal_writestring(p);
+            terminal_writestring("\n");
+        }
+    } else if (starts_with(line, "rm ")) {
+        const char* p = line + 2;
+        while (*p == ' ') p++;
+        const char* leaf = 0;
+        vfs_node_t* dir = vfs_resolve_parent(p, &leaf);
+        vfs_node_t* victim = dir ? vfs_finddir(dir, leaf) : 0;
+        int32_t r = victim
+            ? vfs_unlink(dir, leaf, (victim->flags & VFS_DIRECTORY) ? 1 : 0)
+            : -1;
+        if (r != 0) {
+            terminal_writestring_color("rm failed: ", VGA_COLOR_LIGHT_RED);
+            terminal_writestring(p);
+            terminal_writestring("\n");
+        }
+    } else if (starts_with(line, "cp ")) {
+        /* Two arguments, split on the first space after the command. */
+        char src[128], dst[128];
+        const char* p = line + 2;
+        while (*p == ' ') p++;
+        uint32_t i = 0;
+        while (*p && *p != ' ' && i < sizeof(src) - 1) src[i++] = *p++;
+        src[i] = '\0';
+        while (*p == ' ') p++;
+        i = 0;
+        while (*p && i < sizeof(dst) - 1) dst[i++] = *p++;
+        dst[i] = '\0';
+
+        vfs_node_t* from = src[0] ? vfs_lookup(src) : 0;
+        if (!src[0] || !dst[0]) {
+            terminal_writestring("usage: cp <src> <dst>\n");
+        } else if (!from || (from->flags & VFS_DIRECTORY)) {
+            terminal_writestring_color("cp: cannot read ", VGA_COLOR_LIGHT_RED);
+            terminal_writestring(src);
+            terminal_writestring("\n");
+        } else {
+            const char* leaf = 0;
+            vfs_node_t* dir = vfs_resolve_parent(dst, &leaf);
+            vfs_node_t* to = dir ? vfs_finddir(dir, leaf) : 0;
+            if (dir && !to) to = vfs_create(dir, leaf, VFS_FILE);
+            uint8_t* buf = from->length ? (uint8_t*)kmalloc(from->length) : 0;
+            if (!to || (from->length && !buf)) {
+                terminal_writestring_color("cp failed\n", VGA_COLOR_LIGHT_RED);
+            } else {
+                uint32_t got = vfs_read(from, 0, from->length, buf);
+                vfs_truncate(to, 0);
+                if (got) vfs_write(to, 0, got, buf);
+                terminal_writestring("copied ");
+                print_uint(got);
+                terminal_writestring(" bytes to ");
+                terminal_writestring(dst);
+                terminal_writestring("\n");
+            }
+            if (buf) kfree(buf);
         }
     } else if (starts_with(line, "cat")) {
         const char* fname = line + 3;
         while (*fname == ' ') fname++;
-        vfs_node_t* n = vfs_root ? vfs_finddir(vfs_root, fname) : 0;
+        vfs_node_t* n = *fname ? vfs_lookup(fname) : 0;
+        if (n && (n->flags & VFS_DIRECTORY)) n = 0;
         if (*fname == '\0') {
             terminal_writestring("usage: cat <filename>\n");
         } else if (!n) {

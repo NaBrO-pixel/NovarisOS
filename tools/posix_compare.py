@@ -44,6 +44,15 @@ TESTS = {
         # baked in. Nothing may differ.
         "expected": [],
     },
+    "fstest.elf": {
+        "start": "filesystem test",
+        "end": "filesystem test done.",
+        # Milestone 26. Every path is under /tmp/novaris_fstest, which the
+        # test creates and removes, so the host run owns everything it
+        # touches. Nothing may differ - file semantics are precise, and a
+        # difference here would be a real one.
+        "expected": [],
+    },
     "uctest.elf": {
         "start": "ucontext test",
         "end": "ucontext test done.",
