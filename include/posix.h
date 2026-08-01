@@ -42,6 +42,18 @@
 #define SYS_close            6
 #define SYS_waitpid          7
 #define SYS_unlink          10
+#define SYS_chdir           12
+#define SYS_rename          38
+#define SYS_mkdir           39
+#define SYS_rmdir           40
+#define SYS_fsync          118
+#define SYS_truncate64     193
+#define SYS_ftruncate64    194
+#define SYS_getdents64     220
+#define SYS_mkdirat        296
+#define SYS_unlinkat       301
+#define SYS_renameat       302
+#define SYS_renameat2      353
 #define SYS_time            13
 #define SYS_lseek           19
 #define SYS_getpid          20
@@ -106,6 +118,10 @@
 #define ENODEV  19
 #define EINTR    4
 #define ETIMEDOUT 110   /* what a futex wait that ran out of time returns */
+#define EISDIR  21
+#define ENOTDIR 20
+#define ENOTEMPTY 39
+#define EXDEV   18
 
 /* --- mmap / mprotect flags, as Linux defines them ----------------------- */
 #define PROT_NONE   0x0
@@ -279,8 +295,10 @@ typedef struct {
 #define O_WRONLY   0x0001
 #define O_RDWR     0x0002
 #define O_CREAT    0x0040
+#define O_EXCL     0x0080
 #define O_TRUNC    0x0200
 #define O_APPEND   0x0400
+#define O_DIRECTORY 0x10000
 
 /* --- lseek whence ------------------------------------------------------- */
 #define SEEK_SET 0

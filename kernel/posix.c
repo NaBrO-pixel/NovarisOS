@@ -36,6 +36,8 @@ typedef struct {
     vfs_node_t* node;
     uint32_t    offset;
     int         writable;
+    int         append;      /* O_APPEND: every write goes to the end */
+    uint32_t    dir_index;   /* getdents64's position in a directory */
 } fd_entry_t;
 
 static fd_entry_t fds[MAX_FDS];
@@ -278,37 +280,71 @@ static int32_t sys_brk(uint32_t addr) {
 
 /* --- files -------------------------------------------------------------- */
 
-static int32_t sys_open(const char* path, int flags) {
+/* Path resolution is real since Milestone 26 - every component of
+ * "/tmp/a/b" has to exist and be a directory.
+ *
+ * The one deliberate exception is the basename fallback, and it is what
+ * keeps dynamic linking working. ld-linux.so.2 searches a list of
+ * directories, so it probes "/lib/i386-linux-gnu/libc.so.6",
+ * "/usr/lib/libc.so.6" and several more; the initrd's contents are all at
+ * the root, and none of those directories exist. So a path whose
+ * *directory part does not resolve* falls back to matching the last
+ * component at the root.
+ *
+ * The condition matters. If the directory does resolve, a miss inside it
+ * is a genuine ENOENT - otherwise unlinking /tmp/x/hello.txt and then
+ * opening it would find the root's hello.txt and report success, which
+ * is exactly the kind of quiet wrongness this fallback could have
+ * introduced. */
+static vfs_node_t* resolve_for_read(const char* path) {
+    vfs_node_t* n = vfs_lookup(path);
+    if (n) return n;
+
+    const char* leaf = 0;
+    if (vfs_resolve_parent(path, &leaf)) return 0;  /* the directory exists */
+
+    const char* base = path;
+    for (const char* p = path; *p; p++) if (*p == '/') base = p + 1;
+    if (!*base) return 0;
+    return vfs_root ? vfs_finddir(vfs_root, base) : 0;
+}
+
+static int32_t sys_open(const char* path, int flags, uint32_t mode) {
+    (void)mode;
     if (!path) return -EFAULT;
-    if ((flags & O_WRONLY) || (flags & O_RDWR) || (flags & O_CREAT)) {
-        return -EROFS; /* the initrd is read-only */
+
+    int want_write = (flags & (O_WRONLY | O_RDWR)) != 0;
+    vfs_node_t* node = resolve_for_read(path);
+
+    if (!node) {
+        if (!(flags & O_CREAT)) return -ENOENT;
+
+        const char* leaf = 0;
+        vfs_node_t* dir = vfs_resolve_parent(path, &leaf);
+        if (!dir) return -ENOENT;
+        node = vfs_create(dir, leaf, VFS_FILE);
+        if (!node) return -ENOSPC;
+    } else if ((flags & O_CREAT) && (flags & O_EXCL)) {
+        return -EEXIST;
     }
 
-    /* The initrd is a flat archive with no directories, so a path is
-     * matched on its last component only: "/lib/i386-linux-gnu/libc.so.6"
-     * and "libc.so.6" name the same file. That is a simplification the
-     * kernel is honest about rather than a filesystem - two files with
-     * the same basename could not be told apart, and there are none.
-     *
-     * It is also what makes dynamic linking work at all here: the dynamic
-     * linker searches a list of directories, and every one of its
-     * candidate paths has to be able to resolve. */
-    const char* name = path;
-    for (const char* p = path; *p; p++) {
-        if (*p == '/') name = p + 1;
+    if (node->flags & VFS_DIRECTORY) {
+        /* Opening a directory read-only is legal and is how getdents64
+         * gets a descriptor; opening one for writing is not. */
+        if (want_write || (flags & O_CREAT)) return -EISDIR;
+    } else if (flags & O_TRUNC) {
+        if (want_write) vfs_truncate(node, 0);
     }
-    if (!*name) return -ENOENT;
-
-    vfs_node_t* node = vfs_root ? vfs_finddir(vfs_root, name) : 0;
-    if (!node) return -ENOENT;
 
     int fd = fd_alloc();
     if (fd < 0) return -EMFILE;
 
     fds[fd].kind = FD_FILE;
     fds[fd].node = node;
-    fds[fd].offset = 0;
-    fds[fd].writable = 0;
+    fds[fd].offset = (want_write && (flags & O_APPEND)) ? node->length : 0;
+    fds[fd].writable = want_write;
+    fds[fd].append = (flags & O_APPEND) != 0;
+    fds[fd].dir_index = 0;
     return fd;
 }
 
@@ -321,17 +357,15 @@ static int32_t sys_close(int fd) {
     return 0;
 }
 
-/* access(path, mode). W_OK fails because the initrd is read-only; R_OK,
- * X_OK and F_OK succeed for anything present. The dynamic linker probes
- * with this before it opens, so answering it is what lets it find a
- * library at all. */
+/* access(path, mode). Everything present is now readable, writable and
+ * executable - the filesystem has no permissions, and claiming otherwise
+ * would make W_OK lie in the direction that breaks programs. The dynamic
+ * linker probes with this before it opens, so answering it is what lets
+ * it find a library at all. */
 static int32_t sys_access(const char* path, int mode) {
+    (void)mode;
     if (!path) return -EFAULT;
-    if (mode & 2) return -EROFS;   /* W_OK */
-    int fd = sys_open(path, O_RDONLY);
-    if (fd < 0) return fd;
-    sys_close(fd);
-    return 0;
+    return resolve_for_read(path) ? 0 : -ENOENT;
 }
 
 static int32_t sys_read(int fd, char* buf, uint32_t count) {
@@ -359,7 +393,17 @@ static int32_t sys_write(int fd, const char* buf, uint32_t count) {
     fd_entry_t* e = fd_get(fd);
     if (!e) return -EBADF;
     if (!buf) return -EFAULT;
-    if (e->kind != FD_CONSOLE) return -EROFS;
+    if (e->kind != FD_CONSOLE) {
+        if (!e->writable) return -EBADF;
+        /* O_APPEND is not "seek to the end when you open it" - it is
+         * "every write goes to the end", re-evaluated each time, which is
+         * what makes two descriptors appending to one file not overwrite
+         * each other. */
+        if (e->append) e->offset = e->node->length;
+        int32_t n = vfs_write(e->node, e->offset, count, (const uint8_t*)buf);
+        if (n > 0) e->offset += (uint32_t)n;
+        return n;
+    }
 
     /* stderr in red, so a program's diagnostics are distinguishable from
      * its output the way they are on a real terminal. terminal_write()
@@ -429,6 +473,7 @@ static int32_t sys_lseek(int fd, int32_t offset, int whence) {
 #define ST_INO_OFFSET   88   /* st_ino, the real 64-bit field */
 #define S_IFREG 0100000
 #define S_IFCHR 0020000
+#define S_IFDIR 0040000
 
 /* The device every initrd file claims to be on. Any non-zero value does;
  * it only has to be consistent and not collide with 0. */
@@ -454,7 +499,11 @@ static int32_t stat_common(uint8_t* st, uint32_t size, uint32_t mode,
     kmemset(st, 0, 96);
     *(uint32_t*)(st + ST_DEV_OFFSET) = NOVARIS_INITRD_DEV;
     *(uint32_t*)(st + ST_INO32_OFFSET) = ino;
-    *(uint32_t*)(st + ST_MODE_OFFSET) = mode | 0555;
+    /* 0755 rather than 0555: the filesystem is writable now, and a
+     * program that checks the mode before trying should be told the
+     * truth. There are no permissions to enforce, so every file is
+     * everybody's. */
+    *(uint32_t*)(st + ST_MODE_OFFSET) = mode | 0755;
     *(uint32_t*)(st + ST_NLINK_OFFSET) = 1;
     *(uint64_t*)(st + ST_SIZE_OFFSET) = size;
     *(uint32_t*)(st + ST_BLKSIZE_OFFSET) = PAGE_SIZE;
@@ -479,15 +528,109 @@ static int32_t sys_fstat64(int fd, uint8_t* st) {
          * distinct from every file. */
         return stat_common(st, 0, S_IFCHR, 1u + (uint32_t)fd);
     }
-    return stat_common(st, e->node->length, S_IFREG, node_ino(e->node));
+    uint32_t mode = (e->node->flags & VFS_DIRECTORY) ? S_IFDIR : S_IFREG;
+    return stat_common(st, e->node->length, mode, node_ino(e->node));
 }
 
 static int32_t sys_stat64(const char* path, uint8_t* st) {
-    int fd = sys_open(path, O_RDONLY);
+    int fd = sys_open(path, O_RDONLY, 0);
     if (fd < 0) return fd;
     int32_t r = sys_fstat64(fd, st);
     sys_close(fd);
     return r;
+}
+
+/* --- the writable half (Milestone 26) -----------------------------------
+ *
+ * All of these are thin: kernel/ramfs.c owns the tree and the errno
+ * values, and these only split a path and hand it over. The *at variants
+ * ignore their dirfd, because there is no per-process working directory
+ * yet and every path here is resolved from the root - which is honest for
+ * AT_FDCWD, the only value glibc passes. */
+
+static int32_t sys_unlink(const char* path, int want_dir) {
+    if (!path) return -EFAULT;
+    const char* leaf = 0;
+    vfs_node_t* dir = vfs_resolve_parent(path, &leaf);
+    if (!dir) return -ENOENT;
+    return vfs_unlink(dir, leaf, want_dir);
+}
+
+static int32_t sys_mkdir(const char* path) {
+    if (!path) return -EFAULT;
+    const char* leaf = 0;
+    vfs_node_t* dir = vfs_resolve_parent(path, &leaf);
+    if (!dir) return -ENOENT;
+    if (vfs_finddir(dir, leaf)) return -EEXIST;
+    return vfs_create(dir, leaf, VFS_DIRECTORY) ? 0 : -ENOSPC;
+}
+
+static int32_t sys_ftruncate(int fd, uint32_t length) {
+    fd_entry_t* e = fd_get(fd);
+    if (!e) return -EBADF;
+    if (e->kind == FD_CONSOLE) return -EINVAL;
+    if (!e->writable) return -EBADF;
+    return vfs_truncate(e->node, length);
+}
+
+/* getdents64. The struct is Linux's:
+ *
+ *   u64 d_ino; s64 d_off; u16 d_reclen; u8 d_type; char d_name[];
+ *
+ * so d_name starts at offset 19 and each record is padded to a multiple
+ * of 8. "." and ".." are synthesised - they are not nodes in the tree,
+ * but every Linux directory has them and a program that sorts its
+ * readdir output would otherwise disagree between the two systems. */
+#define DT_DIR 4
+#define DT_REG 8
+
+static int32_t sys_getdents64(int fd, uint8_t* buf, uint32_t count) {
+    fd_entry_t* e = fd_get(fd);
+    if (!e) return -EBADF;
+    if (!buf) return -EFAULT;
+    if (e->kind == FD_CONSOLE || !(e->node->flags & VFS_DIRECTORY)) {
+        return -ENOTDIR;
+    }
+
+    uint32_t written = 0;
+    for (;;) {
+        const char* name;
+        vfs_node_t* target;
+
+        if (e->dir_index == 0) {
+            name = ".";
+            target = e->node;
+        } else if (e->dir_index == 1) {
+            name = "..";
+            target = e->node->parent ? e->node->parent : e->node;
+        } else {
+            target = vfs_readdir(e->node, e->dir_index - 2);
+            if (!target) break;
+            name = target->name;
+        }
+
+        uint32_t namelen = kstrlen(name);
+        uint32_t reclen = (19 + namelen + 1 + 7u) & ~7u;
+        if (written + reclen > count) {
+            /* Not even one record fits: Linux says EINVAL rather than
+             * silently returning nothing, so a caller with a too-small
+             * buffer finds out. */
+            if (written == 0) return -EINVAL;
+            break;
+        }
+
+        uint8_t* rec = buf + written;
+        kmemset(rec, 0, reclen);
+        *(uint64_t*)(rec + 0)  = node_ino(target);
+        *(uint64_t*)(rec + 8)  = (int64_t)(e->dir_index + 1);
+        *(uint16_t*)(rec + 16) = (uint16_t)reclen;
+        rec[18] = (target->flags & VFS_DIRECTORY) ? DT_DIR : DT_REG;
+        kmemcpy(rec + 19, name, namelen);
+
+        written += reclen;
+        e->dir_index++;
+    }
+    return (int32_t)written;
 }
 
 /* --- everything else ---------------------------------------------------- */
@@ -539,6 +682,19 @@ static const char* syscall_name(uint32_t n) {
         case SYS_read: return "read";
         case SYS_write: return "write";
         case SYS_open: return "open";
+        case SYS_unlink: return "unlink";
+        case SYS_unlinkat: return "unlinkat";
+        case SYS_mkdir: return "mkdir";
+        case SYS_mkdirat: return "mkdirat";
+        case SYS_rmdir: return "rmdir";
+        case SYS_rename: return "rename";
+        case SYS_renameat: return "renameat";
+        case SYS_renameat2: return "renameat2";
+        case SYS_getdents64: return "getdents64";
+        case SYS_ftruncate64: return "ftruncate64";
+        case SYS_truncate64: return "truncate64";
+        case SYS_fsync: return "fsync";
+        case SYS_chdir: return "chdir";
         case SYS_close: return "close";
         case SYS_lseek: return "lseek";
         case SYS_getpid: return "getpid";
@@ -646,12 +802,10 @@ void posix_syscall(registers_t* regs) {
         case SYS_write:    r = sys_write((int)a, (const char*)b, c); break;
         case SYS_read:     r = sys_read((int)a, (char*)b, c); break;
         case SYS_writev:   r = sys_writev((int)a, (const iovec_t*)b, (int)c); break;
-        case SYS_open:     r = sys_open((const char*)a, (int)b); break;
+        case SYS_open:     r = sys_open((const char*)a, (int)b, c); break;
         case SYS_access:
             /* The dynamic linker probes with access() before it opens, so
-             * answering this is what lets it find a library at all. Any
-             * file that can be opened is readable and executable; nothing
-             * is writable. */
+             * answering this is what lets it find a library at all. */
             r = sys_access((const char*)a, (int)b);
             break;
         case SYS_faccessat:
@@ -662,11 +816,59 @@ void posix_syscall(registers_t* regs) {
             break;
 
         case SYS_openat:
-            /* (dirfd, path, flags, mode). The initrd is flat and there is
-             * one directory, so a relative path resolves the same way an
-             * absolute one does and dirfd carries no information. glibc
-             * calls this rather than open(). */
-            r = sys_open((const char*)b, (int)c);
+            /* (dirfd, path, flags, mode). There is no per-process working
+             * directory, so a relative path resolves from the root and
+             * dirfd carries no information - which is exactly right for
+             * AT_FDCWD, the only value glibc passes. */
+            r = sys_open((const char*)b, (int)c, d);
+            break;
+
+        /* --- the writable half (Milestone 26) ------------------------- */
+        case SYS_unlink:   r = sys_unlink((const char*)a, 0); break;
+        case SYS_rmdir:    r = sys_unlink((const char*)a, 1); break;
+        case SYS_mkdir:    r = sys_mkdir((const char*)a); break;
+        case SYS_unlinkat:
+            /* (dirfd, path, flags). AT_REMOVEDIR is 0x200 and is how
+             * glibc's rmdir() reaches this. */
+            r = sys_unlink((const char*)b, (c & 0x200) ? 1 : 0);
+            break;
+        case SYS_mkdirat:  r = sys_mkdir((const char*)b); break;
+        case SYS_rename:   r = vfs_rename((const char*)a, (const char*)b); break;
+        case SYS_renameat: r = vfs_rename((const char*)b, (const char*)d); break;
+        case SYS_renameat2:
+            /* (olddirfd, old, newdirfd, new, flags). glibc's rename()
+             * uses this with flags 0; the RENAME_NOREPLACE/EXCHANGE forms
+             * are refused rather than silently treated as a plain rename,
+             * and glibc falls back cleanly. */
+            if (e) { r = -EINVAL; break; }
+            r = vfs_rename((const char*)b, (const char*)d);
+            break;
+        case SYS_ftruncate64:
+            /* (fd, length_lo, length_hi) - the 64-bit length arrives as a
+             * register pair, and anything needing the high half is far
+             * beyond what fits in RAM here. */
+            if (c) { r = -EINVAL; break; }
+            r = sys_ftruncate((int)a, b);
+            break;
+        case SYS_truncate64: {
+            if (c) { r = -EINVAL; break; }
+            vfs_node_t* t = vfs_lookup((const char*)a);
+            r = t ? vfs_truncate(t, b) : -ENOENT;
+            break;
+        }
+        case SYS_getdents64:
+            r = sys_getdents64((int)a, (uint8_t*)b, c);
+            break;
+        case SYS_fsync:
+            /* There is nothing behind the filesystem to flush to. */
+            r = fd_get((int)a) ? 0 : -EBADF;
+            break;
+        case SYS_chdir:
+            /* Accepted for a directory that exists, and then ignored:
+             * paths resolve from the root, so honouring it would take a
+             * per-process cwd this does not have. Reporting success for a
+             * directory that is not there would be worse. */
+            r = vfs_lookup((const char*)a) ? 0 : -ENOENT;
             break;
         case SYS_pread64: {
             /* (fd, buf, count, offset_lo, offset_hi) - a positioned read
