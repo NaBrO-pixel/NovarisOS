@@ -820,7 +820,7 @@ void posix_syscall(registers_t* regs) {
             r = posix_sys_clone(a, b, (uint32_t*)c, d, (uint32_t*)e, regs);
             break;
         case SYS_futex:
-            r = posix_sys_futex(a, (int)b, c);
+            r = posix_sys_futex(a, (int)b, c, d, regs);
             break;
         case SYS_set_tid_address:
             /* glibc calls this at startup to register where to clear the

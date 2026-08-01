@@ -104,6 +104,8 @@
 #define ERANGE  34
 #define EOPNOTSUPP 95
 #define ENODEV  19
+#define EINTR    4
+#define ETIMEDOUT 110   /* what a futex wait that ran out of time returns */
 
 /* --- mmap / mprotect flags, as Linux defines them ----------------------- */
 #define PROT_NONE   0x0
@@ -341,7 +343,15 @@ int32_t posix_sys_rt_sigreturn(registers_t* regs);
 /* --- threads (kernel/posix_thread.c, Milestone 20) ---------------------- */
 int32_t posix_sys_clone(uint32_t flags, uint32_t child_stack, uint32_t* ptid,
                         uint32_t udesc, uint32_t* ctid, registers_t* regs);
-int32_t posix_sys_futex(uint32_t uaddr, int op, uint32_t val);
+int32_t posix_sys_futex(uint32_t uaddr, int op, uint32_t val,
+                        uint32_t timeout, registers_t* regs);
+
+/* Milestone 25's futex counters, for the shell's `futexinfo`. Waiting
+ * being cheaper is not something a program can see in its own output, so
+ * the kernel has to be asked. */
+void posix_futex_stats(uint32_t* waits, uint32_t* blocks, uint32_t* retries,
+                       uint32_t* idles, uint32_t* wakes);
+void posix_futex_stats_reset(void);
 int32_t posix_sys_set_thread_area(uint32_t udesc);
 
 /* Zeroes the CLONE_CHILD_CLEARTID word of the thread that is exiting, so

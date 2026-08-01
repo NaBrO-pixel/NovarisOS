@@ -41,6 +41,7 @@ static long sc6(long n, long a, long b, long c, long d, long e, long f) {
 #define SYS_futex         240
 #define SYS_set_thread_area 243
 #define SYS_gettid        224
+#define SYS_time           13
 
 #define CLONE_VM             0x00000100
 #define CLONE_FS             0x00000200
@@ -182,6 +183,24 @@ static int worker(void* arg) {
 /* clone() with a child that runs `fn(arg)` on its own stack and exits.
  * The child cannot simply return - there is nothing to return to - so the
  * asm calls the function and then issues exit(). */
+/* --- Milestone 25: a thread whose whole job is to be blocked ------------
+ *
+ * `wait_word` is never changed, so this thread cannot come out of the
+ * wait by re-testing it. Only a FUTEX_WAKE can end it, which is what
+ * makes the return value it records meaningful. */
+static volatile int wait_word = 0;
+static volatile int never_woken = 0;
+static volatile int waiter_ready = 0, waiter_done = 0;
+static volatile long waiter_rc = 12345;
+
+static int waiter(void* arg) {
+    (void)arg;
+    waiter_ready = 1;
+    waiter_rc = sc6(SYS_futex, (long)&wait_word, FUTEX_WAIT, 0, 0, 0, 0);
+    waiter_done = 1;
+    return 0;
+}
+
 static int spawn(int (*fn)(void*), void* arg, void* stack_top,
                  struct user_desc* tls, int* ctid) {
     unsigned long* sp = (unsigned long*)stack_top;
@@ -295,6 +314,81 @@ int main_(void) {
     out_dec(expected);
     out("\n");
     check("the futex mutex protected the counter", guarded == expected);
+
+    /* 6. Milestone 25: what a *blocking* futex returns, as opposed to one
+     *    that spins until the word changes. All three of these were
+     *    different on Novaris than on Linux until it really blocked, and
+     *    nothing in this test had ever looked at a return value. */
+    out("\n6. futex return values\n");
+    {
+        long stack = sc6(SYS_mmap2, 0, 65536, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        long blk = sc6(SYS_mmap2, 0, 4096, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        int have = !(stack < 0 && stack > -4096) && stack != 0 &&
+                   !(blk < 0 && blk > -4096) && blk != 0;
+        check("mapped a stack for the waiter", have);
+
+        if (have) {
+            /* CLONE_SETTLS is not optional here - the clone above sets it
+             * unconditionally, and a null user_desc is -EFAULT. */
+            static struct user_desc wud;
+            wud.entry_number = tls_entry;
+            wud.base_addr = (unsigned)blk;
+            wud.limit = 0xFFF;
+            wud.flags = UD_FLAGS;
+
+            int tid = 0;
+            long r = spawn(waiter, 0, (void*)(stack + 65536), &wud, &tid);
+            check("the waiter thread started", r > 0);
+
+            /* Wait until it is about to make the call, then give it long
+             * enough to actually get there. A 20ms slice swallows about
+             * 20 000 spin iterations, so this is several slices' worth -
+             * the waiter only has two instructions to execute after
+             * setting the flag. */
+            while (!waiter_ready) { }
+            for (volatile long i = 0; i < 400000; i++) { }
+
+            /* The word is never changed, so the waiter cannot fall out of
+             * the wait on its own: only this wake can end it. Looping
+             * bounds a lost race rather than papering over the result -
+             * the assertions below are on the values, not on the loop. */
+            long woke = 0;
+            for (int t = 0; t < 200 && woke == 0; t++) {
+                woke = sc6(SYS_futex, (long)&wait_word, FUTEX_WAKE, 1, 0, 0, 0);
+                if (woke == 0) for (volatile long i = 0; i < 100000; i++) { }
+            }
+            while (!waiter_done) { }
+
+            check("FUTEX_WAKE reports how many it woke", woke == 1);
+            check("FUTEX_WAIT returns 0 when it is woken", waiter_rc == 0);
+            check("a wake with nobody waiting reports 0",
+                  sc6(SYS_futex, (long)&wait_word, FUTEX_WAKE, 1, 0, 0, 0) == 0);
+            while (tid != 0) {
+                sc6(SYS_futex, (long)&tid, FUTEX_WAIT, tid, 0, 0, 0);
+            }
+        }
+    }
+
+    /* 7. And a timed wait, which used to be an untimed one: the fourth
+     *    argument was ignored, so a bounded wait became unbounded. The
+     *    elapsed check matters - returning -ETIMEDOUT immediately would
+     *    satisfy the return value and none of the meaning. */
+    out("\n7. futex with a timeout\n");
+    {
+        struct { long tv_sec; long tv_nsec; } ts;
+        ts.tv_sec = 1;
+        ts.tv_nsec = 500000000;   /* 1.5s, over time()'s one-second grain */
+
+        long t0 = sc1(SYS_time, 0);
+        long rc = sc6(SYS_futex, (long)&never_woken, FUTEX_WAIT, 0,
+                      (long)&ts, 0, 0);
+        long t1 = sc1(SYS_time, 0);
+
+        check("a wait nobody satisfies returns -ETIMEDOUT", rc == -110);
+        check("and it really waited", (t1 - t0) >= 1);
+    }
 
     out("\nposix thread test done.\n");
     return 0;

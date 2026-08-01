@@ -1715,9 +1715,12 @@ program via `scheduler_terminate_all()`. Host tests: 38 + 30 + 52 checks,
 - [x] Real preemptive threads in a real Win32 program, with working
       joins and working mutual exclusion.
 - [ ] **Waiting is a retry loop, not a block.** A waiting thread is still
-      scheduled and still burns CPU. Real blocking needs a second switch
-      path that can suspend and resume a task's kernel stack — the piece
-      deliberately not built here.
+      scheduled and still burns CPU. This says real blocking needs "a
+      second switch path that can suspend and resume a task's kernel
+      stack" — Milestone 25 showed that is simply not true, and built
+      blocking for POSIX futexes out of the trap frame the scheduler
+      already saves. Win32's waits have not been moved onto it yet, so
+      this entry stands for them.
 - [ ] `WaitForSingleObject` ignores finite timeouts (treats them as
       `INFINITE`); only a 0 timeout is honoured, as a poll.
       `WaitForMultipleObjects` is still a stub.
@@ -2118,11 +2121,14 @@ threads and all), and host tests are 38 + 30 + 52 with no failures.
 - [x] `clone` (thread shape), `futex` WAIT/WAKE, `set_thread_area`,
       per-thread TLS, `CLONE_CHILD_CLEARTID`, `CLONE_PARENT_SETTID`,
       `set_tid_address`, and thread-vs-process exit.
-- [ ] **`futex` still does not block.** A waiter stays runnable and
+- [x] ~~**`futex` still does not block.** A waiter stays runnable and
       re-tests its word every slice. `FUTEX_WAKE` therefore has nothing to
-      wake and only reports a count. Correct, and wasteful.
-- [ ] No `FUTEX_REQUEUE`, `FUTEX_WAIT_BITSET`, `FUTEX_LOCK_PI` or
-      timeouts — a `FUTEX_WAIT` timeout argument is ignored.
+      wake and only reports a count. Correct, and wasteful.~~ Done in
+      Milestone 25 — and it turned out to be a correctness problem too,
+      not only a wasteful one.
+- [x] ~~timeouts — a `FUTEX_WAIT` timeout argument is ignored.~~ Done in
+      Milestone 25.
+- [ ] No `FUTEX_REQUEUE`, `FUTEX_WAIT_BITSET` or `FUTEX_LOCK_PI`.
 - [ ] **No `fork`.** A clone without `CLONE_VM` returns `-ENOSYS`; a real
       fork needs copy-on-write, which does not exist.
 - [ ] One TLS entry, not three. A program asking for a second gets
@@ -2730,6 +2736,173 @@ Four deliberate breaks, each failing a different, named set of checks:
       exist. The frame is 624 bytes larger than it was, all of it on the
       user stack.
 
+## Milestone 25 — futexes that really block ✅ DONE
+
+Milestone 20 implemented `FUTEX_WAIT` as a retry loop and said the cost
+out loud: a waiting thread stayed runnable and burned its slices
+re-testing its word. This milestone makes it a real block — and the
+interesting part is that the reason it had not been done was wrong.
+
+### The thing that was believed to be hard
+
+Milestone 20's note, repeated in every summary since, said real blocking
+needed *"a second switch path that can suspend and resume a task's kernel
+stack, because the scheduler currently resumes only from a trap frame."*
+
+That is exactly backwards. The scheduler resuming only from a trap frame
+is not the obstacle, it is the *mechanism*. `scheduler_yield_from_trap()`
+already saves `regs` — the task's complete ring-3 state, the frame the
+kernel is about to `iret` from — as its resume point. That is a full,
+resumable snapshot of the task. Blocking is that same save plus a state
+the scheduler declines to pick:
+
+```c
+current->esp = (uint32_t)regs;
+current->wait_addr = uaddr;
+current->state = PROC_BLOCKED;
+switch_to(next);
+```
+
+Nothing about kernel stacks needed inventing. The whole change is one
+enum value, two fields on `process_t`, three small functions, and
+`pick_next_ready()` skipping `PROC_BLOCKED` the way it already skipped
+`PROC_ZOMBIE`.
+
+### It was also wrong, not just wasteful
+
+That is the part the old tests could not see, and it is why this is a
+correctness milestone rather than a performance one. Three things a
+program can observe were different on Novaris than on Linux:
+
+- **`FUTEX_WAIT` returned `-EAGAIN` when it was woken, not `0`.** Under
+  retry the syscall re-executed until the word changed, and the call that
+  finally noticed the change reported "the value was not what you
+  expected" — which is a different answer to the same question.
+- **`FUTEX_WAKE` always returned 0.** There was no wait queue, so there
+  was nothing to count. Callers use that number.
+- **The timeout argument was ignored**, which quietly turns every bounded
+  wait into an unbounded one.
+
+Waking a blocked task has to supply the return value, and that falls out
+of the same observation: `p->esp` points at the task's saved trap frame,
+so writing `eax` *there* is writing the syscall's return value.
+
+### Three things that had to be got right
+
+**`pthread_join` stopped working for free.** `CLONE_CHILD_CLEARTID`
+zeroes a word when a thread exits, and under retry that *was* the wake —
+the joiner was on the run queue and would notice. A joiner that really
+sleeps has to be told, so thread exit now issues an explicit wake.
+
+**Blocking the last runnable task would wedge the machine.** If nothing
+else can run there is nobody to hand the CPU to and nobody left to
+perform the wake, so `scheduler_block_current()` declines and reports it,
+and the caller falls back to Milestone 20's retry. That is not a
+compromise: when there is no one else to give the CPU to, spinning costs
+nothing.
+
+**Every task blocked at once is a deadlock in the program, and must not
+become one in the machine.** `pick_next_ready()` returning 0 while tasks
+are still alive would have let callers unwind past them. It now wakes
+every blocked task with `-EAGAIN` first — a value every futex caller
+already handles, since it means "look again" — so the program degrades to
+the spin it would have done before rather than vanishing.
+
+### The number that makes the case
+
+A timed wait is the one case where blocking cannot help, because a
+single-threaded program waiting on a timeout has no other task to hand
+the CPU to. Under the retry loop the syscall is re-entered from ring 3
+every time round:
+
+```
+--- retry-only kernel, a 1.5s timed wait ---
+Futex waits: 1248002 (0 blocked, 1248002 spun)
+```
+
+1.25 million round trips through `int $0x80` to wait one and a half
+seconds. So that path now idles in the kernel instead — `sti; hlt` until
+the deadline or the word changes, exactly as `sys_nanosleep` does (the
+syscall gate is an interrupt gate, so `IF` has to be set by hand or the
+timer that ends the wait can never arrive).
+
+The whole of `pthtest.elf`, which spawns three threads, contends a futex
+mutex 60 times, joins all three, blocks a fourth thread on a wake and
+then waits 1.5 seconds on a timeout:
+
+```
+novaris> futexinfo
+Futex waits: 6 (5 blocked, 0 spun, 1 idled), woken: 2, blocked now: 0
+```
+
+Six waits. Five parked and cost nothing until woken; one idled. Zero
+slices spent re-testing anything.
+
+### Verified
+
+`pthtest.elf` grows two sections, and they assert the return values
+rather than only the effects — which is what nothing had done before:
+
+```
+6. futex return values
+  [ok]   FUTEX_WAKE reports how many it woke
+  [ok]   FUTEX_WAIT returns 0 when it is woken
+  [ok]   a wake with nobody waiting reports 0
+
+7. futex with a timeout
+  [ok]   a wait nobody satisfies returns -ETIMEDOUT
+  [ok]   and it really waited
+```
+
+The elapsed check in the second one matters: returning `-ETIMEDOUT`
+immediately would satisfy the return value and none of the meaning.
+
+```
+$ make test-posix
+ 41 lines compared, 20 checks, 0 failing, 0 unexpected difference(s)  posixtest.elf
+ 93 lines compared, 67 checks, 0 failing, 0 unexpected difference(s)  sigtest.elf
+ 37 lines compared, 15 checks, 0 failing, 0 unexpected difference(s)  pthtest.elf
+  5 lines compared,  0 checks, 0 failing, 0 unexpected difference(s)  glibc.elf
+  5 lines compared,  0 checks, 0 failing, 0 unexpected difference(s)  dyn.elf
+ 60 lines compared, 45 checks, 0 failing, 0 unexpected difference(s)  uctest.elf
+```
+
+Host tests 38 + 30 + 52, the 26-case smoke suite passes, and repeated
+runs still cost zero frames.
+
+### The negative control
+
+Forcing the old behaviour — `scheduler_block_current()` never called —
+does not merely fail a check. `pthtest.elf` **hangs** at section 6 and
+the transcript never reaches the end, because the waiter's word is
+deliberately never changed: only a real wake can end that wait, and under
+retry there is no such thing. That is the strongest form the control
+could take, and it is why the section is written that way.
+
+### Honest scope
+
+- [x] `FUTEX_WAIT` blocks, `FUTEX_WAKE` wakes and counts, timeouts work,
+      and a woken waiter gets the return value Linux gives it.
+- [x] `pthread_join`'s `CLONE_CHILD_CLEARTID` wake.
+- [x] A timed wait with nothing else runnable idles in the kernel rather
+      than re-entering the syscall a million times.
+- [ ] **The wait queue is a linear scan of the process table**, which is
+      8 entries. Fine at this size and wrong at any real one.
+- [ ] **No `FUTEX_REQUEUE`, `FUTEX_WAKE_OP`, `FUTEX_WAIT_BITSET` or
+      priority inheritance.** glibc's condition variables use requeue on
+      some paths; they have not been exercised here.
+- [ ] Waiters are woken in table order, not FIFO, and there is no
+      fairness guarantee.
+- [ ] An untimed wait with no other runnable task still spins. It is a
+      deadlock in the program either way, but Linux would leave the
+      process asleep rather than burning the CPU.
+- [ ] `FUTEX_PRIVATE_FLAG` is masked off and ignored: there is one
+      address space per program and no shared memory between programs, so
+      every futex is private in practice.
+- [ ] Win32's `WaitForSingleObject` and critical sections still use
+      Milestone 17's retry loop. They could be moved onto this, and
+      should be.
+
 ## Path A — porting Wine (the current direction)
 
 Milestone 8 laid out two ways to run Windows binaries: port Wine (Path
@@ -2750,9 +2923,10 @@ are forced into an order:
 2. **Real threads** — ✅ done for the kernel's own scheduler in Milestone
    16 (address-space-aware switching, multiple threads per address
    space), and for Win32 programs in Milestone 17 (`CreateThread`,
-   `WaitForSingleObject`, working critical sections). Still to do: real
-   blocking rather than retry loops, per-thread TLS, and event/mutex
-   objects.
+   `WaitForSingleObject`, working critical sections). Milestone 20 added
+   per-thread TLS and Milestone 25 real blocking, for POSIX threads.
+   Still to do: moving Win32's waits onto the same blocking path, and
+   event/mutex objects.
 3. **A POSIX-ish syscall surface** — ⏳ in progress. Milestone 18 adopted
    the real Linux/i386 ABI and implemented the memory and file halves
    (`mmap2`/`munmap`/`mprotect`/`brk`, a descriptor table,
@@ -2765,8 +2939,8 @@ are forced into an order:
    `ucontext_t` and `siginfo_t`, in both directions: a handler can read
    the faulting registers and write them back, which is the whole of
    Wine's exception dispatch. Milestone 24 added the x87/SSE half of the
-   same picture. Still to do: blocking (rather than retrying) futexes,
-   and a writable filesystem.
+   same picture, and Milestone 25 made futexes really block. Still to do:
+   a writable filesystem.
 4. **A dynamic linker** — ✅ done in Milestone 22. `ld-linux.so.2` loads
    `libc.so.6` at runtime and a dynamically linked glibc program runs,
    with output identical to Linux. The kernel's half is ET_DYN images,
