@@ -34,4 +34,10 @@ uint32_t pmm_total_frames(void);
 uint32_t pmm_used_frames(void);
 uint32_t pmm_free_frames(void);
 
+/* How many times a frame that was already free has been freed again -
+ * the one error this allocator cannot survive quietly, since the frame
+ * may have been handed to somebody else in between. Zero is the only
+ * acceptable value and `meminfo` prints it when it is not. */
+uint32_t pmm_double_frees(void);
+
 #endif

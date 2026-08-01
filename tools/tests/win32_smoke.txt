@@ -28,6 +28,8 @@ run hellowin.exe
 # private address spaces, and the two scheduler demos Milestone 16 added:
 # multitask is three tasks in three address spaces at one address,
 # threadtest is two threads in one address space sharing one counter.
+run forktest.elf
+ps
 run helloelf.elf
 run helloc.bin
 run posixtest.elf

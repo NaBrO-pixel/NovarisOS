@@ -3406,6 +3406,298 @@ afternoon, and it is the next one:
 
 Nothing above is speculative — each is named by something Wine does.
 
+## Milestone 29 — two processes at once, and a real wineserver ✅ DONE
+
+Milestone 28 ended by naming the four things that had to exist before
+Wine could start a server, and why none of them could: **Novaris's POSIX
+state was a set of globals.** One descriptor table, one mmap arena, one
+break, one signal disposition table, because there had only ever been one
+process. A `fork` that quietly shared its parent's descriptor table would
+have passed a simple test and been wrong.
+
+So the milestone is those four things, in the order they force:
+
+1. per-process POSIX state, keyed by address space;
+2. `fork`;
+3. `execve`;
+4. `wait4`, and an exit status worth waiting for.
+
+Plus the one Milestone 28 named separately — `poll`, because wineserver's
+main loop waits on every descriptor it holds rather than blocking on one —
+and `pipe`/`dup2`, because that is how a spawn wires a child up before it
+becomes something else.
+
+**Real Wine now starts a real wineserver on Novaris, and the two speak
+the wineserver protocol to each other.**
+
+```
+novaris> setenv WINEDEBUG=+server
+novaris> run wine-preloader wine hellowin.exe
+wine: created the configuration directory '/.wine'
+wineserver: starting (pid=258)
+0020: *fd* 03a2 -> 22
+0024: *fd* 7 <- 22
+0024: init_first_thread( unix_pid=256, unix_tid=1, reply_fd=7, wait_fd=9 )
+0024: *fd* 9 <- 23
+0024: init_first_thread() = 0 { pid=0020, tid=0024, session_id=00000001, ... }
+0024: open_mapping( name=L"\KernelObjects\__wine_user_shared_data" )
+0024: open_mapping() = 0 { handle=0004 }
+0024: get_handle_fd( handle=0004 )
+0024: *fd* 0004 -> 18
+0024: get_handle_fd() = 0 { type=1, cacheable=1, access=000f001f }
+```
+
+That is wineserver's own trace, from wineserver itself, running on
+Novaris. Read it for what it is: two Novaris processes, one of them 4MB of
+unmodified Wine, exchanging requests, replies and *file descriptors* over
+a Unix socket. Milestone 27 could not start a server; Milestone 28 could
+open a socket to a server that did not exist. This is the server existing.
+
+Where it stops is recorded below, and it is a different subsystem again.
+
+### The key is the address space
+
+One decision does most of the work: a process's POSIX state is looked up
+by *page directory* (`include/posix_proc.h`). Threads share a page
+directory, so they find the same structure and share its descriptors, its
+break and its signal handlers — which is what POSIX says threads do. A
+forked child gets its own directory, so it finds its own — which is what
+POSIX says processes do. Neither path contains a check for which it is.
+
+What is deliberately *not* in that structure is the open file itself.
+Descriptors are per process; the objects behind them are shared. That is
+why fork gives the child a copy of the table and a *reference* to each
+object, and why sockets grew a reference count in the same milestone —
+without one, a child closing its copy of the server connection would tear
+down its parent's.
+
+### fork copies, and says so
+
+There is no copy-on-write and no machinery to build it on: a page fault
+here means a signal or a dead program, not a mapping to be filled in. So
+`fork` copies every page the parent has, eagerly
+(`paging_copy_user_space()`). The honest consequence is that a fork of
+Wine — tens of megabytes — costs tens of megabytes, for as long as it
+takes the child to exec.
+
+Which is why a process's memory is now released the moment it exits
+rather than when the batch ends. `paging_release_user_pages()` is the
+other half of the same function, and `execve` uses it too: exec is
+"empty this address space, put a different program in it, and rewrite the
+trap frame". The frame *is* the new program's initial state, so rewriting
+it and returning is the whole of starting something else.
+
+### vfork, which is what Wine actually asks for
+
+`start_server()` is not `fork()`. It is glibc's `posix_spawn`, which is
+`clone(CLONE_VM|CLONE_VFORK|SIGCHLD)` — a child process that shares its
+parent's memory, with the parent *suspended* until the child execs or
+exits. The suspension is not an optimisation: the parent's next act is to
+`munmap` the stack it gave the child. Novaris ran the child as a thread
+and returned immediately, so the parent unmapped the ground the child was
+standing on, and the child faulted at the address the stack had been at.
+
+`CLONE_THREAD`, not `CLONE_VM`, is what separates a thread from a process
+here — the obvious guess and the wrong one. Novaris copies the address
+space where Linux shares it and suspends the parent where Linux does, so
+the part that matters to a spawn is preserved. What is lost is written
+down under "honest scope": a vfork child here reports back through its
+exit status, not through memory.
+
+### Five bugs, each found by something failing
+
+**A program after the first got the previous one's memory.** Freshly
+allocated frames were never zeroed, and neither an ELF segment's tail nor
+a process's stack covers every byte of every page it touches. Linux
+guarantees that memory reads as zero and a dynamic linker depends on it:
+`ld-linux.so.2` loaded after any other program had run relocated itself
+through whatever pointers happened to be lying there, and jumped into the
+middle of the kernel. It only ever failed on the *second* program of a
+session, because the first gets memory the machine zeroed at reset — which
+is exactly why the test suite had never seen it. Two lines, in `elf.c` and
+`process.c`.
+
+**A blocked task was woken with a result written over its syscall
+number.** `scheduler_block_current_retry()` set the "do not write eax"
+flag *after* `switch_to()`, so it set it on the task being switched *to*.
+The task that actually blocked came back with 0 in eax, and the
+re-executed `int $0x80` dispatched to syscall 0. Milestone 28 could not
+see it: the retry path only blocks when some other task can run, and
+until fork there never was one.
+
+**`recvmsg` lost the descriptor it was waiting for.** `msg_controllen` is
+both an input (how much room the caller has) and an output (how much was
+used), and a receive that has to wait re-executes the whole syscall.
+Writing the output value before the wait told the second attempt the
+caller had no room for control data at all. Wine's client connected to
+wineserver, got its four bytes of greeting, and then wrote to descriptor
+-1.
+
+**Ancillary data belonged to the socket instead of to a message.** On a
+real Unix socket a descriptor is attached to a point in the byte stream,
+and a receive never merges the control data of two messages. Novaris
+queued them on the socket, so wineserver — which receives with a 256-byte
+control buffer — collected both of the client's passed descriptors in one
+call, used the first and discarded the second. It then killed the client
+for failing to send a descriptor it had in fact sent. Each passed
+descriptor now records the stream offset it was attached at, and a read
+stops at the next one.
+
+**A bound socket did not exist in the filesystem.** Milestone 28 said so
+and thought it a cosmetic simplification. It is not: Wine's client
+`lstat()`s the socket path and waits for it to appear, which is how it
+knows the server it just started is ready. A name that lives only in the
+socket layer never appears, so the client waited, gave up, and reported
+that a server seemed to be running but could not be reached. `bind()` now
+creates a real node (`VFS_SOCKET`), `stat` reports `S_IFSOCK`, and
+`unlink` takes the binding with it.
+
+### And the smaller things Wine asked for
+
+Every one found the same way — by running it and reading the `-ENOSYS`
+reports. `fcntl64` (the whole of it: `F_DUPFD`, the descriptor flags, the
+status flags, and locks that are granted because there is nobody to
+contend with), `pwrite64`, `prlimit64`, `getrusage`, `gettimeofday`,
+`clock_getres`, `clock_nanosleep`, `sched_yield` (a real yield, since
+there is a scheduler to yield to), `madvise`, `lstat64`, `statfs64`,
+`sysinfo`, `setpriority`, `chmod`, `sigaltstack` — real, because a handler
+that runs on the faulting thread's own stack cannot do anything about a
+stack overflow, and Wine's exception handler is installed `SA_ONSTACK`.
+
+Two answered by *refusing* rather than half-building:
+
+- **`symlink` is `-EPERM`, not `-ENOSYS`.** There are no symlinks and no
+  honest way to fake one. Wine makes them inside its prefix and carries
+  on when they fail; `-EPERM` says "understood and refused" rather than
+  "unknown".
+- **`epoll_create` is `-ENOSYS` on purpose.** wineserver asks for an
+  epoll descriptor once and falls back to `poll()` for the whole of its
+  main loop if it does not get one — and `poll()` is the path Novaris
+  implements properly. A half-working epoll would be chosen over a
+  working poll.
+
+Three things became real that had been accepted-and-ignored:
+
+- **A working directory per process.** `chdir` is honoured, `getcwd`
+  answers it, every relative path resolves against it, and it survives
+  fork and exec. `fchdir` too — wineserver opens its config directory and
+  moves into it *by descriptor*, which is the safe way to do it on a real
+  system and was the last thing standing between it and starting.
+- **A file mode.** Recorded, not enforced — there are no users to enforce
+  it against — but a program that sets a mode and reads it back sees what
+  it set. wineserver creates its directory `0700` and refuses to run if
+  `stat` says otherwise, because on a real machine a server directory
+  other users can reach is a security hole. A fixed `0755` failed that.
+- **An environment.** `setenv NAME=VALUE` in the shell, carried through
+  `execve`. Wine reads more of it than most programs.
+
+### poll, and what it honestly is
+
+The blocking path can park a task on exactly one address, and `poll` is
+by definition interested in several. A waiting `poll` registers on the
+first socket in its set *and* takes a one-tick deadline: the first gives
+an immediate wake for the common single-descriptor case, the second means
+nothing in the set goes unnoticed for longer than 10ms. Wake-on-any-of-N
+would need a wait queue per object, which is a bigger change than this
+milestone.
+
+### Verified
+
+A ninth comparison binary, `userland/fork_test.c` → `forktest.elf`, raw
+`int $0x80` like the rest, **byte-identical to the Linux host**:
+
+```
+$ make test-posix
+ 41 lines, 20 checks  posixtest.elf     60 lines, 45 checks  uctest.elf
+ 93 lines, 67 checks  sigtest.elf       67 lines, 45 checks  fstest.elf
+ 37 lines, 15 checks  pthtest.elf       34 lines, 23 checks  socktest.elf
+  5 lines,  0 checks  glibc.elf          5 lines,  0 checks  dyn.elf
+ 51 lines, 34 checks  forktest.elf
+```
+
+34 checks across fork (the child has its own pid, its own parent, a copy
+of its parent's memory that the parent does not see written), pipes and
+end of stream, `dup2` and what closing one of two descriptors onto one
+object does, `poll` (empty, ready, woken by another process, and hung
+up), `execve` of `/proc/self/exe` with a descriptor wired on across it,
+`wait4` with and without `WNOHANG`, `ECHILD`, and a working directory
+that a child inherits and can move without moving its parent's.
+
+Two rules keep that transcript deterministic on a preemptive kernel: only
+the parent prints, and children report by writing into a pipe. The one
+exception is the exec'd image, which prints while the parent is blocked in
+`waitpid` and therefore cannot interleave with it.
+
+Host tests 38 + 30 + 52; the smoke suite is now 14 transcript assertions,
+four of them the new one. `meminfo` grew a double-free counter — zero, and
+written while chasing a bug that turned out to be something else, but a
+frame freed twice is the one error this allocator cannot survive quietly
+and it is worth being able to ask.
+
+### Honest scope
+
+- [x] Per-process POSIX state: descriptors, arenas, break, signal
+      dispositions, working directory, exe path — keyed by address space,
+      so threads share and processes do not.
+- [x] `fork`, `vfork`, and the `clone` shapes that are really fork.
+- [x] `execve`, including `/proc/self/exe`, argv and envp, descriptors
+      that survive and `O_CLOEXEC` descriptors that do not.
+- [x] `wait4`/`waitpid` with Linux's status encoding, `WNOHANG`,
+      `ECHILD`; `kill` across processes.
+- [x] `pipe`/`pipe2`, `dup`/`dup2`/`dup3`, `poll`/`ppoll`,
+      `select`/`pselect6`.
+- [x] **Real Wine starts a real wineserver**, which creates the Wine
+      prefix, writes `system.reg`/`user.reg`/`userdef.reg`, and completes
+      `init_first_thread` and `get_handle_fd` with the client.
+- [ ] **No Windows program has been run.** Wine stops at
+      `virtual_map_user_shared_data`, which needs `MAP_SHARED` — two
+      processes mapping the *same physical frames* of a file. Novaris's
+      `mmap` allocates a private copy and refuses `MAP_SHARED` rather
+      than pretending, so this is a missing subsystem (a page cache, or
+      at least shared file mappings), not a missing syscall. It is the
+      next milestone.
+- [ ] Wine's PE builtins (`ntdll.dll`, `kernel32.dll`, …) are not in the
+      initrd either, so even a working shared mapping would meet that
+      next. The `wine-initrd` target carries the loader, `ntdll.so`,
+      `wineserver` and six NLS tables; the PE side is untouched.
+- [ ] `fork` copies eagerly. No copy-on-write, and no fault machinery to
+      build it on.
+- [ ] A vfork child's memory is copied, not shared, so it can report back
+      through its exit status but not through memory. `posix_spawn`
+      reporting an exec failure is the case that costs — the child exits
+      127 and the parent reads that instead of an errno.
+- [ ] `poll` wakes on one descriptor plus a 10ms tick rather than on any
+      of N.
+- [ ] No `epoll`, `userfaultfd`, `clone3`, `statx`, or `sigreturn` (the
+      legacy non-`rt_` one, which a handler installed without
+      `SA_SIGINFO` would need).
+- [ ] 8 processes, 16 tasks, 32 descriptors each, 32 sockets — all fixed,
+      all small, all deliberate.
+- [ ] No sessions, process groups, users or permissions. `setsid`,
+      `setpgid` and `umask` are answered rather than implemented, and the
+      mode bits are recorded rather than enforced.
+
+### How to reproduce the Wine run
+
+Wine is still **not vendored**, for the reason Milestone 27 gave. What
+changed is what the `wine-initrd` target carries: `wineserver` and the
+NLS tables it will not start without, and the loader under the names
+Wine's own `init_paths()` derives (`wine`, `wine-preloader`) as well as
+the documented ones.
+
+```bash
+git clone --depth 1 -b stable https://github.com/wine-mirror/wine
+cd wine
+CC="gcc -m32" ./configure --enable-archs=i386 --disable-tests \
+    --without-x --without-freetype --without-vulkan --without-opengl ...
+make -j4
+cd ../NovarisOS && make WINE_BUILD=../wine wine-initrd
+qemu-system-i386 -cdrom novaris-wine.iso
+novaris> setenv WINEDEBUG=+server
+novaris> run wine-preloader wine hellowin.exe
+```
+
+
 ## Path A — porting Wine (the current direction)
 
 Milestone 8 laid out two ways to run Windows binaries: port Wine (Path
@@ -3453,14 +3745,19 @@ are forced into an order:
    linking itself is the interpreter's job.
 5. **Pull in real Wine source**, cross-compile it against that surface,
    and find out what is still missing. — ⏳ started in Milestone 27, and
-   it did what it was for. Wine 11.0 builds against this kernel and runs
-   as far as `wine --version`; the thing that stops it is not a missing
-   syscall but a missing *subsystem*, Unix domain sockets, because Wine
-   is a client/server system and every handle lives in wineserver. A GDI
-   display backend was the guess; IPC is the answer. Milestone 28 built
-   the sockets, and real Wine now uses them; what remains before a
-   wineserver can be started is per-process POSIX state, and then
-   fork/exec on top of it.
+   it has done what it was for three times over. Wine 11.0 builds against
+   this kernel; Milestone 27 got it as far as `wine --version` and found
+   that what stopped it was not a missing syscall but a missing
+   *subsystem* — Unix domain sockets, because Wine is a client/server
+   system and every handle lives in wineserver. A GDI display backend was
+   the guess; IPC was the answer. Milestone 28 built the sockets.
+   Milestone 29 built the other half — per-process state, fork, execve,
+   waitpid, poll — and **real Wine now starts a real wineserver**, which
+   creates the Wine prefix and registry and completes the protocol
+   handshake with the client. The next thing that stops it is a
+   subsystem again, and again not the one that looked obvious:
+   `MAP_SHARED`. Two processes have to be able to map the same physical
+   frames of a file, and this kernel has no page cache.
 
 Each is roughly milestone-sized. (3) and (4) are each comparable in scope
 to everything built so far combined. No Wine or ReactOS source gets

@@ -53,6 +53,15 @@ TESTS = {
         # difference here would be a real one.
         "expected": [],
     },
+    "forktest.elf": {
+        "start": "fork test",
+        "end": "fork test done.",
+        # Milestone 29. Two processes at once: fork, execve, waitpid,
+        # pipes, dup2 and poll. Nothing may differ - a parent that reads
+        # the wrong exit status, or a fork that shares memory it should
+        # have copied, would show up here as a changed line.
+        "expected": [],
+    },
     "socktest.elf": {
         "start": "unix socket test",
         "end": "unix socket test done.",

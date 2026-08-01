@@ -222,20 +222,37 @@ uint8_t* process_read_file(const char* path, uint32_t* out_size) {
  * had noticed. The first real Wine binary noticed immediately, and said
  * so in its usage message. */
 #define MAX_ARGS 16
+/* An environment is real since Milestone 29, for the same kind of reason
+ * argv became real in Milestone 27: Wine reads WINEPREFIX, WINEDLLPATH and
+ * half a dozen others out of it to decide where its installation is, and a
+ * program handed an empty environment gets defaults instead of what it was
+ * told. execve carries the caller's across; `run` supplies a small one. */
+#define MAX_ENVS 16
 
 static uint32_t build_initial_stack(uint32_t stack_top, int argc,
                                     const char* const* argv,
+                                    int envc, const char* const* envp,
                                     const elf_info_t* info,
                                     uint32_t interp_base) {
     uint32_t sp = stack_top;
 
     if (argc < 1) argc = 1;
     if (argc > MAX_ARGS) argc = MAX_ARGS;
+    if (envc < 0 || !envp) envc = 0;
+    if (envc > MAX_ENVS) envc = MAX_ENVS;
 
     /* Strings and blobs first, at the very top, so the vector below them
      * can point at fixed addresses. Copied downward in reverse so that
      * argv[0] ends up highest, which is the order a real stack has them
      * and the order /proc/self/cmdline would report. */
+    uint32_t envpp[MAX_ENVS];
+    for (int i = envc - 1; i >= 0; i--) {
+        uint32_t len = kstrlen(envp[i]) + 1;
+        sp -= len;
+        envpp[i] = sp;
+        for (uint32_t j = 0; j < len; j++) ((char*)sp)[j] = envp[i][j];
+    }
+
     uint32_t argp[MAX_ARGS];
     for (int i = argc - 1; i >= 0; i--) {
         uint32_t len = kstrlen(argv[i]) + 1;
@@ -293,8 +310,9 @@ static uint32_t build_initial_stack(uint32_t stack_top, int argc,
     };
     uint32_t aux_words = sizeof(aux) / sizeof(aux[0]);
 
-    /* argc, the argv pointers, NULL, envp NULL, then the aux pairs. */
-    uint32_t words = 1 + (uint32_t)argc + 1 + 1 + aux_words;
+    /* argc, the argv pointers, NULL, the envp pointers, NULL, then the
+     * aux pairs. */
+    uint32_t words = 1 + (uint32_t)argc + 1 + (uint32_t)envc + 1 + aux_words;
     sp -= words * 4;
     sp &= ~15u;   /* esp must be 16-byte aligned at entry */
 
@@ -303,28 +321,23 @@ static uint32_t build_initial_stack(uint32_t stack_top, int argc,
     v[k++] = (uint32_t)argc;
     for (int i = 0; i < argc; i++) v[k++] = argp[i];
     v[k++] = 0;        /* argv terminator */
-    v[k++] = 0;        /* envp terminator - still no environment */
+    for (int i = 0; i < envc; i++) v[k++] = envpp[i];
+    v[k++] = 0;        /* envp terminator */
     for (uint32_t i = 0; i < aux_words; i++) v[k++] = aux[i];
 
     return sp;
 }
 
-int process_run_elf(const uint8_t* image, uint32_t size,
-                    int argc, const char* const* argv) {
-    /* Validated before the address space is created, so a file that isn't
-     * an ELF doesn't cost a page directory. `image` itself is a kernel
-     * heap buffer, which is mapped identically either side of the switch. */
+int process_load_elf_image(const uint8_t* image, uint32_t size,
+                           int argc, const char* const* argv,
+                           int envc, const char* const* envp,
+                           uint32_t* out_entry, uint32_t* out_esp) {
     if (!elf_is_valid(image, size)) return 0;
-
-    int owns_as = process_enter_address_space();
 
     /* Look before loading: an image that wants an interpreter has to be
      * placed alongside it, and a PIE has no address of its own. */
     elf_info_t peek;
-    if (!elf_peek(image, size, &peek)) {
-        if (owns_as) process_leave_address_space();
-        return 0;
-    }
+    if (!elf_peek(image, size, &peek)) return 0;
 
     uint32_t bias = peek.interp[0] ? PIE_BASE : 0;
     /* An ET_DYN with no interpreter is a static PIE and still needs a
@@ -332,10 +345,7 @@ int process_run_elf(const uint8_t* image, uint32_t size,
     if (!bias && ((const Elf32_Ehdr*)image)->e_type == ET_DYN) bias = PIE_BASE;
 
     elf_info_t info;
-    if (!elf_load_at(image, size, bias, &info)) {
-        if (owns_as) process_leave_address_space();
-        return 0;
-    }
+    if (!elf_load_at(image, size, bias, &info)) return 0;
 
     /* If the program named an interpreter, load that too and enter *it*
      * rather than the program. Everything after this point is
@@ -353,7 +363,6 @@ int process_run_elf(const uint8_t* image, uint32_t size,
             terminal_writestring("interpreter not found: ");
             terminal_writestring(info.interp);
             terminal_writestring("\n");
-            if (owns_as) process_leave_address_space();
             return 0;
         }
         elf_info_t iinfo;
@@ -362,7 +371,6 @@ int process_run_elf(const uint8_t* image, uint32_t size,
         if (!ok) {
             terminal_writestring_color("[elf] ", VGA_COLOR_LIGHT_RED);
             terminal_writestring("could not load the interpreter\n");
-            if (owns_as) process_leave_address_space();
             return 0;
         }
         interp_base = INTERP_BASE;
@@ -376,9 +384,119 @@ int process_run_elf(const uint8_t* image, uint32_t size,
      * once there is a real program on top. */
     for (uint32_t va = USER_STACK_TOP - ELF_STACK_SIZE; va < USER_STACK_TOP;
          va += PAGE_SIZE) {
+        if (paging_get_entry(va) & PAGE_PRESENT) continue;
         uint32_t phys = pmm_alloc_frame();
         if (!phys) break;
         paging_map_page(va, phys, PAGE_PRESENT | PAGE_RW | PAGE_USER);
+        /* Zeroed for the same reason elf.c zeroes a freshly mapped
+         * segment page: a frame out of the allocator holds the last
+         * program's bytes, and Linux hands a process a stack that reads
+         * as zero. glibc's startup walks past the end of the auxiliary
+         * vector looking for terminators. */
+        kmemset((void*)va, 0, PAGE_SIZE);
+    }
+
+    static const char* default_argv[1] = { "program" };
+    if (argc < 1 || !argv) { argc = 1; argv = default_argv; }
+
+    *out_entry = start;
+    *out_esp = build_initial_stack(USER_STACK_TOP, argc, argv, envc, envp,
+                                   &info, interp_base);
+    return 1;
+}
+
+/* The environment a program started from the shell is handed. The
+ * defaults are small on purpose - these are the variables a Unix program
+ * looks for before it has been told anything, and inventing more would be
+ * inventing facts - and the shell's `setenv` adds to them. */
+#define ENV_STORE_BYTES 512
+static char env_store[ENV_STORE_BYTES];
+static const char* env_ptr[PROCESS_MAX_ENV];
+static int env_count = 0;
+static uint32_t env_used = 0;
+static int env_ready = 0;
+
+static void env_defaults(void) {
+    static const char* const defaults[] = {
+        "HOME=/", "PATH=/", "USER=root", "TMPDIR=/tmp", "SHELL=/novaris",
+    };
+    env_count = 0;
+    env_used = 0;
+    for (uint32_t i = 0; i < sizeof(defaults) / sizeof(defaults[0]); i++) {
+        process_env_set(defaults[i]);
+    }
+    env_ready = 1;
+}
+
+int process_env_set(const char* assignment) {
+    if (!env_ready) { env_ready = 1; env_count = 0; env_used = 0; }
+    if (!assignment || !*assignment) return 0;
+
+    uint32_t len = kstrlen(assignment) + 1;
+    if (len > ENV_STORE_BYTES - env_used) return 0;
+
+    /* Replacing an existing NAME= rather than shadowing it: two entries
+     * with the same name is a thing a real environment can hold and a
+     * thing nothing sensible reads. The name is everything up to '='. */
+    uint32_t namelen = 0;
+    while (assignment[namelen] && assignment[namelen] != '=') namelen++;
+
+    int slot = -1;
+    for (int i = 0; i < env_count; i++) {
+        uint32_t j = 0;
+        while (j < namelen && env_ptr[i][j] == assignment[j]) j++;
+        if (j == namelen && env_ptr[i][namelen] == '=') { slot = i; break; }
+    }
+    if (slot < 0) {
+        if (env_count >= PROCESS_MAX_ENV) return 0;
+        slot = env_count++;
+    }
+
+    char* dst = &env_store[env_used];
+    for (uint32_t i = 0; i < len; i++) dst[i] = assignment[i];
+    env_used += len;
+    env_ptr[slot] = dst;
+    return 1;
+}
+
+int process_env_count(void) {
+    if (!env_ready) env_defaults();
+    return env_count;
+}
+
+const char* process_env_at(int i) {
+    if (!env_ready) env_defaults();
+    return (i >= 0 && i < env_count) ? env_ptr[i] : 0;
+}
+
+void process_env_reset(void) { env_ready = 0; env_defaults(); }
+
+int process_run_elf(const uint8_t* image, uint32_t size,
+                    int argc, const char* const* argv) {
+    /* Validated before the address space is created, so a file that isn't
+     * an ELF doesn't cost a page directory. `image` itself is a kernel
+     * heap buffer, which is mapped identically either side of the switch. */
+    if (!elf_is_valid(image, size)) return 0;
+
+    int owns_as = process_enter_address_space();
+
+    /* The process structure has to exist before the image is loaded:
+     * loading writes the program's own path into it, and since Milestone
+     * 29 there is a structure per address space rather than one global. */
+    posix_process_begin();
+    /* So readlink("/proc/self/exe") can answer, which is how Wine's
+     * loader works out where it was installed. argv[0] is the path the
+     * program was named by, which is the honest answer and the one execve
+     * records for the programs it starts. */
+    if (argc >= 1 && argv) posix_set_exe_path(argv[0]);
+
+    uint32_t start = 0, esp = 0;
+    if (!env_ready) env_defaults();
+    if (!process_load_elf_image(image, size, argc, argv,
+                                env_count, env_ptr, &start, &esp)) {
+        posix_process_end();
+        if (owns_as) process_leave_address_space();
+        return 0;
     }
 
     /* Run as a scheduler task rather than through the older blocking
@@ -386,13 +504,7 @@ int process_run_elf(const uint8_t* image, uint32_t size,
      * is simply a second task in this same address space, and
      * scheduler_run_single() blocks its caller exactly the way
      * process_run_user_mode() did. */
-    static const char* default_argv[1] = { "program" };
-    if (argc < 1 || !argv) { argc = 1; argv = default_argv; }
-    uint32_t esp = build_initial_stack(USER_STACK_TOP, argc, argv, &info,
-                                       interp_base);
-
     user_active = 1;
-    posix_process_begin();
     scheduler_run_single("main", start, esp);
     posix_process_end();
     user_active = 0;

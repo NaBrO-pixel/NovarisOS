@@ -106,6 +106,41 @@ int32_t socket_read(socket_t* s, void* buf, uint32_t len, registers_t* regs);
 int32_t socket_write(socket_t* s, const void* buf, uint32_t len);
 void    socket_close(socket_t* s);
 
+/* --- Milestone 29 ---------------------------------------------------------
+ *
+ * Two descriptors can now name one socket: dup() makes it happen on
+ * purpose and fork() makes it happen to every descriptor at once. So a
+ * socket is closed when the *last* reference goes, not when the first
+ * one does - without this, a child closing its copy of the server
+ * connection would tear down the parent's. */
+void socket_ref(socket_t* s);
+
+/* Drops a bound name, because unlink() of the socket file has to take the
+ * binding with it - that is what a Unix socket file *is*, and Wine
+ * removes a stale one before starting a server. */
+void socket_unbind_path(const char* path);
+
+/* A pipe, which is a connected pair with each end shut in one direction.
+ * Everything else about it - the byte queue, the blocking read, the
+ * end-of-stream when the writer closes - is the socket machinery
+ * unchanged, which is the reason to build it here rather than beside it. */
+int socket_pipe(socket_t** read_end, socket_t** write_end);
+
+/* What poll() and select() ask. Returns the POLL* bits (see posix.h) that
+ * are true of this socket right now: readable, writable, hung up. */
+uint32_t socket_poll_mask(socket_t* s);
+
+/* Non-zero if this socket is a listening socket with a connection
+ * waiting, or a connected one with bytes or an end-of-stream to report -
+ * i.e. whether a read or accept would return without blocking. */
+int socket_readable(socket_t* s);
+
+/* O_NONBLOCK, after the fact. fcntl(F_SETFL) is how Wine switches its
+ * server connection between blocking and not, so the flag has to be
+ * reachable from outside the socket layer as well as at creation. */
+void socket_set_nonblock(socket_t* s, int on);
+int  socket_get_nonblock(socket_t* s);
+
 /* Per-process setup and teardown: sockets belong to the program, and a
  * program that exits holding one must not leak it into the next. */
 void socket_process_begin(void);

@@ -5,6 +5,18 @@
 
 #define VFS_FILE      0x01u
 #define VFS_DIRECTORY 0x02u
+/* A bound Unix socket. Milestone 28 kept bound names in a table of their
+ * own and said so; Milestone 29 found out why that is not enough. Wine's
+ * client does not try to connect blindly - it lstat()s the socket path
+ * first and waits for it to appear, which is how it knows the server it
+ * just started is ready. A name that exists only inside the socket layer
+ * never appears, so the client waited for ever and then reported that a
+ * server seemed to be running but could not be reached.
+ *
+ * The node holds no data. It exists so that stat() can say S_IFSOCK,
+ * `ls` can show it, and unlink() can take it away - which is exactly what
+ * a Unix socket file is on a real system. */
+#define VFS_SOCKET    0x04u
 #define VFS_NAME_MAX  64
 
 struct vfs_node;
@@ -51,6 +63,16 @@ typedef struct vfs_node {
     uint32_t capacity;
     int      from_initrd;
     int      in_use;
+
+    /* The permission bits this node was created with. Nothing here
+     * *enforces* them - there are no users to enforce them against - but
+     * recording what a program asked for and reporting it back is not the
+     * same as pretending. Milestone 29 needed it for a concrete reason:
+     * wineserver creates its directory with mkdir(0700) and then refuses
+     * to run if stat() says the mode is anything else, because on a real
+     * machine a server directory other users can reach is a security
+     * hole. Reporting a fixed 0755 for everything made that check fail. */
+    uint32_t mode;
 } vfs_node_t;
 
 /* The root of whichever filesystem is currently mounted - just the
@@ -73,6 +95,13 @@ vfs_node_t* vfs_finddir(vfs_node_t* node, const char* name);
  * directory it lives in" and "the final name", which is what create,
  * unlink, mkdir and rename all need. */
 vfs_node_t* vfs_lookup(const char* path);
+
+/* The absolute path of a node, rebuilt by walking parent links. There is
+ * no path stored anywhere - the tree is the only record - so this is how
+ * fchdir() answers "which directory is this descriptor?", which is how
+ * wineserver moves into the config directory it opened. Returns the
+ * length written, or 0 if the buffer was too small. */
+uint32_t vfs_path_of(const vfs_node_t* node, char* buf, uint32_t size);
 vfs_node_t* vfs_resolve_parent(const char* path, const char** leaf_out);
 
 /* Grows the file if needed and copies bytes in. Returns bytes written, or

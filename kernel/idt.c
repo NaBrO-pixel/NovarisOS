@@ -85,8 +85,15 @@ void isr_handler(registers_t* regs) {
         /* On the way back to ring 3 is the one moment a signal can be
          * injected: the frame about to be iret'ed from is the thread's
          * user-mode state, so redirecting it into a handler is all
-         * delivery takes. See kernel/posix_signal.c. */
-        posix_deliver_pending(regs);
+         * delivery takes. See kernel/posix_signal.c.
+         *
+         * Not while a switch is pending, for the reason irq_handler()
+         * gives below and one more since Milestone 29: the syscall that
+         * set it may have been exit, in which case `regs` belongs to a
+         * task whose user stack has already been handed back to the
+         * physical allocator. Writing a signal frame onto it would fault
+         * in the kernel. */
+        if (!scheduler_next_esp) posix_deliver_pending(regs);
         return;
     }
 
