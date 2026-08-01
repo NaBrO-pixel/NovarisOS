@@ -36,6 +36,14 @@ TESTS = {
         # Novaris rather than from a stale host run.
         "expected": [("sysname = Linux", "sysname = Novaris")],
     },
+    "dyn.elf": {
+        "start": "hello from a real glibc-linked program",
+        "end": "sorted:",
+        # The same program as glibc.elf, linked dynamically - so it runs
+        # through ld-linux.so.2 and libc.so.6 rather than having them
+        # baked in. Nothing may differ.
+        "expected": [],
+    },
     "glibc.elf": {
         "start": "hello from a real glibc-linked program",
         "end": "sorted:",

@@ -8,6 +8,7 @@
 #include "vfs.h"
 #include "kheap.h"
 #include "paging.h"
+#include "posix.h"
 #include "elf.h"
 #include "pe.h"
 #include "win32.h"
@@ -519,6 +520,7 @@ static void run_command(char* line) {
         terminal_writestring("  meminfo - physical memory frame usage\n");
         terminal_writestring("  threadtest - two threads sharing one address space,\n");
         terminal_writestring("            incrementing one shared counter (Milestone 16)\n");
+        terminal_writestring("  strace  - run a program with every syscall logged\n");
         terminal_writestring("  vmtest  - prove per-process address spaces work:\n");
         terminal_writestring("            two page directories, one virtual address,\n");
         terminal_writestring("            two different contents (ROADMAP Milestone 14)\n");
@@ -609,6 +611,20 @@ static void run_command(char* line) {
         const char* argument = line + 6;
         while (*argument == ' ') argument++;
         cmd_winapi(argument);
+    } else if (starts_with(line, "strace")) {
+        /* `run` with every syscall logged. Added in Milestone 22 to
+         * compare a dynamic linker's behaviour here against the same
+         * program's strace on Linux - reading two traces side by side
+         * beats reasoning about which of a hundred calls differs. */
+        const char* fname = line + 6;
+        while (*fname == ' ') fname++;
+        if (*fname == '\0') {
+            terminal_writestring("usage: strace <filename>\n");
+        } else {
+            posix_set_trace(1);
+            cmd_run(fname);
+            posix_set_trace(0);
+        }
     } else if (starts_with(line, "run")) {
         const char* fname = line + 3;
         while (*fname == ' ') fname++;

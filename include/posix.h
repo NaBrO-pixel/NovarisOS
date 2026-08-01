@@ -73,7 +73,11 @@
 #define SYS_futex          240
 #define SYS_set_tid_address 258
 #define SYS_ugetrlimit     191
+#define SYS_openat         295
+#define SYS_faccessat      307
+#define SYS_faccessat2     439
 #define SYS_fstatat64      300
+#define SYS_pread64        180
 #define SYS_readlinkat     305
 #define SYS_set_robust_list 311
 #define SYS_getrandom      355
@@ -99,6 +103,7 @@
 #define EAGAIN  11
 #define ERANGE  34
 #define EOPNOTSUPP 95
+#define ENODEV  19
 
 /* --- mmap / mprotect flags, as Linux defines them ----------------------- */
 #define PROT_NONE   0x0
@@ -240,6 +245,14 @@ void posix_thread_exiting(void);
  * being able to suspend a task mid-syscall. Consumed by posix_syscall(),
  * which restores eax, rewinds eip past the `int $0x80`, and yields. */
 int posix_retry_pending(void);
+
+/* Syscall tracing, for comparing what a program does here against what
+ * it does on Linux under strace. Milestone 22 needed it: a dynamic
+ * linker makes a hundred-odd calls before main(), and reasoning about
+ * which one behaves differently is far harder than reading the two
+ * traces side by side. */
+void posix_set_trace(int on);
+int  posix_trace_enabled(void);
 
 /* How many syscalls this program made that Novaris does not implement,
  * for the same reason the Win32 layer counts missing APIs: a program that

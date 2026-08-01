@@ -294,6 +294,27 @@ $(BUILD_DIR)/user/glibc.elf: userland/glibc_hello.c | $(BUILD_DIR)
 	mkdir -p $(BUILD_DIR)/user
 	$(CC) -m32 -static -O2 -o $@ $<
 
+# The same program linked *dynamically*, which is the ordinary way a
+# Linux program is built - it needs ld-linux.so.2 to load libc.so.6 at
+# runtime. See ROADMAP.md Milestone 22.
+$(BUILD_DIR)/user/dyn.elf: userland/glibc_hello.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(CC) -m32 -O2 -o $@ $<
+
+# The dynamic linker and the C library are *copied from the host
+# toolchain* rather than committed to this repository: they are build
+# inputs, like mingw-w64's import libraries, and vendoring several
+# megabytes of LGPL glibc into a hobby kernel's source tree would be both
+# bloat and a licensing question nobody needs. The paths are where a
+# Debian/Ubuntu multilib install puts them.
+HOST_LIB32 ?= /lib32
+$(BUILD_DIR)/user/ld-linux.so.2: | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	cp $(HOST_LIB32)/ld-linux.so.2 $@
+$(BUILD_DIR)/user/libc.so.6: | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	cp $(HOST_LIB32)/libc.so.6 $@
+
 $(BUILD_DIR)/user/crashelf.elf: userland/crash_test.c | $(BUILD_DIR)
 	mkdir -p $(BUILD_DIR)/user
 	$(CC) -m32 -static -nostdlib -ffreestanding -fno-builtin -O2 -Wall \
@@ -397,7 +418,8 @@ $(BUILD_DIR)/user/hello64.exe: userland/pe_test/x64_marker.c | $(BUILD_DIR)
 $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
         $(BUILD_DIR)/user/hello_elf.elf $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf \
         $(BUILD_DIR)/user/pthtest.elf $(BUILD_DIR)/user/crashelf.elf \
-        $(BUILD_DIR)/user/glibc.elf \
+        $(BUILD_DIR)/user/glibc.elf $(BUILD_DIR)/user/dyn.elf \
+        $(BUILD_DIR)/user/ld-linux.so.2 $(BUILD_DIR)/user/libc.so.6 \
         $(BUILD_DIR)/user/hello_pe.exe \
         $(BUILD_DIR)/user/hellowin.exe $(BUILD_DIR)/user/winapi.exe \
         $(BUILD_DIR)/user/cppinit.exe $(BUILD_DIR)/user/guiapp.exe \
@@ -413,6 +435,9 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
 	cp $(BUILD_DIR)/user/pthtest.elf $(BUILD_DIR)/initrd_staging/pthtest.elf
 	cp $(BUILD_DIR)/user/crashelf.elf $(BUILD_DIR)/initrd_staging/crashelf.elf
 	cp $(BUILD_DIR)/user/glibc.elf $(BUILD_DIR)/initrd_staging/glibc.elf
+	cp $(BUILD_DIR)/user/dyn.elf $(BUILD_DIR)/initrd_staging/dyn.elf
+	cp $(BUILD_DIR)/user/ld-linux.so.2 $(BUILD_DIR)/initrd_staging/ld-linux.so.2
+	cp $(BUILD_DIR)/user/libc.so.6 $(BUILD_DIR)/initrd_staging/libc.so.6
 	cp $(BUILD_DIR)/user/hello_pe.exe $(BUILD_DIR)/initrd_staging/hellope.exe
 	cp $(BUILD_DIR)/user/hellowin.exe $(BUILD_DIR)/initrd_staging/hellowin.exe
 	cp $(BUILD_DIR)/user/winapi.exe $(BUILD_DIR)/initrd_staging/winapi.exe
@@ -502,7 +527,8 @@ test: $(BUILD_DIR)/test/format_test $(BUILD_DIR)/test/pe_test \
 # See tools/posix_compare.py and ROADMAP.md Milestone 18.
 .PHONY: test-posix
 test-posix: $(ISO) $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf \
-           $(BUILD_DIR)/user/pthtest.elf $(BUILD_DIR)/user/glibc.elf
+           $(BUILD_DIR)/user/pthtest.elf $(BUILD_DIR)/user/glibc.elf \
+           $(BUILD_DIR)/user/dyn.elf
 	python3 tools/posix_compare.py --iso $(ISO) \
 	    --binary $(BUILD_DIR)/user/posixtest.elf --name posixtest.elf
 	python3 tools/posix_compare.py --iso $(ISO) \
@@ -511,6 +537,8 @@ test-posix: $(ISO) $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf
 	    --binary $(BUILD_DIR)/user/pthtest.elf --name pthtest.elf
 	python3 tools/posix_compare.py --iso $(ISO) \
 	    --binary $(BUILD_DIR)/user/glibc.elf --name glibc.elf
+	python3 tools/posix_compare.py --iso $(ISO) \
+	    --binary $(BUILD_DIR)/user/dyn.elf --name dyn.elf
 
 test-qemu: $(ISO)
 	python3 tools/qemu_test.py --iso $(ISO) --script tools/tests/win32_smoke.txt \

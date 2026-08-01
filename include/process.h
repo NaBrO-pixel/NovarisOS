@@ -81,6 +81,11 @@ void process_leave_address_space(void);
 int process_map_image(uint32_t load_vaddr, const uint8_t* image,
                       uint32_t size);
 
+/* Reads an initrd file into a kmalloc'd buffer by path. The initrd is
+ * flat, so only the last path component is matched - see the comment on
+ * the implementation. Used to load a program's PT_INTERP. */
+uint8_t* process_read_file(const char* path, uint32_t* out_size);
+
 /* The page directory the running program is using, or 0 if it is sharing
  * the kernel's. Reported by `run` so the isolation is visible rather than
  * merely claimed. */

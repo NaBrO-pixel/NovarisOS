@@ -11,6 +11,8 @@
 #include "posix.h"
 #include "scheduler.h"
 #include "pit.h"
+#include "vfs.h"
+#include "kheap.h"
 
 /* Referenced from process_asm.s: the kernel-side stack pointer/frame
  * pointer to restore when the user program exits, so control returns to
@@ -27,6 +29,12 @@ uint32_t user_fs_selector = 0x23;
 #define PAGE_SIZE 4096u
 /* 64KB of stack for an ELF program - see process_run_elf(). */
 #define ELF_STACK_SIZE (16u * PAGE_SIZE)
+/* Where a position-independent image goes. Two distinct bases, because a
+ * PIE program and its interpreter are both ET_DYN and both have to be
+ * loaded at once - and they are far apart so a mistake shows up as a
+ * fault rather than as one quietly overwriting the other. */
+#define PIE_BASE     0x56000000u
+#define INTERP_BASE  0x5A000000u
 
 /* Non-zero between entering ring 3 and coming back out of it. Only the
  * fault path reads it, and only to decide whether a CPU exception belongs
@@ -150,6 +158,27 @@ void process_run_demo_user_program(void) {
     process_run_flat_binary(user_hello_bin, user_hello_bin_len);
 }
 
+/* Reads a file off the initrd into a kmalloc'd buffer, by a path that may
+ * be absolute. The initrd is a flat archive with no directories, so
+ * "/lib/ld-linux.so.2" is matched on its last component - which is a
+ * simplification the kernel is honest about rather than a filesystem:
+ * two files with the same basename in different directories cannot be
+ * told apart, and there are none. Caller owns the buffer. */
+uint8_t* process_read_file(const char* path, uint32_t* out_size) {
+    const char* name = path;
+    for (const char* p = path; *p; p++) {
+        if (*p == '/') name = p + 1;
+    }
+    vfs_node_t* node = vfs_root ? vfs_finddir(vfs_root, name) : 0;
+    if (!node) return 0;
+
+    uint8_t* buf = (uint8_t*)kmalloc(node->length);
+    if (!buf) return 0;
+    vfs_read(node, 0, node->length, buf);
+    *out_size = node->length;
+    return buf;
+}
+
 /* --- the initial process stack ------------------------------------------
  *
  * The System V i386 ABI says a program is entered with esp pointing at
@@ -187,7 +216,8 @@ void process_run_demo_user_program(void) {
 #define AT_EXECFN 31
 
 static uint32_t build_initial_stack(uint32_t stack_top, const char* name,
-                                    const elf_info_t* info) {
+                                    const elf_info_t* info,
+                                    uint32_t interp_base) {
     uint32_t sp = stack_top;
 
     /* Strings and blobs first, at the very top, so the vector below them
@@ -224,7 +254,11 @@ static uint32_t build_initial_stack(uint32_t stack_top, const char* name,
         AT_PHENT,  info->phent,
         AT_PHNUM,  info->phnum,
         AT_PAGESZ, PAGE_SIZE,
-        AT_BASE,   0,           /* no interpreter: nothing was loaded under us */
+        /* Where the dynamic linker was loaded, and 0 for a static image.
+         * ld-linux.so.2 relocates *itself* using this before it can do
+         * anything else, so getting it wrong means the linker faults
+         * before it runs a single instruction of the program. */
+        AT_BASE,   interp_base,
         AT_FLAGS,  0,
         AT_ENTRY,  info->entry,
         AT_UID,    0,
@@ -265,10 +299,55 @@ int process_run_elf(const uint8_t* image, uint32_t size) {
 
     int owns_as = process_enter_address_space();
 
-    elf_info_t info;
-    if (!elf_load_info(image, size, &info)) {
+    /* Look before loading: an image that wants an interpreter has to be
+     * placed alongside it, and a PIE has no address of its own. */
+    elf_info_t peek;
+    if (!elf_peek(image, size, &peek)) {
         if (owns_as) process_leave_address_space();
         return 0;
+    }
+
+    uint32_t bias = peek.interp[0] ? PIE_BASE : 0;
+    /* An ET_DYN with no interpreter is a static PIE and still needs a
+     * base; elf_load_at ignores the bias for ET_EXEC. */
+    if (!bias && ((const Elf32_Ehdr*)image)->e_type == ET_DYN) bias = PIE_BASE;
+
+    elf_info_t info;
+    if (!elf_load_at(image, size, bias, &info)) {
+        if (owns_as) process_leave_address_space();
+        return 0;
+    }
+
+    /* If the program named an interpreter, load that too and enter *it*
+     * rather than the program. Everything after this point is
+     * ld-linux.so.2's job: it maps the shared libraries, relocates them,
+     * resolves symbols, and eventually jumps to AT_ENTRY. The kernel's
+     * entire contribution to dynamic linking is these few lines plus a
+     * correct auxiliary vector. */
+    uint32_t start = info.entry;
+    uint32_t interp_base = 0;
+    if (info.interp[0]) {
+        uint32_t isize = 0;
+        uint8_t* iimg = process_read_file(info.interp, &isize);
+        if (!iimg) {
+            terminal_writestring_color("[elf] ", VGA_COLOR_LIGHT_RED);
+            terminal_writestring("interpreter not found: ");
+            terminal_writestring(info.interp);
+            terminal_writestring("\n");
+            if (owns_as) process_leave_address_space();
+            return 0;
+        }
+        elf_info_t iinfo;
+        int ok = elf_load_at(iimg, isize, INTERP_BASE, &iinfo);
+        kfree(iimg);
+        if (!ok) {
+            terminal_writestring_color("[elf] ", VGA_COLOR_LIGHT_RED);
+            terminal_writestring("could not load the interpreter\n");
+            if (owns_as) process_leave_address_space();
+            return 0;
+        }
+        interp_base = INTERP_BASE;
+        start = iinfo.entry;
     }
 
     /* An ELF program gets a larger stack than the single page a flat
@@ -288,11 +367,12 @@ int process_run_elf(const uint8_t* image, uint32_t size) {
      * is simply a second task in this same address space, and
      * scheduler_run_single() blocks its caller exactly the way
      * process_run_user_mode() did. */
-    uint32_t esp = build_initial_stack(USER_STACK_TOP, "program", &info);
+    uint32_t esp = build_initial_stack(USER_STACK_TOP, "program", &info,
+                                       interp_base);
 
     user_active = 1;
     posix_process_begin();
-    scheduler_run_single("main", info.entry, esp);
+    scheduler_run_single("main", start, esp);
     posix_process_end();
     user_active = 0;
 
@@ -345,6 +425,21 @@ static int handle_user_fault(registers_t* regs) {
     terminal_writestring(") at eip=0x");
     ku32_to_hex(regs->eip, buf, 0, 8);
     terminal_writestring(buf);
+
+    /* For a page fault, which address and what kind - without these the
+     * report says a fault happened and nothing about why, which is most
+     * of the work. err_code bit 0 = the page was present (a protection
+     * violation rather than a missing mapping), bit 1 = it was a write,
+     * bit 2 = from ring 3. */
+    if (regs->int_no == 14) {
+        uint32_t cr2;
+        __asm__ __volatile__("mov %%cr2, %0" : "=r"(cr2));
+        terminal_writestring(" accessing 0x");
+        ku32_to_hex(cr2, buf, 0, 8);
+        terminal_writestring(buf);
+        terminal_writestring(regs->err_code & 2 ? " (write" : " (read");
+        terminal_writestring(regs->err_code & 1 ? ", protection)" : ", not mapped)");
+    }
     terminal_writestring("\n         Terminating it and returning to the shell.\n");
 
     user_active = 0;
