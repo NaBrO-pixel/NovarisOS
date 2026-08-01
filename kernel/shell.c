@@ -518,6 +518,8 @@ static void run_command(char* line) {
         terminal_writestring("  about   - about Novaris\n");
         terminal_writestring("  uptime  - timer ticks since boot\n");
         terminal_writestring("  meminfo - physical memory frame usage\n");
+        terminal_writestring("  futexinfo - futex waiting: how many waits blocked\n");
+        terminal_writestring("            rather than spun (Milestone 25)\n");
         terminal_writestring("  threadtest - two threads sharing one address space,\n");
         terminal_writestring("            incrementing one shared counter (Milestone 16)\n");
         terminal_writestring("  strace  - run a program with every syscall logged\n");
@@ -558,6 +560,29 @@ static void run_command(char* line) {
         terminal_writestring(" total (");
         print_uint(pmm_free_frames() * 4);
         terminal_writestring("KB free)\n");
+    } else if (streq(line, "futexinfo") || streq(line, "futexinfo reset")) {
+        /* Waiting getting cheaper is not visible in any program's output,
+         * so the kernel has to be asked. `waits` counts FUTEX_WAIT calls
+         * that actually had to wait; `blocked` how many of those slept
+         * instead of spinning. Under Milestone 20's retry loop every wait
+         * re-executed the syscall every slice, so `waits` ran into the
+         * thousands for the same program. */
+        uint32_t w, b, r, idle, k;
+        posix_futex_stats(&w, &b, &r, &idle, &k);
+        terminal_writestring("Futex waits: ");
+        print_uint(w);
+        terminal_writestring(" (");
+        print_uint(b);
+        terminal_writestring(" blocked, ");
+        print_uint(r);
+        terminal_writestring(" spun, ");
+        print_uint(idle);
+        terminal_writestring(" idled), woken: ");
+        print_uint(k);
+        terminal_writestring(", blocked now: ");
+        print_uint((uint32_t)scheduler_blocked_count());
+        terminal_writestring("\n");
+        if (line[9]) posix_futex_stats_reset();
     } else if (streq(line, "threadtest")) {
         cmd_threadtest();
     } else if (streq(line, "vmtest")) {
