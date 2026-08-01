@@ -33,6 +33,8 @@ run helloc.bin
 run posixtest.elf
 run sigtest.elf
 run pthtest.elf
+run glibc.elf
+run crashelf.elf
 multitask
 threadtest
 

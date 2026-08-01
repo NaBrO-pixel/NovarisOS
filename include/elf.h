@@ -57,11 +57,25 @@ typedef struct {
  * command to pick between this loader and the older flat-binary path. */
 int elf_is_valid(const uint8_t* image, uint32_t size);
 
+/* What the loader learned about the image, for the initial process stack
+ * the System V ABI says a program is entered with. glibc's startup reads
+ * AT_PHDR/AT_PHNUM/AT_PHENT out of the auxiliary vector to find its own
+ * program headers - among other things, that is how it locates PT_TLS. */
+typedef struct {
+    uint32_t entry;
+    uint32_t phdr;    /* the program headers' address *in the process* */
+    uint32_t phnum;
+    uint32_t phent;
+} elf_info_t;
+
 /* Maps every PT_LOAD segment at its ELF-specified virtual address
  * (PAGE_USER|PAGE_RW - we don't distinguish read-only/executable
  * mappings yet), copies segment data, and zero-fills the
  * memsz-minus-filesz tail (.bss). Returns the entry point in *out_entry,
  * or 0 and leaves *out_entry unchanged on failure. */
 int elf_load(const uint8_t* image, uint32_t size, uint32_t* out_entry);
+
+/* Same, but also reports what the initial process stack needs. */
+int elf_load_info(const uint8_t* image, uint32_t size, elf_info_t* out);
 
 #endif

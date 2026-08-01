@@ -10,6 +10,7 @@
 #include "paging.h"
 #include "kheap.h"
 #include "syscall.h"
+#include "fpu.h"
 #include "process.h"
 #include "scheduler.h"
 #include "vfs.h"
@@ -218,6 +219,10 @@ void kernel_main(uint32_t magic, multiboot_info_t* mbi) {
     terminal_writestring(test_buf);
     terminal_writestring("\n");
     kfree(test_buf);
+
+    fpu_init();
+    terminal_writestring_color("[OK] ", VGA_COLOR_LIGHT_GREEN);
+    terminal_writestring("x87 + SSE enabled (FXSAVE state saved per thread)\n");
 
     syscall_install();
     terminal_writestring_color("[OK] ", VGA_COLOR_LIGHT_GREEN);

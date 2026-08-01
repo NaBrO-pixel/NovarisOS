@@ -10,6 +10,7 @@
 #include "kstring.h"
 #include "posix.h"
 #include "scheduler.h"
+#include "pit.h"
 
 /* Referenced from process_asm.s: the kernel-side stack pointer/frame
  * pointer to restore when the user program exits, so control returns to
@@ -149,6 +150,113 @@ void process_run_demo_user_program(void) {
     process_run_flat_binary(user_hello_bin, user_hello_bin_len);
 }
 
+/* --- the initial process stack ------------------------------------------
+ *
+ * The System V i386 ABI says a program is entered with esp pointing at
+ * argc, followed by argv, a NULL, envp, a NULL, and the auxiliary vector.
+ * Novaris did not build any of that until Milestone 21, and got away with
+ * it because every ELF program in the tree was freestanding and never
+ * looked. A real one looks immediately: glibc's `_start` is
+ *
+ *     xor %ebp, %ebp
+ *     pop %esi          <- argc, and the first instruction to touch the stack
+ *
+ * which faulted, because the esp handed over was the top of the mapping
+ * and there was nothing at it. That fault is what this exists to fix, and
+ * finding it is what "run a real glibc binary" was for.
+ *
+ * Returns the esp to enter the program with. */
+
+#define AT_NULL   0
+#define AT_PHDR   3
+#define AT_PHENT  4
+#define AT_PHNUM  5
+#define AT_PAGESZ 6
+#define AT_BASE   7
+#define AT_FLAGS  8
+#define AT_ENTRY  9
+#define AT_UID   11
+#define AT_EUID  12
+#define AT_GID   13
+#define AT_EGID  14
+#define AT_PLATFORM 15
+#define AT_HWCAP 16
+#define AT_CLKTCK 17
+#define AT_SECURE 23
+#define AT_RANDOM 25
+#define AT_EXECFN 31
+
+static uint32_t build_initial_stack(uint32_t stack_top, const char* name,
+                                    const elf_info_t* info) {
+    uint32_t sp = stack_top;
+
+    /* Strings and blobs first, at the very top, so the vector below them
+     * can point at fixed addresses. */
+    uint32_t namelen = kstrlen(name) + 1;
+    sp -= namelen;
+    uint32_t argv0 = sp;
+    for (uint32_t i = 0; i < namelen; i++) ((char*)argv0)[i] = name[i];
+
+    static const char platform[] = "i686";
+    sp -= sizeof(platform);
+    uint32_t plat = sp;
+    for (uint32_t i = 0; i < sizeof(platform); i++) {
+        ((char*)plat)[i] = platform[i];
+    }
+
+    /* AT_RANDOM: sixteen bytes glibc reads to seed its stack guard and
+     * pointer mangling. Not cryptographically anything - the PIT tick is
+     * the only entropy this kernel has - but it has to be *there*, and
+     * differ run to run, or every program gets the same canary. */
+    sp -= 16;
+    uint32_t randbytes = sp;
+    uint32_t t = pit_get_ticks();
+    for (int i = 0; i < 16; i++) {
+        t = t * 1103515245u + 12345u;
+        ((uint8_t*)randbytes)[i] = (uint8_t)(t >> 16);
+    }
+
+    sp &= ~15u;
+
+    /* Now the vector, laid out downward and then filled in forward. */
+    uint32_t aux[] = {
+        AT_PHDR,   info->phdr,
+        AT_PHENT,  info->phent,
+        AT_PHNUM,  info->phnum,
+        AT_PAGESZ, PAGE_SIZE,
+        AT_BASE,   0,           /* no interpreter: nothing was loaded under us */
+        AT_FLAGS,  0,
+        AT_ENTRY,  info->entry,
+        AT_UID,    0,
+        AT_EUID,   0,
+        AT_GID,    0,
+        AT_EGID,   0,
+        AT_SECURE, 0,
+        AT_CLKTCK, 100,         /* the PIT rate kernel_main() sets */
+        AT_HWCAP,  0,
+        AT_PLATFORM, plat,
+        AT_EXECFN, argv0,
+        AT_RANDOM, randbytes,
+        AT_NULL,   0,
+    };
+    uint32_t aux_words = sizeof(aux) / sizeof(aux[0]);
+
+    /* argc, argv[0], NULL, envp NULL, then the aux pairs. */
+    uint32_t words = 1 + 1 + 1 + 1 + aux_words;
+    sp -= words * 4;
+    sp &= ~15u;   /* esp must be 16-byte aligned at entry */
+
+    uint32_t* v = (uint32_t*)sp;
+    uint32_t k = 0;
+    v[k++] = 1;        /* argc */
+    v[k++] = argv0;    /* argv[0] */
+    v[k++] = 0;        /* argv terminator */
+    v[k++] = 0;        /* envp terminator - no environment yet */
+    for (uint32_t i = 0; i < aux_words; i++) v[k++] = aux[i];
+
+    return sp;
+}
+
 int process_run_elf(const uint8_t* image, uint32_t size) {
     /* Validated before the address space is created, so a file that isn't
      * an ELF doesn't cost a page directory. `image` itself is a kernel
@@ -157,8 +265,8 @@ int process_run_elf(const uint8_t* image, uint32_t size) {
 
     int owns_as = process_enter_address_space();
 
-    uint32_t entry;
-    if (!elf_load(image, size, &entry)) {
+    elf_info_t info;
+    if (!elf_load_info(image, size, &info)) {
         if (owns_as) process_leave_address_space();
         return 0;
     }
@@ -180,9 +288,11 @@ int process_run_elf(const uint8_t* image, uint32_t size) {
      * is simply a second task in this same address space, and
      * scheduler_run_single() blocks its caller exactly the way
      * process_run_user_mode() did. */
+    uint32_t esp = build_initial_stack(USER_STACK_TOP, "program", &info);
+
     user_active = 1;
     posix_process_begin();
-    scheduler_run_single("main", entry, USER_STACK_TOP);
+    scheduler_run_single("main", info.entry, esp);
     posix_process_end();
     user_active = 0;
 
@@ -238,7 +348,20 @@ static int handle_user_fault(registers_t* regs) {
     terminal_writestring("\n         Terminating it and returning to the shell.\n");
 
     user_active = 0;
-    process_exit_to_kernel(); /* does not return */
+
+    /* Which way out depends on how this program was started, and getting
+     * it wrong panics the kernel. Since Milestone 20 an ELF program runs
+     * as a scheduler task, so its unwind target is the one
+     * scheduler_run_until_idle() saved - not process_run_user_mode()'s
+     * kernel_resume_esp, which by then holds a stale value from whatever
+     * last used the blocking path. posix_exit_process() picks correctly.
+     *
+     * This was found by running a real glibc-linked binary, which faults
+     * early; the fault report printed and the kernel then page-faulted
+     * unwinding into a dead frame. Nothing in the suite caught it because
+     * no ELF test program had ever faulted - userland/crash_test.c now
+     * does. */
+    posix_exit_process(); /* does not return */
     return 1;
 }
 

@@ -14,7 +14,7 @@ bootloader hands off to a kernel, and the kernel grows from there. Over time
 you can shape it to *feel* like whichever OS inspires you (windowing system,
 shell conventions, UI style) without copying anyone's code.
 
-## Current status: Milestone 20 complete ✅
+## Current status: Milestone 21 complete ✅
 
 - [x] Multiboot bootloader handoff (via GRUB), 32-bit protected mode
 - [x] Freestanding C kernel — no libc, we own the whole stack
@@ -35,6 +35,10 @@ shell conventions, UI style) without copying anyone's code.
       delivery from `kill` and from CPU faults, and a `SIGSEGV` handler
       that can fix the fault and let the faulting instruction be retried
       (the pattern Wine is built on)
+- [x] **A real glibc-linked program runs** — an ordinary `gcc -m32 -static`
+      binary, hundreds of KB of production C library that has never heard
+      of Novaris: its allocator, SSE2 string functions, `printf` and float
+      formatting all work, with output identical to Linux
 - [x] **POSIX threads** — `clone`, `futex` and per-thread TLS behind `gs`:
       what pthreads is made of, verified with a libc-free program that
       runs identically on Linux and Novaris

@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "idt.h"
+#include "fpu.h"
 
 /* Milestone 9 - real process structures + a round-robin preemptive
  * scheduler. This is additive to process.c's existing model, not a
@@ -78,6 +79,14 @@ typedef struct process {
      * finds out the thread is gone, and is what pthread_join is built
      * from. 0 when the thread was not created with the flag. */
     uint32_t clear_child_tid;
+
+    /* This task's x87 and SSE registers while it is not running. Live
+     * state since Milestone 21 enabled SSE: glibc's string functions are
+     * SSE2, so two preempted threads inside memcpy would otherwise
+     * destroy each other's XMM registers. Pointer rather than inline
+     * because FXSAVE requires 16-byte alignment. */
+    fpu_state_t* fpu;
+    uint32_t fpu_base;   /* the unaligned kmalloc pointer, for freeing */
 
     /* 1 if this task's user stack page was mapped for it here and is its
      * to free. A Win32 thread's stack comes from the emulation layer's
