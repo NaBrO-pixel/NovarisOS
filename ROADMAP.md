@@ -3068,6 +3068,185 @@ test, and `cp` is how the copy-on-write above was demonstrated.
       `userland/mkinitrd.py`, and still has no directories of its own -
       everything it carries lands at the root.
 
+## Milestone 27 — real Wine runs ✅ DONE (as far as it goes)
+
+Path A step 5: *"Pull in real Wine source, cross-compile it against that
+surface, and find out what is still missing."*
+
+**Wine 11.0 runs on Novaris and prints its own version string.**
+
+```
+novaris> run preload.elf wineldr.elf --version
+preloader: Warning: failed to reserve range 00010000-00110000
+[posix] unimplemented syscall 102 -> -ENOSYS
+[posix] unimplemented syscall 102 -> -ENOSYS
+wine-11.0
+```
+
+That is real Wine, unmodified, built from wine-mirror's `stable` branch
+with `gcc -m32` and `i686-w64-mingw32-gcc`. The chain behind those three
+lines is the whole of Milestones 18–26 working at once:
+
+1. `wine-preloader` — a static freestanding ELF — loads and runs;
+2. it reserves what address space it can, and prints *its own warning*
+   about what it cannot;
+3. it maps the real `wine` loader segment by segment, then
+   `ld-linux.so.2`, and jumps to it;
+4. the interpreter loads `libc.so.6`, relocates, sets up TLS;
+5. Wine's `main()` runs, finds its own installation through
+   `readlink("/proc/self/exe")`, and loads **`ntdll.so` — 3.2 MB of real
+   Wine**;
+6. ntdll initialises far enough to parse the command line and answer it.
+
+Read the honest version of that: what runs is Wine's *loader and its
+Unix-side ntdll*, far enough to handle `--version` and `--help`. No
+Windows program has been run. The gap between here and that is described
+below and it is not small.
+
+### What step 5 was for: what it found
+
+Every item below was found by running the thing, not by reading it.
+
+**A ring-3 `mmap` could hang the machine, and it was not Wine's fault.**
+The preloader's second reservation is `0x10000-0x110000`, the DOS area.
+Novaris identity-maps the first 4 MB into every address space because the
+kernel's own image lives at physical `0x100000` and has to stay reachable
+there — so `MAP_FIXED` across that range replaced the kernel's view of
+itself. The machine stopped dead: no panic, no output, nothing.
+
+Six lines of C reproduce it with no Wine involved, which is how it was
+isolated, and a 64 KB-at-a-time bisection named the exact page:
+
+```
+mapping 0x00010000 ... ok      <- everything below 1MB is fine,
+   ...                            including straight over the VGA buffer
+mapping 0x000f0000 ... ok
+mapping 0x00100000 ...         <- and here the machine stops
+```
+
+`paging_reserve_region()` already existed and already knew which ranges
+belong to the kernel — the framebuffer, the initrd, the Win32 arenas.
+`sys_mmap2` had simply never asked it. It does now, and
+`userland/kmap_test.c` is the regression: it asserts not a return value
+but a *survival*, since the kernel has to still be running to report
+anything at all. It is deliberately not part of `make test-posix`,
+because on Linux that same mapping legitimately succeeds.
+
+**`argv` had to become real.** Every ELF program on Novaris was entered
+with one hardcoded argument, `"program"`, and nothing had ever looked —
+so nothing had noticed. Wine's loader takes what it is running as
+`argv[1]`, and said so in its usage message on the very first run:
+
+```
+novaris> strace preload.elf
+Usage: program wine_binary [args]      <- "program" is Novaris's argv[0]
+```
+
+`run` and `strace` now take arguments and pass a real `argv`.
+
+**Four syscalls, each found the same way — by something failing.**
+
+- `readlink("/proc/self/exe")` (85). Wine finds its own installation this
+  way; without it, `wine: could not load ntdll.so: (null)`.
+- `getcwd` (183) — the fallback for the same question. It had a number in
+  `posix.h` and no implementation.
+- `_llseek` (140). glibc's stdio reaches for this rather than `lseek`, so
+  reading a file through `FILE*` needs it. Its absence was invisible
+  until it was not: Wine asked glibc for the passwd entry, glibc could
+  not seek, `getpwuid()` returned NULL, and Wine dereferenced it. The
+  failure looked like a null-pointer bug in Wine and was a missing
+  syscall two layers down.
+- `prctl` (172) — `PR_SET_NAME`. Accepted and ignored.
+
+**Two files, not code.** glibc's `getpwuid()` wants `/etc/passwd` and
+`/etc/nsswitch.conf`. The `wine-initrd` target supplies both. Worth
+recording because it is the kind of thing an ABI checklist does not have
+on it.
+
+### What stops it going further, in order
+
+**`socketcall` (102), and it is architectural.** Wine is a client/server
+system: ntdll talks to `wineserver` over a Unix domain socket, and every
+process, thread, handle and synchronisation object lives on the far side
+of it. Novaris has no sockets of any kind — not because the syscall is
+missing but because there is no IPC to put behind it. Nothing beyond
+ntdll's own initialisation can work until there is. This is a milestone
+of its own, and it is the real answer to "what is missing".
+
+**Address-space reservation.** The preloader asks for `0x110000-0x68000000`
+— 1.66 GB of `PROT_NONE|MAP_NORESERVE` — so that Windows images can be
+loaded low later. Novaris's `mmap` commits a physical frame per page,
+which would need 435 000 frames out of 32 736. It never came up in this
+run only because the preloader drops any range its own stack sits inside,
+and Novaris's user stack is at `0x40100000`, inside that range. That is
+luck, not design. A reservation that costs nothing is the next piece of
+memory-management work, and `mprotect` making it real on demand is the
+other half.
+
+**No per-process working directory.** `getcwd` answers `/` always. Wine
+builds its prefix path from it.
+
+**`statx` and `rseq` return `-ENOSYS`** and glibc falls back cleanly, so
+they cost nothing today — recorded because that is worth knowing rather
+than rediscovering.
+
+### How to reproduce it
+
+Wine is **not vendored**, for the same reason `libc.so.6` is not: it is a
+build input, and several hundred megabytes of LGPL source in a hobby
+kernel's tree would be bloat and a licensing question nobody needs.
+Wine's code stays behind a `WINE_BUILD` path and Novaris's stays in front
+of it.
+
+```bash
+git clone --depth 1 -b stable https://github.com/wine-mirror/wine
+cd wine
+CC="gcc -m32" ./configure --enable-archs=i386 --disable-tests \
+    --without-x --without-freetype --without-vulkan --without-opengl ...
+make -j4
+cd ../NovarisOS && make WINE_BUILD=../wine wine-initrd
+qemu-system-i386 -cdrom novaris-wine.iso
+novaris> run preload.elf wineldr.elf --version
+```
+
+`novaris.iso` stays reproducible from this tree alone; `novaris-wine.iso`
+is a separate target that needs the Wine tree.
+
+### Verified
+
+Everything that was green stays green. Host tests 38 + 30 + 52; the smoke
+suite is now 10 transcript assertions (two of them the new kernel-mapping
+guard); all seven comparison binaries remain byte-identical to the Linux
+host:
+
+```
+ 41 lines, 20 checks  posixtest.elf      60 lines, 45 checks  uctest.elf
+ 93 lines, 67 checks  sigtest.elf        67 lines, 45 checks  fstest.elf
+ 37 lines, 15 checks  pthtest.elf         5 lines,  0 checks  glibc.elf
+                                          5 lines,  0 checks  dyn.elf
+```
+
+### Honest scope
+
+- [x] Real Wine builds against Novaris's syscall surface with the real
+      toolchain, and its loader, `ntdll.so` and command-line handling run.
+- [x] A ring-3 program can no longer map over the kernel.
+- [x] Real `argv`; `readlink("/proc/self/exe")`, `getcwd`, `_llseek`,
+      `prctl`.
+- [ ] **No Windows program has been run.** `wine notepad.exe` needs
+      wineserver, which needs Unix sockets, which need IPC that does not
+      exist. Everything past ntdll's initialisation is blocked on that
+      one thing.
+- [ ] No address-space reservation: `PROT_NONE` still commits frames.
+- [ ] No `fork`/`exec`, so Wine could not start a server process even if
+      it could talk to one.
+- [ ] Wine's PE builtins (`kernel32`, `user32`, …) were built by
+      mingw-w64 and have never been loaded — that is ntdll's job, past
+      the point reached here.
+- [ ] No GDI backend, no display, no registry. Milestone 8's estimate
+      that a display backend "is the obvious one" was wrong only in
+      ordering: IPC comes first.
+
 ## Path A — porting Wine (the current direction)
 
 Milestone 8 laid out two ways to run Windows binaries: port Wine (Path
@@ -3114,8 +3293,12 @@ are forced into an order:
    `PT_INTERP`, `AT_BASE`, file-backed `mmap` and the file syscalls; the
    linking itself is the interpreter's job.
 5. **Pull in real Wine source**, cross-compile it against that surface,
-   and find out what is still missing. Expect that to surface more gaps;
-   a display backend for GDI is the obvious one.
+   and find out what is still missing. — ⏳ started in Milestone 27, and
+   it did what it was for. Wine 11.0 builds against this kernel and runs
+   as far as `wine --version`; the thing that stops it is not a missing
+   syscall but a missing *subsystem*, Unix domain sockets, because Wine
+   is a client/server system and every handle lives in wineserver. A GDI
+   display backend was the guess; IPC is the answer.
 
 Each is roughly milestone-sized. (3) and (4) are each comparable in scope
 to everything built so far combined. No Wine or ReactOS source gets

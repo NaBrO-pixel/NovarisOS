@@ -74,6 +74,22 @@ static uint32_t brk_mapped = BRK_ARENA_START;
 
 static uint32_t unimplemented = 0;
 
+/* The path the running program was started from. Wine's loader finds its
+ * own installation by reading /proc/self/exe, and without an answer it
+ * cannot locate ntdll.so - which is exactly where it stopped the first
+ * time it ran here. See ROADMAP.md Milestone 27. */
+static char exe_path[64] = "/program";
+
+void posix_set_exe_path(const char* path) {
+    if (!path || !*path) { kstrlcpy(exe_path, "/program", sizeof(exe_path)); return; }
+    if (path[0] == '/') {
+        kstrlcpy(exe_path, path, sizeof(exe_path));
+    } else {
+        exe_path[0] = '/';
+        kstrlcpy(exe_path + 1, path, sizeof(exe_path) - 1);
+    }
+}
+
 /* Linux's PROT_* to the x86 page-table bits. There is no way to say
  * "readable but not writable *and* not executable" on 32-bit x86 without
  * PAE's NX bit, so PROT_EXEC is accepted and ignored - noted here because
@@ -184,6 +200,17 @@ static int32_t sys_mmap2(uint32_t addr, uint32_t length, int prot,
 
     if (flags & MAP_FIXED) {
         if (addr == 0 || (addr & (PAGE_SIZE - 1))) return -EINVAL;
+        /* A fixed mapping is the one request that can name an address the
+         * kernel is already using. The first 4MB is identity-mapped and
+         * shared into every address space, so a mapping there replaces
+         * the kernel's own view of itself - Wine's preloader reserves the
+         * DOS area on startup, that range covers the kernel's load
+         * address at 0x100000, and the machine hung. Refusing is what
+         * Linux effectively does too (those addresses are not the
+         * program's to take), and a caller that cannot have the range it
+         * asked for is told so rather than being given a machine that
+         * stops. See ROADMAP.md Milestone 27. */
+        if (paging_region_conflict(addr, addr + bytes)) return -ENOMEM;
         base = addr;
     } else {
         if (mmap_next + bytes > MMAP_ARENA_END) return -ENOMEM;
@@ -540,6 +567,40 @@ static int32_t sys_stat64(const char* path, uint8_t* st) {
     return r;
 }
 
+/* getcwd. There is no per-process working directory, so the answer is
+ * always the root - which is at least true rather than absent, and is
+ * what every path in this kernel already resolves against. Linux returns
+ * the length including the NUL and writes the string into the buffer. */
+static int32_t sys_getcwd(char* buf, uint32_t size) {
+    if (!buf) return -EFAULT;
+    if (size < 2) return -ERANGE;
+    buf[0] = '/';
+    buf[1] = '\0';
+    return 2;
+}
+
+/* readlink. There are no symlinks, so the only link that resolves is the
+ * one every Unix program expects to find: /proc/self/exe. Wine reads it
+ * to work out where it was installed, and answering -EINVAL ("not a
+ * symlink") for everything else is what Linux does for a real file. */
+static int path_is(const char* a, const char* b) {
+    while (*a && *b) { if (*a != *b) return 0; a++; b++; }
+    return *a == *b;
+}
+
+static int32_t sys_readlink(const char* path, char* buf, uint32_t size) {
+    if (!path || !buf) return -EFAULT;
+    int is_self_exe =
+        path_is(path, "/proc/self/exe") || path_is(path, "/proc/curproc/file");
+    if (!is_self_exe) {
+        return vfs_lookup(path) ? -EINVAL : -ENOENT;
+    }
+    uint32_t n = kstrlen(exe_path);
+    if (n > size) n = size;
+    kmemcpy(buf, exe_path, n);
+    return (int32_t)n;   /* not NUL-terminated, exactly as Linux leaves it */
+}
+
 /* --- the writable half (Milestone 26) -----------------------------------
  *
  * All of these are thin: kernel/ramfs.c owns the tree and the errno
@@ -682,6 +743,10 @@ static const char* syscall_name(uint32_t n) {
         case SYS_read: return "read";
         case SYS_write: return "write";
         case SYS_open: return "open";
+        case SYS_readlink: return "readlink";
+        case SYS_getcwd: return "getcwd";
+        case SYS__llseek: return "_llseek";
+        case SYS_prctl: return "prctl";
         case SYS_unlink: return "unlink";
         case SYS_unlinkat: return "unlinkat";
         case SYS_mkdir: return "mkdir";
@@ -980,7 +1045,38 @@ void posix_syscall(registers_t* regs) {
             }
             break;
 
-        case SYS_readlinkat: r = -EINVAL; break;
+        case SYS_readlink:
+            r = sys_readlink((const char*)a, (char*)b, c);
+            break;
+        case SYS_readlinkat:
+            /* (dirfd, path, buf, size) - what glibc's readlink() actually
+             * calls. */
+            r = sys_readlink((const char*)b, (char*)c, d);
+            break;
+        case SYS_getcwd:  r = sys_getcwd((char*)a, b); break;
+        case SYS__llseek: {
+            /* (fd, offset_high, offset_low, loff_t* result, whence).
+             * glibc's stdio reaches for this rather than lseek, so a
+             * program that reads a file through FILE* needs it - which is
+             * how it was found: Wine's ntdll asks glibc for the passwd
+             * entry, glibc could not seek, and getpwuid() returned NULL
+             * for Wine to dereference. Offsets past 4GB are refused
+             * rather than truncated. */
+            if (a > 0x7FFFFFFFu) { r = -EINVAL; break; }
+            if (b) { r = -EINVAL; break; }   /* the high half of the offset */
+            int32_t pos = sys_lseek((int)a, (int32_t)c, (int)e);
+            if (pos < 0) { r = pos; break; }
+            if (!d) { r = -EFAULT; break; }
+            *(int64_t*)d = pos;
+            r = 0;
+            break;
+        }
+        case SYS_prctl:
+            /* PR_SET_NAME and friends: accepted and ignored. Wine's
+             * preloader sets its process name, and there is nowhere here
+             * for a process name to be shown. */
+            r = 0;
+            break;
         case SYS_statx:      r = -ENOSYS; break;
         case SYS_time:     r = (int32_t)rtc_unix_time(); break;
         case SYS_nanosleep: r = sys_nanosleep((const uint32_t*)a); break;
