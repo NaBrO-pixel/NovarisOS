@@ -1975,13 +1975,11 @@ host tests are 38 + 30 + 52 with no failures.
 - [x] `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `kill`, `tgkill`,
       delivery from both `kill` and CPU faults, blocking and pending,
       `SA_NODEFER`, `SA_RESETHAND`, per-handler `sa_mask`.
-- [ ] **`ucontext_t` is not populated.** An `SA_SIGINFO` handler gets a
-      valid, readable third argument full of zeroes. Wine reads the
-      faulting registers out of it, so this will have to be filled in —
-      the saved state is already in the frame, it just is not laid out in
-      the ABI's shape yet.
-- [ ] `siginfo_t` carries only `si_signo`; `si_addr` (the faulting
-      address) and `si_code` are zero.
+- [x] ~~**`ucontext_t` is not populated.** An `SA_SIGINFO` handler gets a
+      valid, readable third argument full of zeroes.~~ Done in Milestone
+      23, in both directions — a handler can also write registers back.
+- [x] ~~`siginfo_t` carries only `si_signo`; `si_addr` (the faulting
+      address) and `si_code` are zero.~~ Done in Milestone 23.
 - [ ] One signal is delivered per return to ring 3, and `pending` is a
       bitmask, so a signal raised twice while blocked is delivered once.
       Real-time signal queueing is not implemented.
@@ -2394,6 +2392,195 @@ needs.
       and not meaningful across boots.
 - [ ] Still no writable filesystem, so `open` for writing is `-EROFS`.
 
+## Milestone 23 — `ucontext_t` and `siginfo_t` ✅ DONE
+
+The first item Milestone 19 left open, and the most concrete single thing
+blocking Wine. An `SA_SIGINFO` handler is called as
+
+```c
+void handler(int signo, siginfo_t *info, void *ucontext);
+```
+
+and since Milestone 19 the second and third arguments had been valid,
+readable pointers to zeroes. That is enough for a handler that reads its
+signal number and no use at all to Wine, whose entire exception machinery
+is *those two arguments*: it reads the faulting registers out of the
+ucontext to build a Windows `CONTEXT`, decides what the `__except` chain
+wants, writes the modified registers back into the same ucontext, and
+returns. Both directions are now real.
+
+### Both directions, and why the second one is the hard half
+
+Reading is the obvious half: fill in the Linux/i386 `struct sigcontext`
+inside `ucontext_t` from the trap frame, which is right there. The layout
+is in `include/posix.h` and is written so every member is four bytes wide
+— on Linux the segment selectors are a 16-bit value plus a 16-bit pad,
+which is what lets glibc's `gregset_t` treat the whole thing as an array
+of 19 longs indexed by `REG_GS`(0) … `REG_SS`(18). A handler indexes it
+by offset and does not care what the kernel calls the fields.
+
+Writing is the half that changes the design. Milestone 19's sigframe kept
+a private `registers_t` copy of the interrupted state and `rt_sigreturn`
+restored from *that*. Adding a ucontext beside it would have passed every
+readable-state test and silently discarded every edit — which is exactly
+the shape of bug that would make Wine's exception dispatch a no-op that
+is very hard to see. So the private copy is gone: the interrupted state
+now lives **only** in `uc.uc_mcontext`, the memory the handler was given
+a pointer to, and `rt_sigreturn` restores from there. The signal mask
+comes back from `uc_sigmask` for the same reason.
+
+The safety rules from Milestone 19 survive intact. `cs`, `ss` and the
+segment selectors are still never taken from the frame — a program that
+asked for ring-0 selectors on the way back would get them — and `eflags`
+is still masked down to the arithmetic flags plus a forced `IF`.
+
+`siginfo_t` is filled in the same spirit. `si_code` distinguishes a
+`kill` (`SI_USER`) from a `tgkill` (`SI_TKILL`) from a fault, and for a
+page fault it splits `SEGV_MAPERR` (nothing mapped there) from
+`SEGV_ACCERR` (mapped, but the access was refused) off the fault's error
+code bit 0 — the distinction Wine uses to tell a guard-page hit from a
+genuinely bad pointer. `si_addr` and `uc_mcontext.cr2` are `cr2`, read at
+fault time. `trapno`, `err` and `cr2` are recorded on every fault and
+reported in *every* subsequent sigcontext whether or not that signal was
+a fault, because that is what Linux does — a signal delivered by `kill`
+carries whatever the last real fault left behind, and matching even a
+meaningless number is cheaper than a binary seeing two different answers.
+
+### Three things checked against the host rather than assumed
+
+Guessing what Linux puts in a field and then implementing the guess makes
+a test that passes for the wrong reason. Three fields were wrong in the
+first draft and were fixed by asking the host:
+
+- **`uc_stack.ss_flags` is 0, not `SS_DISABLE`.** With no alternate
+  signal stack the obvious answer is `SS_DISABLE` (2). A current Linux
+  stores the task's own `sas_ss_flags` field there, not
+  `sas_ss_flags(sp)`, so it reports 0 and lets `ss_size == 0` carry the
+  "disabled" meaning.
+- **`uc_flags` is 1 on Linux and 0 on Novaris**, and that is correct
+  rather than a bug: it is `UC_FP_XSTATE`, set when the kernel has
+  attached extended FP state. Novaris attaches none and leaves `fpstate`
+  null, so 0 and a null pointer are consistent with each other. Nothing
+  in the tests prints it.
+- **`sizeof(ucontext_t)` is 364, not the 348 the field list adds up to.**
+  A current glibc has grown a shadow-stack field past `__fpregs_mem`. The
+  frame reserves 392 bytes so a handler that copies the whole struct — as
+  `getcontext` does — cannot run off the end of it.
+
+### Verified: the same test twice, with different headers
+
+`userland/signal_test.c` grows six new sections (tests 5–10), and every
+check is a *relation* between values the program already knows —
+`si_addr == the address the store was aimed at`, `gregs[REG_EIP] == the
+instruction after the interrupted syscall`. No absolute address, selector
+or pid is printed, because those legitimately differ between the two
+systems and a comparison that demanded they match would be testing the
+wrong thing.
+
+That test writes the two structures out by hand, because it links against
+nothing — which means it proves Novaris matches *what this project
+believes* Linux's layout to be. If the belief were wrong in both places
+the test would still pass. So there is a sixth binary,
+`userland/ucontext_test.c` → `uctest.elf`: an ordinary dynamically linked
+glibc program where `siginfo_t`, `ucontext_t` and `REG_EIP` come from
+`/usr/include`, running through the real `ld-linux.so.2` and `libc.so.6`.
+It is almost literally Wine's access pattern:
+
+```c
+ucontext_t *context = sigcontext;
+context->uc_mcontext.gregs[REG_EIP] = ...;
+```
+
+```
+$ make test-posix
+41 lines compared, 20 checks, 0 failing, 0 unexpected difference(s)  posixtest.elf
+83 lines compared, 59 checks, 0 failing, 0 unexpected difference(s)  sigtest.elf
+26 lines compared,  8 checks, 0 failing, 0 unexpected difference(s)  pthtest.elf
+ 5 lines compared,  0 checks, 0 failing, 0 unexpected difference(s)  glibc.elf
+ 5 lines compared,  0 checks, 0 failing, 0 unexpected difference(s)  dyn.elf
+30 lines compared, 21 checks, 0 failing, 0 unexpected difference(s)  uctest.elf
+```
+
+Both transcripts are byte-identical between the Linux host and Novaris.
+What `uctest.elf` proves, on Novaris:
+
+```
+2. a page fault, read through glibc's ucontext_t
+  [ok]   si_code is SEGV_MAPERR (nothing mapped there)
+  [ok]   si_addr is the address the store was aimed at
+  [ok]   gregs[REG_TRAPNO] is 14 (page fault)
+  [ok]   gregs[REG_ERR] says write, not-present, from user mode
+  [ok]   uc_mcontext.cr2 agrees with si_addr
+  [ok]   gregs[REG_EIP] is inside the faulting probe
+
+3. the handler's write to gregs[REG_EIP] took effect
+  [ok]   execution resumed where the handler pointed eip
+  [ok]   the faulting store never happened
+```
+
+The last two are the Wine move in miniature: the handler does *not* fix
+the fault, it redirects execution somewhere else by rewriting `eip`, and
+the store that faulted is proved never to have happened.
+
+Host tests are 38 + 30 + 52 with no failures, the 26-case smoke suite
+passes, and `sigtest.elf` and `uctest.elf` both cost zero frames on every
+run after the first.
+
+### The negative controls, and one that mattered
+
+A test that passes on the first run is a test to be suspicious of, so all
+of this was broken deliberately three ways:
+
+- **`rt_sigreturn` restores a private shadow copy instead of the
+  ucontext** — the Milestone 19 design with a ucontext bolted on. Every
+  read-only check still passes; `gregs[REG_EAX] written in the handler is
+  what kill returned` fails, and the `eip`-rewriting test loops for ever
+  retrying the faulting store, so the transcript never reaches the end
+  and the comparison fails on length. This is the control that justifies
+  deleting the shadow copy rather than keeping one for safety.
+- **`si_code` and `si_addr` left at zero** — six checks fail, across
+  `tgkill`, both `SEGV_` codes and both `si_addr`s.
+- **The ucontext present but zeroed**, which is exactly what Milestone 19
+  shipped — the program dies at the *first* signal, because
+  `rt_sigreturn` now restores `eip = 0`:
+
+```
+[kernel] User program faulted (exception 14) at eip=0x00000000 accessing
+         0x00000000 (read, protection)
+```
+
+### Honest scope
+
+- [x] `ucontext_t` with a fully populated `sigcontext`: all 19 `gregs`,
+      `trapno`, `err`, `cr2`, `oldmask`, `uc_sigmask`, `uc_stack`.
+- [x] Edits a handler makes to `uc_mcontext` take effect on return —
+      general registers, `eip`, `esp`, the arithmetic flags and the
+      signal mask.
+- [x] `siginfo_t` with `si_signo`, `si_errno`, `si_code`, `si_addr` for
+      the fault signals and `si_pid`/`si_uid` for `kill`/`tgkill`.
+      `SI_USER`, `SI_TKILL`, `SI_KERNEL`, `SEGV_MAPERR`, `SEGV_ACCERR`,
+      `FPE_INTDIV`, `ILL_ILLOPN`.
+- [ ] **No FP state.** `uc_mcontext.fpstate` is null and `uc_flags` is 0.
+      Wine checks that pointer before using it, so this is survivable, but
+      a handler that wants the x87/SSE registers of the faulting
+      instruction cannot have them, and edits to FP state cannot be made
+      at all. This is the obvious next piece of the same milestone.
+- [ ] **`cs`, `ss`, `ds`, `es`, `fs` and `gs` are reported but not
+      restored.** A handler can read them; writing them back is ignored.
+      Wine does change `fs` in a sigcontext when it switches TEB
+      selectors, so this will have to be revisited — safely, which means
+      validating the selector rather than trusting it, and probably means
+      LDT support that does not exist yet.
+- [ ] `si_uid` is always 0, and `si_pid` is the argument the caller
+      passed rather than a checked identity — there is one process.
+- [ ] `siginfo` is one record per signal *number*, not a queue, because
+      `pending` is still a bitmask. Two `SIGSEGV`s raised while blocked
+      deliver once, with the second one's `si_addr`.
+- [ ] Still no `sigaltstack`, so a handler cannot run on its own stack —
+      which is how a real kernel survives a stack-overflow `SIGSEGV`, and
+      which Wine uses.
+- [ ] Signal state is still per *process*, not per thread.
+
 ## Path A — porting Wine (the current direction)
 
 Milestone 8 laid out two ways to run Windows binaries: port Wine (Path
@@ -2425,9 +2612,11 @@ are forced into an order:
    — delivery, masking, `rt_sigreturn`, and a `SIGSEGV` handler that can
    fix a fault and resume the faulting instruction, which is the pattern
    Wine is built on. Milestone 20 added `clone`, `futex` and per-thread
-   TLS — enough for what pthreads is made of. Still to do: `ucontext_t`,
-   blocking (rather than retrying) futexes, file-backed `mmap`, and a
-   writable filesystem.
+   TLS — enough for what pthreads is made of. Milestone 23 filled in
+   `ucontext_t` and `siginfo_t`, in both directions: a handler can read
+   the faulting registers and write them back, which is the whole of
+   Wine's exception dispatch. Still to do: FP state in the sigcontext,
+   blocking (rather than retrying) futexes, and a writable filesystem.
 4. **A dynamic linker** — ✅ done in Milestone 22. `ld-linux.so.2` loads
    `libc.so.6` at runtime and a dynamically linked glibc program runs,
    with output identical to Linux. The kernel's half is ET_DYN images,
