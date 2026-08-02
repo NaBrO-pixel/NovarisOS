@@ -469,10 +469,17 @@ int      posix_fd_import(uint32_t token);
 void posix_request_block(uint32_t addr, registers_t* regs);
 
 /* The same, with a deadline: "wake me when `addr` is signalled *or* when
- * tick `deadline` arrives, whichever comes first". poll() needs both,
- * because it is waiting on several descriptors and can only name one of
- * them - the deadline is what stops the others going unnoticed. */
+ * tick `deadline` arrives, whichever comes first". A pure sleep passes an
+ * `addr` of 0 - there is nothing to be woken *by*, only a time to be
+ * woken *at*. */
 void posix_request_block_until(uint32_t addr, uint32_t deadline,
+                               registers_t* regs);
+
+/* And the set form: "wake me when any of these `n` is signalled, or at
+ * `deadline`". This is poll's shape, and having it is what lets a poll
+ * be woken by the descriptor that actually moved rather than noticing on
+ * the next tick - see the comment above sys_poll(). */
+void posix_request_block_multi(const uint32_t* addrs, int n, uint32_t deadline,
                                registers_t* regs);
 void posix_process_end(void);
 

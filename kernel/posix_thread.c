@@ -78,21 +78,25 @@ int posix_retry_pending(void) {
     return r;
 }
 
+/* "Allocate one for me", which is what both glibc and Wine ask. The
+ * middle entry goes first so that a program that only ever needs one gets
+ * the same selector it always got. Returns -1 if all three are taken. */
+static int free_tls_slot(void) {
+    uint32_t used = scheduler_current_tls_used();
+    static const int order[GDT_TLS_COUNT] = { 7, 6, 8 };
+    for (int i = 0; i < GDT_TLS_COUNT; i++) {
+        if (!(used & (1u << order[i]))) return order[i];
+    }
+    return -1;
+}
+
 int32_t posix_sys_set_thread_area(uint32_t udesc) {
     user_desc_t* u = (user_desc_t*)udesc;
     if (!u) return -EFAULT;
 
     int slot;
     if (u->entry_number == 0xFFFFFFFFu) {
-        /* "Allocate one for me", which is what both glibc and Wine ask.
-         * The middle entry goes first so that a program that only ever
-         * needs one gets the same selector it always got. */
-        uint32_t used = scheduler_current_tls_used();
-        static const int order[GDT_TLS_COUNT] = { 7, 6, 8 };
-        slot = -1;
-        for (int i = 0; i < GDT_TLS_COUNT; i++) {
-            if (!(used & (1u << order[i]))) { slot = order[i]; break; }
-        }
+        slot = free_tls_slot();
         if (slot < 0) return -ESRCH;   /* what Linux says when all are taken */
         u->entry_number = (uint32_t)slot;
     } else {
@@ -116,11 +120,25 @@ int32_t posix_sys_clone(uint32_t flags, uint32_t child_stack, uint32_t* ptid,
     if (!(flags & CLONE_VM)) return -ENOSYS;
     if (!child_stack) return -EINVAL;
 
+    /* CLONE_SETTLS points at a user_desc, and which of the three
+     * descriptors it means is in entry_number - it is not always the one
+     * glibc happens to use. A caller that asks for "any" here is asking
+     * for the child to be given a descriptor the parent has not got, and
+     * there is no sensible answer to that, so it falls back to whichever
+     * is free the same way set_thread_area() picks one. */
+    int tls_slot = -1;
     uint32_t tls_base = 0, tls_limit = 0;
     if ((flags & CLONE_SETTLS) && udesc) {
         user_desc_t* u = (user_desc_t*)udesc;
         tls_base = u->base_addr;
         tls_limit = u->limit;
+        if (u->entry_number == 0xFFFFFFFFu) {
+            tls_slot = free_tls_slot();
+            if (tls_slot < 0) return -ESRCH;
+        } else {
+            tls_slot = (int)u->entry_number;
+            if (tls_slot < GDT_TLS_MIN || tls_slot > GDT_TLS_MAX) return -EINVAL;
+        }
     }
 
     uint32_t clear_tid = (flags & CLONE_CHILD_CLEARTID) ? (uint32_t)ctid : 0;
@@ -130,8 +148,9 @@ int32_t posix_sys_clone(uint32_t flags, uint32_t child_stack, uint32_t* ptid,
      * regs->eip, since the CPU already advanced past it - on the stack
      * the caller supplied. The scheduler puts 0 in the child's eax; the
      * parent gets the tid from this function's return value. */
-    int tid = scheduler_spawn_posix_thread("thread", regs->eip, child_stack,
-                                           tls_base, tls_limit, clear_tid);
+    int tid = scheduler_spawn_posix_thread("thread", regs, child_stack,
+                                           tls_slot, tls_base, tls_limit,
+                                           clear_tid);
     if (tid < 0) return -ENOMEM;
 
     if ((flags & CLONE_PARENT_SETTID) && ptid) *ptid = (uint32_t)tid;
@@ -284,16 +303,43 @@ int32_t posix_sys_futex(uint32_t uaddr_v, int op, uint32_t val,
              * behaviour rather than inventing a new way to hang. */
             if (deadline) {
                 futex_idles++;
-                __asm__ __volatile__("sti");
-                while ((int32_t)(pit_get_ticks() - deadline) < 0) {
+                for (;;) {
+                    __asm__ __volatile__("sti");
+                    if ((int32_t)(pit_get_ticks() - deadline) >= 0) {
+                        __asm__ __volatile__("cli");
+                        break;
+                    }
                     if (*uaddr != val) {
                         __asm__ __volatile__("cli");
                         spin_addr = 0; spin_deadline = 0;
                         return -EAGAIN;
                     }
                     __asm__ __volatile__("hlt");
+                    __asm__ __volatile__("cli");
+
+                    /* Milestone 31. "Nothing else can run" was true when
+                     * this loop was entered and stops being true while it
+                     * runs: the tick that woke us from hlt is the same
+                     * tick scheduler_expire_waits() uses to end another
+                     * task's timed wait, and an IRQ can make one runnable
+                     * too. Holding the CPU past that moment is not idling,
+                     * it is starving the task this one is waiting *for* -
+                     * which is exactly what a Wine thread waiting on a
+                     * critical section held by a thread whose own timed
+                     * wait had just expired did, for the whole five
+                     * seconds of its timeout, three times a run.
+                     *
+                     * So try to park again on every tick. Once this
+                     * succeeds the task is properly blocked and whoever
+                     * wakes it writes the result into its frame, so there
+                     * is nothing left to do here but return. */
+                    if (scheduler_block_current(regs, uaddr_v, deadline)) {
+                        futex_blocks++;
+                        futex_idles--;   /* it slept after all */
+                        spin_addr = 0; spin_deadline = 0;
+                        return 0;
+                    }
                 }
-                __asm__ __volatile__("cli");
                 spin_addr = 0; spin_deadline = 0;
                 return -ETIMEDOUT;
             }

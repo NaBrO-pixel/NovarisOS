@@ -54,7 +54,8 @@ OBJS = $(BUILD_DIR)/boot.o $(BUILD_DIR)/kernel.o \
 KERNEL = $(BUILD_DIR)/novaris.bin
 ISO = novaris.iso
 
-.PHONY: all clean run run-nographic iso test test-qemu test-posix test-wine zip wine-initrd
+.PHONY: all clean run run-nographic iso test test-qemu test-posix test-wine \
+        test-wine-threads zip wine-initrd
 
 all: $(ISO)
 
@@ -742,6 +743,16 @@ wine-initrd: $(BUILD_DIR)/initrd.img $(KERNEL)
 	# the last-component fallback resolves /etc/passwd to them.
 	printf 'root:x:0:0:root:/:/bin/sh\n' > $(BUILD_DIR)/wine_staging/passwd
 	printf 'passwd: files\ngroup: files\n' > $(BUILD_DIR)/wine_staging/nsswitch.conf
+	# Milestone 31. glibc unwinds a thread out of itself with
+	# _Unwind_ForcedUnwind, which lives in libgcc_s.so.1 and is reached by
+	# dlopen()ing it the first time pthread_exit() is called - so a
+	# library nothing links against is a hard requirement for a *thread*
+	# to end. Without it glibc prints "libgcc_s.so.1 must be installed
+	# for pthread_exit to work" and aborts, which is what every Wine
+	# worker thread did the moment it returned. Copied from the host
+	# toolchain, like ld-linux.so.2 and libc.so.6 and for the same
+	# reasons.
+	cp $(HOST_LIB32)/libgcc_s.so.1 $(BUILD_DIR)/wine_staging/libgcc_s.so.1
 	python3 userland/mkinitrd.py $(BUILD_DIR)/wine_staging \
 	    $(BUILD_DIR)/wine_iso/boot/initrd.img
 	cp $(BUILD_DIR)/novaris.bin $(BUILD_DIR)/wine_iso/boot/novaris.bin
@@ -771,6 +782,38 @@ test-wine:
 	    --expect "fib\(20\):    6765" \
 	    --expect "argv\[0\]: C:.windows.hellowin\.exe" \
 	    --expect "Exiting with code 0" \
+	    --reject "KERNEL PANIC"
+
+# Milestone 31: the same, for a *threaded* Windows program. threads.exe is
+# the Milestone 17 binary - CreateThread, WaitForSingleObject and a
+# CRITICAL_SECTION - running through Wine's own kernel32 and ntdll rather
+# than Novaris's Win32 layer, so every Win32 thread is a real pthread on a
+# real clone().
+#
+# The two counters are the point. The interlocked one proves the workers
+# all ran and their increments all landed; the guarded one proves the
+# critical section serialised them, because it is incremented with a
+# deliberately racy read-modify-write. And RtlpWaitForCriticalSection is
+# rejected: Wine prints it when a lock wait times out, which is what a
+# thread starved by the scheduler looks like from inside Wine, and the
+# program still finishes with the right answers when it happens.
+test-wine-threads:
+	@test -f novaris-wine.iso || \
+	    { echo "run 'make WINE_BUILD=/path/to/wine wine-initrd' first"; exit 1; }
+	python3 tools/qemu_test.py --iso novaris-wine.iso --memory 768 \
+	    --boot-wait 30 --settle 200 \
+	    --cmd "run wine-preloader wine threads.exe" \
+	    --expect "Win32 threads test - real CreateThread on Novaris" \
+	    --expect "worker 1 starting, GetCurrentThreadId" \
+	    --expect "worker 2 starting, GetCurrentThreadId" \
+	    --expect "worker 3 starting, GetCurrentThreadId" \
+	    --expect "all 3 workers joined" \
+	    --expect "worker 3 exit code 300" \
+	    --expect "interlocked counter: 60, expected 60  -> ok" \
+	    --expect "guarded counter:     60, expected 60  -> ok" \
+	    --expect "threads test done" \
+	    --reject "RtlpWaitForCriticalSection" \
+	    --reject "libgcc_s\.so\.1 must be installed" \
 	    --reject "KERNEL PANIC"
 
 zip:
