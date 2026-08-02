@@ -352,7 +352,9 @@ void paging_destroy_address_space(uint32_t pd_phys) {
 
         uint32_t* ft = FOREIGN_TABLE(i);
         for (uint32_t j = 0; j < ENTRIES_PER_TABLE; j++) {
-            if (ft[j] & PAGE_PRESENT) pmm_free_frame(ft[j] & ~0xFFFu);
+            if (!(ft[j] & PAGE_PRESENT)) continue;
+            if (ft[j] & PAGE_SHARED) continue;   /* the file's, not ours */
+            pmm_free_frame(ft[j] & ~0xFFFu);
         }
         pmm_free_frame(fpd[i] & ~0xFFFu);
         fpd[i] = 0;
@@ -406,13 +408,13 @@ int paging_map_page_in(uint32_t pd_phys, uint32_t virt_addr,
  * allocates the child's copy of a page from the PMM, and the only way to
  * put bytes in it is to give it a virtual address here first.
  *
- * The address is deliberately in the private half and deliberately
- * nowhere any loader places anything (the mmap arena starts at
- * 0x42000000, the program at 0x40000000, a PIE at 0x56000000), so the
- * page table it needs is this process's own and goes away with it. The
- * copy loop skips its directory entry, which is why it has to be a fixed
- * address rather than one taken from anywhere. */
-#define SCRATCH_VA      0x3F000000u
+ * The address is in the *kernel* half (see PAGING_SCRATCH_VA), which is
+ * the Milestone 30 correction: while it was a user-half address it was a
+ * page that a process teardown would happily have freed, and the frame it
+ * pointed at would have been somebody else's. Being in the shared kernel
+ * set also means the page table is created once, at boot, rather than per
+ * process. The copy loop skips its directory entry either way. */
+#define SCRATCH_VA      PAGING_SCRATCH_VA
 #define SCRATCH_PD_IDX  PD_INDEX(SCRATCH_VA)
 
 static void* scratch_map(uint32_t phys) {
@@ -452,7 +454,7 @@ int paging_copy_user_space(uint32_t dest_pd) {
 
         for (uint32_t j = 0; j < ENTRIES_PER_TABLE; j++) {
             uint32_t pte = pt[j];
-            if (!(pte & PAGE_PRESENT)) continue;
+            if (!(pte & (PAGE_PRESENT | PAGE_RESERVED))) continue;
 
             if (!(fpd[i] & PAGE_PRESENT)) {
                 uint32_t pt_phys = pmm_alloc_frame();
@@ -461,6 +463,21 @@ int paging_copy_user_space(uint32_t dest_pd) {
                 invlpg((uint32_t)FOREIGN_TABLE(i));
                 uint32_t* ft = FOREIGN_TABLE(i);
                 for (uint32_t k = 0; k < ENTRIES_PER_TABLE; k++) ft[k] = 0;
+            }
+
+            if (!(pte & PAGE_PRESENT)) {
+                /* A reservation. The child inherits the *address*, which
+                 * is the whole of what a reservation is. */
+                FOREIGN_TABLE(i)[j] = pte;
+                continue;
+            }
+
+            if (pte & PAGE_SHARED) {
+                /* Shared memory is shared across a fork - that is what
+                 * makes it shared. The child gets the same frame, not a
+                 * copy of it, and inherits the flag that says so. */
+                FOREIGN_TABLE(i)[j] = pte;
+                continue;
             }
 
             uint32_t frame = pmm_alloc_frame();
@@ -484,6 +501,27 @@ int paging_copy_user_space(uint32_t dest_pd) {
     return 1;
 }
 
+int paging_reserve_page(uint32_t virt_addr) {
+    uint32_t pd_idx = PD_INDEX(virt_addr);
+
+    if (!(PAGE_DIRECTORY[pd_idx] & PAGE_PRESENT)) {
+        uint32_t pt_phys = pmm_alloc_frame();
+        if (!pt_phys) return 0;
+        PAGE_DIRECTORY[pd_idx] = pt_phys | PAGE_PRESENT | PAGE_RW | PAGE_USER;
+        invlpg((uint32_t)PAGE_TABLE(pd_idx));
+        uint32_t* pt = PAGE_TABLE(pd_idx);
+        for (int i = 0; i < ENTRIES_PER_TABLE; i++) pt[i] = 0;
+    }
+
+    /* Not present, so an access faults; the bit is only for the kernel to
+     * read back. A page table per 4MB is the whole cost of a
+     * reservation - two megabytes for the two gigabytes Wine asks for,
+     * against two gigabytes for the same request before this existed. */
+    PAGE_TABLE(pd_idx)[PT_INDEX(virt_addr)] = PAGE_RESERVED;
+    invlpg(virt_addr);
+    return 1;
+}
+
 uint32_t paging_release_user_pages(void) {
     uint32_t freed = 0;
 
@@ -498,9 +536,10 @@ uint32_t paging_release_user_pages(void) {
         uint32_t* pt = PAGE_TABLE(i);
         for (uint32_t j = 0; j < ENTRIES_PER_TABLE; j++) {
             if (!(pt[j] & PAGE_PRESENT)) continue;
-            pmm_free_frame(pt[j] & ~0xFFFu);
+            /* Mapped here, but somebody else's - a shared file mapping's
+             * frames belong to the file. Unmap and leave them alone. */
+            if (!(pt[j] & PAGE_SHARED)) { pmm_free_frame(pt[j] & ~0xFFFu); freed++; }
             pt[j] = 0;
-            freed++;
         }
         pmm_free_frame(PAGE_DIRECTORY[i] & ~0xFFFu);
         PAGE_DIRECTORY[i] = 0;

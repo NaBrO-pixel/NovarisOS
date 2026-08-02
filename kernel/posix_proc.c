@@ -124,10 +124,12 @@ posix_proc_t* posix_proc_clone(const posix_proc_t* src, uint32_t pd) {
         /* Every descriptor the parent had is the child's too, and the
          * *object* behind each is now referred to twice - which is what
          * makes closing one end in the child leave the parent's working.
-         * A file needs no reference count (the VFS owns the node and it
-         * outlives both); a socket does. */
+         * Both kinds are counted since Milestone 30: a file's node can
+         * outlive its name, so a descriptor to an unlinked file is the
+         * only thing keeping it. */
         for (int f = 0; f < POSIX_MAX_FDS; f++) {
             if (p->fds[f].kind == FD_SOCKET) socket_ref(p->fds[f].sock);
+            if (p->fds[f].kind == FD_FILE) vfs_node_ref(p->fds[f].node);
         }
         return p;
     }

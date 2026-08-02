@@ -29,6 +29,7 @@ run hellowin.exe
 # multitask is three tasks in three address spaces at one address,
 # threadtest is two threads in one address space sharing one counter.
 run forktest.elf
+run mmaptest.elf
 ps
 run helloelf.elf
 run helloc.bin

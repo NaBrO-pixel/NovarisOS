@@ -22,7 +22,10 @@ struct gdt_ptr {
  * Milestone 2; the TSS entry came with Milestone 5; entry 6 is
  * Milestone 10's, and is the only one whose base changes at runtime -
  * see gdt_set_teb(). */
-#define GDT_ENTRIES 8
+/* Nine entries: the flat set, the TSS, and *three* thread-local storage
+ * descriptors, because that is how many Linux/i386 offers and a program
+ * that needs two must not be given one twice. See include/gdt.h. */
+#define GDT_ENTRIES 9
 static struct gdt_entry gdt[GDT_ENTRIES];
 static struct gdt_ptr   gp;
 
@@ -111,13 +114,16 @@ void gdt_install(void) {
      * access faults rather than silently addressing something real. */
     gdt_set_gate(6, 0, 0, 0xF2, 0x40);
 
-    /* Thread-local storage segment (selector 0x3B = entry 7, RPL 3), for
-     * POSIX threads. Milestone 20: glibc-shaped i386 TLS reaches its
-     * per-thread data through gs:[...], exactly as Windows code reaches
-     * its TEB through fs:[...], so it needs a segment whose base is the
-     * thread's TLS block. Filled in by set_thread_area()/CLONE_SETTLS and
-     * reprogrammed on every thread switch - see gdt_set_tls(). */
+    /* Thread-local storage segments (entries 6-8, selectors 0x33/0x3B/
+     * 0x43, RPL 3), for POSIX threads. Milestone 20: glibc-shaped i386
+     * TLS reaches its per-thread data through gs:[...], exactly as
+     * Windows code reaches its TEB through fs:[...], so it needs a
+     * segment whose base is the thread's TLS block. Filled in by
+     * set_thread_area()/CLONE_SETTLS and reprogrammed on every thread
+     * switch - see gdt_set_tls_entry(). Entry 6 doubles as the Win32
+     * layer's TEB descriptor, which is the same idea by another name. */
     gdt_set_gate(7, 0, 0, 0xF2, 0x40);
+    gdt_set_gate(8, 0, 0, 0xF2, 0x40);
 
     gdt_flush((uint32_t)&gp);
 
@@ -133,15 +139,20 @@ uint32_t gdt_get_kernel_stack(void) {
     return tss.esp0;
 }
 
-void gdt_set_tls(uint32_t base, uint32_t limit) {
+void gdt_set_tls_entry(int slot, uint32_t base, uint32_t limit) {
+    if (slot < GDT_TLS_MIN || slot > GDT_TLS_MAX) return;
     /* Byte granularity below 1MB, page granularity above, so a thread can
      * describe either a small TLS block or a large one. The 0x40/0xC0
      * difference is the G bit. */
     if (limit >= 0x100000u) {
-        gdt_set_gate(7, base, limit >> 12, 0xF2, 0xC0);
+        gdt_set_gate(slot, base, limit >> 12, 0xF2, 0xC0);
     } else {
-        gdt_set_gate(7, base, limit, 0xF2, 0x40);
+        gdt_set_gate(slot, base, limit, 0xF2, 0x40);
     }
+}
+
+void gdt_set_tls(uint32_t base, uint32_t limit) {
+    gdt_set_tls_entry(7, base, limit);
 }
 
 void gdt_set_teb(uint32_t base, uint32_t limit) {

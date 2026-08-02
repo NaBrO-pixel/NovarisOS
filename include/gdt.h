@@ -29,12 +29,34 @@ uint32_t gdt_get_kernel_stack(void);
  * kernel/win32.c. `limit` is in bytes (byte granularity). */
 void gdt_set_teb(uint32_t base, uint32_t limit);
 
-/* Points GDT entry 7 (selector 0x3B) at a thread's local-storage block.
- * The POSIX counterpart of gdt_set_teb: i386 TLS is reached through
- * gs:[...], so gs has to be a segment whose base *is* the thread's TLS
- * area. Set by set_thread_area() and by clone(CLONE_SETTLS), and
- * reprogrammed by the scheduler on every switch, since it is per-thread.
- * See kernel/posix_thread.c. */
+/* --- the thread-local storage descriptors -------------------------------
+ *
+ * Linux/i386 gives a thread *three* of these, numbered 6, 7 and 8, and
+ * set_thread_area() hands out whichever is free. Novaris had one, which
+ * was enough while the only thing asking was glibc - and exactly one
+ * short the moment Wine asked too.
+ *
+ * Wine's i386 code reaches the Windows TEB through fs:[...] the way glibc
+ * reaches its TLS through gs:[...], and it gets that segment by calling
+ * set_thread_area() itself. With one descriptor, Wine's request silently
+ * overwrote glibc's, and the next glibc function to touch errno read it
+ * out of the middle of a TEB. What it looked like from outside was Wine
+ * dereferencing a null pointer inside its own SIGSEGV handler.
+ *
+ * So: three, numbered as Linux numbers them, and all three saved and
+ * restored on every thread switch because all three are per-thread. */
+#define GDT_TLS_MIN 6
+#define GDT_TLS_MAX 8
+#define GDT_TLS_COUNT (GDT_TLS_MAX - GDT_TLS_MIN + 1)
+
+/* Points GDT entry `slot` (6, 7 or 8; selector (slot<<3)|3) at a thread's
+ * local-storage block. Set by set_thread_area() and by
+ * clone(CLONE_SETTLS), and reprogrammed by the scheduler on every switch,
+ * since it is per-thread. See kernel/posix_thread.c. */
+void gdt_set_tls_entry(int slot, uint32_t base, uint32_t limit);
+
+/* The middle one, kept for the callers that only ever wanted a single
+ * descriptor - the Win32 layer's threads. */
 void gdt_set_tls(uint32_t base, uint32_t limit);
 
 #endif

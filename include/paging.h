@@ -6,6 +6,51 @@
 #define PAGE_PRESENT 0x1
 #define PAGE_RW      0x2
 #define PAGE_USER    0x4
+/* Bit 9 is one of the three the CPU leaves to the OS, and Milestone 30
+ * spends it on the one fact a page table otherwise cannot record: this
+ * frame is mapped here but is not this address space's to free.
+ *
+ * A MAP_SHARED file mapping hands user space the very frames the file's
+ * bytes live in, so tearing the process down must unmap them and stop -
+ * freeing them would hand the file's contents back to the physical
+ * allocator while the file still exists. Every teardown path checks it:
+ * munmap, process exit, execve, and the destruction of an address space.
+ * fork checks it too, and *shares* rather than copies, which is what
+ * makes a shared mapping shared across a fork. */
+#define PAGE_SHARED  0x200
+
+/* Bit 10, and the other fact a page table cannot otherwise record: this
+ * address is *spoken for* but has no memory behind it.
+ *
+ * PROT_NONE means "reserve the address range and give me nothing", and
+ * Novaris used to answer it by allocating a frame per page and marking it
+ * unreadable - which is the same observable behaviour and a completely
+ * different cost. Wine's preloader asks for 2GB of it before it does
+ * anything else, so on a 512MB machine the reservation succeeded, ate
+ * every frame there was, and the loader ground to a halt on the next
+ * allocation.
+ *
+ * A reserved entry is *not present*, so an access to it faults exactly as
+ * PROT_NONE should. What the bit adds is the ability to tell "reserved"
+ * from "free" afterwards - which is what mprotect needs when the program
+ * comes back and asks for the memory it reserved. */
+#define PAGE_RESERVED 0x400
+
+/* Where the scratch page used to copy an address space lives. In the
+ * kernel half deliberately: it was in the user half until Milestone 30,
+ * where it was a page a process teardown would have freed if a copy had
+ * ever been interrupted between mapping and unmapping it. kernel.c
+ * reserves its page table before the kernel address space is frozen, so
+ * every address space has it. */
+#define PAGING_SCRATCH_VA 0xE0000000u
+
+/* Where the initrd is mapped. In the kernel half since Milestone 30,
+ * because GRUB puts modules just above the kernel image - across
+ * 0x400000, which is where a Windows executable wants to load, and the
+ * first thing real Wine asked this kernel for. The initrd only ever
+ * needed to be reachable, not to be at its physical address. */
+#define INITRD_VIRTUAL_BASE 0xE1000000u
+#define INITRD_VIRTUAL_MAX  (192u * 1024u * 1024u)
 
 /* Replaces boot.s's coarse 4MB-page bootstrap mapping with a real
  * 4KB-granularity page directory: identity-maps the first 4MB (so the
@@ -164,5 +209,16 @@ int paging_copy_user_space(uint32_t dest_pd);
  * The caller must not touch user memory afterwards - which for both of
  * its callers is the point rather than a caveat. */
 uint32_t paging_release_user_pages(void);
+
+/* Marks `virt_addr` reserved: an address that belongs to the process but
+ * has no frame behind it. Allocates a page table if the range has none.
+ * Returns 0 only if that allocation failed. See PAGE_RESERVED. */
+int paging_reserve_page(uint32_t virt_addr);
+
+/* The highest address a program may map. Everything above is the
+ * kernel's, shared by every address space, and a fixed mapping that
+ * reached into it would hand the kernel's own memory to a program - or,
+ * worse, hand it to every other process too. */
+#define USER_SPACE_END 0xC0000000u
 
 #endif

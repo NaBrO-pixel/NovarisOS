@@ -646,12 +646,20 @@ int32_t posix_sys_rt_sigprocmask(int how, const uint32_t* set, uint32_t* old,
     return 0;
 }
 
-int32_t posix_sys_rt_sigreturn(registers_t* regs) {
+int32_t posix_sigreturn_common(registers_t* regs, uint32_t arg_bytes) {
     posix_proc_t* S = posix_current();
     /* The handler's `ret` popped the return address, leaving its three
      * cdecl arguments on the stack, and the frame sits immediately above
-     * them. */
-    uint32_t sp = regs->useresp + 12;
+     * them - *minus* whatever the restorer itself popped on the way.
+     *
+     * That difference is the whole reason this takes a parameter.
+     * glibc's rt restorer is two instructions and pops nothing, so the
+     * frame is three arguments up. Its legacy restorer pops the signal
+     * number first, so the frame is two arguments up. Getting it wrong
+     * does not fail quietly: the magic check below fires and the program
+     * is terminated for returning from a handler it did return from
+     * correctly. */
+    uint32_t sp = regs->useresp + arg_bytes;
     sigframe_t* frame = (sigframe_t*)sp;
 
     if (frame->magic != SIGFRAME_MAGIC) {
@@ -742,4 +750,16 @@ int32_t posix_sys_rt_sigreturn(registers_t* regs) {
     }
 
     return (int32_t)regs->eax;
+}
+
+int32_t posix_sys_rt_sigreturn(registers_t* regs) {
+    return posix_sigreturn_common(regs, 12);
+}
+
+/* The legacy sigreturn, which glibc's restorer issues for a handler
+ * installed without SA_SIGINFO. Novaris builds one shape of frame and
+ * passes all three arguments to every handler, so the only difference
+ * here is where the restorer left esp. */
+int32_t posix_sys_sigreturn(registers_t* regs) {
+    return posix_sigreturn_common(regs, 8);
 }

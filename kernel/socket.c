@@ -27,10 +27,13 @@
 #include "console.h"
 #include "vfs.h"
 
-#define MAX_SOCKETS   32
+/* Raised in Milestone 30 for the same reason the descriptor table was:
+ * wineserver plus two clients is already a dozen sockets and pipes, and
+ * every Windows handle backed by a file is another descriptor in flight. */
+#define MAX_SOCKETS   64
 #define SOCK_BUF_SIZE 16384      /* per direction */
-#define MAX_BACKLOG   4
-#define MAX_PASSED_FDS 8
+#define MAX_BACKLOG   8
+#define MAX_PASSED_FDS 16
 #define MAX_BOUND     8
 
 typedef enum {

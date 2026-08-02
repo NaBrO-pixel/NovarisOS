@@ -53,6 +53,14 @@ TESTS = {
         # difference here would be a real one.
         "expected": [],
     },
+    "mmaptest.elf": {
+        "start": "mmap test",
+        "end": "mmap test done.",
+        # Milestone 30. Shared file mappings, reservations that cost no
+        # memory, and a file that outlives its name. Nothing may differ -
+        # these are the semantics Wine's loader is built on.
+        "expected": [],
+    },
     "forktest.elf": {
         "start": "fork test",
         "end": "fork test done.",

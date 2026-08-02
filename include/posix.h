@@ -47,6 +47,8 @@
 #define SYS_mkdir           39
 #define SYS_rmdir           40
 #define SYS_fsync          118
+#define SYS_truncate        92
+#define SYS_ftruncate       93
 #define SYS_truncate64     193
 #define SYS_ftruncate64    194
 #define SYS_getdents64     220
@@ -145,6 +147,9 @@
 #define SYS_fchmod          94
 #define SYS_fchmodat       306
 #define SYS_clock_nanosleep 267
+#define SYS_sigreturn      119
+#define SYS_sched_setaffinity 241
+#define SYS_sched_getaffinity 242
 #define SYS_pwrite64       181
 #define SYS_statfs64       268
 #define SYS_fstatfs64      269
@@ -228,6 +233,18 @@ typedef struct {
 #define MAP_PRIVATE   0x02
 #define MAP_FIXED     0x10
 #define MAP_ANONYMOUS 0x20
+#define MAP_NORESERVE 0x4000
+/* "This address or nothing" - MAP_FIXED without the part of MAP_FIXED
+ * that silently unmaps whatever was there. Wine asks for a Windows
+ * image's ImageBase this way, because taking it by force would destroy
+ * something else and taking a different address would be wrong.
+ *
+ * Novaris ignored the flag, which meant it read the request as "anywhere
+ * will do" and answered with an arena address. Wine compared that against
+ * the address it had asked for, saw a difference, and reported
+ * "out of memory for 0x400000" - a message about the one thing that was
+ * not the problem. */
+#define MAP_FIXED_NOREPLACE 0x100000
 
 /* --- signals (Milestone 19) ---------------------------------------------
  *
@@ -506,6 +523,7 @@ int32_t posix_sys_rt_sigaction(int signo, const k_sigaction_t* act,
 int32_t posix_sys_rt_sigprocmask(int how, const uint32_t* set, uint32_t* old,
                                  uint32_t sigsetsize);
 int32_t posix_sys_rt_sigreturn(registers_t* regs);
+int32_t posix_sys_sigreturn(registers_t* regs);
 int32_t posix_sys_sigaltstack(const k_stack_t* ss, k_stack_t* old);
 
 /* --- threads (kernel/posix_thread.c, Milestone 20) ---------------------- */

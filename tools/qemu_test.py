@@ -97,13 +97,18 @@ class Monitor:
         self.sock.close()
 
 
-def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None):
+def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
+        memory=128):
     serial_path = keep_serial or tempfile.mktemp(suffix=".log", prefix="novaris-serial-")
     port = 45000 + (os.getpid() % 10000)
 
     qemu = subprocess.Popen(
         [
             "qemu-system-i386",
+            # 128MB is plenty for novaris.iso. The Wine ISO carries an
+            # initrd of PE builtins that is read into RAM whole, so those
+            # runs ask for more.
+            "-m", "%dM" % memory,
             "-cdrom", iso,
             "-display", "none",
             "-serial", "file:" + serial_path,
@@ -163,6 +168,8 @@ def main():
                     help="seconds to wait after each command before the next")
     ap.add_argument("--timeout", type=float, default=20.0)
     ap.add_argument("--serial-log", help="keep the raw serial capture at this path")
+    ap.add_argument("--memory", type=int, default=128,
+                    help="guest RAM in MB")
     ap.add_argument("--expect", action="append", default=[],
                     help="regex that must appear in the transcript (repeatable)")
     ap.add_argument("--reject", action="append", default=[],
@@ -176,7 +183,7 @@ def main():
                          if ln.strip() and not ln.startswith("#")]
 
     transcript = run(args.iso, commands, args.boot_wait, args.key_delay,
-                     args.settle, args.timeout, args.serial_log)
+                     args.settle, args.timeout, args.serial_log, args.memory)
     sys.stdout.write(transcript)
 
     failures = []
