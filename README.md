@@ -14,7 +14,7 @@ bootloader hands off to a kernel, and the kernel grows from there. Over time
 you can shape it to *feel* like whichever OS inspires you (windowing system,
 shell conventions, UI style) without copying anyone's code.
 
-## Current status: Milestone 30 complete ✅
+## Current status: Milestone 31 complete ✅
 
 - [x] Multiboot bootloader handoff (via GRUB), 32-bit protected mode
 - [x] Freestanding C kernel — no libc, we own the whole stack
@@ -70,7 +70,8 @@ shell conventions, UI style) without copying anyone's code.
 - [x] **Two processes at once** — `fork`, `vfork`, `execve`, `wait4`,
       pipes, `dup2`, `poll`/`select`, and a POSIX state that is genuinely
       per process rather than a set of globals
-- [x] **A real Windows `.exe` runs under real Wine** — see below
+- [x] **A real Windows `.exe` runs under real Wine**, threads and all —
+      see below
 - [x] **A real windowing desktop**: a compositing window manager with
       draggable, resizable, overlapping windows, a taskbar, a Start menu
       and built-in apps — see below
@@ -245,15 +246,53 @@ ntdll, kernel32, kernelbase and msvcrt, with a wineserver process behind
 it. Two Novaris processes passing file descriptors over a Unix socket.
 `make test-wine` asserts seven lines of it.
 
-Wine is not vendored; it is a build input, fetched and built separately
-and pointed at with `WINE_BUILD`. `ROADMAP.md` Milestone 30 has the full
-account, including the six things `MAP_SHARED` turned out to be hiding
-behind it.
+**And a *threaded* one, since Milestone 31:**
 
-**What does not work yet**: threaded Windows programs (a new thread's
-Windows TEB segment is not set up the way Wine expects, so the worker
-faults — cleanly, but it faults); anything with a GUI, since there is no
-display backend; and anything needing networking, since there is none.
+```
+novaris> run wine-preloader wine threads.exe
+Win32 threads test - real CreateThread on Novaris
+
+created worker 1, thread id 56
+created worker 2, thread id 60
+created worker 3, thread id 64
+
+  worker 1 starting, GetCurrentThreadId() = 56
+  worker 2 starting, GetCurrentThreadId() = 60
+  worker 3 starting, GetCurrentThreadId() = 64
+  worker 1 done
+  worker 2 done
+  worker 3 done
+
+all 3 workers joined
+  worker 1 exit code 100
+  worker 2 exit code 200
+  worker 3 exit code 300
+
+interlocked counter: 60, expected 60  -> ok
+guarded counter:     60, expected 60  -> ok
+```
+
+Every Win32 thread there is a real pthread on a real `clone()`. The two
+counters are the point: the interlocked one proves the workers all ran
+and every increment landed, and the guarded one is incremented with a
+deliberately racy read-modify-write, so it only comes out at 60 if the
+critical section really serialised three threads. `make
+test-wine-threads` asserts eleven lines of it.
+
+Wine is not vendored; it is a build input, fetched and built separately
+and pointed at with `WINE_BUILD`. `ROADMAP.md` Milestones 30 and 31 have
+the full account — the six things `MAP_SHARED` was hiding, why a Wine
+thread cannot inherit one TLS descriptor when Linux gives it three, and
+why `poll` waking on the wrong socket looked like threads being slow.
+
+**What does not work yet**: there is no Wine *prefix*, because
+`wineboot` cannot run `wine.inf` — so there is no `C:\windows`, no real
+console, and no drive letters worth having. Symbolic links are written
+and tested and would give Wine its DOS drives, but the startup path they
+unlock needs the prefix, so they are deliberately not enabled; see
+Milestone 31. That whole knot is one missing subsystem: a real
+filesystem on a real disk, which is Milestone 32. Beyond it, still: no
+GUI (there is no display backend) and no networking.
 
 ## Project layout
 
@@ -359,6 +398,7 @@ make test        # host-side tests: the printf engine and the PE loader
 make test-qemu   # boots the ISO, drives the shell, asserts on the output
 make test-posix  # runs ten binaries on Linux AND Novaris, diffs the two
 make test-wine   # boots novaris-wine.iso, asserts a Windows .exe's output
+make test-wine-threads   # ... and a *threaded* Windows .exe's
 ```
 
 `make test-posix` is the strongest of these, and the one the POSIX work
