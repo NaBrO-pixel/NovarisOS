@@ -448,8 +448,14 @@ static const char* signal_name(int signo) {
  * exit status carries the signal number in Linux's encoding, so a parent
  * in wait4 can tell a program that died from one that exited. */
 static void default_action(int signo) {
+    posix_proc_t* P = posix_current();
     terminal_writestring_color("[posix] ", VGA_COLOR_LIGHT_RED);
-    terminal_writestring("terminated by ");
+    /* Which program, because with several processes running "terminated
+     * by SIGUSR1" names the event and not the casualty - and when the
+     * casualty is wineserver rather than the client that misbehaved, that
+     * is the whole of the diagnosis. */
+    terminal_writestring(P->exe_path);
+    terminal_writestring(" terminated by ");
     terminal_writestring(signal_name(signo));
     terminal_writestring(" (no handler installed)\n");
     posix_exit_status(signo);

@@ -136,6 +136,22 @@ posix_proc_t* posix_proc_clone(const posix_proc_t* src, uint32_t pd) {
     return 0;
 }
 
+/* The process a *task* belongs to. A thread's id is a task id, not a
+ * process id, so a signal naming one - which is what tgkill does, and
+ * what wineserver's kill() does when it suspends a client thread - has
+ * to be routed through the scheduler to find whose thread it is. */
+posix_proc_t* posix_proc_by_task(int tid) {
+    uint32_t pd = scheduler_address_space_of(tid);
+    if (!pd) return 0;
+    for (int i = 0; i < POSIX_MAX_PROCS; i++) {
+        if (procs[i].in_use && !procs[i].exited &&
+            procs[i].page_directory == pd) {
+            return &procs[i];
+        }
+    }
+    return 0;
+}
+
 posix_proc_t* posix_proc_by_pid(int pid) {
     for (int i = 0; i < POSIX_MAX_PROCS; i++) {
         if (procs[i].in_use && procs[i].pid == pid) return &procs[i];

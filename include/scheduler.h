@@ -354,12 +354,27 @@ int scheduler_block_current_retry_multi(registers_t* regs,
  * reports, and callers do use it. */
 int scheduler_wake_on(uint32_t addr, int max, int32_t result);
 
+/* The same, restricted to tasks sharing the caller's address space. Every
+ * caller that names a *user* address - a futex word, a thread's clear-tid
+ * word - must use this: those addresses are virtual, and two processes
+ * routinely have different words at the same one. The unscoped form is
+ * for kernel object addresses, which are unique across the machine and
+ * whose waiters are deliberately in other processes. */
+int scheduler_wake_on_local(uint32_t addr, int max, int32_t result);
+
 /* Called from the timer. Wakes any blocked task whose deadline has
  * passed, with `result` in eax (-ETIMEDOUT). Returns how many. */
 int scheduler_expire_waits(uint32_t now, int32_t result);
 
 /* How many tasks are blocked right now. Used by the shell's `futexinfo`
  * to show the state rather than only the counters. */
+/* The address space a task is running in, by task id, or 0 if there is no
+ * such live task. A *thread's* id, which is what tgkill and wineserver's
+ * kill() both name, is a task id here - and turning one into the process
+ * it belongs to is the only way a signal aimed at another process's
+ * thread can be delivered to that process rather than to the sender. */
+uint32_t scheduler_address_space_of(int pid);
+
 int scheduler_blocked_count(void);
 
 /* Whether scheduler_yield_from_trap() would actually switch - i.e.

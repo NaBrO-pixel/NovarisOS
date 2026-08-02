@@ -30,7 +30,12 @@
  * shared, which is why fork gives the child a copy of the table and a
  * reference to each object rather than a copy of the object. */
 
-#define POSIX_MAX_PROCS 8
+/* 24 since Milestone 31. Eight was the number a shell, a Wine client and
+ * a wineserver needed. Once Wine's prefix had DOS drives, wineboot got
+ * far enough to start services.exe and a helper of its own, and the
+ * exhaustion was silent from outside: fork returned -EAGAIN, Wine
+ * reported nothing, and the Windows program simply never ran. */
+#define POSIX_MAX_PROCS 24
 /* 128 since Milestone 30. Thirty-two was a shell's worth and wineserver
  * is not a shell: it holds its listening socket, a connection, a request
  * pipe, a reply pipe and a wait pipe per client, and an open descriptor
@@ -169,6 +174,10 @@ posix_proc_t* posix_proc_clone(const posix_proc_t* src, uint32_t pd);
 /* Finds a process by pid, including exited ones whose status nobody has
  * collected. Null if there is no such process. */
 posix_proc_t* posix_proc_by_pid(int pid);
+
+/* The process a task id belongs to, or 0. See the implementation for why
+ * a signal aimed at a thread needs this. */
+posix_proc_t* posix_proc_by_task(int tid);
 
 /* Marks `p` exited with `status`, unhooks it from its address space, and
  * hands any children it had to nobody (they become parentless rather than
