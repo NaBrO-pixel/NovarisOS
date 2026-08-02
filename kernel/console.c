@@ -139,6 +139,18 @@ int console_has_framebuffer(void) {
     return has_framebuffer;
 }
 
+/* The text area's size in characters, which is what a program asking
+ * ioctl(TIOCGWINSZ) wants. Milestone 31: Wine reads it at startup and
+ * passes it to conhost as the console's geometry, so a kernel that
+ * answered the ioctl without writing anything handed conhost whatever
+ * was on its stack - "--width 0" - and conhost died of it. */
+void console_get_size(uint32_t* out_cols, uint32_t* out_rows) {
+    /* Before the framebuffer console is up, the VGA text mode this falls
+     * back to is 80x25 and those are the honest numbers. */
+    if (out_cols) *out_cols = cols ? cols : 80u;
+    if (out_rows) *out_rows = rows ? rows : 25u;
+}
+
 void terminal_initialize(void) {
     if (has_framebuffer) {
         draw_chrome();

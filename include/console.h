@@ -44,6 +44,11 @@ int console_use_framebuffer(uint32_t addr, uint32_t pitch, uint32_t width,
  * framebuffer to draw on. */
 int console_has_framebuffer(void);
 
+/* The text area's size in characters. ioctl(TIOCGWINSZ) answers with it,
+ * which is how a program that draws its own screen - Wine's conhost -
+ * finds out how big one is. */
+void console_get_size(uint32_t* cols, uint32_t* rows);
+
 void terminal_initialize(void);
 void terminal_setcolor(uint8_t color);
 uint8_t terminal_getcolor(void);

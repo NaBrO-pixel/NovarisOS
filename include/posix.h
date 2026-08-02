@@ -172,6 +172,8 @@
 #define EFAULT  14
 #define EEXIST  17
 #define EINVAL  22
+#define ENOTTY  25   /* not a terminal - what an ioctl this kernel
+                      * does not implement answers, rather than 0 */
 #define EMFILE  24
 #define ENOSPC  28
 #define ESPIPE  29

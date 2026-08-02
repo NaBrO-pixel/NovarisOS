@@ -40,11 +40,12 @@
 #include "pit.h"
 #include "posix.h"   /* EAGAIN, ETIMEDOUT - the values a woken waiter gets */
 
-/* Sixteen since Milestone 29. A forked child is a task like any other, so
- * a program that forks a helper which forks in turn - which is exactly
- * what Wine's loader does to reach wineserver - needs headroom the old
- * eight (chosen for three demo tasks plus threads) did not leave. */
-#define MAX_PROCESSES 16
+/* Thirty-two since Milestone 31, sixteen since Milestone 29. A forked
+ * child is a task like any other and so is a thread, so a Wine batch is
+ * the loader, a wineserver, wineboot and its helpers, and every thread
+ * each of them creates. Sixteen was enough for one unthreaded program
+ * and a server; it is not enough for a threaded one. */
+#define MAX_PROCESSES 32
 /* 8KB, not 4KB. Milestone 17 runs Win32 programs as scheduler tasks, and
  * their kernel-side call chains are far deeper than a demo task's
  * sys_write: int 0x81 -> win32_dispatch -> printf -> the format engine ->
@@ -378,6 +379,15 @@ int scheduler_as_sibling_count(uint32_t pd) {
 
 uint32_t scheduler_current_address_space(void) {
     return current ? current->page_directory : 0;
+}
+
+uint32_t scheduler_address_space_of(int pid) {
+    for (int i = 0; i < process_count; i++) {
+        if (process_table[i].pid == pid && process_table[i].state != PROC_ZOMBIE) {
+            return process_table[i].page_directory;
+        }
+    }
+    return 0;
 }
 
 void scheduler_set_current_tls_entry(int slot, uint32_t base, uint32_t limit) {
@@ -743,12 +753,13 @@ int scheduler_block_current_retry_multi(registers_t* regs,
     return block_common(regs, addrs, n, deadline, 1);
 }
 
-int scheduler_wake_on(uint32_t addr, int max, int32_t result) {
+static int wake_on_common(uint32_t pd, uint32_t addr, int max, int32_t result) {
     int n = 0;
     if (!addr) return 0;
     for (int i = 0; i < process_count && n < max; i++) {
         process_t* p = &process_table[i];
         if (p->state != PROC_BLOCKED) continue;
+        if (pd && p->page_directory != pd) continue;
         for (int w = 0; w < p->wait_count; w++) {
             if (p->wait_addr[w] != addr) continue;
             wake_one(p, result);
@@ -757,6 +768,27 @@ int scheduler_wake_on(uint32_t addr, int max, int32_t result) {
         }
     }
     return n;
+}
+
+int scheduler_wake_on(uint32_t addr, int max, int32_t result) {
+    return wake_on_common(0, addr, max, result);
+}
+
+int scheduler_wake_on_local(uint32_t addr, int max, int32_t result) {
+    /* Only tasks sharing this address space, which for a futex means only
+     * the threads that can actually see the word. Milestone 31: a wake
+     * used to match the address in every process, and a futex address is
+     * a *virtual* one - two processes started the same way get the same
+     * mmap arena and hand out the same addresses. The first match in
+     * table order won, so a FUTEX_WAKE meant for a thread of this process
+     * could be delivered to an unrelated one in another, and the thread
+     * that should have been woken waited out its whole timeout instead.
+     *
+     * Invisible while a Wine batch was three processes; a wineboot that
+     * gets as far as services.exe makes it a handful of times a run. */
+    uint32_t pd = scheduler_current_address_space();
+    if (!pd) return wake_on_common(0, addr, max, result);
+    return wake_on_common(pd, addr, max, result);
 }
 
 int scheduler_expire_waits(uint32_t now, int32_t result) {

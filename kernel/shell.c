@@ -625,7 +625,7 @@ static void run_command(char* line) {
          * has waited for is still in the table. */
         terminal_writestring("  PID  PPID  STATE     PROGRAM\n");
         for (int i = 0; ; i++) {
-            if (i >= 8) break;
+            if (i >= POSIX_MAX_PROCS) break;
             posix_proc_t* p = posix_proc_at(i);
             if (!p) continue;
             terminal_writestring("  ");

@@ -170,7 +170,7 @@ void posix_thread_exiting(void) {
      * used to be on the run queue re-testing its word, so zeroing it was
      * the wake. A waiter that really sleeps has to be told. This is the
      * whole of pthread_join's kernel side. */
-    scheduler_wake_on(ctid, MAX_JOINERS, 0);
+    scheduler_wake_on_local(ctid, MAX_JOINERS, 0);
 }
 
 /* --- futex ---------------------------------------------------------------
@@ -350,7 +350,7 @@ int32_t posix_sys_futex(uint32_t uaddr_v, int op, uint32_t val,
         }
 
         case FUTEX_WAKE: {
-            int n = scheduler_wake_on(uaddr_v, (int)val, 0);
+            int n = scheduler_wake_on_local(uaddr_v, (int)val, 0);
             futex_wakes += (uint32_t)n;
             return (int32_t)n;
         }

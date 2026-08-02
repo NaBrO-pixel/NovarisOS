@@ -706,6 +706,13 @@ static vfs_node_t* resolve_for_read(const char* path) {
 
 #define O_CLOEXEC 0x80000
 
+/* The handful of terminal ioctls that reach this kernel. */
+#define TCGETS      0x5401
+#define TCSETS      0x5402
+#define TCSETSW     0x5403
+#define TCSETSF     0x5404
+#define TIOCGWINSZ  0x5413
+
 static int32_t sys_open(const char* path, int flags, uint32_t mode) {
     if (!path) return -EFAULT;
 
@@ -1533,10 +1540,30 @@ static uint32_t poll_deadline_for(posix_proc_t* P, uint32_t key,
     return P->poll_deadline;
 }
 
-/* One tick from now, so a poll waiting on several descriptors re-tests
- * them promptly even though it could only register on one. */
+/* When to look again, for a poll that has not been fully registered on
+ * its descriptors: one tick, so nothing in the set goes unnoticed for
+ * longer than 10ms. */
 static uint32_t poll_next_wake(uint32_t deadline) {
     uint32_t tick = pit_get_ticks() + 1u;
+    if (!tick) tick = 1u;
+    if (deadline && (int32_t)(deadline - tick) < 0) return deadline;
+    return tick;
+}
+
+/* And when to look again for a poll that *is* registered on every one of
+ * its descriptors, and should therefore be woken by whichever one moves.
+ *
+ * Not "never", which is what the registration alone would justify. Every
+ * readiness transition has to have a wake behind it for that to be true,
+ * and one did not: draining a socket makes its peer writable, and
+ * nothing said so until Milestone 31 found it - by hanging, because a
+ * poll with no deadline and a missed wake waits for ever. The bug is
+ * fixed; the half-second is the standing admission that the next one of
+ * its kind should cost latency rather than liveness. */
+#define POLL_SAFETY_TICKS 50u
+
+static uint32_t poll_safety_wake(uint32_t deadline) {
+    uint32_t tick = pit_get_ticks() + POLL_SAFETY_TICKS;
     if (!tick) tick = 1u;
     if (deadline && (int32_t)(deadline - tick) < 0) return deadline;
     return tick;
@@ -1591,7 +1618,8 @@ static int32_t sys_poll(k_pollfd_t* fds_u, uint32_t nfds, int timeout_ms,
      * a set this task could not fully register - too big, or holding a
      * descriptor that is not a socket - still needs the one-tick
      * re-test. */
-    uint32_t until = all_registered ? deadline : poll_next_wake(deadline);
+    uint32_t until = all_registered ? poll_safety_wake(deadline)
+                                    : poll_next_wake(deadline);
     posix_request_block_multi(socks, nsocks, until, regs);
     return 0;   /* not used: the call is going to happen again */
 }
@@ -1674,7 +1702,8 @@ static int32_t sys_select(int nfds, uint32_t* rd, uint32_t* wr, uint32_t* ex,
     }
 
     /* Registered on every socket in the set - see sys_poll(). */
-    uint32_t until = all_registered ? deadline : poll_next_wake(deadline);
+    uint32_t until = all_registered ? poll_safety_wake(deadline)
+                                    : poll_next_wake(deadline);
     posix_request_block_multi(socks, nsocks, until, regs);
     return 0;   /* not used: the call is going to happen again */
 }
@@ -2424,11 +2453,15 @@ void posix_syscall(registers_t* regs) {
 
         case SYS_symlink:
         case SYS_symlinkat:
-            /* There are no symlinks in this filesystem and there is no
-             * honest way to fake one. Wine makes them inside its prefix
-             * (the dosdevices drive letters) and carries on when they
-             * fail, which is why -EPERM rather than -ENOSYS: the operation
-             * is understood and refused, not unknown. */
+            /* There are no symlinks in this filesystem. Milestone 31
+             * built them - a VFS node holding a path, resolution that
+             * walks through one, real lstat and readlink, verified
+             * byte-identical to Linux - and then took them back out,
+             * because what they unlock is a milestone rather than a
+             * feature. See ROADMAP.md Milestone 31.
+             *
+             * -EPERM rather than -ENOSYS: the operation is understood and
+             * refused, not unknown, and Wine carries on when it fails. */
             r = -EPERM;
             break;
 
@@ -2560,15 +2593,38 @@ void posix_syscall(registers_t* regs) {
             } else {
                 r = posix_raise_pid((int)a, (int)b, SI_USER,
                                     posix_current()->pid);
+                /* Not a process id. On Linux every thread has an id in
+                 * the same space as a process's, and wineserver signals
+                 * client threads by theirs - so a miss here is worth one
+                 * more look before it becomes ESRCH. */
+                if (r == -ESRCH) {
+                    posix_proc_t* t = posix_proc_by_task((int)a);
+                    if (t) r = posix_raise_pid(t->pid, (int)b, SI_USER,
+                                               posix_current()->pid);
+                }
             }
             break;
-        case SYS_tgkill:
-            /* Targets a *thread*, and threads share this process's
-             * structure - so this is always the local path. It differs
-             * from kill only in the si_code an SA_SIGINFO handler sees,
-             * which is how a program tells the two apart. */
-            r = posix_raise_from((int)c, SI_TKILL, (int32_t)a);
+        case SYS_tgkill: {
+            /* (tgid, tid, sig). Threads of one process share its
+             * structure, so a signal aimed at a sibling is the local
+             * path - but a *thread of another process* is not, and
+             * Milestone 30's "always local" reading sent it to the
+             * sender instead. Which was invisible until wineserver did
+             * it: it suspends a client's threads by tid, and the signal
+             * landed on wineserver, which has no handler for it, and
+             * killed the server every client depends on.
+             *
+             * It differs from kill only in the si_code an SA_SIGINFO
+             * handler sees, which is how a program tells the two apart. */
+            posix_proc_t* me = posix_current();
+            posix_proc_t* target = posix_proc_by_task((int)b);
+            if (!target || target == me) {
+                r = posix_raise_from((int)c, SI_TKILL, (int32_t)a);
+            } else {
+                r = posix_raise_pid(target->pid, (int)c, SI_TKILL, me->pid);
+            }
             break;
+        }
 
         /* Real since Milestone 20 - see kernel/posix_thread.c. */
         case SYS_set_thread_area:
@@ -2585,9 +2641,38 @@ void posix_syscall(registers_t* regs) {
 
         /* isatty() is ioctl(TCGETS) under the covers; saying "yes, a
          * terminal" for the console streams and "no" otherwise is enough
-         * for a libc to pick line buffering. */
+         * for a libc to pick line buffering.
+         *
+         * TIOCGWINSZ is real since Milestone 31, and it had to become
+         * real because answering 0 to *every* request was worse than
+         * refusing. A successful ioctl that writes nothing tells the
+         * caller "here is your answer" and leaves it reading its own
+         * uninitialised stack: Wine asks for the terminal's size at
+         * startup and passes it to conhost, so what conhost was told to
+         * draw was `--width 0 --height 676`, and a console zero columns
+         * wide is not something a console program survives. Everything
+         * else this kernel does not implement now says so. */
         case SYS_ioctl:
-            r = (a < 3) ? 0 : -EINVAL;
+            if (a >= 3) { r = -ENOTTY; break; }
+            if (b == TIOCGWINSZ) {
+                /* struct winsize { unsigned short ws_row, ws_col,
+                 *                  ws_xpixel, ws_ypixel; } */
+                uint16_t* ws = (uint16_t*)c;
+                if (!ws) { r = -EFAULT; break; }
+                uint32_t cols = 0, rws = 0;
+                console_get_size(&cols, &rws);
+                ws[0] = (uint16_t)rws;
+                ws[1] = (uint16_t)cols;
+                ws[2] = 0;
+                ws[3] = 0;
+                r = 0;
+                break;
+            }
+            /* The termios requests, which is all isatty() needs: the
+             * call succeeding is the answer, and no libc here reads the
+             * struct back. */
+            r = (b == TCGETS || b == TCSETS || b == TCSETSW ||
+                 b == TCSETSF) ? 0 : -ENOTTY;
             break;
 
         case SYS_exit:

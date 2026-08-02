@@ -242,6 +242,13 @@ int32_t socket_read(socket_t* s, void* buf, uint32_t len, registers_t* regs) {
     }
 
     uint32_t n = q_get(s, (uint8_t*)buf, len, 0);
+    /* Draining this socket's queue is what makes the *peer* writable
+     * again, so anyone parked on the peer has to be told. Milestone 31:
+     * this was missing, and invisible for as long as every poll also
+     * carried a one-tick deadline and re-tested everything anyway. A poll
+     * that is really woken by its descriptors notices the difference
+     * immediately - as a hang. */
+    if (n && s->peer) scheduler_wake_on((uint32_t)s->peer, MAX_SOCKETS, 0);
     return (int32_t)n;
 }
 
