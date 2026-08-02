@@ -3927,6 +3927,263 @@ make -j4
 cd ../NovarisOS && make WINE_BUILD=../wine wine-initrd test-wine
 ```
 
+## Milestone 31 — threaded Windows programs, under real Wine ✅ DONE
+
+```
+novaris> run wine-preloader wine threads.exe
+Win32 threads test - real CreateThread on Novaris
+
+main thread GetCurrentThreadId() = 36
+
+created worker 1, thread id 56
+created worker 2, thread id 60
+created worker 3, thread id 64
+
+  worker 1 starting, GetCurrentThreadId() = 56
+  worker 2 starting, GetCurrentThreadId() = 60
+  worker 3 starting, GetCurrentThreadId() = 64
+  worker 1 done
+  worker 2 done
+  worker 3 done
+
+all 3 workers joined
+  worker 1 exit code 100
+  worker 2 exit code 200
+  worker 3 exit code 300
+
+interlocked counter: 60, expected 60  -> ok
+guarded counter:     60, expected 60  -> ok
+
+threads test done.
+```
+
+That is `userland/pe_test/threads.c`, the Milestone 17 binary — real
+`CreateThread`, `WaitForSingleObject`, `InterlockedIncrement` and a
+`CRITICAL_SECTION` — running through Wine's own kernel32 and ntdll rather
+than Novaris's hand-written Win32 layer. Every Win32 thread is a real
+pthread on a real `clone()`. `make test-wine-threads` asserts eleven
+lines of it.
+
+The two counters are the whole point. The interlocked one proves the
+workers all ran and every increment landed; the guarded one is
+incremented with a deliberately racy read-modify-write, so it only comes
+out at 60 if the critical section really serialised three threads.
+
+### What Milestone 30 named, and what it actually was
+
+Milestone 30 said it precisely: "a new thread's `fs` is not set up the
+way Wine expects before it runs". That was one of four things, and the
+other three were bigger.
+
+**A thread inherits its creator's segmentation, and inherited none of
+it.** Linux copies the parent's three TLS descriptors into the child in
+`copy_thread()` and only *then* applies `CLONE_SETTLS`. glibc cannot tell
+the difference — it sets its own descriptor before the new thread runs a
+line of its own code — and Wine can: its i386 ntdll allocates **one**
+descriptor for the whole process in `signal_init_threading()`, and every
+thread reaches its TEB through `fs` on that entry before ntdll gets as
+far as calling `set_thread_area()` for itself. With the entry's base left
+at zero in the child, that is a read through a null pointer, in the
+worker, which is exactly what was seen and could not be explained.
+
+So a POSIX thread's initial frame is a copy of its creator's now, the way
+`fork`'s already was — which is what carries the segment registers across
+— and all three TLS descriptors are inherited before `CLONE_SETTLS`
+overwrites the one it names. *Which* one it names comes from the
+`user_desc`'s `entry_number` rather than being assumed to be glibc's; a
+process where Wine allocated first has glibc on another. And the
+scheduler programs all three descriptors on every switch, including the
+ones a task has not set — only reprogramming the ones in use left the
+others holding the outgoing task's bases, so a stale selector addressed
+another thread's TLS block instead of faulting, which is the one failure
+mode that looks like working code.
+
+**`libgcc_s.so.1` is a hard requirement for a thread to end.** glibc
+unwinds a thread out of itself with `_Unwind_ForcedUnwind`, which it
+reaches by `dlopen()`ing a library nothing links against. Without it,
+every Wine worker printed `libgcc_s.so.1 must be installed for
+pthread_exit to work` and aborted. It is copied from the host toolchain
+into the Wine initrd now, like `ld-linux.so.2` and `libc.so.6` and for
+the same reasons.
+
+**"Nothing else can run" is a fact about a moment, not about a timeout.**
+A futex wait that could not park — because every sibling was blocked —
+idled in the kernel until its own deadline, holding the CPU across every
+tick that expired somebody else's wait. So a Wine thread waiting on a
+critical section held by a thread whose own timed wait had just expired
+starved it for the whole five seconds. It re-offers the CPU on every tick
+now, and parks properly the moment there is anyone to hand it to.
+`posix_syscall()`'s retry path had the identical loop and the identical
+fix, and `nanosleep` had the same shape — a Windows program calling
+`Sleep()` suspended every other thread of itself for the duration — so it
+parks too, on a remembered absolute deadline the way `poll()` already
+did.
+
+**And `poll` registered on one descriptor.** Milestone 28 parked on the
+*first* socket in the set plus a one-tick deadline and called the
+compromise openly. This is the bill: a wineserver round trip is one poll
+wake, and the socket carrying it is not the first in wineserver's set —
+the listening socket is. So every round trip cost 10ms, and Wine's
+console makes one per escape sequence while drawing a Windows console. A
+worker thread spent five seconds inside a single `printf`, holding
+msvcrt's lock, and every other thread of the program timed out waiting
+for it. "Threads work but are slow" was one wake latency wearing a
+disguise. A task can be parked on a *set* of addresses now, so a poll is
+woken by whichever descriptor moved.
+
+### The builtins that were built and not shipped
+
+Milestone 30 listed "no networking, so `ws2_32.dll` fails to initialise"
+as a limitation of the machine. It was not. A Wine builtin is two halves
+— a PE `.dll` the Windows program links against, and a Unix `.so` it
+reaches through `__wine_init_unix_call()` — and only the first half was
+being copied into the initrd. ws2_32's process attach *is* that call and
+nothing else, so it failed, and ntdll's loader turns a failed process
+attach into "Initializing dlls for wineboot.exe failed". The diagnosis
+had been "a subsystem is missing"; the fix is three lines of Makefile.
+
+With its Unix half present, wineboot got past ws2_32 and into the next
+things shipped by halves: shell32 needs shlwapi needs shcore,
+services.exe needs userenv, ole32 needs coml2, and shell32 delay-loads
+wininet (which needs mpr) to make the browser cache folders. Each missing
+one was not "that feature is unavailable" but an abort into a debugger
+that is not there. wineboot now runs to the end of what it can do without
+a prefix.
+
+### Four bugs the busier Wine then found
+
+**A signal aimed at another process's thread was delivered to the
+sender.** `tgkill`'s target is a thread, and Milestone 30 read that as
+"threads share this process's structure, so this is always the local
+path" — true of a sibling, false of a thread somewhere else. wineserver
+suspends a client's threads by tid, so the signal landed on wineserver,
+which has no `SIGUSR1` handler, and killed the one process every client
+is waiting on. The whole batch then hung. A tid is a *task* id, so it
+resolves through the scheduler to the address space it runs in and from
+there to the process that owns it; `kill()` falls back to the same lookup
+rather than reporting `ESRCH` for a thread that exists.
+
+**A futex wake matched the address in every process.** A futex word is a
+*virtual* address, and two processes started the same way get the same
+mmap arena and hand out the same addresses — so a `FUTEX_WAKE` could wake
+an unrelated task in another process and leave the thread it was meant
+for to time out. Invisible while a Wine batch was three processes; a
+handful of times a run once wineboot reached services.exe. Wakes that
+name a user address are scoped to the caller's address space now; wakes
+that name a kernel object still are not, because their waiters are
+deliberately elsewhere.
+
+**Draining a socket did not wake anyone waiting for it to be writable.**
+Harmless for as long as every poll also re-tested everything on a
+one-tick timer, and a hang the moment poll was really woken by its
+descriptors. The backstop stays for that reason, at half a second rather
+than 10ms: the registration is only exhaustive if every readiness
+transition has a wake behind it, and one did not.
+
+**`ioctl` answered 0 to everything and wrote nothing.** A successful
+ioctl that fills in no answer is worse than a refused one — it tells the
+caller "here is your answer" and leaves it reading its own uninitialised
+stack. Wine asks for the terminal size at startup and passes it to
+conhost, so conhost was told to draw a console `--width 0`. `TIOCGWINSZ`
+is real now and reports the console's actual character grid; everything
+else says `ENOTTY`.
+
+Plus process tables sized for a Wine batch of three. A wineboot that gets
+as far as services.exe needs more, and running out was silent from
+outside: fork returned `-EAGAIN`, Wine reported nothing, and the Windows
+program simply never ran. 24 processes, 32 tasks.
+
+### Symbolic links: built, working, and deliberately not enabled
+
+They were built and they work. A VFS node whose contents are a path;
+resolution that walks *through* a link in the middle of a path and stops
+at one on the end when the caller means `lstat`; real `readlink`; `ELOOP`
+rather than `ENOENT` for a link that points at itself, because a program
+testing for a file's absence must not read "could not tell" as "not
+there"; `unlink` that removes the link and never the target. Twenty-four
+checks in `fstest.elf`, byte-identical to Linux on the first run.
+
+They are not enabled, and the reason is what they unlock rather than
+anything wrong with them.
+
+Wine's prefix has no DOS drives without symlinks — `dosdevices/c:` and
+`dosdevices/z:` **are** symlinks, made by two lines of
+`create_config_dir()` in its ntdll — and that missing drive table is the
+whole of the "could not find DOS drive for the current working directory"
+message Milestone 30 reported. With symlinks, that message goes away,
+Wine resolves `Z:\hellowin.exe` properly instead of falling back to the
+Windows directory, and it then does what a real installation does next:
+allocates a real Windows console by starting `conhost.exe`.
+
+conhost is where it stops. The Windows program loads, its three DLLs
+load, `init_console creating unix console (size 155 43)` is the last
+thing it says, and nothing prints. A working conhost needs the prefix
+`wine.inf` builds, and `wine.inf` needs a filesystem that is not 40MB of
+initrd read into RAM whole. That is the next milestone, and it should be
+entered deliberately.
+
+So `symlink()` still answers `-EPERM` — understood and refused, which is
+what Milestone 30 chose it for. Turning it on would trade a Windows
+program that runs for one that does not.
+
+### Verified
+
+```
+$ make test-wine-threads
+All 11 transcript assertion(s) passed.
+
+$ make test-wine
+All 7 transcript assertion(s) passed.
+
+$ make test-posix
+ 41 lines, 20 checks  posixtest.elf     60 lines, 45 checks  uctest.elf
+ 93 lines, 67 checks  sigtest.elf       67 lines, 45 checks  fstest.elf
+ 50 lines, 25 checks  pthtest.elf       34 lines, 23 checks  socktest.elf
+ 51 lines, 34 checks  forktest.elf      39 lines, 24 checks  mmaptest.elf
+  5 lines,  0 checks  glibc.elf          5 lines,  0 checks  dyn.elf
+```
+
+`pthtest.elf` grew a section that fails without the kernel change and
+passes with it, and it is the interesting kind of test: a *second* TLS
+descriptor behind `fs`, a thread cloned with `CLONE_SETTLS` naming only
+`gs`, and the worker reading `fs` before touching it. Everything above it
+in that file uses one segment, so none of it could see the difference
+between "the child got its creator's descriptors" and "the child got one
+descriptor and two zeroes".
+
+Host tests 38 + 30 + 52, smoke suite 17 assertions, all ten comparison
+binaries byte-identical to Linux.
+
+### Honest scope
+
+- [x] **A threaded Windows `.exe` runs to completion under real Wine on
+      Novaris** — three worker threads, a real join, correct exit codes,
+      and a critical section that really serialises.
+- [x] Thread-local storage inherited the way Linux inherits it, and the
+      descriptor `CLONE_SETTLS` names rather than the one glibc happens
+      to use.
+- [x] A blocked thread no longer starves the thread it is waiting for,
+      in the futex path, the syscall retry path or `nanosleep`.
+- [x] `poll` woken by the descriptor that moved rather than by a timer.
+- [x] Signals aimed at another process's thread reach that process.
+- [x] Wine's builtins ship with both halves, so wineboot runs to the end
+      of what it can do without a prefix.
+- [ ] **One lock wait per run still times out.** Wine prints
+      `err:sync:RtlpWaitForCriticalSection ... wait timed out`, waits its
+      five seconds, retries and succeeds. It was three a run before this
+      milestone and none once the scheduler stopped starving threads —
+      and then wineboot started getting far enough to launch
+      services.exe, the machine got busier, and one came back. The
+      counters prove it is a latency defect and not a correctness one,
+      which is why `make test-wine-threads` asserts the counters and does
+      not assert its absence.
+- [ ] **No Wine prefix.** `wineboot` cannot run `wine.inf`, so there is
+      no `C:\windows`, no registry beyond what wineserver creates, and no
+      real console. Symlinks are built and would give it the drives; the
+      rest needs a real filesystem on a real disk.
+- [ ] **No GUI**, **no networking**, and `fork` still copies eagerly —
+      unchanged from Milestone 30.
+
 ## Path A — porting Wine (the current direction)
 
 Milestone 8 laid out two ways to run Windows binaries: port Wine (Path
@@ -3989,7 +4246,12 @@ are forced into an order:
    handshake with the client. The next thing that stops it is a
    subsystem again, and again not the one that looked obvious:
    `MAP_SHARED`. Two processes have to be able to map the same physical
-   frames of a file, and this kernel has no page cache.
+   frames of a file, and this kernel has no page cache. Milestone 30
+   built that and ran a Windows program; Milestone 31 made a *threaded*
+   one work, and found that the last thing between Novaris and a real
+   Wine installation is a filesystem — `wine.inf` builds the prefix, and
+   forty megabytes of initrd read into RAM is not somewhere to build
+   one.
 
 Each is roughly milestone-sized. (3) and (4) are each comparable in scope
 to everything built so far combined. No Wine or ReactOS source gets
@@ -4002,6 +4264,30 @@ broader real-world Windows software, running on Novaris via Wine. It is
 not a claim that anything at all will run. Chrome will not: that needs
 networking, GPU acceleration, sandboxing and hundreds of DLLs far beyond
 this project's scope, Wine or no Wine.
+
+## Milestone 32 — a real filesystem on a real disk (next)
+
+Named by Milestone 31 rather than guessed at, which is how every step of
+Path A has gone. Everything left on the Wine list runs through it:
+
+- **The Wine prefix.** `wineboot` runs `wine.inf` through setupapi to
+  build `C:\windows`, the registry and the user profile — hundreds of
+  files, against a node table that is 384 entries in RAM. Without it
+  there is no real console (conhost has nowhere to live) and every
+  Windows program starts in a directory that does not exist.
+- **Symlinks, which are already written.** They are held back only
+  because turning them on gives Wine its DOS drives and therefore its
+  full startup path, which then needs the prefix. Milestone 31's
+  write-up has the detail; the code is straightforward and was verified
+  byte-identical to Linux.
+- **The 40MB initrd.** It is read into memory whole, which is why the
+  Wine ISO wants 768MB of guest RAM, and shipping the DLLs a real
+  prefix needs would roughly double it. A disk makes the size question
+  go away rather than answering it.
+
+Roughly: an ATA PIO driver, a partition table, and a filesystem simple
+enough to write from scratch — FAT32 is the obvious one, and Milestone 6
+deferred it once already.
 
 ## Later / open-ended
 
@@ -4045,8 +4331,20 @@ much each would widen what runs:
 
    ```bash
    apt-get install nasm grub-pc-bin grub-common xorriso mtools \
-       qemu-system-x86 build-essential gcc-multilib mingw-w64
+       qemu-system-x86 build-essential gcc-multilib mingw-w64 flex bison
    make && make test && make test-qemu && make test-posix
+   ```
+
+   And for the Wine half, which needs a built Wine tree (`flex` and
+   `bison` are Wine's, not Novaris's):
+
+   ```bash
+   git clone --depth 1 -b stable https://github.com/wine-mirror/wine
+   cd wine && CC="gcc -m32" ./configure --enable-archs=i386 \
+       --disable-tests --without-x --without-freetype --without-vulkan \
+       --without-opengl && make -j4
+   cd ../NovarisOS && make WINE_BUILD=../wine wine-initrd \
+       test-wine test-wine-threads
    ```
 
    `mingw-w64` builds the Windows test programs in `userland/pe_test/`;
