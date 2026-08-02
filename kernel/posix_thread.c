@@ -55,12 +55,16 @@ typedef struct {
     uint32_t flags;
 } user_desc_t;
 
-/* Novaris has exactly one TLS descriptor (GDT entry 7), reprogrammed on
- * every thread switch. Linux offers three (entries 6-8) and glibc uses
- * the first it is given, so answering with a fixed one is enough - and
- * refusing a request for a second is more honest than handing back a
- * descriptor that quietly aliases the first. */
-#define TLS_ENTRY_NUMBER 7
+/* Linux/i386 gives a thread three TLS descriptors, entries 6 to 8, and
+ * hands out whichever is free. Novaris had exactly one and said that was
+ * enough because glibc uses the first it is given - which was true right
+ * up until something *else* asked for one too.
+ *
+ * Wine does. Its i386 code reaches the Windows TEB through fs the way
+ * glibc reaches its TLS through gs, and it gets that segment by calling
+ * set_thread_area(). With one descriptor to go round, Wine's request
+ * overwrote glibc's and every glibc function that touched errno
+ * afterwards read it out of the middle of a TEB. See include/gdt.h. */
 
 /* Set by an implementation that wants its whole syscall re-executed
  * later; consumed by posix_syscall(). See posix_retry_pending(). */
@@ -78,14 +82,26 @@ int32_t posix_sys_set_thread_area(uint32_t udesc) {
     user_desc_t* u = (user_desc_t*)udesc;
     if (!u) return -EFAULT;
 
+    int slot;
     if (u->entry_number == 0xFFFFFFFFu) {
-        u->entry_number = TLS_ENTRY_NUMBER;   /* "allocate one for me" */
-    } else if (u->entry_number != TLS_ENTRY_NUMBER) {
-        return -EINVAL;
+        /* "Allocate one for me", which is what both glibc and Wine ask.
+         * The middle entry goes first so that a program that only ever
+         * needs one gets the same selector it always got. */
+        uint32_t used = scheduler_current_tls_used();
+        static const int order[GDT_TLS_COUNT] = { 7, 6, 8 };
+        slot = -1;
+        for (int i = 0; i < GDT_TLS_COUNT; i++) {
+            if (!(used & (1u << order[i]))) { slot = order[i]; break; }
+        }
+        if (slot < 0) return -ESRCH;   /* what Linux says when all are taken */
+        u->entry_number = (uint32_t)slot;
+    } else {
+        slot = (int)u->entry_number;
+        if (slot < GDT_TLS_MIN || slot > GDT_TLS_MAX) return -EINVAL;
     }
 
-    gdt_set_tls(u->base_addr, u->limit);
-    scheduler_set_current_tls(u->base_addr, u->limit);
+    gdt_set_tls_entry(slot, u->base_addr, u->limit);
+    scheduler_set_current_tls_entry(slot, u->base_addr, u->limit);
     return 0;
 }
 

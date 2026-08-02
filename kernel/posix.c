@@ -60,7 +60,7 @@ static fd_entry_t* fd_get(int fd) {
  * is the sender's and means nothing at the other end - what travels is
  * the object, not the name for it. */
 
-#define MAX_IN_FLIGHT 8
+#define MAX_IN_FLIGHT 32
 static fd_entry_t in_flight[MAX_IN_FLIGHT];
 
 /* The trap frame of the call being served. read() on a socket may have to
@@ -121,6 +121,7 @@ uint32_t posix_fd_export(int fd) {
              * reference travels with the message and is handed to the
              * receiver by posix_fd_import(). */
             if (e->kind == FD_SOCKET) socket_ref(e->sock);
+            if (e->kind == FD_FILE) vfs_node_ref(e->node);
             return (uint32_t)(i + 1);   /* 0 means "nothing" */
         }
     }
@@ -137,6 +138,39 @@ int posix_fd_import(uint32_t token) {
     p->fds[fd] = *src;
     src->kind = FD_FREE;
     return fd;
+}
+
+/* --- files kept alive by a mapping (Milestone 30) ------------------------
+ *
+ * A shared mapping outlives the descriptor it was made from, and on Unix
+ * it outlives the file's *name* too: the ordinary way to make anonymous
+ * shared memory is to create a file, open it, unlink it and map it, which
+ * is exactly what wineserver does. So a mapping holds a reference.
+ *
+ * Released at the end of the program run rather than at munmap, because
+ * nothing here records which file a given address range came from. That
+ * is a real limit and a small one - the reference costs a node, the run
+ * ends, and the table is fixed at four because Wine uses one. */
+#define MAX_PINNED 4
+static vfs_node_t* pinned[MAX_PINNED];
+
+static void posix_pin_mapped(vfs_node_t* node) {
+    for (int i = 0; i < MAX_PINNED; i++) {
+        if (pinned[i] == node) return;      /* already held */
+        if (!pinned[i]) {
+            pinned[i] = node;
+            vfs_node_ref(node);
+            return;
+        }
+    }
+}
+
+static void posix_unpin_all(void) {
+    for (int i = 0; i < MAX_PINNED; i++) {
+        if (!pinned[i]) continue;
+        vfs_node_unref(pinned[i]);
+        pinned[i] = 0;
+    }
 }
 
 /* --- the process's address space ----------------------------------------
@@ -175,9 +209,16 @@ void posix_set_exe_path(const char* path) {
  * PAE's NX bit, so PROT_EXEC is accepted and ignored - noted here because
  * a silently-wrong protection is worth being explicit about. */
 static uint32_t prot_to_pte(int prot) {
-    uint32_t flags = PAGE_USER;
-    if (prot == PROT_NONE) return 0; /* caller unmaps instead */
-    flags |= PAGE_PRESENT;
+    /* PROT_NONE on a page that already has memory behind it is "present,
+     * but not the program's" - the frame stays, PAGE_USER goes, and a
+     * ring-3 access faults while the bytes survive. That distinction is
+     * not academic: mprotect(PROT_NONE) followed by mprotect(READ|WRITE)
+     * has to give the data back, which is how Wine's heap marks a block
+     * inaccessible and then reuses it. An implementation that freed the
+     * frame passed every test here and made Wine read its own heap
+     * headers out of a page of zeroes. */
+    if (prot == PROT_NONE) return PAGE_PRESENT;
+    uint32_t flags = PAGE_USER | PAGE_PRESENT;
     if (prot & PROT_WRITE) flags |= PAGE_RW;
     return flags;
 }
@@ -210,6 +251,7 @@ static void process_teardown(int status) {
      * gone - which is precisely how a pipe reports end of file. */
     for (int i = 3; i < MAX_FDS; i++) {
         if (p->fds[i].kind == FD_SOCKET) socket_close(p->fds[i].sock);
+        if (p->fds[i].kind == FD_FILE) vfs_node_unref(p->fds[i].node);
         p->fds[i].kind = FD_FREE;
     }
 
@@ -263,6 +305,7 @@ void posix_process_begin(void) {
 
 void posix_process_end(void) {
     socket_process_end();
+    posix_unpin_all();
     /* The mappings themselves need no teardown: they were made in the
      * process's own page directory, which is about to be destroyed. Only
      * the bookkeeping goes, so the next program starts from a clean table
@@ -288,8 +331,10 @@ static int map_range(uint32_t base, uint32_t bytes, uint32_t flags) {
              * segment actually wants. Keeping the frame but *not* applying
              * the new flags would leave every one of those segments with
              * the reservation's permissions, so a write to the GOT would
-             * fault. Keep the page, take the new protection. */
-            paging_map_page(va, pte & ~0xFFFu, flags);
+             * fault. Keep the page, take the new protection - and keep
+             * PAGE_SHARED, which is not a protection but a fact about who
+             * owns the frame. */
+            paging_map_page(va, pte & ~0xFFFu, flags | (pte & PAGE_SHARED));
             continue;
         }
         uint32_t phys = pmm_alloc_frame();
@@ -303,9 +348,12 @@ static int map_range(uint32_t base, uint32_t bytes, uint32_t flags) {
 static void unmap_range(uint32_t base, uint32_t bytes) {
     for (uint32_t va = base; va < base + bytes; va += PAGE_SIZE) {
         uint32_t pte = paging_get_entry(va);
+        if (!(pte & (PAGE_PRESENT | PAGE_RESERVED))) continue;
+        paging_unmap_page(va);   /* clears a reservation too */
         if (!(pte & PAGE_PRESENT)) continue;
-        paging_unmap_page(va);
-        pmm_free_frame(pte & ~0xFFFu);
+        /* A shared mapping's frames are the file's, not this process's -
+         * unmapping is the whole of what munmap does to them. */
+        if (!(pte & PAGE_SHARED)) pmm_free_frame(pte & ~0xFFFu);
     }
 }
 
@@ -321,18 +369,42 @@ static int32_t sys_mmap2(uint32_t addr, uint32_t length, int prot,
      * essentially nothing else. With no page cache, a private file
      * mapping degenerates to "allocate pages and read the bytes in",
      * which is behaviourally correct for MAP_PRIVATE: the mapping is a
-     * private copy, and nothing here ever writes it back. MAP_SHARED
-     * would be a lie and is refused. */
+     * private copy, and nothing here ever writes it back.
+     *
+     * MAP_SHARED is real since Milestone 30, and needed no page cache: a
+     * mappable file's bytes live in *page-aligned* storage, so page N of
+     * the file is exactly one physical frame and the mapping hands that
+     * frame to user space. The file's contents and the mapping are then
+     * the same memory rather than two copies to keep in step, which is
+     * what makes two processes mapping one file see each other's writes.
+     * Wine needs exactly that: wineserver publishes the Windows
+     * KUSER_SHARED_DATA page to every client this way. */
     int file_backed = !(flags & MAP_ANONYMOUS) && fd >= 0;
-    if (file_backed && (flags & MAP_SHARED)) return -ENODEV;
+    int shared = file_backed && (flags & MAP_SHARED);
     if (!file_backed && fd >= 0 && !(flags & MAP_ANONYMOUS)) return -ENOSYS;
 
     posix_proc_t* P = posix_current();
     uint32_t bytes = (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     uint32_t base;
 
-    if (flags & MAP_FIXED) {
+    if (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) {
         if (addr == 0 || (addr & (PAGE_SIZE - 1))) return -EINVAL;
+        /* The range has to exist and has to be the program's. Wine's
+         * preloader asks for two gigabytes at a time and halves until
+         * something fits, so both of these are answers it expects. */
+        if (addr + bytes < addr) return -ENOMEM;            /* wrapped */
+        if (addr + bytes > USER_SPACE_END) return -ENOMEM;  /* the kernel's */
+        /* MAP_FIXED_NOREPLACE differs from MAP_FIXED in exactly one way,
+         * and it is the way that matters to a loader: it refuses rather
+         * than evicting. A reservation counts as occupied - it is
+         * somebody's plan for that address. */
+        if (flags & MAP_FIXED_NOREPLACE) {
+            for (uint32_t p = 0; p < bytes; p += PAGE_SIZE) {
+                if (paging_get_entry(addr + p) & (PAGE_PRESENT | PAGE_RESERVED)) {
+                    return -EEXIST;
+                }
+            }
+        }
         /* A fixed mapping is the one request that can name an address the
          * kernel is already using. The first 4MB is identity-mapped and
          * shared into every address space, so a mapping there replaces
@@ -351,8 +423,61 @@ static int32_t sys_mmap2(uint32_t addr, uint32_t length, int prot,
         P->mmap_next += bytes;
     }
 
+    /* PROT_NONE with nothing behind it is a *reservation*, and it costs a
+     * page table per 4MB rather than a frame per page. Wine's preloader
+     * opens by reserving whatever it can of the low 2GB so that Windows
+     * images can be placed there later; committing that would be
+     * committing the machine. mprotect() below turns it into memory when
+     * the program comes back for it. */
+    if (prot == PROT_NONE && !file_backed) {
+        for (uint32_t p = 0; p < bytes; p += PAGE_SIZE) {
+            uint32_t old = paging_get_entry(base + p);
+            if ((old & PAGE_PRESENT) && !(old & PAGE_SHARED)) {
+                paging_unmap_page(base + p);
+                pmm_free_frame(old & ~0xFFFu);
+            }
+            if (!paging_reserve_page(base + p)) {
+                unmap_range(base, p);
+                return -ENOMEM;
+            }
+        }
+        return (int32_t)base;
+    }
+
     uint32_t pte_flags = prot_to_pte(prot);
-    if (!pte_flags) pte_flags = PAGE_PRESENT | PAGE_USER; /* PROT_NONE: mapped, unwritable */
+
+    if (shared) {
+        fd_entry_t* e = fd_get(fd);
+        if (!e || e->kind != FD_FILE) return -EBADF;
+        uint32_t off = pgoff * PAGE_SIZE;
+
+        /* Give the file page-aligned storage covering the mapping, then
+         * hand over the frames that storage is made of. */
+        if (!vfs_make_mappable(e->node, off + bytes)) return -ENOMEM;
+
+        for (uint32_t p = 0; p < bytes; p += PAGE_SIZE) {
+            uint32_t kva = (uint32_t)e->node->data + off + p;
+            uint32_t kpte = paging_get_entry(kva);
+            if (!(kpte & PAGE_PRESENT)) { unmap_range(base, p); return -ENOMEM; }
+
+            /* MAP_FIXED over something this process already had: that
+             * frame is going out of use here and now, so give it back
+             * rather than leaking it. */
+            uint32_t old = paging_get_entry(base + p);
+            if ((old & PAGE_PRESENT) && !(old & PAGE_SHARED)) {
+                pmm_free_frame(old & ~0xFFFu);
+            }
+            paging_map_page(base + p, kpte & ~0xFFFu,
+                            pte_flags | PAGE_SHARED);
+        }
+
+        /* The mapping keeps the file alive. Wine closes the descriptor
+         * as soon as the mapping exists - and wineserver unlinked the
+         * file before that - so without this the node would be freed
+         * while its frames were still mapped into two processes. */
+        posix_pin_mapped(e->node);
+        return (int32_t)base;
+    }
 
     if (!map_range(base, bytes, pte_flags)) {
         unmap_range(base, bytes);
@@ -404,13 +529,30 @@ static int32_t sys_mprotect(uint32_t addr, uint32_t length, int prot) {
     if (addr & (PAGE_SIZE - 1)) return -EINVAL;
     uint32_t bytes = (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     uint32_t flags = prot_to_pte(prot);
-    if (!flags) flags = PAGE_PRESENT | PAGE_USER;
 
     for (uint32_t va = addr; va < addr + bytes; va += PAGE_SIZE) {
         uint32_t pte = paging_get_entry(va);
-        if (!(pte & PAGE_PRESENT)) return -ENOMEM;
-        /* Keep the frame, change the permission bits. */
-        paging_map_page(va, pte & ~0xFFFu, flags);
+
+        if (!(pte & PAGE_PRESENT)) {
+            /* A reservation being cashed in. This is the other half of
+             * PROT_NONE costing nothing: the address was kept for the
+             * program, and now the program wants the memory. Anything
+             * that was never reserved at all is still -ENOMEM. */
+            if (!(pte & PAGE_RESERVED)) return -ENOMEM;
+            if (prot == PROT_NONE) continue;      /* already exactly that */
+            uint32_t frame = pmm_alloc_frame();
+            if (!frame) return -ENOMEM;
+            paging_map_page(va, frame, flags);
+            kmemset((void*)va, 0, PAGE_SIZE);     /* it reads as zero */
+            continue;
+        }
+
+        /* Keep the frame, change the permission bits - but not the bit
+         * that says the frame is somebody else's. PROT_NONE is a
+         * permission here like any other (see prot_to_pte): the page
+         * stays mapped and stops being the program's, so the bytes are
+         * still there when it asks for them back. */
+        paging_map_page(va, pte & ~0xFFFu, flags | (pte & PAGE_SHARED));
     }
     return 0;
 }
@@ -552,6 +694,8 @@ static int32_t sys_open(const char* path, int flags, uint32_t mode) {
 
     P->fds[fd].kind = FD_FILE;
     P->fds[fd].node = node;
+    /* A descriptor keeps the file alive even after its name is gone. */
+    vfs_node_ref(node);
     P->fds[fd].offset = (want_write && (flags & O_APPEND)) ? node->length : 0;
     P->fds[fd].writable = want_write;
     P->fds[fd].append = (flags & O_APPEND) != 0;
@@ -565,6 +709,7 @@ static int32_t sys_close(int fd) {
     if (!e) return -EBADF;
     if (fd < 3) return 0; /* closing a standard stream is a no-op here */
     if (e->kind == FD_SOCKET) socket_close(e->sock);
+    if (e->kind == FD_FILE) vfs_node_unref(e->node);
     e->kind = FD_FREE;
     e->node = 0;
     e->sock = 0;
@@ -588,6 +733,7 @@ static int32_t fd_dup_to(int oldfd, int newfd, int cloexec) {
     P->fds[newfd] = *e;
     P->fds[newfd].cloexec = cloexec;
     if (e->kind == FD_SOCKET) socket_ref(e->sock);
+    if (e->kind == FD_FILE) vfs_node_ref(e->node);
     return newfd;
 }
 
@@ -1582,6 +1728,8 @@ static const char* syscall_name(uint32_t n) {
         case SYS_renameat2: return "renameat2";
         case SYS_getdents64: return "getdents64";
         case SYS_ftruncate64: return "ftruncate64";
+        case SYS_ftruncate: return "ftruncate";
+        case SYS_truncate: return "truncate";
         case SYS_truncate64: return "truncate64";
         case SYS_fsync: return "fsync";
         case SYS_chdir: return "chdir";
@@ -1600,6 +1748,7 @@ static const char* syscall_name(uint32_t n) {
         case SYS_rt_sigaction: return "rt_sigaction";
         case SYS_rt_sigprocmask: return "rt_sigprocmask";
         case SYS_sigaltstack: return "sigaltstack";
+        case SYS_sigreturn: return "sigreturn";
         case SYS_rt_sigreturn: return "rt_sigreturn";
         case SYS_mmap2: return "mmap2";
         case SYS_stat64: return "stat64";
@@ -1744,6 +1893,17 @@ void posix_syscall(registers_t* regs) {
             if (e) { r = -EINVAL; break; }
             r = sys_rename((const char*)b, (const char*)d);
             break;
+        case SYS_ftruncate:
+            /* The 32-bit forms. glibc uses the 64-bit ones, but a program
+             * writing raw syscalls reaches for these - and so does
+             * anything built before large-file support. */
+            r = sys_ftruncate((int)a, b);
+            break;
+        case SYS_truncate: {
+            vfs_node_t* t = resolve_for_read((const char*)a);
+            r = t ? vfs_truncate(t, b) : -ENOENT;
+            break;
+        }
         case SYS_ftruncate64:
             /* (fd, length_lo, length_hi) - the 64-bit length arrives as a
              * register pair, and anything needing the high half is far
@@ -2162,6 +2322,23 @@ void posix_syscall(registers_t* regs) {
             r = 0;
             break;
 
+        case SYS_sched_getaffinity: {
+            /* (pid, cpusetsize, mask). One CPU, so one bit. Wine reads
+             * this to size its thread pools; answering "processor 0, and
+             * that is all" is the truth here. */
+            if (c == 0) { r = -EFAULT; break; }
+            if (b < 4) { r = -EINVAL; break; }
+            uint32_t* mask = (uint32_t*)c;
+            mask[0] = 1;
+            r = 4;
+            break;
+        }
+        case SYS_sched_setaffinity:
+            /* Accepted: there is one processor and every mask that names
+             * it is satisfied by doing nothing. */
+            r = 0;
+            break;
+
         case SYS_sched_yield:
             /* A real yield: the caller is telling the scheduler it has
              * nothing to do, and there is a scheduler to tell. */
@@ -2220,6 +2397,14 @@ void posix_syscall(registers_t* regs) {
         case SYS_sigaltstack:
             r = posix_sys_sigaltstack((const k_stack_t*)a, (k_stack_t*)b);
             break;
+        case SYS_sigreturn:
+            /* The *legacy* sigreturn, which glibc's restorer issues for a
+             * handler installed without SA_SIGINFO. It differs from the
+             * rt_ one only in where the restorer left esp - see
+             * posix_sigreturn_common(). A program whose handler was not
+             * SA_SIGINFO could not return from it at all before this. */
+            posix_sys_sigreturn(regs);
+            return;
         case SYS_rt_sigreturn:
             /* Restores the interrupted context wholesale, so eax is set
              * by the restore rather than by the usual `regs->eax = r`

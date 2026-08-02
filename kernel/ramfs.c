@@ -34,7 +34,10 @@
  * process table is one: a fixed, visible ceiling beats an allocator
  * failure in the middle of a path walk. 256 is about ten times what the
  * initrd needs. */
-#define RAMFS_MAX_NODES 256
+/* 384 since Milestone 30: the Wine initrd carries the loader, wineserver,
+ * the NLS tables and a few dozen PE builtins, and a directory tree the
+ * programs then create on top of that. */
+#define RAMFS_MAX_NODES 384
 
 static vfs_node_t nodes[RAMFS_MAX_NODES];
 static vfs_node_t* root = 0;
@@ -44,7 +47,7 @@ static uint32_t heap_bytes = 0;
 /* --- the initrd archive, which is now only an input --------------------- */
 
 #define INITRD_MAGIC      0x53544C52u /* 'STLR' */
-#define INITRD_MAX_FILES  64
+#define INITRD_MAX_FILES  256
 #define INITRD_NAME_MAX   60
 
 typedef struct {
@@ -77,10 +80,19 @@ static vfs_node_t* node_alloc(void) {
 static void node_free(vfs_node_t* n) {
     if (n->data && !n->from_initrd) {
         heap_bytes -= n->capacity;
-        kfree(n->data);
+        kfree(n->data_base ? n->data_base : n->data);
     }
     kmemset(n, 0, sizeof(*n));
     nodes_used--;
+}
+
+void vfs_node_ref(vfs_node_t* node) {
+    if (node) node->refs++;
+}
+
+void vfs_node_unref(vfs_node_t* node) {
+    if (!node || node->refs <= 0) return;
+    if (--node->refs == 0 && node->unlinked) node_free(node);
 }
 
 static int name_eq(const char* a, const char* b) {
@@ -197,7 +209,12 @@ int32_t vfs_unlink(vfs_node_t* dir, const char* name, int want_dir) {
     if (is_dir && victim->first_child) return -ENOTEMPTY;
 
     *link = victim->next_sibling;
-    node_free(victim);
+    /* The name goes now; the file goes when the last descriptor and the
+     * last mapping do. */
+    victim->unlinked = 1;
+    victim->parent = 0;
+    victim->next_sibling = 0;
+    if (victim->refs == 0) node_free(victim);
     return 0;
 }
 
@@ -294,12 +311,57 @@ static int ensure_capacity(vfs_node_t* n, uint32_t want) {
 
     if (n->data && !n->from_initrd) {
         heap_bytes -= n->capacity;
-        kfree(n->data);
+        kfree(n->data_base ? n->data_base : n->data);
     }
     n->data = buf;
+    n->data_base = 0;
+    n->mappable = 0;
     n->capacity = cap;
     n->from_initrd = 0;
     heap_bytes += cap;
+    return 1;
+}
+
+/* Page-aligned storage, so that a shared mapping can hand user space the
+ * frames the file's bytes are actually in.
+ *
+ * Alignment is got the blunt way - over-allocate by a page and round up -
+ * because the kernel heap has no aligned allocator and one caller does
+ * not justify inventing it. `data_base` remembers the real allocation so
+ * it can still be freed.
+ *
+ * Growing a file after this moves its bytes, and therefore breaks any
+ * mapping already handed out. Nothing does that here: a file is sized by
+ * ftruncate before it is mapped, which is how anonymous shared memory is
+ * made on Unix and exactly what wineserver does. Recorded rather than
+ * defended against, because defending would mean a page cache and a page
+ * cache is a different milestone. */
+int vfs_make_mappable(vfs_node_t* n, uint32_t bytes) {
+    if (!n || (n->flags & VFS_DIRECTORY)) return 0;
+    if (bytes < n->length) bytes = n->length;
+    if (bytes == 0) bytes = 1;
+
+    uint32_t cap = (bytes + 4095u) & ~4095u;
+    if (n->mappable && n->capacity >= cap) return 1;
+
+    uint8_t* raw = (uint8_t*)kmalloc(cap + 4096u);
+    if (!raw) return 0;
+    uint8_t* buf = (uint8_t*)(((uint32_t)raw + 4095u) & ~4095u);
+
+    uint32_t keep = n->length < cap ? n->length : cap;
+    if (n->data && keep) kmemcpy(buf, n->data, keep);
+    kmemset(buf + keep, 0, cap - keep);
+
+    if (n->data && !n->from_initrd) {
+        heap_bytes -= n->capacity;
+        kfree(n->data_base ? n->data_base : n->data);
+    }
+    n->data = buf;
+    n->data_base = raw;
+    n->capacity = cap;
+    n->mappable = 1;
+    n->from_initrd = 0;
+    heap_bytes += cap + 4096u;
     return 1;
 }
 

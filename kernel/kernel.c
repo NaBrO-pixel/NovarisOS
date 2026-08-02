@@ -197,21 +197,38 @@ void kernel_main(uint32_t magic, multiboot_info_t* mbi) {
     terminal_writestring("Kernel heap installed (kmalloc/kfree)\n");
 
     if (initrd_mod) {
-        /* The module's physical memory is reserved but not necessarily
-         * mapped yet - identity-map it explicitly rather than assuming
-         * it landed inside boot.s's first-4MB mapping, since GRUB is
-         * free to place modules anywhere. */
+        /* Mapped into the *kernel* half rather than identity-mapped where
+         * GRUB happened to put it. Milestone 30 forced the change: GRUB
+         * places modules just above the kernel, so the initrd sat across
+         * 0x400000 - and 0x400000 is where every Windows executable ever
+         * built wants to load. Real Wine asked for exactly that range,
+         * was refused, and reported "out of memory".
+         *
+         * There was never a reason for the initrd to be at its physical
+         * address; the kernel only needs it to be *somewhere* it can
+         * read. Putting it high leaves the whole classic image range free
+         * for a program to map, and it costs one reservation of kernel
+         * page tables before the address space is frozen. */
         uint32_t start = initrd_mod->mod_start & ~0xFFFu;
         uint32_t end = (initrd_mod->mod_end + 0xFFFu) & ~0xFFFu;
-        for (uint32_t p = start; p < end; p += 4096) {
-            paging_map_page(p, p, PAGE_PRESENT | PAGE_RW);
+        uint32_t span = end - start;
+        if (span > INITRD_VIRTUAL_MAX) span = INITRD_VIRTUAL_MAX;
+
+        paging_reserve_kernel_tables(INITRD_VIRTUAL_BASE,
+                                     INITRD_VIRTUAL_BASE + span);
+        for (uint32_t p = 0; p < span; p += 4096) {
+            paging_map_page(INITRD_VIRTUAL_BASE + p, start + p,
+                            PAGE_PRESENT | PAGE_RW);
         }
         /* Same reasoning as the framebuffer above: a .exe that opens a
          * file reaches the initrd through these very addresses, so the
-         * loader must not place an image over them. GRUB is free to put
-         * modules anywhere, including inside a typical 0x400000 ImageBase. */
-        paging_reserve_region(start, end, "initrd");
-        ramfs_init(initrd_mod->mod_start, initrd_mod->mod_end - initrd_mod->mod_start);
+         * loader must not place an image over them. Nothing ever will
+         * now - they are in the kernel's half - but saying so keeps the
+         * rule in one place. */
+        paging_reserve_region(INITRD_VIRTUAL_BASE, INITRD_VIRTUAL_BASE + span,
+                              "initrd");
+        uint32_t vaddr = INITRD_VIRTUAL_BASE + (initrd_mod->mod_start - start);
+        ramfs_init(vaddr, initrd_mod->mod_end - initrd_mod->mod_start);
         terminal_writestring_color("[OK] ", VGA_COLOR_LIGHT_GREEN);
         terminal_writestring("Filesystem mounted from initrd (try 'ls' in the shell)\n");
     } else {
@@ -279,6 +296,10 @@ void kernel_main(uint32_t magic, multiboot_info_t* mbi) {
      * space happened to be loaded at the time. See paging.h. */
     paging_reserve_kernel_tables(KHEAP_VIRTUAL_BASE,
                                  KHEAP_VIRTUAL_BASE + KHEAP_MAX_SIZE);
+    /* And the one page the address-space copier borrows to write a frame
+     * that is mapped nowhere else. It lives in the kernel half so that no
+     * process teardown can mistake it for its own - see PAGING_SCRATCH_VA. */
+    paging_reserve_kernel_tables(PAGING_SCRATCH_VA, PAGING_SCRATCH_VA + 4096);
     paging_finalize_kernel_space();
     terminal_writestring_color("[OK] ", VGA_COLOR_LIGHT_GREEN);
     terminal_writestring("Kernel address space frozen (shared by every process)\n");

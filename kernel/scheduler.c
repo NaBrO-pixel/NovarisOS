@@ -183,8 +183,7 @@ static int spawn_common(const char* name, uint32_t entry, uint32_t load_vaddr,
     p->owns_page_directory = owns_pd;
     p->teb = teb;
     p->owns_stack = map_stack;
-    p->tls_base = 0;
-    p->tls_limit = 0;
+    for (int t = 0; t < GDT_TLS_COUNT; t++) { p->tls_base[t] = 0; p->tls_limit[t] = 0; }
     p->clear_child_tid = 0;
     p->wait_addr = 0;
     p->wait_deadline = 0;
@@ -261,8 +260,9 @@ int scheduler_spawn_posix_thread(const char* name, uint32_t entry,
     if (pid < 0) return -1;
 
     process_t* p = &process_table[process_count - 1];
-    p->tls_base = tls_base;
-    p->tls_limit = tls_limit;
+    /* CLONE_SETTLS names one descriptor, and glibc's is the middle one. */
+    p->tls_base[7 - GDT_TLS_MIN] = tls_base;
+    p->tls_limit[7 - GDT_TLS_MIN] = tls_limit;
     p->clear_child_tid = clear_child_tid;
 
     /* clone() returns 0 in the child and the tid in the parent, and the
@@ -291,8 +291,10 @@ int scheduler_fork_current(registers_t* regs, uint32_t child_pd,
      * it maps goes into whatever is current. Nothing was mapped, and the
      * child runs somewhere else. */
     p->page_directory = child_pd;
-    p->tls_base = current->tls_base;
-    p->tls_limit = current->tls_limit;
+    for (int t = 0; t < GDT_TLS_COUNT; t++) {
+        p->tls_base[t] = current->tls_base[t];
+        p->tls_limit[t] = current->tls_limit[t];
+    }
     p->teb = current->teb;
 
     /* The child's entire initial state is the parent's, one register
@@ -320,8 +322,10 @@ void scheduler_exec_current(void) {
     /* The image that owned these is gone. Leaving them set would point
      * fs and gs at addresses in an address space that no longer has
      * anything there. */
-    current->tls_base = 0;
-    current->tls_limit = 0;
+    for (int t = 0; t < GDT_TLS_COUNT; t++) {
+        current->tls_base[t] = 0;
+        current->tls_limit[t] = 0;
+    }
     current->teb = 0;
     current->clear_child_tid = 0;
 }
@@ -341,10 +345,24 @@ uint32_t scheduler_current_address_space(void) {
     return current ? current->page_directory : 0;
 }
 
-void scheduler_set_current_tls(uint32_t base, uint32_t limit) {
+void scheduler_set_current_tls_entry(int slot, uint32_t base, uint32_t limit) {
     if (!current) return;
-    current->tls_base = base;
-    current->tls_limit = limit;
+    if (slot < GDT_TLS_MIN || slot > GDT_TLS_MAX) return;
+    current->tls_base[slot - GDT_TLS_MIN] = base;
+    current->tls_limit[slot - GDT_TLS_MIN] = limit;
+}
+
+void scheduler_set_current_tls(uint32_t base, uint32_t limit) {
+    scheduler_set_current_tls_entry(7, base, limit);
+}
+
+uint32_t scheduler_current_tls_used(void) {
+    uint32_t used = 0;
+    if (!current) return 0;
+    for (int t = 0; t < GDT_TLS_COUNT; t++) {
+        if (current->tls_base[t]) used |= 1u << (t + GDT_TLS_MIN);
+    }
+    return used;
 }
 
 uint32_t scheduler_current_clear_child_tid(void) {
@@ -499,9 +517,16 @@ static void switch_to(process_t* next) {
      * switch between threads, not just once per program. Getting this
      * wrong would give two threads one errno and one SEH chain. */
     if (next->teb) gdt_set_teb(next->teb, PAGE_SIZE - 1);
-    /* Same reasoning for POSIX thread-local storage, which lives behind
-     * gs rather than fs - see gdt_set_tls(). */
-    if (next->tls_base) gdt_set_tls(next->tls_base, next->tls_limit);
+    /* Same reasoning for POSIX thread-local storage - see gdt.h. All
+     * three descriptors, because a thread can be using more than one:
+     * glibc's TLS behind gs and Wine's Windows TEB behind fs are two
+     * different segments of the same thread. */
+    for (int t = 0; t < GDT_TLS_COUNT; t++) {
+        if (next->tls_base[t]) {
+            gdt_set_tls_entry(GDT_TLS_MIN + t, next->tls_base[t],
+                              next->tls_limit[t]);
+        }
+    }
     current = next;
     current->state = PROC_RUNNING;
     gdt_set_kernel_stack(current->kernel_stack_top);

@@ -31,7 +31,14 @@
  * reference to each object rather than a copy of the object. */
 
 #define POSIX_MAX_PROCS 8
-#define POSIX_MAX_FDS   32
+/* 128 since Milestone 30. Thirty-two was a shell's worth and wineserver
+ * is not a shell: it holds its listening socket, a connection, a request
+ * pipe, a reply pipe and a wait pipe per client, and an open descriptor
+ * for every file any client has mapped. It ran out while opening
+ * ntdll.dll and reported STATUS_TOO_MANY_OPENED_FILES, which the client
+ * turned into "invalid image format" - a true statement about the wrong
+ * thing. */
+#define POSIX_MAX_FDS   128
 #define POSIX_PATH_MAX  128
 
 typedef enum {

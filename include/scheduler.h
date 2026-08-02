@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "idt.h"
 #include "fpu.h"
+#include "gdt.h"
 
 /* Milestone 9 - real process structures + a round-robin preemptive
  * scheduler. This is additive to process.c's existing model, not a
@@ -71,13 +72,17 @@ typedef struct process {
      * none. Non-zero also means "run with fs addressing it", and makes
      * the switch path repoint the TEB GDT descriptor - see switch_to(). */
     uint32_t teb;
-    /* This thread's local-storage segment, for POSIX threads: base and
-     * limit of the block gs should address, and 0 for a task that has
-     * none. Reprogrammed into GDT entry 7 on every switch, the same way
-     * `teb` is into entry 6 - both are per-thread, and both would
-     * otherwise leak one thread's view into another's. */
-    uint32_t tls_base;
-    uint32_t tls_limit;
+    /* This thread's local-storage segments, for POSIX threads: base and
+     * limit of each block, and 0 for a slot the thread never asked for.
+     * Reprogrammed into GDT entries 6-8 on every switch, the same way
+     * `teb` is - all of them are per-thread, and all of them would
+     * otherwise leak one thread's view into another's.
+     *
+     * Three since Milestone 30, because Linux offers three and a program
+     * can need two at once: glibc puts its TLS behind gs and Wine puts
+     * the Windows TEB behind fs. See include/gdt.h. */
+    uint32_t tls_base[GDT_TLS_COUNT];
+    uint32_t tls_limit[GDT_TLS_COUNT];
 
     /* CLONE_CHILD_CLEARTID: the address in the *shared* address space to
      * zero when this thread exits, and futex-wake. That is how a joiner
@@ -207,10 +212,16 @@ int scheduler_as_sibling_count(uint32_t pd);
  * answer rather than CR3 when the kernel has switched away. */
 uint32_t scheduler_current_address_space(void);
 
-/* Records the current task's TLS block, so a switch away and back
- * reprograms the descriptor with this thread's values rather than
- * whichever thread last called set_thread_area. */
+/* Records the current task's TLS block for GDT entry `slot`, so a switch
+ * away and back reprograms the descriptor with this thread's values
+ * rather than whichever thread last called set_thread_area. */
+void scheduler_set_current_tls_entry(int slot, uint32_t base, uint32_t limit);
 void scheduler_set_current_tls(uint32_t base, uint32_t limit);
+
+/* Which entries the current task has already claimed, as a bitmask over
+ * slots GDT_TLS_MIN..GDT_TLS_MAX. set_thread_area() asks so it can hand
+ * out a free one rather than overwriting a live one. */
+uint32_t scheduler_current_tls_used(void);
 
 /* The clear_child_tid of the task that is exiting, or 0. Read by the
  * POSIX layer on thread exit so it can zero the word and wake anyone

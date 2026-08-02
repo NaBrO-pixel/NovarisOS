@@ -563,6 +563,7 @@ static void run_command(char* line) {
         terminal_writestring("  strace  - the same, with every syscall logged\n");
         terminal_writestring("  setenv NAME=VALUE, env - the environment programs are given\n");
         terminal_writestring("  ps      - the process table (fork gave it more than one row)\n");
+        terminal_writestring("  sum <file> - size, checksum and first bytes, for comparing with a host\n");
         terminal_writestring("  vmtest  - prove per-process address spaces work:\n");
         terminal_writestring("            two page directories, one virtual address,\n");
         terminal_writestring("            two different contents (ROADMAP Milestone 14)\n");
@@ -592,6 +593,31 @@ static void run_command(char* line) {
         terminal_writestring("Ticks since boot: ");
         print_uint(pit_get_ticks());
         terminal_writestring("\n");
+    } else if (starts_with(line, "sum ")) {
+        /* A checksum and the first bytes of a file, so "does the kernel
+         * serve this file's contents correctly?" can be answered against
+         * the host rather than argued about. Written while chasing a
+         * fault deep inside Wine's locale tables, where the question was
+         * exactly that. */
+        uint32_t size = 0;
+        uint8_t* buf = read_file(line + 4, &size);
+        if (buf) {
+            uint32_t h = 2166136261u;      /* FNV-1a, 32-bit */
+            for (uint32_t i = 0; i < size; i++) {
+                h = (h ^ buf[i]) * 16777619u;
+            }
+            terminal_writestring("  bytes ");
+            print_uint(size);
+            terminal_writestring("  fnv1a ");
+            print_hex(h, 8);
+            terminal_writestring("\n  head ");
+            for (uint32_t i = 0; i < 16 && i < size; i++) {
+                print_hex(buf[i], 2);
+                terminal_writestring(" ");
+            }
+            terminal_writestring("\n");
+            kfree(buf);
+        }
     } else if (streq(line, "ps")) {
         /* What Milestone 29 made possible to ask: there is more than one
          * process now, and they outlive each other. A zombie is listed

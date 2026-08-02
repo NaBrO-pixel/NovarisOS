@@ -64,6 +64,22 @@ typedef struct vfs_node {
     int      from_initrd;
     int      in_use;
 
+    /* The unaligned allocation `data` was carved out of, when the file
+     * has been made mappable and `data` is a page-aligned address inside
+     * it. 0 when `data` is the allocation. See vfs_make_mappable(). */
+    uint8_t* data_base;
+    int      mappable;
+
+    /* Open descriptors and shared mappings referring to this node, and
+     * whether its name has been removed while they existed. Milestone 30
+     * needed both: a program that creates a temporary file, opens it,
+     * unlinks it and keeps using the descriptor is doing the ordinary
+     * Unix thing - it is how wineserver makes anonymous shared memory -
+     * and freeing the node under it would leave an open descriptor and a
+     * live mapping pointing at reused heap. The node survives its name. */
+    int      refs;
+    int      unlinked;
+
     /* The permission bits this node was created with. Nothing here
      * *enforces* them - there are no users to enforce them against - but
      * recording what a program asked for and reporting it back is not the
@@ -102,6 +118,28 @@ vfs_node_t* vfs_lookup(const char* path);
  * wineserver moves into the config directory it opened. Returns the
  * length written, or 0 if the buffer was too small. */
 uint32_t vfs_path_of(const vfs_node_t* node, char* buf, uint32_t size);
+
+/* --- lifetime (Milestone 30) --------------------------------------------
+ *
+ * A name and a file are different things, and until now this filesystem
+ * conflated them: unlink freed the node, so an open descriptor to an
+ * unlinked file pointed at nothing. Every descriptor and every shared
+ * mapping now holds a reference, and the node goes when the last one
+ * does - which is what makes `open(); unlink(); keep using it` work. */
+void vfs_node_ref(vfs_node_t* node);
+void vfs_node_unref(vfs_node_t* node);
+
+/* --- shared mappings (Milestone 30) -------------------------------------
+ *
+ * Makes a file's bytes mappable: its storage is reallocated page-aligned
+ * and large enough for `bytes`, so that page N of the file is exactly one
+ * physical frame and mapping it into a process hands over *that* frame.
+ *
+ * That is the whole of MAP_SHARED here, and it is why there is no page
+ * cache: the file's bytes and the mapping are the same memory, so there
+ * is nothing to keep coherent. The cost is that growing a mapped file
+ * moves it - see the note in ramfs.c. Returns 0 if memory ran out. */
+int vfs_make_mappable(vfs_node_t* node, uint32_t bytes);
 vfs_node_t* vfs_resolve_parent(const char* path, const char** leaf_out);
 
 /* Grows the file if needed and copies bytes in. Returns bytes written, or

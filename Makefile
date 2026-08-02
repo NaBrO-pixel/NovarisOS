@@ -343,6 +343,16 @@ HOST_LIB32 ?= /lib32
 # loader, ntdll.so and the two files glibc's getpwuid needs. See
 # ROADMAP.md Milestone 27 for exactly how far that gets.
 WINE_BUILD ?=
+
+# Wine's PE builtins, the subset a console program needs. Kept as a list
+# rather than a wildcard so that what ships is a decision rather than
+# whatever happened to be built, and so the initrd stays small enough to
+# read into RAM.
+WINE_PE_DLLS = ntdll apisetschema kernel32 kernelbase win32u user32 gdi32 advapi32 \
+               sechost rpcrt4 msvcrt ucrtbase ws2_32 setupapi version \
+               imm32 combase ole32 oleaut32 shell32 shlwapi winex11 \
+               wow64cpu cryptbase bcrypt
+WINE_PE_PROGS = wineboot start conhost services explorer rundll32 cmd
 $(BUILD_DIR)/user/ld-linux.so.2: | $(BUILD_DIR)
 	mkdir -p $(BUILD_DIR)/user
 	cp $(HOST_LIB32)/ld-linux.so.2 $@
@@ -383,6 +393,13 @@ $(BUILD_DIR)/user/socktest.elf: userland/sock_test.c | $(BUILD_DIR)
 # Milestone 29: fork, execve, waitpid, pipes, dup2 and poll. It re-executes
 # itself through /proc/self/exe to test execve, so the binary is both the
 # test and its own exec target.
+# Milestone 30: shared file mappings, PROT_NONE reservations,
+# MAP_FIXED_NOREPLACE, and a file that outlives its name.
+$(BUILD_DIR)/user/mmaptest.elf: userland/mmap_test.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(CC) -m32 -static -nostdlib -ffreestanding -fno-builtin -O2 -Wall \
+	    -o $@ $<
+
 $(BUILD_DIR)/user/forktest.elf: userland/fork_test.c | $(BUILD_DIR)
 	mkdir -p $(BUILD_DIR)/user
 	$(CC) -m32 -static -nostdlib -ffreestanding -fno-builtin -O2 -Wall \
@@ -483,6 +500,7 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
         $(BUILD_DIR)/user/pthtest.elf $(BUILD_DIR)/user/crashelf.elf \
         $(BUILD_DIR)/user/fstest.elf $(BUILD_DIR)/user/kmaptest.elf \
         $(BUILD_DIR)/user/socktest.elf $(BUILD_DIR)/user/forktest.elf \
+        $(BUILD_DIR)/user/mmaptest.elf \
         $(BUILD_DIR)/user/glibc.elf $(BUILD_DIR)/user/dyn.elf \
         $(BUILD_DIR)/user/uctest.elf \
         $(BUILD_DIR)/user/ld-linux.so.2 $(BUILD_DIR)/user/libc.so.6 \
@@ -503,6 +521,7 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
 	cp $(BUILD_DIR)/user/kmaptest.elf $(BUILD_DIR)/initrd_staging/kmaptest.elf
 	cp $(BUILD_DIR)/user/socktest.elf $(BUILD_DIR)/initrd_staging/socktest.elf
 	cp $(BUILD_DIR)/user/forktest.elf $(BUILD_DIR)/initrd_staging/forktest.elf
+	cp $(BUILD_DIR)/user/mmaptest.elf $(BUILD_DIR)/initrd_staging/mmaptest.elf
 	cp $(BUILD_DIR)/user/crashelf.elf $(BUILD_DIR)/initrd_staging/crashelf.elf
 	cp $(BUILD_DIR)/user/glibc.elf $(BUILD_DIR)/initrd_staging/glibc.elf
 	cp $(BUILD_DIR)/user/dyn.elf $(BUILD_DIR)/initrd_staging/dyn.elf
@@ -601,7 +620,7 @@ test-posix: $(ISO) $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf
            $(BUILD_DIR)/user/pthtest.elf $(BUILD_DIR)/user/glibc.elf \
            $(BUILD_DIR)/user/dyn.elf $(BUILD_DIR)/user/uctest.elf \
            $(BUILD_DIR)/user/fstest.elf $(BUILD_DIR)/user/socktest.elf \
-           $(BUILD_DIR)/user/forktest.elf
+           $(BUILD_DIR)/user/forktest.elf $(BUILD_DIR)/user/mmaptest.elf
 	python3 tools/posix_compare.py --iso $(ISO) \
 	    --binary $(BUILD_DIR)/user/posixtest.elf --name posixtest.elf
 	python3 tools/posix_compare.py --iso $(ISO) \
@@ -620,6 +639,8 @@ test-posix: $(ISO) $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf
 	    --binary $(BUILD_DIR)/user/socktest.elf --name socktest.elf
 	python3 tools/posix_compare.py --iso $(ISO) \
 	    --binary $(BUILD_DIR)/user/forktest.elf --name forktest.elf
+	python3 tools/posix_compare.py --iso $(ISO) \
+	    --binary $(BUILD_DIR)/user/mmaptest.elf --name mmaptest.elf
 
 test-qemu: $(ISO)
 	python3 tools/qemu_test.py --iso $(ISO) --script tools/tests/win32_smoke.txt \
@@ -636,6 +657,9 @@ test-qemu: $(ISO)
 	    --expect "the exec'd image kept the descriptor it was given" \
 	    --expect "poll waits, and a write from another process wakes it" \
 	    --expect "fork test done" \
+	    --expect "a store through it is visible through read" \
+	    --expect "the bytes are still there" \
+	    --expect "mmap test done" \
 	    --expect "the kernel is still running" \
 	    --reject "KERNEL PANIC"
 
@@ -681,6 +705,34 @@ wine-initrd: $(BUILD_DIR)/initrd.img $(KERNEL)
 	for f in l_intl.nls locale.nls c_20127.nls c_1252.nls c_437.nls c_850.nls; do \
 	    cp $(WINE_BUILD)/nls/$$f $(BUILD_DIR)/wine_staging/$$f; \
 	done
+	# --- Wine's Windows side (Milestone 30) ---------------------------
+	#
+	# The PE builtins. Everything above this line is Wine's *Unix* half;
+	# these are the DLLs it loads as Windows modules once the server
+	# handshake is done, and without them the loader gets as far as
+	# "failed to load start.exe" and stops.
+	#
+	# Not all 601 of them: a console program needs the core plus what
+	# ntdll's loader touches on the way, and the initrd is read into RAM
+	# whole. They are stripped on the way in - debug information is three
+	# quarters of the bytes and nothing here reads it.
+	#
+	# The initrd is flat, so these land at the root and the last-component
+	# fallback resolves Wine's "<dir>/i386-windows/ntdll.dll" to them.
+	for d in $(WINE_PE_DLLS); do \
+	    cp $(WINE_BUILD)/dlls/$$d/i386-windows/$$d.dll \
+	       $(BUILD_DIR)/wine_staging/$$d.dll 2>/dev/null || true; \
+	done
+	for p in $(WINE_PE_PROGS); do \
+	    cp $(WINE_BUILD)/programs/$$p/i386-windows/$$p.exe \
+	       $(BUILD_DIR)/wine_staging/$$p.exe 2>/dev/null || true; \
+	done
+	# win32u is the other Unix-side library ntdll loads, beside itself.
+	cp $(WINE_BUILD)/dlls/win32u/win32u.so $(BUILD_DIR)/wine_staging/win32u.so
+	i686-w64-mingw32-strip $(BUILD_DIR)/wine_staging/*.dll \
+	                       $(BUILD_DIR)/wine_staging/*.exe 2>/dev/null || true
+	strip $(BUILD_DIR)/wine_staging/ntdll.so $(BUILD_DIR)/wine_staging/win32u.so \
+	      $(BUILD_DIR)/wine_staging/wineserver 2>/dev/null || true
 	# glibc's getpwuid() needs these, and Wine dereferences its result
 	# without checking. The initrd is flat, so they land at the root and
 	# the last-component fallback resolves /etc/passwd to them.
@@ -691,7 +743,7 @@ wine-initrd: $(BUILD_DIR)/initrd.img $(KERNEL)
 	cp $(BUILD_DIR)/novaris.bin $(BUILD_DIR)/wine_iso/boot/novaris.bin
 	cp grub.cfg $(BUILD_DIR)/wine_iso/boot/grub/grub.cfg
 	grub-mkrescue -o novaris-wine.iso $(BUILD_DIR)/wine_iso 2>/dev/null
-	@echo "Wrote novaris-wine.iso - try: run preload.elf wineldr.elf --version"
+	@echo "Wrote novaris-wine.iso - try: run wine-preloader wine hellowin.exe"
 
 zip:
 	rm -rf $(BUILD_DIR)/pkg novaris.zip
