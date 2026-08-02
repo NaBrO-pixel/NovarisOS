@@ -112,6 +112,15 @@ static unsigned tls_tag(void) {
     return v;
 }
 
+/* The same read through fs, which is the descriptor Wine's i386 code uses
+ * for the Windows TEB while glibc has gs. Nothing in this program needs
+ * two segments; section 8 needs two to have something to inherit. */
+static unsigned fs_tag(void) {
+    unsigned v;
+    __asm__ __volatile__("movl %%fs:0, %0" : "=r"(v));
+    return v;
+}
+
 static int tls_install(struct user_desc* ud, void* block) {
     ud->entry_number = 0xFFFFFFFFu;   /* "allocate one for me" */
     ud->base_addr = (unsigned)block;
@@ -198,6 +207,34 @@ static int waiter(void* arg) {
     waiter_ready = 1;
     waiter_rc = sc6(SYS_futex, (long)&wait_word, FUTEX_WAIT, 0, 0, 0, 0);
     waiter_done = 1;
+    return 0;
+}
+
+/* --- Milestone 31: what a thread inherits -------------------------------
+ *
+ * clone(CLONE_SETTLS) sets exactly *one* of the three descriptors. The
+ * other two are copies of the creator's, and a program that only ever
+ * uses one cannot tell - which is why Novaris got away with giving a new
+ * thread nothing but the one CLONE_SETTLS named right up until Wine.
+ *
+ * Wine's i386 ntdll allocates one descriptor for the whole process in
+ * signal_init_threading() and runs every thread with fs on it. A new
+ * thread therefore reaches through fs before it has called
+ * set_thread_area() for itself, and with an uninherited descriptor that
+ * is a read through a base of zero. The worker below is that sequence,
+ * spelled without Wine: read fs before touching it, and see the creator's
+ * block. */
+static volatile unsigned inherited_fs = 0;
+static volatile unsigned own_gs = 0;
+static volatile int inherit_ran = 0;
+
+static int inherit_worker(void* arg) {
+    (void)arg;
+    /* Before anything else, and deliberately without a set_thread_area of
+     * this thread's own: whatever fs addresses here is what was inherited. */
+    inherited_fs = fs_tag();
+    own_gs = tls_tag();
+    inherit_ran = 1;
     return 0;
 }
 
@@ -388,6 +425,73 @@ int main_(void) {
 
         check("a wait nobody satisfies returns -ETIMEDOUT", rc == -110);
         check("and it really waited", (t1 - t0) >= 1);
+    }
+
+    /* 8. Milestone 31: a second descriptor, and a thread that inherits it.
+     *    Everything above uses one segment, so none of it could see the
+     *    difference between "the child got the creator's descriptors" and
+     *    "the child got one descriptor and three zeroes". */
+    out("\n8. a thread inherits its creator's other TLS descriptors\n");
+    {
+        static unsigned fs_block[16];
+        static struct user_desc fs_ud;
+        fs_block[0] = 4242;
+        fs_ud.entry_number = 0xFFFFFFFFu;   /* a *second* one, not gs's */
+        fs_ud.base_addr = (unsigned)fs_block;
+        fs_ud.limit = 0xFFF;
+        fs_ud.flags = UD_FLAGS;
+        int got = sc1(SYS_set_thread_area, (long)&fs_ud) == 0;
+        check("a second descriptor was allocated", got);
+        check("and it is not the one gs already has",
+              got && fs_ud.entry_number != tls_entry);
+
+        if (got) {
+            unsigned sel = (fs_ud.entry_number << 3) | 3;
+            __asm__ __volatile__("movw %w0, %%fs" : : "r"(sel));
+            check("fs:0 reads the second block", fs_tag() == 4242);
+
+            long stack = sc6(SYS_mmap2, 0, 65536, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            long blk = sc6(SYS_mmap2, 0, 4096, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            int have = !(stack < 0 && stack > -4096) && stack != 0 &&
+                       !(blk < 0 && blk > -4096) && blk != 0;
+            check("mapped a stack and a TLS block for the worker", have);
+
+            if (have) {
+                ((unsigned*)blk)[0] = 3000;
+                /* CLONE_SETTLS names gs's entry and only gs's entry. The
+                 * child's fs is nobody's business but the kernel's. */
+                static struct user_desc iud;
+                iud.entry_number = tls_entry;
+                iud.base_addr = (unsigned)blk;
+                iud.limit = 0xFFF;
+                iud.flags = UD_FLAGS;
+
+                int tid = 0;
+                long r = spawn(inherit_worker, 0, (void*)(stack + 65536),
+                               &iud, &tid);
+                check("the worker started", r > 0);
+                /* Spun on rather than joined through the tid word, as in
+                 * section 6: this worker is three stores long and can be
+                 * finished before the tid word is even assigned, which
+                 * would leave a join waiting on a word nobody will clear
+                 * again. The flag is the last thing it writes. */
+                while (!inherit_ran) { }
+                check("the worker ran to completion", inherit_ran == 1);
+                out("  worker read fs:0 = ");
+                out_dec((long)inherited_fs);
+                out(", gs:0 = ");
+                out_dec((long)own_gs);
+                out("\n");
+                check("it inherited fs and read its creator's block",
+                      inherited_fs == 4242);
+                check("and gs was the block CLONE_SETTLS named",
+                      own_gs == 3000);
+            }
+            check("the creator's own fs is untouched", fs_tag() == 4242);
+            check("and so is its gs", tls_tag() == 1000);
+        }
     }
 
     out("\nposix thread test done.\n");

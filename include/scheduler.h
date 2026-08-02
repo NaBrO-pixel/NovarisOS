@@ -30,6 +30,13 @@
 
 #define PROCESS_MAX_NAME 16
 
+/* How many things one task can be parked on at once. Twelve covers what
+ * wineserver's main loop actually polls - a listening socket, a
+ * connection per client and a request pipe per thread - and a set larger
+ * than this simply falls back to the one-tick re-test that every poll
+ * used before. */
+#define PROC_WAIT_MAX 12
+
 typedef enum {
     PROC_READY,
     PROC_RUNNING,
@@ -109,11 +116,19 @@ typedef struct process {
 
     process_state_t state;
 
-    /* Only meaningful while state == PROC_BLOCKED. `wait_addr` is the
-     * futex word this task is parked on, which is what a FUTEX_WAKE
-     * matches against; `wait_deadline` is a PIT tick count after which
-     * the wait expires, or 0 for "no timeout". */
-    uint32_t wait_addr;
+    /* Only meaningful while state == PROC_BLOCKED. `wait_addr` holds the
+     * addresses this task is parked on - a futex word, or the kernel
+     * address of a socket - and a wake naming any one of them ends the
+     * wait; `wait_deadline` is a PIT tick count after which it expires
+     * anyway, or 0 for "no timeout".
+     *
+     * Several since Milestone 31, and poll() is why. It is by definition
+     * interested in a set of descriptors and could register on only one
+     * of them, so everything arriving on any of the others waited for the
+     * next tick. That is 10ms per wineserver round trip, and Wine's
+     * console draws a Windows console one escape sequence at a time. */
+    uint32_t wait_addr[PROC_WAIT_MAX];
+    int      wait_count;
     uint32_t wait_deadline;
     /* 1 when this task's frame is rewound to re-run its syscall, so a
      * wake must leave eax alone. */
@@ -169,13 +184,26 @@ int scheduler_spawn_win32_thread(const char* name, uint32_t entry,
 
 /* A POSIX thread, created by clone(). Like the Win32 form, the caller has
  * already built the ring-3 stack, and the stack belongs to the program
- * (it came out of the program's own mmap) rather than to this task. The
- * child starts at `entry` with eax = 0, which is how clone tells parent
- * from child, and runs with gs addressing [tls_base, tls_base+tls_limit]
- * when tls_base is non-zero. Returns the new tid, or -1. */
-int scheduler_spawn_posix_thread(const char* name, uint32_t entry,
-                                 uint32_t esp, uint32_t tls_base,
-                                 uint32_t tls_limit, uint32_t clear_child_tid);
+ * (it came out of the program's own mmap) rather than to this task.
+ *
+ * The child's initial state is the *parent's* trap frame - `regs` - with
+ * eip left where the caller's `int $0x80` already put it, esp pointed at
+ * the caller-supplied stack, and eax zeroed, which is how clone tells
+ * parent from child. Copying the frame rather than synthesising one is
+ * what carries the parent's segment registers across, and fs matters:
+ * Wine's i386 code runs with fs addressing a Windows TEB, and a child
+ * that started with the flat 0x23 instead would fault on the first
+ * fs-relative access it made.
+ *
+ * For the same reason the child inherits all three of the parent's TLS
+ * descriptors, and CLONE_SETTLS then overwrites the one it names -
+ * `tls_slot`, which is the user_desc's entry_number, not a guess. Pass
+ * tls_slot < 0 for a clone that set no TLS at all. Returns the new tid,
+ * or -1. */
+int scheduler_spawn_posix_thread(const char* name, registers_t* regs,
+                                 uint32_t esp, int tls_slot,
+                                 uint32_t tls_base, uint32_t tls_limit,
+                                 uint32_t clear_child_tid);
 
 /* A forked child: a task in `child_pd` (which the caller has already
  * filled with a copy of this address space) whose initial register state
@@ -309,11 +337,16 @@ int scheduler_block_current(registers_t* regs, uint32_t wait_addr,
  * overwriting it would send the re-executed `int $0x80` to whatever that
  * value happened to name.
  *
- * `deadline` is an absolute PIT tick count, or 0 for an indefinite wait -
- * poll() needs both halves at once, since it is waiting on several
- * descriptors and can only name one of them. */
+ * `deadline` is an absolute PIT tick count, or 0 for an indefinite wait. */
 int scheduler_block_current_retry(registers_t* regs, uint32_t wait_addr,
                                   uint32_t deadline);
+
+/* The same again, for a caller waiting on a *set* of addresses - poll's
+ * shape. A wake naming any of the first `n` (up to PROC_WAIT_MAX) ends
+ * the wait. `n` of 0 with a deadline is a pure sleep. */
+int scheduler_block_current_retry_multi(registers_t* regs,
+                                        const uint32_t* addrs, int n,
+                                        uint32_t deadline);
 
 /* Wakes up to `max` tasks blocked on `addr`, in table order. Each one's
  * saved trap frame gets `result` in eax, so the syscall it blocked inside

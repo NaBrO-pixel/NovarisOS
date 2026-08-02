@@ -185,7 +185,7 @@ static int spawn_common(const char* name, uint32_t entry, uint32_t load_vaddr,
     p->owns_stack = map_stack;
     for (int t = 0; t < GDT_TLS_COUNT; t++) { p->tls_base[t] = 0; p->tls_limit[t] = 0; }
     p->clear_child_tid = 0;
-    p->wait_addr = 0;
+    p->wait_count = 0;
     p->wait_deadline = 0;
     p->wait_retry = 0;
     p->state = PROC_READY;
@@ -251,26 +251,61 @@ int scheduler_spawn_process(const char* name, const uint8_t* image,
     return pid;
 }
 
-int scheduler_spawn_posix_thread(const char* name, uint32_t entry,
-                                 uint32_t esp, uint32_t tls_base,
-                                 uint32_t tls_limit,
+int scheduler_spawn_posix_thread(const char* name, registers_t* regs,
+                                 uint32_t esp, int tls_slot,
+                                 uint32_t tls_base, uint32_t tls_limit,
                                  uint32_t clear_child_tid) {
     if (process_count >= MAX_PROCESSES) return -1;
-    int pid = spawn_common(name, entry, entry, 0, esp, 0, 0, 0);
+    if (!regs || !current) return -1;
+    int pid = spawn_common(name, regs->eip, 0, 0, esp, 0, 0, 0);
     if (pid < 0) return -1;
 
     process_t* p = &process_table[process_count - 1];
-    /* CLONE_SETTLS names one descriptor, and glibc's is the middle one. */
-    p->tls_base[7 - GDT_TLS_MIN] = tls_base;
-    p->tls_limit[7 - GDT_TLS_MIN] = tls_limit;
+
+    /* Milestone 31. A thread inherits the whole of its creator's
+     * segmentation, and until this milestone it inherited none of it.
+     *
+     * Linux copies the parent's three TLS descriptors into the child in
+     * copy_thread(), and only then applies CLONE_SETTLS. The difference
+     * is invisible to glibc, which sets its own descriptor before the
+     * new thread runs a line of its own code, and fatal to Wine, which
+     * does not: a Wine thread comes up with fs already pointing at
+     * whichever GDT entry signal_init_threading() allocated once for the
+     * whole process, and reaches its TEB through it before ntdll gets as
+     * far as calling set_thread_area() for itself. With that entry's base
+     * left at zero in the child, the first fs-relative read was a null
+     * dereference - and it was the *worker* that died, which is exactly
+     * what Milestone 30 saw and could not explain. */
+    for (int t = 0; t < GDT_TLS_COUNT; t++) {
+        p->tls_base[t] = current->tls_base[t];
+        p->tls_limit[t] = current->tls_limit[t];
+    }
+    /* And CLONE_SETTLS names *which* descriptor by entry_number. Assuming
+     * the middle one was right only as long as glibc was the only caller;
+     * a process where Wine got there first has glibc on another. */
+    if (tls_slot >= GDT_TLS_MIN && tls_slot <= GDT_TLS_MAX) {
+        p->tls_base[tls_slot - GDT_TLS_MIN] = tls_base;
+        p->tls_limit[tls_slot - GDT_TLS_MIN] = tls_limit;
+    }
+    /* A Win32 TEB is per-thread and set up by whoever creates the thread,
+     * so it is deliberately *not* inherited - only the POSIX descriptors
+     * above are. */
     p->clear_child_tid = clear_child_tid;
 
-    /* clone() returns 0 in the child and the tid in the parent, and the
-     * synthetic frame is the child's whole initial state - so eax is set
-     * here rather than anywhere the child could observe being changed. */
+    /* The child's entire initial state is the parent's, three registers
+     * different - the same reasoning as scheduler_fork_current(), and for
+     * the same reason: a synthesised frame gets the segment registers
+     * wrong, and a thread that does not share its creator's ds/es/fs/gs
+     * is not sharing its address space in any way it can use. */
     registers_t* frame = (registers_t*)p->esp;
-    frame->eax = 0;
-    if (tls_base) frame->gs = 0x3B; /* GDT entry 7 | RPL 3 */
+    *frame = *regs;
+    frame->eax = 0;      /* clone returns 0 in the child */
+    frame->useresp = esp;
+    if (tls_slot >= GDT_TLS_MIN && tls_slot <= GDT_TLS_MAX) {
+        /* CLONE_SETTLS is glibc saying "and run the child with gs on
+         * this" - the selector it will use before it can ask for it. */
+        frame->gs = (uint16_t)((tls_slot << 3) | 3);
+    }
     return pid;
 }
 
@@ -512,21 +547,30 @@ static void switch_to(process_t* next) {
     if (next->page_directory != current->page_directory) {
         paging_switch_address_space(next->page_directory);
     }
-    /* Each Win32 thread has its own TEB, and fs is a segment whose *base*
-     * is that TEB - so the GDT descriptor has to be repointed on every
-     * switch between threads, not just once per program. Getting this
-     * wrong would give two threads one errno and one SEH chain. */
-    if (next->teb) gdt_set_teb(next->teb, PAGE_SIZE - 1);
-    /* Same reasoning for POSIX thread-local storage - see gdt.h. All
-     * three descriptors, because a thread can be using more than one:
-     * glibc's TLS behind gs and Wine's Windows TEB behind fs are two
-     * different segments of the same thread. */
+    /* POSIX thread-local storage - see gdt.h. All three descriptors,
+     * because a thread can be using more than one: glibc's TLS behind gs
+     * and Wine's Windows TEB behind fs are two different segments of the
+     * same thread.
+     *
+     * Unconditionally, including the ones this task has *not* set. Only
+     * reprogramming the descriptors in use left the others holding the
+     * outgoing task's bases, so a stale selector addressed another
+     * thread's TLS block instead of faulting - the one failure mode that
+     * looks like working code. A base and limit of zero is a present
+     * descriptor that faults on the first byte, which is what an unused
+     * entry should do. */
     for (int t = 0; t < GDT_TLS_COUNT; t++) {
-        if (next->tls_base[t]) {
-            gdt_set_tls_entry(GDT_TLS_MIN + t, next->tls_base[t],
-                              next->tls_limit[t]);
-        }
+        gdt_set_tls_entry(GDT_TLS_MIN + t, next->tls_base[t],
+                          next->tls_limit[t]);
     }
+    /* And after them, not before: entry 6 is both the first TLS
+     * descriptor and the Win32 layer's TEB (see gdt.h), so a Win32
+     * thread's TEB has to be the last word on what that entry holds.
+     * Each Win32 thread has its own, and fs is a segment whose *base* is
+     * that TEB, so the descriptor is repointed on every switch between
+     * threads rather than once per program. Getting this wrong would give
+     * two threads one errno and one SEH chain. */
+    if (next->teb) gdt_set_teb(next->teb, PAGE_SIZE - 1);
     current = next;
     current->state = PROC_RUNNING;
     gdt_set_kernel_stack(current->kernel_stack_top);
@@ -629,7 +673,7 @@ int scheduler_task_alive(int pid) {
  * isr epilogue will iret from when the task next runs. */
 static void wake_one(process_t* p, int32_t result) {
     if (!p->wait_retry) ((registers_t*)p->esp)->eax = (uint32_t)result;
-    p->wait_addr = 0;
+    p->wait_count = 0;
     p->wait_deadline = 0;
     p->wait_retry = 0;
     p->state = PROC_READY;
@@ -646,7 +690,7 @@ static int wake_every_blocked(int32_t result) {
     return n;
 }
 
-static int block_common(registers_t* regs, uint32_t wait_addr,
+static int block_common(registers_t* regs, const uint32_t* addrs, int n,
                         uint32_t deadline, int retry) {
     if (!active || !current) return 0;
 
@@ -671,7 +715,10 @@ static int block_common(registers_t* regs, uint32_t wait_addr,
      * blocked on. */
     process_t* me = current;
     me->esp = (uint32_t)regs;
-    me->wait_addr = wait_addr;
+    if (n > PROC_WAIT_MAX) n = PROC_WAIT_MAX;
+    if (n < 0) n = 0;
+    for (int i = 0; i < n; i++) me->wait_addr[i] = addrs[i];
+    me->wait_count = n;
     me->wait_deadline = deadline;
     me->wait_retry = retry;
     me->state = PROC_BLOCKED;
@@ -682,12 +729,18 @@ static int block_common(registers_t* regs, uint32_t wait_addr,
 
 int scheduler_block_current(registers_t* regs, uint32_t wait_addr,
                             uint32_t deadline) {
-    return block_common(regs, wait_addr, deadline, 0);
+    return block_common(regs, &wait_addr, wait_addr ? 1 : 0, deadline, 0);
 }
 
 int scheduler_block_current_retry(registers_t* regs, uint32_t wait_addr,
                                   uint32_t deadline) {
-    return block_common(regs, wait_addr, deadline, 1);
+    return block_common(regs, &wait_addr, wait_addr ? 1 : 0, deadline, 1);
+}
+
+int scheduler_block_current_retry_multi(registers_t* regs,
+                                        const uint32_t* addrs, int n,
+                                        uint32_t deadline) {
+    return block_common(regs, addrs, n, deadline, 1);
 }
 
 int scheduler_wake_on(uint32_t addr, int max, int32_t result) {
@@ -695,9 +748,12 @@ int scheduler_wake_on(uint32_t addr, int max, int32_t result) {
     if (!addr) return 0;
     for (int i = 0; i < process_count && n < max; i++) {
         process_t* p = &process_table[i];
-        if (p->state == PROC_BLOCKED && p->wait_addr == addr) {
+        if (p->state != PROC_BLOCKED) continue;
+        for (int w = 0; w < p->wait_count; w++) {
+            if (p->wait_addr[w] != addr) continue;
             wake_one(p, result);
             n++;
+            break;
         }
     }
     return n;

@@ -139,6 +139,14 @@ typedef struct posix_proc {
     uint32_t poll_key;
     uint32_t poll_deadline;
 
+    /* nanosleep()'s, for the same reason and keyed the same way - the
+     * user address of the caller's own timespec. Milestone 31: a sleep
+     * used to idle in the kernel for its whole duration, which meant a
+     * Windows program calling Sleep() stopped every *other* thread of
+     * itself for that long too. */
+    uint32_t sleep_key;
+    uint32_t sleep_deadline;
+
     uint32_t unimplemented;
 } posix_proc_t;
 

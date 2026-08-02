@@ -69,13 +69,16 @@ static fd_entry_t in_flight[MAX_IN_FLIGHT];
 static registers_t* cur_regs = 0;
 
 /* An implementation asking to be run again later rather than returning
- * now. `addr` is what it wants to be woken on, `deadline` an absolute PIT
- * tick after which it wants to be woken anyway. See posix.h. */
-static uint32_t block_addr = 0;
+ * now. `block_addrs` are the things it wants to be woken by - a wake on
+ * any one of them will do - and `block_deadline` an absolute PIT tick
+ * after which it wants to be woken anyway. See posix.h. */
+static uint32_t block_addrs[PROC_WAIT_MAX];
+static int block_count = 0;
 static uint32_t block_deadline = 0;
 
 void posix_request_block(uint32_t addr, registers_t* regs) {
-    block_addr = addr;
+    block_addrs[0] = addr;
+    block_count = addr ? 1 : 0;
     block_deadline = 0;
     posix_request_retry();
     (void)regs;
@@ -83,7 +86,20 @@ void posix_request_block(uint32_t addr, registers_t* regs) {
 
 void posix_request_block_until(uint32_t addr, uint32_t deadline,
                                registers_t* regs) {
-    block_addr = addr;
+    block_addrs[0] = addr;
+    block_count = addr ? 1 : 0;
+    block_deadline = deadline;
+    posix_request_retry();
+    (void)regs;
+}
+
+/* The set form - poll's shape. See sys_poll(). */
+void posix_request_block_multi(const uint32_t* addrs, int n, uint32_t deadline,
+                               registers_t* regs) {
+    if (n > PROC_WAIT_MAX) n = PROC_WAIT_MAX;
+    if (n < 0) n = 0;
+    for (int i = 0; i < n; i++) block_addrs[i] = addrs[i];
+    block_count = n;
     block_deadline = deadline;
     posix_request_retry();
     (void)regs;
@@ -1452,14 +1468,25 @@ static int32_t sys_wait4(int pid, int32_t* status, int options,
  * than blocking on one, so a socket layer without this is a socket layer
  * wineserver cannot use. Milestone 28 said so and this is the answer.
  *
- * Waiting is the interesting part, and it is a compromise stated openly.
- * The blocking path can park a task on exactly one address, and poll is
- * by definition interested in several - so a waiting poll registers on
- * the first socket in its set *and* takes a one-tick deadline. The first
- * gives an immediate wake for the common single-descriptor case; the
- * second means nothing in the set can go unnoticed for longer than 10ms.
- * A wake-on-any-of-N would need a wait queue per object, which is a
- * bigger change than this milestone is. */
+ * Waiting is the interesting part. Milestone 28 registered on the *first*
+ * socket in the set and took a one-tick deadline as insurance, and called
+ * the compromise openly: anything arriving on any other descriptor waited
+ * for the next tick.
+ *
+ * Milestone 31 pays for it. A wineserver round trip is one poll wake, and
+ * the socket that carries it is not the first in wineserver's set - the
+ * listening socket is. So every round trip cost 10ms, and Wine's console
+ * makes one per escape sequence while drawing a Windows console: a
+ * worker thread spent five seconds inside a single printf, holding
+ * msvcrt's lock, and every other thread of the program timed out waiting
+ * for it. "Threads work but are slow" turned out to be one wake latency
+ * wearing a disguise.
+ *
+ * A task can be parked on a set of addresses now (PROC_WAIT_MAX of them),
+ * so a poll registers on *every* socket it is given and is woken by
+ * whichever one moves. The one-tick re-test stays for the sets that do
+ * not fit and for descriptors that are not sockets, so nothing that used
+ * to be noticed can stop being noticed. */
 
 static uint32_t fd_ready_mask(int fd) {
     fd_entry_t* e = fd_get(fd);
@@ -1522,7 +1549,10 @@ static int32_t sys_poll(k_pollfd_t* fds_u, uint32_t nfds, int timeout_ms,
     if (nfds > MAX_FDS * 2) return -EINVAL;
 
     int ready = 0;
-    uint32_t first_sock = 0;
+    uint32_t socks[PROC_WAIT_MAX];
+    int nsocks = 0;
+    int all_registered = 1;    /* every descriptor in the set is a socket
+                                * this task is now parked on */
     for (uint32_t i = 0; i < nfds; i++) {
         if (fds_u[i].fd < 0) { fds_u[i].revents = 0; continue; }
         uint32_t want = (uint32_t)(uint16_t)fds_u[i].events;
@@ -1534,10 +1564,15 @@ static int32_t sys_poll(k_pollfd_t* fds_u, uint32_t nfds, int timeout_ms,
         uint32_t rev = (got & (want | POLLERR | POLLHUP | POLLNVAL));
         fds_u[i].revents = (int16_t)rev;
         if (rev) ready++;
-        if (!first_sock) {
-            fd_entry_t* e = fd_get(fds_u[i].fd);
-            if (e && e->kind == FD_SOCKET) first_sock = (uint32_t)e->sock;
-        }
+
+        fd_entry_t* e = fd_get(fds_u[i].fd);
+        if (!e || e->kind != FD_SOCKET) { all_registered = 0; continue; }
+        uint32_t key = (uint32_t)e->sock;
+        int seen = 0;
+        for (int k = 0; k < nsocks; k++) if (socks[k] == key) { seen = 1; break; }
+        if (seen) continue;
+        if (nsocks == PROC_WAIT_MAX) { all_registered = 0; continue; }
+        socks[nsocks++] = key;
     }
 
     if (ready) {
@@ -1551,7 +1586,13 @@ static int32_t sys_poll(k_pollfd_t* fds_u, uint32_t nfds, int timeout_ms,
                                           &expired);
     if (expired) return 0;
 
-    posix_request_block_until(first_sock, poll_next_wake(deadline), regs);
+    /* Every socket in the set is registered, so a wake on any of them is
+     * immediate and there is nothing left to poll *for* on a timer. Only
+     * a set this task could not fully register - too big, or holding a
+     * descriptor that is not a socket - still needs the one-tick
+     * re-test. */
+    uint32_t until = all_registered ? deadline : poll_next_wake(deadline);
+    posix_request_block_multi(socks, nsocks, until, regs);
     return 0;   /* not used: the call is going to happen again */
 }
 
@@ -1572,7 +1613,9 @@ static int32_t sys_select(int nfds, uint32_t* rd, uint32_t* wr, uint32_t* ex,
 
     uint32_t rout = 0, wout = 0, eout = 0;
     int ready = 0;
-    uint32_t first_sock = 0;
+    uint32_t socks[PROC_WAIT_MAX];
+    int nsocks = 0;
+    int all_registered = 1;
 
     for (int fd = 0; fd < nfds; fd++) {
         int want_r = fdset_get(rd, fd), want_w = fdset_get(wr, fd);
@@ -1585,10 +1628,14 @@ static int32_t sys_select(int nfds, uint32_t* rd, uint32_t* wr, uint32_t* ex,
         if (want_w && (got & POLLOUT))            { wout |= 1u << fd; ready++; }
         if (want_e && (got & POLLPRI))            { eout |= 1u << fd; ready++; }
 
-        if (!first_sock) {
-            fd_entry_t* e = fd_get(fd);
-            if (e && e->kind == FD_SOCKET) first_sock = (uint32_t)e->sock;
-        }
+        fd_entry_t* e = fd_get(fd);
+        if (!e || e->kind != FD_SOCKET) { all_registered = 0; continue; }
+        uint32_t key = (uint32_t)e->sock;
+        int seen = 0;
+        for (int k = 0; k < nsocks; k++) if (socks[k] == key) { seen = 1; break; }
+        if (seen) continue;
+        if (nsocks == PROC_WAIT_MAX) { all_registered = 0; continue; }
+        socks[nsocks++] = key;
     }
 
     /* Only the words that cover `nfds` descriptors are written back. The
@@ -1626,7 +1673,9 @@ static int32_t sys_select(int nfds, uint32_t* rd, uint32_t* wr, uint32_t* ex,
         return 0;
     }
 
-    posix_request_block_until(first_sock, poll_next_wake(deadline), regs);
+    /* Registered on every socket in the set - see sys_poll(). */
+    uint32_t until = all_registered ? deadline : poll_next_wake(deadline);
+    posix_request_block_multi(socks, nsocks, until, regs);
     return 0;   /* not used: the call is going to happen again */
 }
 
@@ -1709,14 +1758,40 @@ static int32_t sys_uname(uint8_t* buf) {
     return 0;
 }
 
-static int32_t sys_nanosleep(const uint32_t* req) {
+/* Milestone 31. Sleeping used to be `sti; hlt` until the clock ran out,
+ * which is correct for one task and wrong for two: the sleeper held the
+ * CPU for the whole duration, so a Windows program that called Sleep()
+ * suspended every other thread of itself as well. It parks now, exactly
+ * as poll() does and through the same machinery - the deadline is
+ * absolute and remembered across the retries that implement the wait,
+ * because the argument is *relative* and recomputing it every time the
+ * syscall re-executes would restart the sleep and it would never end.
+ *
+ * The fallback when nothing else can run is still an in-kernel idle, in
+ * posix_syscall()'s retry path - which now re-offers the CPU on every
+ * tick rather than holding it to the deadline. */
+/* `key` is the caller's own timespec address, so two sleeps in flight
+ * cannot inherit each other's clock. It is passed rather than taken from
+ * `req` because the 64-bit-time form hands in a narrowed copy. */
+static int32_t sys_nanosleep(const uint32_t* req, uint32_t key,
+                             registers_t* regs) {
     if (!req) return -EFAULT;
-    uint32_t ticks = req[0] * 100u + req[1] / 10000000u; /* 100Hz PIT */
-    uint32_t target = pit_get_ticks() + ticks;
-    __asm__ __volatile__("sti");
-    while (pit_get_ticks() < target) __asm__ __volatile__("hlt");
-    __asm__ __volatile__("cli");
-    return 0;
+    posix_proc_t* P = posix_current();
+
+    if (P->sleep_key != key || !P->sleep_deadline) {
+        uint32_t ticks = req[0] * 100u + req[1] / 10000000u; /* 100Hz PIT */
+        P->sleep_key = key;
+        P->sleep_deadline = pit_get_ticks() + ticks;
+        if (!P->sleep_deadline) P->sleep_deadline = 1;  /* 0 means "none" */
+    }
+    if ((int32_t)(pit_get_ticks() - P->sleep_deadline) >= 0) {
+        P->sleep_key = 0;
+        P->sleep_deadline = 0;
+        return 0;
+    }
+    /* Nothing to be woken *by*, only a time to be woken *at*. */
+    posix_request_block_until(0, P->sleep_deadline, regs);
+    return 0;   /* not used: the call is going to happen again */
 }
 
 static void report_unimplemented(uint32_t number) {
@@ -2334,7 +2409,7 @@ void posix_syscall(registers_t* regs) {
                  * can matter on a machine this size. */
                 const uint32_t* ts = (const uint32_t*)c;
                 uint32_t rel[2] = { ts[0], ts[2] };
-                r = sys_nanosleep(rel);
+                r = sys_nanosleep(rel, c, regs);
             } else {
                 r = -EFAULT;
             }
@@ -2437,14 +2512,14 @@ void posix_syscall(registers_t* regs) {
             break;
 
         case SYS_time:     r = (int32_t)rtc_unix_time(); break;
-        case SYS_nanosleep: r = sys_nanosleep((const uint32_t*)a); break;
+        case SYS_nanosleep: r = sys_nanosleep((const uint32_t*)a, a, regs); break;
         case SYS_clock_nanosleep:
             /* (clockid, flags, request, remain). TIMER_ABSTIME (1) would
              * mean the timespec is a deadline rather than a duration;
              * nothing here asks for it, and treating one as the other
              * would sleep for fifty-odd years. */
             if (b & 1) { r = -ENOSYS; break; }
-            r = sys_nanosleep((const uint32_t*)c);
+            r = sys_nanosleep((const uint32_t*)c, c, regs);
             break;
 
         /* Real since Milestone 19 - see kernel/posix_signal.c. */
@@ -2552,12 +2627,15 @@ void posix_syscall(registers_t* regs) {
          * the retry loop finally using it. Waking must not overwrite eax,
          * which now holds the syscall number - see PROC_BLOCKED's
          * wait_retry in the scheduler. */
-        uint32_t waiting_on = block_addr;
+        uint32_t waiting_on[PROC_WAIT_MAX];
+        int waiting_n = block_count;
+        for (int i = 0; i < waiting_n; i++) waiting_on[i] = block_addrs[i];
         uint32_t until = block_deadline;
-        block_addr = 0;
+        block_count = 0;
         block_deadline = 0;
-        if ((waiting_on || until) &&
-            scheduler_block_current_retry(regs, waiting_on, until)) {
+        if ((waiting_n || until) &&
+            scheduler_block_current_retry_multi(regs, waiting_on, waiting_n,
+                                                until)) {
             return;
         }
         /* Nothing else could run, so parking would leave the machine with
@@ -2568,12 +2646,26 @@ void posix_syscall(registers_t* regs) {
          * hand before hlt or the timer that ends the wait never arrives.
          * (posix_sys_futex takes the same path, for the same reason.) */
         if (until) {
-            __asm__ __volatile__("sti");
-            while ((int32_t)(pit_get_ticks() - until) < 0) {
+            for (;;) {
+                __asm__ __volatile__("sti");
+                if ((int32_t)(pit_get_ticks() - until) >= 0) {
+                    __asm__ __volatile__("cli");
+                    return;
+                }
                 __asm__ __volatile__("hlt");
+                __asm__ __volatile__("cli");
+                /* Milestone 31, and the same correction posix_sys_futex's
+                 * idle loop needed: "nothing else can run" was a fact
+                 * about the moment this loop started, not about every
+                 * tick of it. The tick that ends the hlt is the one that
+                 * expires other tasks' waits, so re-offering the CPU here
+                 * is what stops a poll with a timeout from starving the
+                 * task whose write would have satisfied it. */
+                if (scheduler_block_current_retry_multi(regs, waiting_on,
+                                                       waiting_n, until)) {
+                    return;
+                }
             }
-            __asm__ __volatile__("cli");
-            return;
         }
         scheduler_yield_from_trap(regs);
         return;
