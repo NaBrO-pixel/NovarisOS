@@ -14,7 +14,7 @@ bootloader hands off to a kernel, and the kernel grows from there. Over time
 you can shape it to *feel* like whichever OS inspires you (windowing system,
 shell conventions, UI style) without copying anyone's code.
 
-## Current status: Milestone 29 complete ✅
+## Current status: Milestone 30 complete ✅
 
 - [x] Multiboot bootloader handoff (via GRUB), 32-bit protected mode
 - [x] Freestanding C kernel — no libc, we own the whole stack
@@ -70,7 +70,7 @@ shell conventions, UI style) without copying anyone's code.
 - [x] **Two processes at once** — `fork`, `vfork`, `execve`, `wait4`,
       pipes, `dup2`, `poll`/`select`, and a POSIX state that is genuinely
       per process rather than a set of globals
-- [x] **Real Wine runs, and starts a real wineserver** — see below
+- [x] **A real Windows `.exe` runs under real Wine** — see below
 - [x] **A real windowing desktop**: a compositing window manager with
       draggable, resizable, overlapping windows, a taskbar, a Start menu
       and built-in apps — see below
@@ -216,34 +216,44 @@ The project committed to **Path A** — porting real Wine on top of Novaris
 rather than hand-writing more Win32 forever. That road has forced
 prerequisites, and they are now built: per-process address spaces, real
 threads, the Linux/i386 syscall ABI, signals with a writable `ucontext`,
-a dynamic linker, Unix sockets with `SCM_RIGHTS`, and — since Milestone
-29 — `fork`, `execve`, `wait4` and `poll`.
+a dynamic linker, Unix sockets with `SCM_RIGHTS`, `fork`/`execve`/`wait4`,
+`poll`, and shared file mappings.
 
-Wine 11.0, unmodified, built with stock `gcc -m32`, now runs far enough
-to **start a wineserver of its own and talk to it**:
+**A real Windows program now runs to completion under Wine 11.0 on
+Novaris:**
 
 ```
-novaris> setenv WINEDEBUG=+server
 novaris> run wine-preloader wine hellowin.exe
-wine: created the configuration directory '/.wine'
-wineserver: starting (pid=258)
-0024: init_first_thread( unix_pid=256, unix_tid=1, reply_fd=7, wait_fd=9 )
-0024: init_first_thread() = 0 { pid=0020, tid=0024, session_id=00000001 }
-0024: open_mapping( name=L"\KernelObjects\__wine_user_shared_data" )
-0024: get_handle_fd() = 0 { type=1, cacheable=1, access=000f001f }
+Hello from a real Windows .exe running on Novaris!
+  compiled by mingw-w64, linked against msvcrt.dll
+
+integers:   42 -7 4000000000 00042 42    | +42
+hex/octal:  beef BEEF 0xbeef 10
+floats:     3.141593 2.50 1.234568e+04 0.0001
+64-bit:     1234567890123
+heap:       "malloc + strcpy + strlen" (24 bytes)
+fib(20):    6765
+argc:       1, argv[0]: C:\windows\hellowin.exe
+
+Exiting with code 0.
 ```
 
-That is wineserver's own trace: two Novaris processes, one of them 4MB of
-real Wine, exchanging requests, replies and file descriptors over a Unix
-socket. The Wine prefix and its registry (`system.reg`, `user.reg`,
-`userdef.reg`) are written by wineserver itself.
+That is `userland/pe_test/hello_win.c` — an ordinary mingw-w64 program
+linked against the real msvcrt import library, the *same binary* the
+hand-written Win32 layer runs — going instead through Wine's own PE
+ntdll, kernel32, kernelbase and msvcrt, with a wineserver process behind
+it. Two Novaris processes passing file descriptors over a Unix socket.
+`make test-wine` asserts seven lines of it.
 
-**No Windows program has run under Wine yet.** It stops at
-`virtual_map_user_shared_data`, which needs `MAP_SHARED` — two processes
-mapping the same physical frames of a file, which needs a page cache this
-kernel does not have. That is the next milestone, and `ROADMAP.md`
-Milestone 29 is precise about it. Wine is not vendored; it is a build
-input, fetched and built separately and pointed at with `WINE_BUILD`.
+Wine is not vendored; it is a build input, fetched and built separately
+and pointed at with `WINE_BUILD`. `ROADMAP.md` Milestone 30 has the full
+account, including the six things `MAP_SHARED` turned out to be hiding
+behind it.
+
+**What does not work yet**: threaded Windows programs (a new thread's
+Windows TEB segment is not set up the way Wine expects, so the worker
+faults — cleanly, but it faults); anything with a GUI, since there is no
+display backend; and anything needing networking, since there is none.
 
 ## Project layout
 
@@ -347,11 +357,12 @@ qemu-system-i386 -cdrom novaris.iso -display none -serial stdio
 ```bash
 make test        # host-side tests: the printf engine and the PE loader
 make test-qemu   # boots the ISO, drives the shell, asserts on the output
-make test-posix  # runs nine binaries on Linux AND Novaris, diffs the two
+make test-posix  # runs ten binaries on Linux AND Novaris, diffs the two
+make test-wine   # boots novaris-wine.iso, asserts a Windows .exe's output
 ```
 
-`make test-posix` is the strongest of the three, and the one the POSIX
-work is held to: nine programs written for Linux (raw `int $0x80`, built
+`make test-posix` is the strongest of these, and the one the POSIX work
+is held to: ten programs written for Linux (raw `int $0x80`, built
 with plain `gcc -m32 -static -nostdlib`, linked against nothing that has
 heard of Novaris) are executed on the build host *and* inside QEMU, and
 the transcripts must match line for line. Exactly one line is allowed to

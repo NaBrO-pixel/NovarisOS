@@ -147,6 +147,9 @@
 #define SYS_fchmod          94
 #define SYS_fchmodat       306
 #define SYS_clock_nanosleep 267
+#define SYS_clock_settime64 404
+#define SYS_clock_getres_time64 406
+#define SYS_clock_nanosleep_time64 407
 #define SYS_sigreturn      119
 #define SYS_sched_setaffinity 241
 #define SYS_sched_getaffinity 242
@@ -156,6 +159,9 @@
 #define SYS_getpriority     96
 #define SYS_setpriority     97
 #define SYS_sigaltstack    186
+#define SYS_userfaultfd    374
+#define SYS_clone3         435
+#define SYS_membarrier     375
 
 /* --- errno values, negated on return ------------------------------------ */
 #define EPERM    1
@@ -476,6 +482,12 @@ void posix_process_end(void);
  * signal number for a program killed by one. Releases the process's
  * memory and wakes a parent waiting in wait4. Does not return. */
 void posix_exit_status(int wstatus);
+
+/* The same, for every thread of the process at once. What an unhandled
+ * fault does: Linux terminates the thread group rather than the thread,
+ * and a kernel that terminates only the thread leaves the others running
+ * in an address space it has just taken apart. */
+void posix_exit_process_group(int wstatus);
 
 /* --- signal delivery ----------------------------------------------------
  *

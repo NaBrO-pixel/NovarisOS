@@ -54,7 +54,7 @@ OBJS = $(BUILD_DIR)/boot.o $(BUILD_DIR)/kernel.o \
 KERNEL = $(BUILD_DIR)/novaris.bin
 ISO = novaris.iso
 
-.PHONY: all clean run run-nographic iso test test-qemu test-posix zip wine-initrd
+.PHONY: all clean run run-nographic iso test test-qemu test-posix test-wine zip wine-initrd
 
 all: $(ISO)
 
@@ -343,6 +343,7 @@ HOST_LIB32 ?= /lib32
 # loader, ntdll.so and the two files glibc's getpwuid needs. See
 # ROADMAP.md Milestone 27 for exactly how far that gets.
 WINE_BUILD ?=
+WINE_STRIP ?= 1
 
 # Wine's PE builtins, the subset a console program needs. Kept as a list
 # rather than a wildcard so that what ships is a decision rather than
@@ -697,14 +698,16 @@ wine-initrd: $(BUILD_DIR)/initrd.img $(KERNEL)
 	# re-execing itself finds what it expects without being told.
 	cp $(WINE_BUILD)/loader/wine $(BUILD_DIR)/wine_staging/wine
 	cp $(WINE_BUILD)/loader/wine-preloader $(BUILD_DIR)/wine_staging/wine-preloader
-	# The NLS tables. wineserver calls fatal_error() if it cannot load
-	# l_intl.nls, so this is not decoration - without it the server exits
-	# before it binds its socket and the client reports that it cannot
-	# connect. Only the handful Wine actually opens are shipped; the full
-	# set is 11MB and the initrd is read into RAM.
-	for f in l_intl.nls locale.nls c_20127.nls c_1252.nls c_437.nls c_850.nls; do \
-	    cp $(WINE_BUILD)/nls/$$f $(BUILD_DIR)/wine_staging/$$f; \
-	done
+	# The NLS tables. Not decoration and not optional: wineserver calls
+	# fatal_error() if it cannot load l_intl.nls, and kernelbase's
+	# init_locale walks sortdefault.nls without checking that it got it -
+	# with that one missing it parsed whatever pointer was left over,
+	# read a zero count, indexed to "the last of nothing" and took an
+	# access violation twenty-four bytes before the mapping.
+	#
+	# The whole directory rather than a hand-picked list, for exactly
+	# that reason: a missing table does not announce itself.
+	cp $(WINE_BUILD)/nls/*.nls $(BUILD_DIR)/wine_staging/
 	# --- Wine's Windows side (Milestone 30) ---------------------------
 	#
 	# The PE builtins. Everything above this line is Wine's *Unix* half;
@@ -729,8 +732,9 @@ wine-initrd: $(BUILD_DIR)/initrd.img $(KERNEL)
 	done
 	# win32u is the other Unix-side library ntdll loads, beside itself.
 	cp $(WINE_BUILD)/dlls/win32u/win32u.so $(BUILD_DIR)/wine_staging/win32u.so
-	i686-w64-mingw32-strip $(BUILD_DIR)/wine_staging/*.dll \
-	                       $(BUILD_DIR)/wine_staging/*.exe 2>/dev/null || true
+	test -z "$(WINE_STRIP)" || i686-w64-mingw32-strip \
+	    $(BUILD_DIR)/wine_staging/*.dll \
+	    $(BUILD_DIR)/wine_staging/*.exe 2>/dev/null || true
 	strip $(BUILD_DIR)/wine_staging/ntdll.so $(BUILD_DIR)/wine_staging/win32u.so \
 	      $(BUILD_DIR)/wine_staging/wineserver 2>/dev/null || true
 	# glibc's getpwuid() needs these, and Wine dereferences its result
@@ -744,6 +748,30 @@ wine-initrd: $(BUILD_DIR)/initrd.img $(KERNEL)
 	cp grub.cfg $(BUILD_DIR)/wine_iso/boot/grub/grub.cfg
 	grub-mkrescue -o novaris-wine.iso $(BUILD_DIR)/wine_iso 2>/dev/null
 	@echo "Wrote novaris-wine.iso - try: run wine-preloader wine hellowin.exe"
+
+# Boots novaris-wine.iso and asserts that a real Windows .exe runs under
+# real Wine. Separate from `make test-qemu` for the same reason
+# novaris-wine.iso is separate from novaris.iso: it needs a built Wine
+# tree, and this repository must stay buildable without one.
+#
+#   make WINE_BUILD=../wine wine-initrd test-wine
+#
+# 768MB because the initrd carries Wine's PE builtins and the NLS tables
+# and is read into RAM whole, and because a fork of a Wine process copies
+# its address space eagerly.
+test-wine:
+	@test -f novaris-wine.iso || \
+	    { echo "run 'make WINE_BUILD=/path/to/wine wine-initrd' first"; exit 1; }
+	python3 tools/qemu_test.py --iso novaris-wine.iso --memory 768 \
+	    --boot-wait 30 --settle 200 \
+	    --cmd "run wine-preloader wine hellowin.exe" \
+	    --expect "Hello from a real Windows \.exe running on Novaris" \
+	    --expect "compiled by mingw-w64, linked against msvcrt\.dll" \
+	    --expect "floats:     3\.141593 2\.50 1\.234568e\+04 0\.0001" \
+	    --expect "fib\(20\):    6765" \
+	    --expect "argv\[0\]: C:.windows.hellowin\.exe" \
+	    --expect "Exiting with code 0" \
+	    --reject "KERNEL PANIC"
 
 zip:
 	rm -rf $(BUILD_DIR)/pkg novaris.zip

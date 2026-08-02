@@ -753,6 +753,26 @@ int scheduler_yield_from_trap(registers_t* regs) {
     return 1;
 }
 
+void scheduler_exit_address_space(uint32_t pd) {
+    if (!active || !current) return;
+    if (!pd) pd = current->page_directory;
+
+    for (int i = 0; i < process_count; i++) {
+        if (process_table[i].page_directory == pd) {
+            process_table[i].state = PROC_ZOMBIE;
+        }
+    }
+
+    process_t* next = pick_next_ready();
+    if (!next) {
+        active = 0;
+        current = 0;
+        scheduler_return_to_caller();
+        __builtin_unreachable();
+    }
+    switch_to(next);
+}
+
 void scheduler_terminate_all(void) {
     /* Nothing is being scheduled, so there is no saved caller stack to
      * unwind to. Returning is the only safe answer; the caller is

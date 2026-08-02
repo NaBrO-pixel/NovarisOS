@@ -184,7 +184,7 @@ static void fb_scroll_one_line(void) {
     terminal_row = rows - 1;
 }
 
-void terminal_putchar(char c) {
+static void putchar_plain(char c) {
     /* Mirror every character out COM1 before drawing it, whichever
      * backend is live. This is the transcript tools/qemu_test.py asserts
      * against - see serial.h. */
@@ -220,6 +220,151 @@ void terminal_putchar(char c) {
         terminal_column = 0;
         if (++terminal_row == rows) fb_scroll_one_line();
     }
+}
+
+/* --- a minimal ANSI escape reader (Milestone 30) -------------------------
+ *
+ * Novaris's console is a framebuffer and a font, not a terminal, and for
+ * twenty-nine milestones nothing needed it to be one: the kernel and its
+ * programs write plain text.
+ *
+ * Wine's conhost does not. It draws a Windows console by positioning a
+ * VT cursor - every space is "erase to end of line, cursor forward one",
+ * every character is bracketed by hide-cursor/show-cursor - so the first
+ * Windows program to run under Wine here produced perfectly correct text
+ * with an escape sequence between each letter of it.
+ *
+ * So: the handful of sequences a console actually uses. Not a terminal
+ * emulator, and deliberately not - anything unrecognised is swallowed
+ * rather than printed, because printing it is what the problem looked
+ * like. Applied before the serial mirror, so the transcript the test
+ * harness reads is the text and not the drawing instructions. */
+#define ANSI_MAX_PARAMS 8
+
+static enum { ANSI_NONE = 0, ANSI_ESC, ANSI_CSI } ansi_state = ANSI_NONE;
+static int  ansi_params[ANSI_MAX_PARAMS];
+static int  ansi_nparams;
+static int  ansi_private;
+
+static void ansi_erase_to_eol(void) {
+    if (!has_framebuffer) return;
+    uint32_t bg = palette_lookup((terminal_color >> 4) & 0xF);
+    for (uint32_t c = terminal_column; c < cols; c++) {
+        draw_glyph_px(area_x + c * CHAR_W, area_y + terminal_row * CHAR_H,
+                      ' ', bg, bg);
+    }
+}
+
+/* SGR, as far as a 16-colour palette can honour it. The bright bit is
+ * kept separately from the colour so that "bold" then "red" gives bright
+ * red, which is what every terminal does and what a program setting them
+ * in either order expects. */
+static void ansi_sgr(void) {
+    static const uint8_t vga_of_ansi[8] = { 0, 4, 2, 6, 1, 5, 3, 7 };
+    static int bright = 0;
+    for (int i = 0; i < ansi_nparams; i++) {
+        int p = ansi_params[i];
+        if (p == 0) {
+            bright = 0;
+            terminal_color = VGA_COLOR_LIGHT_GREY;
+        } else if (p == 1) {
+            bright = 8;
+            terminal_color = (uint8_t)((terminal_color & 0xF0) |
+                                       ((terminal_color & 0x07) | 8));
+        } else if (p >= 30 && p <= 37) {
+            terminal_color = (uint8_t)((terminal_color & 0xF0) |
+                                       vga_of_ansi[p - 30] | bright);
+        } else if (p >= 40 && p <= 47) {
+            terminal_color = (uint8_t)((terminal_color & 0x0F) |
+                                       (vga_of_ansi[p - 40] << 4));
+        } else if (p >= 90 && p <= 97) {
+            terminal_color = (uint8_t)((terminal_color & 0xF0) |
+                                       vga_of_ansi[p - 90] | 8);
+        }
+    }
+}
+
+/* Acts on a complete CSI sequence. `final` is the letter that ended it. */
+static void ansi_dispatch(char final) {
+    int n = ansi_nparams > 0 ? ansi_params[0] : 0;
+
+    /* Private sequences (ESC [ ? ...) are the cursor-visibility ones and
+     * a few others; none of them mean anything to a console that has no
+     * hardware cursor to hide. */
+    if (ansi_private) return;
+
+    switch (final) {
+        case 'C':   /* cursor forward - which is how conhost writes a space */
+            if (n < 1) n = 1;
+            for (int i = 0; i < n; i++) putchar_plain(' ');
+            break;
+        case 'D':   /* cursor back */
+            if (n < 1) n = 1;
+            for (int i = 0; i < n && terminal_column > 0; i++) terminal_column--;
+            break;
+        case 'K':   /* erase to end of line */
+            ansi_erase_to_eol();
+            break;
+        case 'H': case 'f': {   /* cursor position, 1-based */
+            uint32_t r = (ansi_nparams > 0 && ansi_params[0] > 0)
+                             ? (uint32_t)ansi_params[0] - 1 : 0;
+            uint32_t c = (ansi_nparams > 1 && ansi_params[1] > 0)
+                             ? (uint32_t)ansi_params[1] - 1 : 0;
+            if (r < rows) terminal_row = r;
+            if (c < cols) terminal_column = c;
+            break;
+        }
+        case 'J':   /* erase display: only "the whole of it" is used */
+            if (n == 2) {
+                console_clear();
+            } else {
+                ansi_erase_to_eol();
+            }
+            break;
+        case 'm':
+            ansi_sgr();
+            break;
+        default:
+            break;   /* recognised as a sequence, and ignored */
+    }
+}
+
+void terminal_putchar(char c) {
+    switch (ansi_state) {
+        case ANSI_NONE:
+            if (c == 0x1B) { ansi_state = ANSI_ESC; return; }
+            break;
+        case ANSI_ESC:
+            if (c == '[') {
+                ansi_state = ANSI_CSI;
+                ansi_nparams = 0;
+                ansi_private = 0;
+                ansi_params[0] = 0;
+                return;
+            }
+            /* Not a CSI. Two-character escapes are not used by anything
+             * here, so the sequence ends and the character is dropped. */
+            ansi_state = ANSI_NONE;
+            return;
+        case ANSI_CSI:
+            if (c == '?') { ansi_private = 1; return; }
+            if (c >= '0' && c <= '9') {
+                if (ansi_nparams == 0) ansi_nparams = 1;
+                int* p = &ansi_params[ansi_nparams - 1];
+                *p = *p * 10 + (c - '0');
+                return;
+            }
+            if (c == ';') {
+                if (ansi_nparams < ANSI_MAX_PARAMS) {
+                    ansi_params[ansi_nparams++] = 0;
+                }
+                return;
+            }
+            ansi_state = ANSI_NONE;
+            ansi_dispatch(c);
+            return;
+    }
+    putchar_plain(c);
 }
 
 void terminal_backspace(void) {
