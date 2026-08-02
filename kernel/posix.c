@@ -272,6 +272,37 @@ static void process_teardown(int status) {
     if (parent) scheduler_wake_on((uint32_t)parent, 1, 0);
 }
 
+/* Ends the whole process rather than the calling thread: every thread of
+ * this address space stops. That is what an unhandled fault means - Linux
+ * terminates the thread group, not the thread - and getting it wrong
+ * panicked this kernel, because the fault path cleared the "ring 3 is
+ * running" flag while the *other* threads were still running, and the
+ * next one to fault fell through to the panic handler. */
+void posix_exit_process_group(int wstatus) {
+    uint32_t pd = scheduler_current_address_space();
+
+    /* Force the teardown even though siblings exist: they are about to
+     * stop too. */
+    posix_proc_t* p = posix_current();
+    for (int i = 3; i < MAX_FDS; i++) {
+        if (p->fds[i].kind == FD_SOCKET) socket_close(p->fds[i].sock);
+        if (p->fds[i].kind == FD_FILE) vfs_node_unref(p->fds[i].node);
+        p->fds[i].kind = FD_FREE;
+    }
+    if (pd && p->owns_memory) paging_release_user_pages();
+    vfork_release(p);
+    int ppid = p->ppid;
+    posix_proc_exit(p, wstatus);
+    posix_proc_t* parent = posix_proc_by_pid(ppid);
+    if (parent) scheduler_wake_on((uint32_t)parent, 1, 0);
+
+    if (scheduler_is_active()) {
+        scheduler_exit_address_space(pd);
+        return;
+    }
+    process_exit_to_kernel(); /* does not return */
+}
+
 void posix_exit_status(int status) {
     process_teardown(status);
     if (scheduler_is_active()) {
@@ -2164,6 +2195,17 @@ void posix_syscall(registers_t* regs) {
          * glibc treats as optional and falls back from cleanly. */
         case SYS_set_robust_list: r = 0; break;
         case SYS_rseq:            r = -ENOSYS; break;
+        /* Deliberately absent, and answered rather than reported. Every
+         * caller of these tries something else when refused, and saying
+         * so quietly is the difference between a clean transcript and one
+         * with three warnings in it that mean nothing:
+         *   userfaultfd - handling page faults in user space, which is a
+         *     kernel feature Novaris has no equivalent of;
+         *   clone3      - the wider clone; glibc falls back to clone;
+         *   membarrier  - a memory-ordering hint on one CPU. */
+        case SYS_userfaultfd:     r = -ENOSYS; break;
+        case SYS_clone3:          r = -ENOSYS; break;
+        case SYS_membarrier:      r = -ENOSYS; break;
 
         /* Genuinely absent, and answered rather than reported: there are
          * no symlinks and no statx, and glibc falls back to fstat64. */
@@ -2277,6 +2319,26 @@ void posix_syscall(registers_t* regs) {
             break;
         }
 
+        case SYS_clock_getres_time64: {
+            /* The 64-bit-time variants, which a glibc built past the 2038
+             * transition calls first. Same answer, wider fields. */
+            uint32_t* ts = (uint32_t*)b;
+            if (ts) { ts[0] = 0; ts[1] = 0; ts[2] = 10000000u; ts[3] = 0; }
+            r = 0;
+            break;
+        }
+        case SYS_clock_nanosleep_time64:
+            if (b & 1) { r = -ENOSYS; break; }
+            if (c) {
+                /* A 64-bit timespec, and only the low half of each field
+                 * can matter on a machine this size. */
+                const uint32_t* ts = (const uint32_t*)c;
+                uint32_t rel[2] = { ts[0], ts[2] };
+                r = sys_nanosleep(rel);
+            } else {
+                r = -EFAULT;
+            }
+            break;
         case SYS_clock_getres: {
             /* 10ms, which is the PIT rate and therefore the truth. */
             uint32_t* ts = (uint32_t*)b;

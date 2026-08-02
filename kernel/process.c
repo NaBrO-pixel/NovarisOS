@@ -575,7 +575,14 @@ static int handle_user_fault(registers_t* regs) {
     }
     terminal_writestring("\n         Terminating it and returning to the shell.\n");
 
-    user_active = 0;
+    /* `user_active` is cleared only on the path that has no scheduler
+     * behind it. While the scheduler is running it belongs to the batch,
+     * not to this task: clearing it here let the *next* thread's fault
+     * fall past this hook and into the kernel's panic handler, which is
+     * how a threaded Windows program under Wine took the machine down
+     * instead of the program. scheduler_run_until_idle() returns to
+     * process_run_elf(), which clears it. */
+    if (!scheduler_is_active()) user_active = 0;
 
     /* Which way out depends on how this program was started, and getting
      * it wrong panics the kernel. Since Milestone 20 an ELF program runs
@@ -589,7 +596,12 @@ static int handle_user_fault(registers_t* regs) {
      * unwinding into a dead frame. Nothing in the suite caught it because
      * no ELF test program had ever faulted - userland/crash_test.c now
      * does. */
-    posix_exit_process(); /* does not return */
+    /* And it takes every thread of the process with it, not just the one
+     * that faulted - an unhandled SIGSEGV ends the thread group. Other
+     * *processes* keep running, which matters here: when Wine's client
+     * crashes, wineserver is still a program in the middle of its own
+     * work. */
+    posix_exit_process_group(regs->int_no == 14 ? SIGSEGV : SIGILL);
     return 1;
 }
 

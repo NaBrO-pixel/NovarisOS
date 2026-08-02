@@ -335,6 +335,18 @@ int scheduler_blocked_count(void);
  * rewind its trap frame speculatively. */
 int scheduler_yield_would_switch(void);
 
+/* Ends every task running in address space `pd` - which is every thread
+ * of one process, and nothing else. An unhandled fault takes the whole
+ * process with it, the way an unhandled SIGSEGV does on Linux, but must
+ * leave the other processes of the batch alone: when Wine's client
+ * crashes, wineserver is still a running program.
+ *
+ * Returns normally if other tasks remain (the switch happens in isr.s's
+ * epilogue as the call chain unwinds); does not return if that was the
+ * last of them, in which case control goes back to whoever called
+ * scheduler_run_until_idle(). */
+void scheduler_exit_address_space(uint32_t pd);
+
 /* Ends every task in the batch at once and unwinds to whoever called
  * scheduler_run_until_idle(). This is process termination as opposed to
  * thread termination: ExitProcess, and an unhandled exception, both take

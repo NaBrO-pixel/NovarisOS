@@ -3698,6 +3698,235 @@ novaris> run wine-preloader wine hellowin.exe
 ```
 
 
+## Milestone 30 — a Windows program runs under real Wine ✅ DONE
+
+```
+novaris> run wine-preloader wine hellowin.exe
+Hello from a real Windows .exe running on Novaris!
+  compiled by mingw-w64, linked against msvcrt.dll
+
+integers:   42 -7 4000000000 00042 42    | +42
+hex/octal:  beef BEEF 0xbeef 10
+strings:    [abc] [       abc] [abc       ] [abc]
+floats:     3.141593 2.50 1.234568e+04 0.0001
+64-bit:     1234567890123
+heap:       "malloc + strcpy + strlen" (24 bytes)
+fib(20):    6765
+argc:       1, argv[0]: C:\windows\hellowin.exe
+
+Exiting with code 0.
+```
+
+That is `userland/pe_test/hello_win.c`, built by mingw-w64 against the
+real msvcrt import library - the same binary Milestone 10 runs against
+Novaris's hand-written Win32 - running instead on **Wine 11.0**, on
+Novaris, through Wine's own PE ntdll, kernel32, kernelbase and msvcrt,
+with a wineserver behind it. `make test-wine` asserts seven lines of it.
+
+The whole of Path A, end to end: an unmodified Unix program that
+implements Windows, cross-compiled against this kernel's syscall surface,
+loading unmodified Windows PE modules and running an unmodified Windows
+executable.
+
+### What Milestone 29 was stopped by, and what it actually took
+
+Milestone 29 named the blocker precisely and got the size of it wrong.
+`MAP_SHARED` was an afternoon; the six things behind it were the
+milestone.
+
+**MAP_SHARED, and why there is no page cache.** Two processes mapping one
+file have to see the same memory - it is how wineserver publishes the
+Windows `KUSER_SHARED_DATA` page to every client. The implementation is
+not a cache: a mappable file's bytes are moved into *page-aligned*
+storage, so page N of the file is exactly one physical frame, and the
+mapping hands that frame to user space. The file's contents and the
+mapping are then the same memory, and there is nothing to keep coherent.
+
+What it cost is one page-table bit. `PAGE_SHARED` means "mapped here, but
+not this address space's to free", and every teardown path checks it -
+munmap, process exit, execve, and the destruction of an address space.
+fork checks it too, and *shares* rather than copies, which is what makes
+a shared mapping shared across a fork.
+
+**PROT_NONE was a mapping, not a reservation.** Novaris answered "reserve
+this address range and give me nothing" by allocating a frame per page
+and marking it unreadable: the same observable behaviour and a completely
+different cost. Wine's preloader asks for two gigabytes of it before it
+does anything else. On a 512MB machine the reservation *succeeded*, ate
+every frame there was, and the loader stopped on the next allocation. A
+reservation is now a not-present entry with `PAGE_RESERVED` set - a page
+table per 4MB, two megabytes for Wine's two gigabytes - and `mprotect`
+turns it into memory when the program comes back for it.
+
+**And `mprotect(PROT_NONE)` has to keep the page.** The first version
+freed the frame and allocated a zeroed one on the way back, which passes
+any test that does not look. Wine's heap marks a block inaccessible and
+reuses it, so what it looked like from outside was Wine reading its own
+heap headers out of a page of zeroes. PROT_NONE is a *permission* here:
+the frame stays and `PAGE_USER` goes, so ring 3 faults and the bytes
+survive.
+
+**`MAP_FIXED_NOREPLACE` was ignored.** "This address or nothing" is how a
+loader asks for a Windows image's base address, and reading it as
+"anywhere will do" produced an arbitrary address and the error
+`out of memory for 0x400000` - a message about the one thing that was not
+the problem.
+
+**0x400000 was the initrd's.** GRUB puts modules just above the kernel,
+Novaris identity-mapped them there, and every Windows executable ever
+built wants to load at 0x400000. The initrd never needed to be at its
+physical address - only to be reachable - so it moved to the kernel half
+at `INITRD_VIRTUAL_BASE`, and the classic image range became the
+program's.
+
+**Linux gives a thread three TLS descriptors; Novaris gave one.** That
+was enough while glibc was the only thing asking. Wine asks too: its i386
+code reaches the Windows TEB through `fs` the way glibc reaches its TLS
+through `gs`, and it gets that segment by calling `set_thread_area()`.
+With one descriptor to go round, Wine's request silently overwrote
+glibc's, and the next glibc function to touch `errno` read it out of the
+middle of a TEB. What that looked like was Wine dereferencing a null
+pointer inside its own SIGSEGV handler.
+
+**A file has to outlive its name.** Open a file, unlink it, keep using
+the descriptor: that is how anonymous shared memory is made on Unix and
+exactly what wineserver does. Novaris freed the node on unlink, so an
+open descriptor and a live mapping pointed at reused heap. VFS nodes are
+reference counted now, and a shared mapping holds a reference too.
+
+### And the ones only findable by running it
+
+**`sortdefault.nls` was not in the initrd**, and kernelbase's
+`init_locale` walks it without checking that it got it. With the table
+missing it parsed whatever pointer was left over, read a count of zero,
+computed "the last entry of nothing", and took an access violation
+twenty-four bytes *before* the mapping. Four instructions of
+disassembly - `mov (%eax),%edx; lea (%edx,%edx,2),%ecx; shl $3,%ecx;
+lea -0x18(%eax,%ecx,1),%edi` - identified it, because a count of zero is
+the only input that produces that address. The initrd now carries the
+whole `nls` directory: a missing table does not announce itself.
+
+**The legacy `sigreturn` frame is two arguments up, not three.** glibc's
+non-`SA_SIGINFO` restorer pops the signal number before the syscall.
+Novaris only implemented `rt_sigreturn`, so a handler installed without
+`SA_SIGINFO` could not return from itself at all.
+
+**wineserver ran out of descriptors at 32.** It holds a listening socket,
+a connection, and a request, reply and wait pipe per client, plus an open
+descriptor for every file any client has mapped. It reported
+`STATUS_TOO_MANY_OPENED_FILES` while opening ntdll.dll and the client
+turned that into "invalid image format" - a true statement about the
+wrong thing. The table is 128 now.
+
+**A faulting thread took the kernel with it.** The fault path cleared the
+"ring 3 is running" flag and terminated one task; the *other* threads
+kept running, and the next one to fault fell straight past the hook into
+the panic handler. An unhandled fault now ends the whole thread group -
+which is what Linux does - and leaves the other processes of the batch
+alone, because when Wine's client crashes wineserver is still a running
+program.
+
+**And the console had to learn to read.** Novaris's console is a
+framebuffer and a font. Wine's conhost draws a Windows console by
+positioning a VT cursor: every space is "erase to end of line, cursor
+forward one", every character is bracketed by hide-cursor/show-cursor. So
+the first Windows program to run here produced perfectly correct text
+with an escape sequence between each letter of it. `kernel/console.c` now
+reads the handful of sequences a console actually uses, and swallows
+anything else rather than printing it.
+
+Plus the syscalls, each found by an `-ENOSYS` report: `fcntl64` in full,
+`pwrite64`, `prlimit64`, `getrusage`, `gettimeofday`, `clock_getres`,
+`clock_nanosleep` (and the 64-bit-time forms), `sched_yield`,
+`sched_getaffinity`, `madvise`, `lstat64`, `statfs64`, `sysinfo`,
+`setpriority`, `chmod`, `ftruncate`, `truncate`, `fchdir` (real, by
+rebuilding the path from the tree - wineserver moves into its config
+directory by descriptor), and `sigaltstack` (real, because a handler on
+the faulting thread's own stack cannot do anything about a stack
+overflow).
+
+Two answered by refusing rather than half-building: `symlink` is `-EPERM`
+rather than `-ENOSYS`, because the operation is understood and refused
+rather than unknown; and `epoll_create` is refused *on purpose*, because
+wineserver falls back to `poll()` for its whole main loop if it does not
+get an epoll descriptor, and `poll()` is the path Novaris implements
+properly. A half-working epoll would have been chosen over a working
+poll.
+
+### Verified
+
+A tenth comparison binary, `userland/mmap_test.c` -> `mmaptest.elf`, raw
+`int $0x80` like the rest, **byte-identical to the Linux host**:
+
+```
+$ make test-posix
+ 41 lines, 20 checks  posixtest.elf     60 lines, 45 checks  uctest.elf
+ 93 lines, 67 checks  sigtest.elf       67 lines, 45 checks  fstest.elf
+ 37 lines, 15 checks  pthtest.elf       34 lines, 23 checks  socktest.elf
+ 51 lines, 34 checks  forktest.elf      39 lines, 24 checks  mmaptest.elf
+  5 lines,  0 checks  glibc.elf          5 lines,  0 checks  dyn.elf
+```
+
+24 checks across a shared mapping seen through `read()`, two mappings of
+one file seeing each other, a shared mapping surviving a fork, a private
+mapping staying private, a megabyte reserved with `PROT_NONE`,
+`MAP_FIXED_NOREPLACE` refusing a reserved address and `MAP_FIXED` taking
+it, `mprotect` round-tripping through `PROT_NONE` without losing data,
+and a file read through a descriptor after its name is gone.
+
+And `make test-wine`, which boots `novaris-wine.iso` and asserts seven
+lines of a real Windows program's output.
+
+Host tests 38 + 30 + 52, smoke suite 17 assertions, all ten comparison
+binaries identical.
+
+### Honest scope
+
+- [x] **A real Windows `.exe` runs to completion under real Wine on
+      Novaris** - console output, printf with floats and 64-bit integers,
+      the heap, argv, and the exit code.
+- [x] `qsorttest.exe` too: `qsort`, `bsearch` and nested callbacks,
+      through Wine rather than through Novaris's own Win32 layer.
+- [x] `MAP_SHARED`, `PROT_NONE` reservations, `MAP_FIXED_NOREPLACE`,
+      three TLS descriptors, reference-counted files, and a console that
+      reads ANSI.
+- [ ] **Threaded Windows programs do not work.** `threads.exe` starts,
+      creates a worker, and the worker faults reading its thread block -
+      a new thread's `fs` is not set up the way Wine expects before it
+      runs. It fails *cleanly* - the process dies, the shell comes back,
+      every frame is reclaimed - but it fails.
+- [ ] **No GUI.** `winex11` is not built and there is no display backend,
+      so a windowed program has nowhere to draw. Novaris has a window
+      manager of its own and connecting the two is a milestone.
+- [ ] **No networking**, so `ws2_32.dll` fails to initialise and anything
+      needing it will not start. `wineboot` does not, which is why the
+      prefix has no drive mapping and Wine reports "could not find DOS
+      drive for the current working directory" and starts in the Windows
+      directory instead.
+- [ ] `fork` still copies eagerly, `poll` still wakes on one descriptor
+      plus a tick, and a vfork child's memory is copied rather than
+      shared.
+- [ ] The Wine ISO needs 768MB of guest RAM and carries a 40MB initrd
+      read into memory whole. That wants a real filesystem on a real
+      disk, and there is not one.
+
+### How to reproduce it
+
+Wine is still **not vendored**. What `make wine-initrd` carries has grown:
+the loader and `ntdll.so` as before, plus `wineserver`, `win32u.so`, the
+whole `nls` directory, and the PE builtins a console program needs -
+`WINE_PE_DLLS` and `WINE_PE_PROGS` in the Makefile name them, so what
+ships is a decision rather than whatever happened to be built.
+
+```bash
+git clone --depth 1 -b stable https://github.com/wine-mirror/wine
+cd wine
+CC="gcc -m32" ./configure --enable-archs=i386 --disable-tests \
+    --without-x --without-freetype --without-vulkan --without-opengl ...
+make -j4
+cd ../NovarisOS && make WINE_BUILD=../wine wine-initrd test-wine
+```
+
 ## Path A — porting Wine (the current direction)
 
 Milestone 8 laid out two ways to run Windows binaries: port Wine (Path
@@ -3744,7 +3973,10 @@ are forced into an order:
    `PT_INTERP`, `AT_BASE`, file-backed `mmap` and the file syscalls; the
    linking itself is the interpreter's job.
 5. **Pull in real Wine source**, cross-compile it against that surface,
-   and find out what is still missing. — ⏳ started in Milestone 27, and
+   and find out what is still missing. — ✅ **done**. Milestone 30 runs a
+   real Windows `.exe` under real Wine on Novaris. The history below is
+   worth keeping, because each step found the *next* missing subsystem
+   rather than the one that looked obvious. Started in Milestone 27, and
    it has done what it was for three times over. Wine 11.0 builds against
    this kernel; Milestone 27 got it as far as `wine --version` and found
    that what stopped it was not a missing syscall but a missing
