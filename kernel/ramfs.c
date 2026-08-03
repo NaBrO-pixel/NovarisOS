@@ -52,6 +52,7 @@
 #include "kstring.h"
 #include "posix.h"
 #include "console.h"
+#include "rtc.h"
 
 /* Nodes come from the kernel heap in blocks, threaded onto a free list.
  *
@@ -78,9 +79,13 @@ static uint32_t heap_bytes = 0;
 
 /* --- the initrd archive, which is now only an input --------------------- */
 
-#define INITRD_MAGIC      0x53544C52u /* 'STLR' */
-#define INITRD_MAX_FILES  256
-#define INITRD_NAME_MAX   60
+/* 'STL2' since Milestone 35, when the format grew directories - a name is
+ * a path now, and the old 'STLR' images have a 60-byte name field where
+ * this one has 124. Different magic so a stale image is refused rather
+ * than read as gibberish. */
+#define INITRD_MAGIC      0x324C5453u /* 'STL2' */
+#define INITRD_MAX_FILES  2048
+#define INITRD_NAME_MAX   124
 
 typedef struct {
     uint32_t magic;
@@ -220,8 +225,18 @@ vfs_node_t* vfs_create(vfs_node_t* dir, const char* name, uint32_t flags) {
     if (!dir || !(dir->flags & VFS_DIRECTORY)) return 0;
     if (!name || !*name) return 0;
     if (vfs_finddir(dir, name)) return 0;   /* already exists */
-    if (dir->ops && dir->ops->create) return dir->ops->create(dir, name, flags);
-    return ramfs_create(dir, name, flags);
+    vfs_node_t* n = (dir->ops && dir->ops->create)
+                        ? dir->ops->create(dir, name, flags)
+                        : ramfs_create(dir, name, flags);
+    if (n) n->mtime = rtc_unix_time();
+    return n;
+}
+
+/* A file has just changed. One place rather than three, because the two
+ * callers that matter (a write and a truncate) are exactly the two things
+ * that make a modification time wrong if they are missed. */
+void vfs_touch(vfs_node_t* node) {
+    if (node) node->mtime = rtc_unix_time();
 }
 
 /* Walks up to the root collecting names, then writes them out forwards.
@@ -546,6 +561,7 @@ static int32_t ramfs_write(vfs_node_t* node, uint32_t offset, uint32_t size,
      * true and worth saying rather than relying on. */
     kmemcpy(node->data + offset, buffer, size);
     if (end > node->length) node->length = end;
+    node->mtime = rtc_unix_time();
     return (int32_t)size;
 }
 
@@ -575,6 +591,7 @@ static int32_t ramfs_truncate(vfs_node_t* node, uint32_t length) {
         kmemset(node->data + length, 0, node->length - length);
     }
     node->length = length;
+    node->mtime = rtc_unix_time();
     return 0;
 }
 
@@ -681,6 +698,46 @@ void vfs_heap_account(int32_t delta) {
     else heap_bytes = (uint32_t)((int32_t)heap_bytes + delta);
 }
 
+/* Makes every directory named on the way to `path`'s last component, and
+ * hands back that directory plus a pointer to the leaf name inside
+ * `path`. Milestone 35: the initrd carries a tree, and the tree is
+ * described only by the paths of the files in it, so the directories have
+ * to be inferred rather than read.
+ *
+ * Nothing here needs the archive sorted, though mkinitrd.py sorts it -
+ * an existing directory is found and reused, and a component that exists
+ * as a *file* is a broken archive and stops that entry rather than
+ * replacing anything. */
+static vfs_node_t* initrd_make_dirs(const char* path, const char** leaf_out) {
+    vfs_node_t* dir = root;
+    const char* p = path;
+
+    *leaf_out = 0;
+    while (*p == '/') p++;
+
+    for (;;) {
+        const char* slash = p;
+        while (*slash && *slash != '/') slash++;
+        if (!*slash) {                      /* no more separators: the leaf */
+            *leaf_out = p;
+            return dir;
+        }
+
+        char comp[VFS_NAME_MAX];
+        uint32_t n = 0;
+        while (p < slash && n < VFS_NAME_MAX - 1) comp[n++] = *p++;
+        comp[n] = '\0';
+        p = slash;
+        while (*p == '/') p++;
+        if (!n) continue;                   /* a doubled separator */
+
+        vfs_node_t* next = vfs_finddir(dir, comp);
+        if (!next) next = vfs_create(dir, comp, VFS_DIRECTORY);
+        if (!next || !(next->flags & VFS_DIRECTORY)) return 0;
+        dir = next;
+    }
+}
+
 void ramfs_init(uint32_t initrd_addr, uint32_t initrd_size) {
     (void)initrd_size;
     free_list = 0;
@@ -717,7 +774,15 @@ void ramfs_init(uint32_t initrd_addr, uint32_t initrd_size) {
             name[len] = '\0';
             if (!len) continue;
 
-            vfs_node_t* f = vfs_create(root, name, VFS_FILE);
+            /* A name is a path now. Everything before the last '/' is
+             * directories, made on the way if they are not there yet -
+             * which is how /usr/lib/wine/i386-unix comes to exist without
+             * the archive having to describe directories separately. */
+            const char* leaf = 0;
+            vfs_node_t* dir = initrd_make_dirs(name, &leaf);
+            if (!dir || !leaf || !*leaf) continue;
+
+            vfs_node_t* f = vfs_create(dir, leaf, VFS_FILE);
             if (!f) break;
             /* Referenced, not copied - see the file header. */
             f->data = (uint8_t*)(initrd_addr + entries[i].offset);
@@ -741,4 +806,12 @@ void ramfs_init(uint32_t initrd_addr, uint32_t initrd_size) {
      * with no disk at all - `ls /disk` should say "empty", not "no such
      * directory". */
     vfs_create(root, "disk", VFS_DIRECTORY);
+
+    /* Home. $HOME is /root on a machine with no disk (see process.c), and
+     * Wine's prefix is $HOME/.wine - which it creates itself, but only the
+     * last component of it. Made here rather than shipped in the initrd
+     * because the archive carries files and an empty directory is not a
+     * file: "wine: chdir to /root/.wine : No such file or directory" is
+     * what shipping it as nothing at all looks like. */
+    vfs_create(root, "root", VFS_DIRECTORY);
 }

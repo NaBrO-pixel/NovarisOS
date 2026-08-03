@@ -40,6 +40,7 @@
  */
 
 #include "fat32.h"
+#include "console.h"
 #include "blockdev.h"
 #include "vfs.h"
 #include "kheap.h"
@@ -1102,6 +1103,22 @@ static int generate_short(vfs_node_t* dir, const char* name, uint8_t* out11) {
     return 0;
 }
 
+/* Why a create failed, said out loud.
+ *
+ * Milestone 35. `mkdir /disk/.wine` returning nothing is what Wine sees as
+ * "chdir to /disk/.wine : No such file or directory", three layers up and
+ * with no clue in it, and there are five different ways to get there. A
+ * line naming which one turns an afternoon into a minute. */
+static vfs_node_t* create_failed(const char* why, const char* name) {
+    terminal_writestring_color("[fat32] ", VGA_COLOR_LIGHT_RED);
+    terminal_writestring("cannot create \"");
+    terminal_writestring(name);
+    terminal_writestring("\": ");
+    terminal_writestring(why);
+    terminal_writestring("\n");
+    return 0;
+}
+
 static vfs_node_t* fat_create(vfs_node_t* dir, const char* name,
                               uint32_t flags) {
     if (kstrlen(name) >= VFS_NAME_MAX) return 0;
@@ -1114,13 +1131,15 @@ static vfs_node_t* fat_create(vfs_node_t* dir, const char* name,
     if (make_short(name, short11, &ntflags) && !short_name_taken(dir, short11)) {
         lfn_count = 0;
     } else {
-        if (!generate_short(dir, name, short11)) return 0;
+        if (!generate_short(dir, name, short11)) {
+            return create_failed("no free 8.3 short name", name);
+        }
         ntflags = 0;
         lfn_count = lfn_slots_for(kstrlen(name));
     }
 
     int32_t slot = dir_find_slots(dir, lfn_count + 1);
-    if (slot < 0) return 0;
+    if (slot < 0) return create_failed("no room in the directory", name);
 
     uint32_t cluster = 0;
     uint8_t attr = ATTR_ARCHIVE;
@@ -1128,8 +1147,11 @@ static vfs_node_t* fat_create(vfs_node_t* dir, const char* name,
         /* A directory always has at least one cluster, because it has to
          * hold "." and "..". */
         cluster = alloc_cluster(0);
-        if (!cluster) return 0;
-        if (zero_cluster(cluster) != 0) return 0;
+        if (!cluster) return create_failed("no free cluster", name);
+        if (zero_cluster(cluster) != 0) {
+            free_chain(cluster);
+            return create_failed("write error zeroing its cluster", name);
+        }
         attr = ATTR_DIRECTORY;
     } else if (flags & VFS_SYMLINK) {
         attr = ATTR_SYSTEM | ATTR_ARCHIVE;
@@ -1139,7 +1161,7 @@ static vfs_node_t* fat_create(vfs_node_t* dir, const char* name,
     if (dir_write_entries(dir, (uint32_t)slot, name, short11, ntflags, attr,
                           cluster, 0, lfn_count, &short_pos) != 0) {
         if (cluster) free_chain(cluster);
-        return 0;
+        return create_failed("write error storing its directory entry", name);
     }
 
     vfs_node_t* n = vfs_node_alloc();

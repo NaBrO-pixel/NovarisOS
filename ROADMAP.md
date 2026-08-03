@@ -4934,6 +4934,220 @@ user's business. On the ordinary `novaris.iso`, which carries no Wine,
   the whole file, and nothing evicts it. That is the price of having no
   page cache, and it is now paid by private mappings too.
 
+## Milestone 35 — Wine, installed ✅ DONE
+
+Milestone 34 got a Windows program running under Wine on the real startup
+path. It did not make Wine part of this operating system, and the
+difference is not cosmetic.
+
+What "a tool sitting next to an OS" looked like, concretely:
+
+- **Two ISOs.** `novaris.iso` was the OS; `novaris-wine.iso` was a
+  separate image built by a separate target.
+- **No paths.** The initrd format had a 60-byte name field and no
+  directories, so everything shipped in it landed at the root:
+  `/ntdll.so`, `/gdi32.dll`, `/wine-preloader`, `/passwd`.
+- **A fallback holding it together.** `/lib32/libc.so.6` resolved only
+  because the kernel matches the last component of a path whose
+  directories do not exist. That fallback is load-bearing for a flat
+  archive and invisible until you look.
+- **An invocation nobody would guess.** `run wine-preloader wine
+  hellowin.exe`, because the preloader had to be named and handed the
+  loader by hand.
+- **A prefix built somewhere else.** Novaris could not make one, so it was
+  built by the same Wine on a host and written into a disk image with
+  `make wine-disk`.
+
+The last two were consequences of the second. Wine finds itself by
+`dladdr`-ing ntdll.so and then does *relative* arithmetic on that path
+(`dlls/ntdll/unix/loader.c`, `init_paths` and `build_relative_path`):
+
+    dll_dir    = <prefix>/lib/wine          the builtins, both halves
+    bin_dir    = <prefix>/bin               wineserver
+    data_dir   = <prefix>/share/wine        wine.inf and the NLS tables
+    wineloader = <dll_dir>/i386-unix/wine   what it re-execs
+
+With ntdll.so at `/`, all four came out as nonsense. Three of them were
+survivable because the fallback found the files anyway. The fourth was
+not: a path that does not resolve at all has no NT form, so `WINEDATADIR`
+was never set, so `get_wine_inf_path()` returned NULL, so wineboot printed
+
+```
+wine: failed to update L"\??\Z:\disk\.wine", wine.inf not found
+```
+
+and returned. That one line was the whole of Wine not being installed, and
+it is why every milestone up to 34 needed a prefix built on a host.
+
+### Directories in the initrd
+
+The archive format grew them. `'STLR'` became `'STL2'`, the name field
+went from 60 bytes to 124, and a name is a path now:
+`mkinitrd.py` walks the tree, and `ramfs.c` makes each directory on the
+way to a file the first time it sees one. Different magic so a stale image
+is refused rather than read as gibberish.
+
+### Installed
+
+`tools/install_wine.sh` puts Wine where `make install` puts it:
+
+```
+/usr/lib/wine/i386-unix/     ntdll.so, win32u.so, ws2_32.so, bcrypt.so,
+                             wine, wine-preloader
+/usr/lib/wine/i386-windows/  the PE builtins - 29 DLLs and 10 programs
+/usr/bin/                    wine, wineserver
+/usr/share/wine/             wine.inf
+/usr/share/wine/nls/         the NLS tables
+/lib32/, /lib/               the host's ld-linux.so.2, libc, libm, libgcc
+/etc/                        passwd, nsswitch.conf
+```
+
+Wine's arithmetic lands on that without being told anything.
+
+One trap on the way, and it is a good one. `/usr/bin/wine` is a *different
+binary* from the loader in `i386-unix`: the loader finds ntdll.so beside
+itself, which is only true where it is installed, while the bin-directory
+wrapper (`tools/wine/wine.c`) works out bindir from its own path, converts
+that to libdir with the same relative arithmetic, and dlopens
+`<libdir>/wine/i386-unix/ntdll.so`. Installing the loader in `/usr/bin`
+instead gets
+
+```
+wine: could not load ntdll.so: /usr/bin/ntdll.so: cannot open shared
+    object file: No such file or directory
+```
+
+which is what the first attempt at this did.
+
+### And then Wine built its own prefix
+
+With `/usr/share/wine/wine.inf` where Wine expects it, wineboot stops
+saying it cannot find it and runs `rundll32` over it — the thing
+`ROADMAP.md` had listed as out of reach since Milestone 32. setupapi
+copies the files, writes the registry, makes the drive table, and the
+program runs:
+
+```
+novaris> wine hellowin.exe
+Hello from a real Windows .exe running on Novaris!
+  compiled by mingw-w64, linked against msvcrt.dll
+...
+fib(20):    6765
+argc:       1, argv[0]: Z:\hellowin.exe
+
+Exiting with code 0.
+```
+
+No disk, no host, no setup commands, symbolic links on, one ISO.
+`Z:\hellowin.exe` is the DOS drive table resolving the path — the prefix
+Wine built for itself, on Novaris, a minute earlier.
+
+Two smaller things had to be true for that:
+
+- **`/root` exists, and `$HOME` is it.** Wine creates `$HOME/.wine` but
+  only the last component of it, so a missing `/root` is "wine: chdir to
+  /root/.wine : No such file or directory". The initrd carries files, and
+  an empty directory is not a file, so the kernel makes it — beside `/tmp`
+  and `/disk`, which it already made for the same reason.
+- **Files have a modification time.** setupapi sets the times on every
+  file it copies, and `utimensat` was not implemented. Seventy-six
+  `Converting errno 38 to STATUS_UNSUCCESSFUL` lines in one wineboot, each
+  one a file copy reporting failure. `vfs_node_t` has an `mtime` now, set
+  on create, write and truncate, reported by `stat`, and settable through
+  `utimensat`/`utime`/`utimes`/`futimesat`. The `*removexattr` family is
+  answered too, which was the only other unimplemented syscall left in a
+  run.
+
+### One write per boot failed, and had since Milestone 32
+
+The prefix belongs on the disk, so `make test-wine-prefix` puts an empty
+512MB volume in front of Wine and lets it build one there. Wine said:
+
+```
+wine: chdir to /disk/.wine : No such file or directory
+```
+
+`mkdir /disk/.wine` from the shell failed too — and then the *next* one
+worked, and so did every write after it. One write per boot, always the
+first, on any volume, of any size, for any name. `make test-qemu-disk` had
+never caught it because it writes a file first and asserts on the second
+operation onwards; nothing had ever looked at the very first write.
+
+The chase is worth recording because three plausible answers were wrong.
+It was not the leading dot in `.wine` (a plain `mkdir` failed identically).
+It was not the 4096-byte clusters (a one-sector write failed too). It was
+not the driver's logic at all: `tests/fat32_host_test.c`'s harness, which
+links the real FAT32 driver against an image file, created both
+directories on the same 512MB image without complaint — which pointed
+squarely at the one thing the host harness does not have, the ATA driver.
+
+Two new diagnostics found it in one run each. `fat_create()` says which of
+its five failure paths it took, and `ata_report()` prints the status and
+error registers. Together:
+
+```
+[ata] busy after flush: status 0xc0 error 0x00
+[fat32] cannot create "x": write error zeroing its cluster
+```
+
+`0xc0` is BSY|DRDY: the CACHE FLUSH at the end of the write had not
+finished, and `ata_wait_not_busy()` gave up on it. Its timeout was
+`ATA_TIMEOUT`, four million iterations of a polling loop — and **a spin
+count is not a duration**. One `inb` is a bus cycle on real hardware and a
+trap into the emulator here, two figures orders of magnitude apart, and
+four million of the latter is a few seconds. The first flush of a boot is
+the one where the host has to allocate and `fsync` a sparse image it has
+never written to, so it is the one flush that takes longer than that.
+Every later flush is fast, which is exactly why exactly one write failed.
+
+The timeout is in PIT ticks now — five seconds, a real duration — with the
+old spin count kept as a backstop for a wait that happens with interrupts
+disabled, where the tick counter cannot move.
+
+### One image
+
+There is one ISO. `make` builds the OS; with `WINE_BUILD` pointing at a
+built Wine, `make` installs Wine into it. Without, it builds the same OS
+without Wine, and `wine` in the shell says so and points at `run` instead
+of failing three layers down. `make wine-initrd`, `novaris-wine.iso`,
+`make wine-disk` and `WINE_PREFIX_DIR` are all gone.
+
+`make test-wine` and `make test-wine-threads` now run the default
+configuration and ask for nothing: no `symlinks off`, no separate image,
+`wine hellowin.exe` typed at the shell. Between them they reject
+`wine.inf not found`, `Failed to get shared session object`, `Too many
+open files`, `could not load ntdll.so` and `unimplemented syscall` —
+every line that used to be normal. `make test-wine-prefix` is the same
+thing on an *empty* disk, where Wine builds its prefix on real storage and
+names it `Z:\disk\.wine`.
+
+`tools/qemu_test.py` grew `--stop-when-matched`, because a Wine run takes
+minutes and varies: the settle is a budget now rather than a fixed cost,
+and only a failing run spends it.
+
+### Still open
+
+- **No display backend.** `err:winediag:nodrv_CreateWindow` is honest -
+  there is no `winex11.drv` equivalent for Novaris's own window manager,
+  so a Windows program can have a console and not a window. That is the
+  next thing worth building, and Milestone 11's compositor is what it
+  would be built on.
+- **It is slow.** wineboot takes longer than the five minutes Wine allows
+  for its own boot event, so a successful run contains
+  `err:environ:run_wineboot`. Most of it is having no page cache: a mapped
+  DLL is read in full and copied into the heap, per file.
+- **The DLL set is curated.** 29 of Wine's 601, so parts of `wine.inf`
+  have nothing to install and say so (`SetupDefaultQueueCallbackW copy
+  error 1812`, `register_fake_dll failed to create IRegistrar`). Widening
+  it is a question of how big an initrd may be, which is a question about
+  the page cache above.
+- **The prefix is rebuilt at every boot when there is no disk**, because
+  `$HOME` is `/root` and `/root` is a ramfs. With a disk it is built once
+  and stays - which is what `make test-wine-prefix` sets up, and what
+  anybody actually using this would do.
+- **Networking.** Unchanged, and still the reason `nsiproxy` and `NDIS`
+  fail to start.
+
 ## Later / open-ended
 
 - Networking (a NIC driver + a minimal TCP/IP stack) — big undertaking.
@@ -4988,20 +5202,20 @@ much each would widen what runs:
    cd wine && CC="gcc -m32" ./configure --enable-archs=i386 \
        --disable-tests --without-x --without-freetype --without-vulkan \
        --without-opengl && make -j4
-   cd ../NovarisOS && make WINE_BUILD=../wine wine-initrd \
-       test-wine test-wine-threads
+   cd ../NovarisOS && make WINE_BUILD=../wine
+   make test-wine test-wine-threads
    ```
+
+   Since Milestone 35 there is one ISO and Wine is installed into it, so
+   `WINE_BUILD` is a variable to `make` rather than an argument to a
+   separate target. Set it once (`export WINE_BUILD=../wine`) and the
+   ordinary `make` builds an OS with Wine in it.
 
    And, since Milestone 32, the disk. `make disk` makes an empty one and
    `make run-disk` boots with it attached; `make test-qemu-disk` is the
-   write-reboot-read test. For Wine's real startup path you need a prefix,
-   and Novaris cannot build one yet, so it comes from the same Wine tree
-   on the host:
-
-   ```bash
-   WINEPREFIX=/tmp/pfx ../wine/loader/wine wineboot -u
-   make WINE_PREFIX_DIR=/tmp/pfx wine-disk test-wine-prefix
-   ```
+   write-reboot-read test. `make test-wine-prefix` makes an empty one of
+   its own and lets Wine build its prefix on it - since Milestone 35 that
+   needs no host-built prefix and no extra variables.
 
    `test-wine-prefix` is the long one: it boots a whole Wine on an
    emulated machine and a run takes minutes, most of it wineboot. It stops

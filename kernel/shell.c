@@ -292,44 +292,45 @@ static void cmd_run(const char* line) {
 
 /* --- wine ---------------------------------------------------------------
  *
- * `wine hellowin.exe` rather than `run wine-preloader wine hellowin.exe`.
+ * `wine hellowin.exe`, and that is the whole invocation.
  *
- * The three names in the long form are all real and all necessary.
- * `wine-preloader` is a small static ELF whose whole job is to reserve
- * the low two gigabytes before ld.so can put anything there, because that
- * is where a Windows image wants to load; `wine` is the loader it hands
- * control to once the address space is safe; and the .exe is the program.
- * None of that is interesting to somebody who wants to run a program, and
- * remembering it is exactly the kind of thing a shell should do for you.
+ * Milestone 34 made this shorthand for `run wine-preloader wine
+ * hellowin.exe`, because that was the only sequence that worked: Wine's
+ * files were a heap at the root of the initrd, so the preloader had to be
+ * named explicitly and handed the loader explicitly. Milestone 35
+ * installed Wine into the OS instead - /usr/bin/wine, /usr/lib/wine,
+ * /usr/share/wine - and an installed Wine does that part itself. The
+ * wrapper at /usr/bin/wine loads ntdll.so, works out where the real
+ * loader is, and re-execs itself through the preloader.
  *
- * The long form still works and is what `make test-wine` uses, on purpose:
- * a test that spells out the whole invocation is testing one layer fewer
- * than a test that goes through this. */
+ * So this command is now what it looks like: run /usr/bin/wine, with the
+ * arguments the user gave. */
+#define WINE_LOADER "/usr/bin/wine"
+
 static void cmd_wine(const char* args) {
-    /* "wine-preloader wine " is 20 characters; the rest is the caller's. */
     static char cmdline[CMD_BUFFER_SIZE + 24];
 
     if (!*args) {
         terminal_writestring("usage: wine <program.exe> [args]\n");
-        terminal_writestring("Runs a Windows program under real Wine. The prefix is $HOME/.wine,\n");
-        terminal_writestring("which is /disk/.wine when a disk is mounted and in RAM otherwise.\n");
+        terminal_writestring("Runs a Windows program under real Wine. The prefix is $HOME/.wine:\n");
+        terminal_writestring("/disk/.wine when a disk is mounted, /root/.wine otherwise.\n");
         return;
     }
 
-    /* This ISO or that one: novaris-wine.iso carries a built Wine and the
-     * ordinary novaris.iso does not, and "file not found" three layers
-     * down is a much worse answer than this one. */
-    if (!vfs_lookup("wine-preloader") || !vfs_lookup("wine")) {
-        terminal_writestring_color("No Wine here. ", VGA_COLOR_LIGHT_RED);
-        terminal_writestring("This is novaris.iso; the Wine build is\n"
-                             "novaris-wine.iso (make WINE_BUILD=... wine-initrd).\n"
+    /* An OS built without Wine is a supported thing to have - Wine is a
+     * build input, not a vendored tree - and "file not found" three
+     * layers down is a much worse answer than this one. */
+    if (!vfs_lookup(WINE_LOADER)) {
+        terminal_writestring_color("No Wine installed. ", VGA_COLOR_LIGHT_RED);
+        terminal_writestring("This OS was built without it;\n"
+                             "rebuild with 'make WINE_BUILD=/path/to/a/built/wine'.\n"
                              "The built-in Win32 layer runs a .exe directly: "
                              "try 'run <program.exe>'.\n");
         return;
     }
 
     uint32_t w = 0;
-    const char* prefix = "wine-preloader wine ";
+    const char* prefix = WINE_LOADER " ";
     while (*prefix && w < sizeof(cmdline) - 1) cmdline[w++] = *prefix++;
     while (*args && w < sizeof(cmdline) - 1) cmdline[w++] = *args++;
     cmdline[w] = '\0';

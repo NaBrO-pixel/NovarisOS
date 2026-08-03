@@ -14,7 +14,7 @@ bootloader hands off to a kernel, and the kernel grows from there. Over time
 you can shape it to *feel* like whichever OS inspires you (windowing system,
 shell conventions, UI style) without copying anyone's code.
 
-## Current status: Milestone 34 complete ✅
+## Current status: Milestone 35 complete ✅
 
 - [x] Multiboot bootloader handoff (via GRUB), 32-bit protected mode
 - [x] Freestanding C kernel — no libc, we own the whole stack
@@ -93,6 +93,11 @@ shell conventions, UI style) without copying anyone's code.
       window classes registered, a desktop window created, services and
       explorer started, and the program's own path resolved through the
       prefix's DOS drive table — see below
+- [x] **Wine is installed in the OS, not bolted onto it** — one ISO, with
+      Wine at `/usr/lib/wine` and `/usr/share/wine` the way any Unix has
+      it. Which is what lets Wine find `wine.inf` and **build its own
+      prefix on Novaris**: `wine hellowin.exe`, on a fresh boot, with no
+      disk and nothing set up beforehand
 
 See `ROADMAP.md` for the full history and what's next, in order.
 
@@ -208,7 +213,7 @@ Seven shell commands drive it:
 | Command | What it does |
 | --- | --- |
 | `run prog.exe` | Loads and runs a program (also handles ELF and flat binaries) |
-| `wine prog.exe` | Runs it under *real* Wine instead — short for `run wine-preloader wine prog.exe` (novaris-wine.iso only) |
+| `wine prog.exe` | Runs it under *real* Wine instead, through the copy installed at `/usr/bin/wine` |
 | `peinfo prog.exe` | Dumps a PE's headers and shows, per symbol, which imports resolve |
 | `winapi [module]` | Lists the emulated DLLs, or one module's exports |
 | `strace prog [args]` | The same as `run`, with every syscall logged |
@@ -236,11 +241,12 @@ threads, the Linux/i386 syscall ABI, signals with a writable `ucontext`,
 a dynamic linker, Unix sockets with `SCM_RIGHTS`, `fork`/`execve`/`wait4`,
 `poll`, and shared file mappings.
 
-**A real Windows program now runs to completion under Wine 11.0 on
-Novaris:**
+**A real Windows program runs to completion under Wine 11.0 on Novaris**,
+and since Milestone 35 that is the whole of it — one command, on a fresh
+boot, with no disk and nothing set up beforehand:
 
 ```
-novaris> run wine-preloader wine hellowin.exe
+novaris> wine hellowin.exe
 Hello from a real Windows .exe running on Novaris!
   compiled by mingw-w64, linked against msvcrt.dll
 
@@ -250,7 +256,7 @@ floats:     3.141593 2.50 1.234568e+04 0.0001
 64-bit:     1234567890123
 heap:       "malloc + strcpy + strlen" (24 bytes)
 fib(20):    6765
-argc:       1, argv[0]: C:\windows\hellowin.exe
+argc:       1, argv[0]: Z:\hellowin.exe
 
 Exiting with code 0.
 ```
@@ -259,13 +265,18 @@ That is `userland/pe_test/hello_win.c` — an ordinary mingw-w64 program
 linked against the real msvcrt import library, the *same binary* the
 hand-written Win32 layer runs — going instead through Wine's own PE
 ntdll, kernel32, kernelbase and msvcrt, with a wineserver process behind
-it. Two Novaris processes passing file descriptors over a Unix socket.
-`make test-wine` asserts seven lines of it.
+it. Novaris processes passing file descriptors over a Unix socket.
+`make test-wine` asserts eleven lines of it.
+
+`Z:\hellowin.exe` is the detail that says how much is real. `Z:\` is a
+DOS drive, and the drive table is made of symbolic links inside a Wine
+prefix — a prefix Wine built for itself, on Novaris, a minute earlier, by
+running `wineboot` and `rundll32` over its own `wine.inf`.
 
 **And a *threaded* one, since Milestone 31:**
 
 ```
-novaris> run wine-preloader wine threads.exe
+novaris> wine threads.exe
 Win32 threads test - real CreateThread on Novaris
 
 created worker 1, thread id 56
@@ -296,7 +307,11 @@ critical section really serialised three threads. `make
 test-wine-threads` asserts eleven lines of it.
 
 Wine is not vendored; it is a build input, fetched and built separately
-and pointed at with `WINE_BUILD`. `ROADMAP.md` Milestones 30 and 31 have
+and pointed at with `WINE_BUILD`. Installed *into* the OS image, but not
+committed to this tree: `novaris.iso` stays reproducible from what is
+here, and several hundred megabytes of LGPL source in a hobby kernel's
+repository would be both bloat and a licensing question nobody needs.
+`ROADMAP.md` Milestones 30 and 31 have
 the full account — the six things `MAP_SHARED` was hiding, why a Wine
 thread cannot inherit one TLS descriptor when Linux gives it three, and
 why `poll` waking on the wrong socket looked like threads being slow.
@@ -362,45 +377,56 @@ Against the same prefix image, the difference over a whole run:
 `ROADMAP.md` Milestone 34 has the full account, including the two bugs
 the change itself introduced and how each was found.
 
-**And a Windows program now runs on the real path**, with the prefix on
-the disk and symbolic links on:
+**And since Milestone 35, Wine is installed in the OS rather than bolted
+onto it.** Up to Milestone 34 there were two ISOs, and the Wine one
+carried Wine's files as a heap at the root of a flat initrd: `/ntdll.so`,
+`/gdi32.dll`, `/wine-preloader`, `/passwd`. That worked because the kernel
+matches the last component of a path whose directories do not exist — but
+Wine finds itself by where `ntdll.so` was loaded and derives everything
+else from it by *relative* arithmetic, so with `ntdll.so` at `/` every one
+of those came out wrong:
+
+| what Wine computes | where it should land | what it got |
+| --- | --- | --- |
+| `dll_dir` — the builtins | `/usr/lib/wine` | `/` |
+| `bin_dir` — wineserver | `/usr/bin` | `//../../bin` |
+| `data_dir` — `wine.inf`, NLS | `/usr/share/wine` | nothing at all |
+
+The last one is the one that mattered. A path that does not resolve has no
+NT form, so `WINEDATADIR` was never set, so wineboot could not find
+`wine.inf`, so **a prefix could never be built** — it had to be built by
+the same Wine on a host and written into a disk image.
+
+So Wine is installed now, at the paths `make install` uses:
 
 ```
-novaris> wine hellowin.exe
-Hello from a real Windows .exe running on Novaris!
-  compiled by mingw-w64, linked against msvcrt.dll
-...
-fib(20):    6765
-argc:       1, argv[0]: Z:\hellowin.exe
-
-Exiting with code 0.
+/usr/lib/wine/i386-unix/     ntdll.so, win32u.so, wine, wine-preloader
+/usr/lib/wine/i386-windows/  the PE builtins
+/usr/bin/                    wine, wineserver
+/usr/share/wine/             wine.inf, nls/
+/lib32/, /lib/, /etc/        the host C library, passwd, nsswitch.conf
 ```
 
-`Z:\hellowin.exe` is the line that matters. Every earlier milestone got
-`C:\windows\hellowin.exe`, which is what Wine falls back to when it has no
-DOS drives at all; `Z:\` means the drive table built out of symbolic links
-in the prefix is what resolved the path. `make test-wine-prefix` asserts
-that transcript and rejects every line in the table above, so the progress
-is a test and not a claim.
+The initrd grew directories to make that possible (a path per entry
+instead of a 60-byte name), the kernel makes `/root` beside `/tmp` and
+`/disk` for `$HOME` to point at, and `utimensat` is implemented because
+setupapi sets the times on every file it copies. With all of that, Wine
+runs `wineboot`, `wineboot` runs `rundll32` over `wine.inf`, and the
+prefix is built on Novaris by Wine.
 
-`symlink()` is still a switch, and `symlinks off` still takes the older
-path — Wine falls back to the Windows directory, and `hellowin.exe` and
-`threads.exe` run exactly as shown further up — which is what `make
-test-wine` and `make test-wine-threads` ask for explicitly rather than
-leaving to a default. That path needs no disk, and it is the one to use if
-you have not built a prefix.
+One ISO, then. `make` builds the OS; with `WINE_BUILD` pointing at a built
+Wine, `make` installs Wine into it. Without, the same OS builds without
+Wine and the `wine` command says so rather than failing three layers down.
 
-Two things are still true and worth saying plainly. Novaris cannot
-*build or update* a prefix — `wine.inf` needs `rundll32` and setupapi's
-file-copy machinery — so the one used here was built by the same Wine on a
-host and written to the image with `make wine-disk`; only the building is
-missing now, using one works. And it is **slow**: wineboot takes longer
-than the five minutes Wine allows for its own boot event, so a successful
-run contains `err:environ:run_wineboot`, which is Wine giving up on waiting
-and carrying on. Most of that is having no page cache — a mapped DLL is
-read off an ATA PIO disk and copied into the heap in full, per file.
-Beyond those, still: no GUI (there is no display backend) and no
-networking.
+Two things are still true and worth saying plainly. There is **no display
+backend** — `err:winediag:nodrv_CreateWindow` in a transcript is honest,
+and a Windows program can have a console and not a window; wiring
+Milestone 11's compositor up to Wine is the next thing worth building. And
+it is **slow**: wineboot takes longer than the five minutes Wine allows
+for its own boot event, so a successful run contains
+`err:environ:run_wineboot`. Most of that is having no page cache — a
+mapped DLL is read in full and copied into the heap, per file. Networking
+is still absent, which is why `nsiproxy` and `NDIS` fail to start.
 
 ## The disk
 
@@ -502,6 +528,8 @@ novaris/
 │   ├── gen_font.py            # Generates the 8x16 terminal font
 │   ├── gen_uifont.py          # Generates the antialiased UI faces
 │   ├── mkfat32.py             # Builds a FAT32 image from a directory
+│   ├── install_wine.sh        # Installs Wine into the OS image
+│   ├── check_wine_installed.py # Refuses a Wine test on an image without it
 │   └── qemu_test.py           # Boots the ISO and drives the shell
 ├── tests/                     # Host-side tests of kernel code
 ├── linker.ld                  # Places the kernel at the 1MB mark
@@ -532,6 +560,20 @@ driver talks to.
 make          # builds build/novaris.bin and novaris.iso
 ```
 
+To have Wine in it, point `WINE_BUILD` at a built Wine tree and build the
+same target — there is one ISO and Wine is installed into it:
+
+```bash
+git clone --depth 1 -b stable https://github.com/wine-mirror/wine
+cd wine && CC="gcc -m32" ./configure --enable-archs=i386 \
+    --disable-tests --without-x --without-freetype --without-vulkan \
+    --without-opengl && make -j4
+cd ../NovarisOS && make WINE_BUILD=../wine
+```
+
+Without it, `make` builds the same OS without Wine, and the `wine` command
+in the shell says so rather than failing three layers down.
+
 ## Running it
 
 ```bash
@@ -559,9 +601,10 @@ make test        # host-side tests: printf, the PE loader, FAT32, the WM
 make test-qemu   # boots the ISO, drives the shell, asserts on the output
 make test-qemu-disk      # writes to the disk, reboots, reads it back
 make test-posix  # runs ten binaries on Linux AND Novaris, diffs the two
-make test-wine   # boots novaris-wine.iso, asserts a Windows .exe's output
+make test-wine   # types 'wine hellowin.exe' at the shell and asserts the output
 make test-wine-threads   # ... and a *threaded* Windows .exe's
-make test-wine-prefix    # ... on Wine's real startup path, with a prefix on disk
+make test-wine-prefix    # ... on an empty disk, where Wine builds its prefix
+                         #     (the three Wine tests need WINE_BUILD set when the ISO was built)
 ```
 
 `userland/mmap_test.c` is worth singling out among the `test-posix`

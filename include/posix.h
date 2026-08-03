@@ -131,6 +131,15 @@
 #define SYS_gettimeofday    78
 #define SYS_symlink         83
 #define SYS_symlinkat      304
+/* Setting a file's times. Milestone 35: Wine's setupapi sets them on
+ * every file it copies into a prefix, and -ENOSYS there turned each copy
+ * into "Converting errno 38 to STATUS_UNSUCCESSFUL". utimensat is the one
+ * glibc actually calls; the older three are here because they are three
+ * lines and a program that reaches for one is asking the same question. */
+#define SYS_utime           30
+#define SYS_utimes         271
+#define SYS_futimesat      299
+#define SYS_utimensat      320
 /* Extended attributes. Wine asks for one on every file it opens - it is
  * where Samba and Wine both keep the DOS attribute bits - and this
  * filesystem has none. See the dispatch for why they are answered rather
@@ -141,6 +150,12 @@
 #define SYS_setxattr       226
 #define SYS_lsetxattr      227
 #define SYS_fsetxattr      228
+/* And removing one, which Wine does when a file stops having DOS
+ * attributes worth recording. Milestone 35 - the only unimplemented
+ * syscall left in a wineboot run. */
+#define SYS_removexattr    235
+#define SYS_lremovexattr   236
+#define SYS_fremovexattr   237
 #define SYS_sched_yield    158
 #define SYS_madvise        219
 #define SYS_lstat64        196
