@@ -184,8 +184,15 @@ class Image:
         self.clusters = (self.vol_sectors - self.data_start) // self.spc
         # The FAT is sized in whole sectors, so it can end up able to
         # address slightly fewer clusters than the data area holds. The
-        # table is the authority - kernel/fat32.c clamps the same way.
+        # table is the authority - kernel/fat32.c clamps the same way -
+        # and the volume is then declared *shorter* so that the two agree
+        # exactly. Leaving the declared length alone is what made
+        # `fsck.vfat -n` say "filesystem has 129024 clusters but only
+        # space for 129022 FAT entries": true, and a real defect, since
+        # anything that trusted the boot sector over the table would
+        # allocate two clusters whose entries live off the end of it.
         self.clusters = min(self.clusters, self.fat_sectors * SECTOR // 4 - 2)
+        self.vol_sectors = self.data_start + self.clusters * self.spc
         if self.clusters < 4:
             raise SystemExit("image too small to hold a filesystem")
         self.cluster_bytes = self.spc * SECTOR
