@@ -97,8 +97,57 @@ class Monitor:
         self.sock.close()
 
 
+def normalize(raw):
+    """The serial capture as a user would have seen it on screen.
+
+    The guest emits CRLF; normalize that, and apply backspaces, since the
+    shell's line editing is real and a transcript full of "\b" would not
+    match what the screen said."""
+    text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n")
+    out = []
+    for ch in text:
+        if ch == "\b":
+            if out:
+                out.pop()
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def read_transcript(path):
+    with open(path, "rb") as fh:
+        return normalize(fh.read())
+
+
+def wait_for(serial_path, seconds, patterns):
+    """Sleeps up to `seconds`, stopping early once every pattern has shown up.
+
+    Without this a settle is a fixed cost paid in full on every run, so it
+    has to be set for the slowest plausible machine and then everybody
+    waits that long. Wine's real startup path takes minutes and varies by
+    a lot between runs, and the difference between "generous" and "slow"
+    should not have to be guessed in a Makefile.
+
+    Only the --expect patterns are waited for. Stopping as soon as they
+    have all appeared means the --reject patterns are only checked over
+    the window actually observed - which is the right trade when the last
+    thing expected is the program's own exit line, and the reason this is
+    opt-in rather than the default."""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        time.sleep(min(2.0, max(0.0, deadline - time.time())))
+        if not patterns:
+            continue
+        try:
+            text = read_transcript(serial_path)
+        except OSError:
+            continue
+        if all(re.search(p, text, re.MULTILINE) for p in patterns):
+            return
+
+
 def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
-        memory=128, disk=None, setup=()):
+        memory=128, disk=None, setup=(), stop_when=()):
     serial_path = keep_serial or tempfile.mktemp(suffix=".log", prefix="novaris-serial-")
     port = 45000 + (os.getpid() % 10000)
 
@@ -154,9 +203,13 @@ def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
             mon.type(cmd + "\n", key_delay)
             time.sleep(3.0)
 
-        for cmd in commands:
+        for i, cmd in enumerate(commands):
             mon.type(cmd + "\n", key_delay)
-            time.sleep(settle)
+            last = (i == len(commands) - 1)
+            if last and stop_when:
+                wait_for(serial_path, settle, stop_when)
+            else:
+                time.sleep(settle)
 
         mon.close()
     finally:
@@ -166,22 +219,10 @@ def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
             qemu.kill()
             qemu.wait()
 
-    with open(serial_path, "rb") as fh:
-        raw = fh.read()
+    transcript = read_transcript(serial_path)
     if keep_serial is None:
         os.unlink(serial_path)
-
-    # The guest emits CRLF; normalize, and apply backspaces so the captured
-    # text matches what a user would actually see on screen.
-    text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n")
-    out = []
-    for ch in text:
-        if ch == "\b":
-            if out:
-                out.pop()
-        else:
-            out.append(ch)
-    return "".join(out)
+    return transcript
 
 
 def main():
@@ -211,6 +252,10 @@ def main():
                     help="regex that must appear in the transcript (repeatable)")
     ap.add_argument("--reject", action="append", default=[],
                     help="regex that must NOT appear in the transcript (repeatable)")
+    ap.add_argument("--stop-when-matched", action="store_true",
+                    help="end the last command's settle as soon as every "
+                         "--expect pattern has appeared, instead of always "
+                         "waiting it out")
     args = ap.parse_args()
 
     commands = list(args.cmd)
@@ -221,7 +266,8 @@ def main():
 
     transcript = run(args.iso, commands, args.boot_wait, args.key_delay,
                      args.settle, args.timeout, args.serial_log, args.memory,
-                     args.disk, args.setup)
+                     args.disk, args.setup,
+                     args.expect if args.stop_when_matched else ())
     sys.stdout.write(transcript)
 
     failures = []

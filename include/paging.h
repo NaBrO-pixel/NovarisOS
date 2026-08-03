@@ -36,6 +36,35 @@
  * comes back and asks for the memory it reserved. */
 #define PAGE_RESERVED 0x400
 
+/* Bit 11, the last one the CPU leaves to the OS, and the one Milestone 34
+ * needed: this page is a *private* view of memory that belongs to
+ * somebody else - a file's storage - and a write to it has to be given a
+ * copy first.
+ *
+ * That is what MAP_PRIVATE on a file actually means. Novaris used to
+ * answer it by allocating pages and reading the bytes in, which is a
+ * snapshot: correct about this process's stores staying here, wrong about
+ * everything else, because until a page is written the mapping is the
+ * file's own memory and a writer elsewhere shows through it. Wine takes
+ * that deliberately - it maps a read-only view of a section with
+ * MAP_PRIVATE and says so in a comment - and win32u's shared session
+ * block is exactly such a view. See ROADMAP.md Milestone 34.
+ *
+ * A COW page carries PAGE_SHARED too, because until it is written the
+ * frame really is the file's and no teardown path may free it. */
+#define PAGE_COW      0x800
+
+/* And the fact a COW page still has to record: whether the mapping it
+ * belongs to was made writable. Both kinds have PAGE_RW clear, because
+ * both have to fault on a write - one to be given its copy, the other
+ * because writing to a read-only mapping is an access violation and
+ * Novaris says so with SIGSEGV.
+ *
+ * Bit 10 again, which is free here: PAGE_RESERVED only ever means
+ * anything on an entry that is *not present*, and a COW page is present.
+ * The CPU consults bit 0 first, so the two readings never overlap. */
+#define PAGE_COW_RW   0x400
+
 /* Where the scratch page used to copy an address space lives. In the
  * kernel half deliberately: it was in the user half until Milestone 30,
  * where it was a page a process teardown would have freed if a copy had
@@ -214,6 +243,13 @@ uint32_t paging_release_user_pages(void);
  * has no frame behind it. Allocates a page table if the range has none.
  * Returns 0 only if that allocation failed. See PAGE_RESERVED. */
 int paging_reserve_page(uint32_t virt_addr);
+
+/* Gives a COW page (see PAGE_COW) a private frame with the same bytes in
+ * it, mapped writable, and drops the two bits that said it was somebody
+ * else's. Returns 1 if it did that, 0 if the page was not a COW page or
+ * there was no memory left - and 0 is the caller's cue to treat the fault
+ * as a fault. Safe to call on an address that is not page-aligned. */
+int paging_break_cow(uint32_t virt_addr);
 
 /* The highest address a program may map. Everything above is the
  * kernel's, shared by every address space, and a fixed mapping that

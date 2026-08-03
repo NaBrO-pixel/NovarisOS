@@ -2,6 +2,7 @@
 #include "kheap.h"
 #include "paging.h"
 #include "pmm.h"
+#include "console.h"
 
 /* The heap lives in its own dedicated virtual range, well away from the
  * kernel image and the 0xC0000000-0xC0800000 low-memory alias set up by
@@ -73,7 +74,23 @@ void* kmalloc(size_t size) {
      * allocation out of the freshly-mapped space. */
     uint32_t needed = (uint32_t)size + (uint32_t)sizeof(block_header_t);
     uint32_t grow_to = heap_end + needed;
-    if (grow_to > HEAP_START + HEAP_MAX_SIZE) return 0; /* heap exhausted */
+    if (grow_to > HEAP_START + HEAP_MAX_SIZE) {
+        /* Said out loud, once. The heap is where a mapped file's bytes
+         * live - this kernel has no page cache, so mapping a nine-megabyte
+         * DLL costs nine megabytes of heap and keeps costing it - and
+         * running out of it arrives everywhere else as something else
+         * entirely: a DLL that will not load, an image reported as an
+         * invalid format, a program that stops with no message at all.
+         * One line here is worth an afternoon there. */
+        static int said = 0;
+        if (!said) {
+            said = 1;
+            terminal_writestring_color("[kheap] ", VGA_COLOR_LIGHT_RED);
+            terminal_writestring("kernel heap exhausted (max is KHEAP_MAX_SIZE) - "
+                                 "allocations fail from here\n");
+        }
+        return 0;   /* heap exhausted */
+    }
 
     uint32_t old_end = heap_end;
     uint32_t aligned_grow_to = (grow_to + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);

@@ -14,7 +14,7 @@ bootloader hands off to a kernel, and the kernel grows from there. Over time
 you can shape it to *feel* like whichever OS inspires you (windowing system,
 shell conventions, UI style) without copying anyone's code.
 
-## Current status: Milestone 32 complete ✅
+## Current status: Milestone 34 complete ✅
 
 - [x] Multiboot bootloader handoff (via GRUB), 32-bit protected mode
 - [x] Freestanding C kernel — no libc, we own the whole stack
@@ -85,6 +85,14 @@ shell conventions, UI style) without copying anyone's code.
       inspected on the host — see below
 - [x] **Symbolic links**, on disk and in RAM, byte-identical to Linux —
       which is what Wine's DOS drive table is made of
+- [x] **Copy-on-write private file mappings** — `MAP_PRIVATE` on a file
+      is the file's own memory until this process writes to a page, one
+      page at a time, which is what Linux means by it and what Wine's
+      shared session block is built on
+- [x] **A Windows `.exe` runs under Wine on the real startup path** —
+      window classes registered, a desktop window created, services and
+      explorer started, and the program's own path resolved through the
+      prefix's DOS drive table — see below
 
 See `ROADMAP.md` for the full history and what's next, in order.
 
@@ -195,11 +203,12 @@ across kernel32, msvcrt, ntdll and user32, reached through generated
 ring-3 thunks that trap into the kernel on `int 0x81`. `include/win32.h`
 explains the mechanism.
 
-Six shell commands drive it:
+Seven shell commands drive it:
 
 | Command | What it does |
 | --- | --- |
 | `run prog.exe` | Loads and runs a program (also handles ELF and flat binaries) |
+| `wine prog.exe` | Runs it under *real* Wine instead — short for `run wine-preloader wine prog.exe` (novaris-wine.iso only) |
 | `peinfo prog.exe` | Dumps a PE's headers and shows, per symbol, which imports resolve |
 | `winapi [module]` | Lists the emulated DLLs, or one module's exports |
 | `strace prog [args]` | The same as `run`, with every syscall logged |
@@ -315,29 +324,83 @@ and a four-entry, *global* table of shared-mapping references, past which
 a mapped file could be freed under a live mapping. All four are fixed and
 `ROADMAP.md` Milestone 33 has the full account of how each was found.
 
-**What stops it now is a different thing**: `NtUserRegisterClassExWOW`
-cannot get its shared session object, so there is no desktop window. The
-client maps wineserver's session file and reads an object header that is
-not the one the server wrote — two processes' `MAP_SHARED` views of one
-file disagreeing. The mapping mechanism itself has been ruled out by test
-(`userland/mmap_test.c` reproduces wineserver's exact grow-and-extend
-pattern, across two processes, and matches Linux); what has not been
-tested is the same thing through a descriptor passed over a Unix socket
-for a file that has already been unlinked.
+**And since Milestone 34, Wine's window classes and its desktop window
+work.** What had stopped them was `NtUserRegisterClassExWOW` failing to
+get its shared session object, sixteen times a run, in every process —
+read as two processes' `MAP_SHARED` views of one file disagreeing. It was
+not that. The client's view was never `MAP_SHARED`: Wine maps a read-only
+section view with `MAP_PRIVATE` and says why in a comment —
 
-So `symlink()` is a switch. `symlinks off` in the shell restores the
-older path — Wine falls back to the Windows directory, and `hellowin.exe`
-and `threads.exe` run exactly as shown above — which is what `make
+```c
+/* changes to the file are not guaranteed to be visible in read-only
+ * MAP_PRIVATE mappings, but they are on Linux so we take advantage of it */
+```
+
+— and Novaris answered `MAP_PRIVATE` by allocating pages and reading the
+bytes in, which is a snapshot. So win32u read the objects wineserver had
+written *so far* and never saw another one.
+
+**Private file mappings are copy-on-write now**, which is what
+`MAP_PRIVATE` actually means: the frames are the file's until this process
+writes to one, and then only that page becomes its own. Two page-table
+bits and a fault handler; `fork` needed no change, because it already
+shared those frames rather than copying them. `userland/mmap_test.c`
+sections 4a and 4b pin it down against Linux, and the second cause behind
+the invalid-image-format reports that would not stay still turned out to
+be a process running out of its 128 file descriptors while loading DLLs
+(512 now, and `RLIMIT_NOFILE` says so rather than answering "unlimited").
+
+Against the same prefix image, the difference over a whole run:
+
+| | before | after |
+| --- | --- | --- |
+| `Failed to get shared session object` | 16 | 0 |
+| `failed to create desktop window` | 17 | 0 |
+| `service ... failed to start` (timeout) | 4 | 0 |
+| `Loading library ... failed (c000011f)` | yes | 0 |
+
+`ROADMAP.md` Milestone 34 has the full account, including the two bugs
+the change itself introduced and how each was found.
+
+**And a Windows program now runs on the real path**, with the prefix on
+the disk and symbolic links on:
+
+```
+novaris> wine hellowin.exe
+Hello from a real Windows .exe running on Novaris!
+  compiled by mingw-w64, linked against msvcrt.dll
+...
+fib(20):    6765
+argc:       1, argv[0]: Z:\hellowin.exe
+
+Exiting with code 0.
+```
+
+`Z:\hellowin.exe` is the line that matters. Every earlier milestone got
+`C:\windows\hellowin.exe`, which is what Wine falls back to when it has no
+DOS drives at all; `Z:\` means the drive table built out of symbolic links
+in the prefix is what resolved the path. `make test-wine-prefix` asserts
+that transcript and rejects every line in the table above, so the progress
+is a test and not a claim.
+
+`symlink()` is still a switch, and `symlinks off` still takes the older
+path — Wine falls back to the Windows directory, and `hellowin.exe` and
+`threads.exe` run exactly as shown further up — which is what `make
 test-wine` and `make test-wine-threads` ask for explicitly rather than
-leaving to a default. `make test-wine-prefix` is the other half: it
-asserts how far the new path gets, so the progress is a test and not a
-claim.
+leaving to a default. That path needs no disk, and it is the one to use if
+you have not built a prefix.
 
-Novaris still cannot *build* a prefix — `wine.inf` needs `rundll32` and
-setupapi's file-copy machinery — so the one used here was built by the
-same Wine on a host and written to the image with `make wine-disk`. That
-is a real gap, not a packaging detail. Beyond it, still: no GUI (there is
-no display backend) and no networking.
+Two things are still true and worth saying plainly. Novaris cannot
+*build or update* a prefix — `wine.inf` needs `rundll32` and setupapi's
+file-copy machinery — so the one used here was built by the same Wine on a
+host and written to the image with `make wine-disk`; only the building is
+missing now, using one works. And it is **slow**: wineboot takes longer
+than the five minutes Wine allows for its own boot event, so a successful
+run contains `err:environ:run_wineboot`, which is Wine giving up on waiting
+and carrying on. Most of that is having no page cache — a mapped DLL is
+read off an ATA PIO disk and copied into the heap in full, per file.
+Beyond those, still: no GUI (there is no display backend) and no
+networking.
 
 ## The disk
 
@@ -498,7 +561,7 @@ make test-qemu-disk      # writes to the disk, reboots, reads it back
 make test-posix  # runs ten binaries on Linux AND Novaris, diffs the two
 make test-wine   # boots novaris-wine.iso, asserts a Windows .exe's output
 make test-wine-threads   # ... and a *threaded* Windows .exe's
-make test-wine-prefix    # ... and how far Wine's real startup path gets
+make test-wine-prefix    # ... on Wine's real startup path, with a prefix on disk
 ```
 
 `userland/mmap_test.c` is worth singling out among the `test-posix`
@@ -508,7 +571,11 @@ pinned down against Linux: a store through a mapping being visible to
 its file's name, and — since Milestone 33 — wineserver's own pattern of
 growing a file with `ftruncate` while it is mapped, mapping only the new
 tail at a non-zero offset, and a *separate process* writing through its
-own view. Ten checks, all compared line for line with what the same
+own view. Since Milestone 34 it pins down the *private* half too, which is
+the one that had been wrong: that a `MAP_PRIVATE` file mapping is not a
+snapshot but the file's own memory, that a writer elsewhere shows through
+it until this process writes, and that the copy then happens one page at a
+time. Forty-three checks, all compared line for line with what the same
 binary prints on Linux.
 
 `make test-posix` is the strongest of these, and the one the POSIX work

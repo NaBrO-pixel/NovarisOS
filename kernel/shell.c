@@ -290,6 +290,53 @@ static void cmd_run(const char* line) {
     terminal_writestring("Back in the shell.\n");
 }
 
+/* --- wine ---------------------------------------------------------------
+ *
+ * `wine hellowin.exe` rather than `run wine-preloader wine hellowin.exe`.
+ *
+ * The three names in the long form are all real and all necessary.
+ * `wine-preloader` is a small static ELF whose whole job is to reserve
+ * the low two gigabytes before ld.so can put anything there, because that
+ * is where a Windows image wants to load; `wine` is the loader it hands
+ * control to once the address space is safe; and the .exe is the program.
+ * None of that is interesting to somebody who wants to run a program, and
+ * remembering it is exactly the kind of thing a shell should do for you.
+ *
+ * The long form still works and is what `make test-wine` uses, on purpose:
+ * a test that spells out the whole invocation is testing one layer fewer
+ * than a test that goes through this. */
+static void cmd_wine(const char* args) {
+    /* "wine-preloader wine " is 20 characters; the rest is the caller's. */
+    static char cmdline[CMD_BUFFER_SIZE + 24];
+
+    if (!*args) {
+        terminal_writestring("usage: wine <program.exe> [args]\n");
+        terminal_writestring("Runs a Windows program under real Wine. The prefix is $HOME/.wine,\n");
+        terminal_writestring("which is /disk/.wine when a disk is mounted and in RAM otherwise.\n");
+        return;
+    }
+
+    /* This ISO or that one: novaris-wine.iso carries a built Wine and the
+     * ordinary novaris.iso does not, and "file not found" three layers
+     * down is a much worse answer than this one. */
+    if (!vfs_lookup("wine-preloader") || !vfs_lookup("wine")) {
+        terminal_writestring_color("No Wine here. ", VGA_COLOR_LIGHT_RED);
+        terminal_writestring("This is novaris.iso; the Wine build is\n"
+                             "novaris-wine.iso (make WINE_BUILD=... wine-initrd).\n"
+                             "The built-in Win32 layer runs a .exe directly: "
+                             "try 'run <program.exe>'.\n");
+        return;
+    }
+
+    uint32_t w = 0;
+    const char* prefix = "wine-preloader wine ";
+    while (*prefix && w < sizeof(cmdline) - 1) cmdline[w++] = *prefix++;
+    while (*args && w < sizeof(cmdline) - 1) cmdline[w++] = *args++;
+    cmdline[w] = '\0';
+
+    cmd_run(cmdline);
+}
+
 /* --- vmtest -------------------------------------------------------------
  *
  * Milestone 14's evidence. Two address spaces, one virtual address, two
@@ -574,6 +621,8 @@ static void run_command(char* line) {
         terminal_writestring("  threadtest - two threads sharing one address space,\n");
         terminal_writestring("            incrementing one shared counter (Milestone 16)\n");
         terminal_writestring("  run <file> [args] - run a program, with a real argv\n");
+        terminal_writestring("  wine <prog.exe> [args] - run a Windows program under\n");
+        terminal_writestring("            real Wine (novaris-wine.iso only)\n");
         terminal_writestring("  strace  - the same, with every syscall logged\n");
         terminal_writestring("  setenv NAME=VALUE, env - the environment programs are given\n");
         terminal_writestring("  ps      - the process table (fork gave it more than one row)\n");
@@ -999,6 +1048,10 @@ static void run_command(char* line) {
             cmd_run(fname);
             posix_set_trace(0);
         }
+    } else if (starts_with(line, "wine")) {
+        const char* p = line + 4;
+        while (*p == ' ') p++;
+        cmd_wine(p);
     } else if (starts_with(line, "run")) {
         const char* fname = line + 3;
         while (*fname == ' ') fname++;

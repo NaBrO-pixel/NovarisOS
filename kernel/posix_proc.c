@@ -112,7 +112,11 @@ posix_proc_t* posix_proc_clone(const posix_proc_t* src, uint32_t pd) {
     for (int i = 0; i < POSIX_MAX_PROCS; i++) {
         if (procs[i].in_use) continue;
         posix_proc_t* p = &procs[i];
-        *p = *src;
+        /* kmemcpy rather than `*p = *src`, which is the same thing until
+         * the struct is big enough that gcc stops inlining the copy and
+         * emits a call to memcpy - a libc this kernel does not have. The
+         * descriptor table crossing that threshold is what found it. */
+        kmemcpy(p, src, sizeof(*p));
         p->page_directory = pd;
         p->pid = next_pid++;
         p->ppid = src->pid;

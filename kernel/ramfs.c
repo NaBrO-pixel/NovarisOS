@@ -51,6 +51,7 @@
 #include "kheap.h"
 #include "kstring.h"
 #include "posix.h"
+#include "console.h"
 
 /* Nodes come from the kernel heap in blocks, threaded onto a free list.
  *
@@ -466,10 +467,44 @@ int vfs_make_mappable(vfs_node_t* n, uint32_t bytes) {
     if (bytes == 0) bytes = 1;
 
     uint32_t cap = (bytes + 4095u) & ~4095u;
-    /* The growth reserve, for files this kernel's own memory backs. See
-     * VFS_MAPPING_RESERVE. */
-    if (!n->ops && cap < VFS_MAPPING_RESERVE) cap = VFS_MAPPING_RESERVE;
+    /* The growth reserve, for files this kernel's own memory backs, and
+     * a decision made *once* - when the storage is first laid out and
+     * nothing can be mapped through it yet. See VFS_MAPPING_RESERVE.
+     *
+     * Both halves of that are Milestone 34's, and both were bugs first.
+     * The reserve is for a file a program creates and then grows while it
+     * is mapped - wineserver's session file, which is what it was
+     * measured against. A file out of the initrd is a program or a DLL:
+     * nothing grows one, and since private file mappings became
+     * copy-on-write *every* library a dynamic linker maps comes through
+     * here, so four megabytes each of headroom for growth that cannot
+     * happen is a hundred megabytes of heap given to Wine's few dozen.
+     *
+     * And re-deciding it later is worse than either answer. `from_initrd`
+     * is cleared by the copy below, so a second mapping of the same
+     * library would find a file that no longer looked like an initrd one,
+     * take the reserve, and *reallocate* - moving every byte to a new
+     * address while the mapping made a moment earlier still pointed at
+     * the old frames. ld.so maps a library four times over (the whole
+     * file, then each segment), and what it read out of the second
+     * mapping was the third one's memory: "wine: could not load ntdll.so:
+     * eh\xdd\xdd\xdd: cannot open shared object file", a DT_NEEDED name
+     * read out of a freed heap block. */
+    if (!n->mappable && !n->ops && !n->from_initrd && cap < VFS_MAPPING_RESERVE) {
+        cap = VFS_MAPPING_RESERVE;
+    }
     if (n->mappable && n->capacity >= cap) return 1;
+
+    /* Storage that is already mappable and is being replaced anyway: the
+     * file has outgrown what it was given, and anything mapping it is
+     * about to be left pointing at the old frames. Nothing here can
+     * prevent that without a page cache - so say it, because silently it
+     * arrives as a corrupt file three subsystems away. */
+    if (n->mappable) {
+        terminal_writestring_color("[vfs] ", VGA_COLOR_LIGHT_RED);
+        terminal_writestring("mapped file grew past its storage - "
+                             "existing mappings of it are now stale\n");
+    }
 
     uint8_t* raw = (uint8_t*)kmalloc(cap + 4096u);
     if (!raw) return 0;
