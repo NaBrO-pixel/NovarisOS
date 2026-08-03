@@ -12,6 +12,7 @@
 #include "scheduler.h"
 #include "pit.h"
 #include "vfs.h"
+#include "fat32.h"
 #include "kheap.h"
 
 /* Referenced from process_asm.s: the kernel-side stack pointer/frame
@@ -418,10 +419,21 @@ static int env_ready = 0;
 
 static void env_defaults(void) {
     static const char* const defaults[] = {
-        "HOME=/", "PATH=/", "USER=root", "TMPDIR=/tmp", "SHELL=/novaris",
+        "PATH=/", "USER=root", "TMPDIR=/tmp", "SHELL=/novaris",
     };
     env_count = 0;
     env_used = 0;
+    /* HOME follows the disk. Milestone 32: a home directory is where a
+     * program puts the things it means to keep, and until there was a
+     * disk the only honest answer was "/" - the root of a filesystem that
+     * exists until the machine is switched off.
+     *
+     * It matters most to Wine, whose prefix is $HOME/.wine: hundreds of
+     * files that wine.inf builds, a registry it rewrites, and a drive
+     * table made of symbolic links. On the ramfs that is a node table
+     * away from full and gone at the next boot. On the disk it is an
+     * installation. */
+    process_env_set(fat32_mounted() ? "HOME=/disk" : "HOME=/");
     for (uint32_t i = 0; i < sizeof(defaults) / sizeof(defaults[0]); i++) {
         process_env_set(defaults[i]);
     }

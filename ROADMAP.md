@@ -4126,6 +4126,12 @@ So `symlink()` still answers `-EPERM` — understood and refused, which is
 what Milestone 30 chose it for. Turning it on would trade a Windows
 program that runs for one that does not.
 
+*(Milestone 32 turned it on, and the trade turned out to be exactly the
+one described here: with drives Wine reaches the prefix, the server, the
+services and its builtins on the disk, and then stops in shell32's
+imports. It is a switch now - `symlinks on|off` in the shell - and the
+Wine transcript tests ask for `off` explicitly. See Milestone 32.)*
+
 ### Verified
 
 ```
@@ -4251,7 +4257,14 @@ are forced into an order:
    one work, and found that the last thing between Novaris and a real
    Wine installation is a filesystem — `wine.inf` builds the prefix, and
    forty megabytes of initrd read into RAM is not somewhere to build
-   one.
+   one. Milestone 32 built the filesystem: an ATA disk, FAT32 from
+   scratch, and the symbolic links Wine's DOS drive table is made of.
+   With them Wine stops falling back and takes its real startup path -
+   it finds a prefix on the disk, names it by its DOS path, starts
+   wineserver and services.exe, and loads its builtins off the disk -
+   and stops in shell32's imports. Which is, once again, a subsystem
+   rather than a syscall, and once again not the one that looked
+   obvious.
 
 Each is roughly milestone-sized. (3) and (4) are each comparable in scope
 to everything built so far combined. No Wine or ReactOS source gets
@@ -4265,29 +4278,289 @@ not a claim that anything at all will run. Chrome will not: that needs
 networking, GPU acceleration, sandboxing and hundreds of DLLs far beyond
 this project's scope, Wine or no Wine.
 
-## Milestone 32 — a real filesystem on a real disk (next)
+## Milestone 32 — a real filesystem on a real disk ✅ DONE
 
 Named by Milestone 31 rather than guessed at, which is how every step of
-Path A has gone. Everything left on the Wine list runs through it:
+Path A has gone. Everything left on the Wine list ran through it: the
+prefix `wineboot` builds, the symlinks that give Wine its DOS drives, and
+a 40MB initrd read into RAM whole.
 
-- **The Wine prefix.** `wineboot` runs `wine.inf` through setupapi to
-  build `C:\windows`, the registry and the user profile — hundreds of
-  files, against a node table that is 384 entries in RAM. Without it
-  there is no real console (conhost has nowhere to live) and every
-  Windows program starts in a directory that does not exist.
-- **Symlinks, which are already written.** They are held back only
-  because turning them on gives Wine its DOS drives and therefore its
-  full startup path, which then needs the prefix. Milestone 31's
-  write-up has the detail; the code is straightforward and was verified
-  byte-identical to Linux.
-- **The 40MB initrd.** It is read into memory whole, which is why the
-  Wine ISO wants 768MB of guest RAM, and shipping the DLLs a real
-  prefix needs would roughly double it. A disk makes the size question
-  go away rather than answering it.
+There is now an ATA PIO driver, a FAT32 filesystem written from scratch,
+a VFS that can have more than one filesystem in it, and symbolic links —
+switched on, compared against Linux byte for byte, and stored on the disk
+in a form that survives a reboot.
 
-Roughly: an ATA PIO driver, a partition table, and a filesystem simple
-enough to write from scratch — FAT32 is the obvious one, and Milestone 6
-deferred it once already.
+### What was built
+
+**An ATA PIO driver** (`kernel/ata.c`, `include/ata.h`). Polling, not
+DMA; both legacy IDE buses, master and slave; LBA28, so 128GB is the
+ceiling and the images here are measured in hundreds of megabytes. The
+two things that actually bite are in the code with the reasons attached:
+the 400ns settle after a drive select, without which the status register
+answers for the *previous* drive, and FLUSH CACHE after a write, without
+which the image looks right in RAM and wrong after a reboot — which is
+precisely the property this milestone exists to provide.
+
+**A block layer** (`kernel/blockdev.c`, `include/blockdev.h`). Four
+functions and a vtable, and it is there for one concrete reason: with a
+device behind an interface, `tests/fat32_host_test.c` hands the *same*
+FAT32 driver a device backed by a file on the host. A mis-set cluster is
+a file that reads as somebody else's bytes three operations later, and
+from inside a VM the serial log says nothing at all.
+
+**FAT32** (`kernel/fat32.c`, `include/fat32.h`). Reading and writing
+files of any size the volume holds, growing and truncating them, creating
+and removing files and directories, renaming within the volume, long
+filenames in both directions, MBR partition tables and bare volumes, and
+the FSInfo block. Chosen for the reason Milestone 6 first considered it:
+it is the only filesystem both simple enough to write from scratch and
+universally readable, so the image can be mounted on the host and looked
+at — and `mdir` reading back what this driver wrote is a kind of evidence
+that no amount of self-consistency testing provides.
+
+Two decisions are worth stating, because they are what the milestone is
+actually about:
+
+- **Nodes are cached, bytes are not.** The first time anything looks
+  inside a directory, its entries are read off the disk and turned into
+  VFS nodes, which then stay. File contents are never cached — a read
+  goes to the disk every time — unless something has to see the whole
+  file at once, which is `mmap` and `exec`. So the cost of a filesystem
+  became proportional to what is *used* rather than to what exists. A
+  Wine prefix of 1,117 files costs about 280KB of nodes where the initrd
+  charged forty megabytes for every file whether or not it was opened.
+
+- **Metadata is written through, immediately.** No journal, no delayed
+  allocation. A create writes the directory entry before it returns; a
+  write updates the size in the directory entry before it returns. The
+  only thing held back is the FAT sector the allocator is working in,
+  and `sync` pushes that out. Slower than a real driver, and it means a
+  machine that stops mid-write loses at most the one operation in
+  flight — which for a kernel with no fsck is the right trade.
+
+**A VFS that can hold two filesystems** (`include/vfs.h`,
+`kernel/ramfs.c`). `vfs_write`, `vfs_create`, `vfs_unlink`,
+`vfs_truncate` and `vfs_rename` used to *be* the ramfs implementations;
+they now dispatch on the node's `ops`, and a node with none is a ramfs
+node — so every existing caller and every existing node behaves exactly
+as it did. Path resolution stopped walking `first_child` directly and
+started going through the finddir hook, which is not tidiness: a FAT
+directory's children do not exist as nodes until something asks, and the
+hook is where "read this directory off the disk" happens.
+
+The node table moved off a fixed 384-entry array onto the heap, in
+blocks. Milestone 26 chose a fixed ceiling for the reason the process
+table has one, and that was right until a volume with thousands of files
+turned "the initrd is too small" into "the node table is too small" — the
+same wall, one milestone later.
+
+**Symbolic links**, at last. Milestone 31 built them and took them back
+out; they are in, and `symlink()` answers. FAT has no link type, so a
+link is stored the way every other system that has had to put one on a
+DOS filesystem stores it: a small file with the SYSTEM attribute whose
+contents are `NVSYMLNK` followed by the target. Nothing else on the
+volume sets SYSTEM, so the check costs one sector read for a handful of
+files, and a link written here reads back elsewhere as an ordinary small
+file rather than as corruption.
+
+**Tooling.** `tools/mkfat32.py` builds a FAT32 image from a directory
+tree — reproducible, symlink-aware, and a completely separate
+implementation of the format from the driver's. That separation is the
+point: the writer and the reader agreeing is evidence; a driver reading
+back its own output is not.
+
+### What it cost elsewhere, and why
+
+Four limits moved, and every one of them moved because something failed
+rather than because a number looked small:
+
+- `VFS_NAME_MAX` 64 → 128 and `POSIX_PATH_MAX` 128 → 256. A Wine
+  prefix's winsxs assembly directories have 91-character names, and a
+  name too long for a node is a file reachable only by its 8.3 short
+  name.
+- `MAX_SOCKETS` 64 → 256. With a prefix on the disk, wineboot gets far
+  enough to start `services.exe`, which starts a process per service,
+  each of which is a server connection plus two pipes with the other end
+  held by the server. Sixty-four ran out four services in, and every
+  service after that failed with "pipe: Too many open files in system".
+- `POSIX_MAX_PROCS` 24 → 40, for the same reason.
+- `KHEAP_MAX_SIZE` 48MB → 192MB. There is no page cache, so a mapped
+  file's bytes *are* heap. `shell32.dll` alone is nine megabytes and
+  wineboot maps dozens; at 48MB the heap ran out part way through and
+  Wine reported it as "Loading library gdi32.dll failed", which is what
+  a failed `mmap` looks like from inside a PE loader. The ceiling is now
+  the address space rather than a guess.
+
+`getxattr` and its five relatives are answered with `-EOPNOTSUPP` rather
+than reported as unimplemented. Wine looks for `user.DOSATTRIB` on every
+file it opens, so on a filesystem without extended attributes this is not
+an unusual call, it is one per file — and `-EOPNOTSUPP` is the specific
+answer Linux gives for a filesystem mounted without them, which is what
+Wine checks for before falling back.
+
+### Verified
+
+```
+$ make test
+=== printf/dtoa engine ===   38 check(s), 0 failure(s)
+=== PE loader ===            30 check(s), 0 failure(s)
+=== FAT32 driver ===         64 check(s), 0 failure(s)
+=== window manager ===       52 checks, 0 failures
+
+$ make test-qemu-disk
+All 7 transcript assertion(s) passed.   (write, reboot, read back)
+
+$ make test-posix
+ 41 lines, 20 checks  posixtest.elf     60 lines, 45 checks  uctest.elf
+ 93 lines, 67 checks  sigtest.elf       82 lines, 58 checks  fstest.elf
+ 50 lines, 25 checks  pthtest.elf       34 lines, 23 checks  socktest.elf
+ 51 lines, 34 checks  forktest.elf      39 lines, 24 checks  mmaptest.elf
+  5 lines,  0 checks  glibc.elf          5 lines,  0 checks  dyn.elf
+
+$ make test-qemu            All 17 transcript assertion(s) passed.
+$ make test-wine            All 7 transcript assertion(s) passed.
+$ make test-wine-threads    All 11 transcript assertion(s) passed.
+```
+
+`fstest.elf` grew from 45 checks to 58, and the thirteen new ones are the
+symbolic-link section - all of them compared line for line against what
+the same binary printed on Linux.
+
+The FAT32 host test is the substantial one. It mounts an image built by
+`mkfat32.py`, reads what the *other* implementation wrote, then writes,
+truncates, grows a directory past its first cluster, renames across
+directories, unlinks a file whose name used long-filename entries, and
+unmounts and remounts to check every one of those survived. The last
+section fills the volume and then checks that an ordinary small file
+still works — which is a test of the rollback in `ensure_chain()`, and
+that rollback exists because without it the first program to ask for too
+much left clusters allocated that no directory entry mentioned, and the
+volume stayed full for ever.
+
+`fstest.elf` gained a symbolic-link section that runs on both Linux and
+Novaris and is compared line by line: create a link with a relative
+target, `lstat` it and find `S_IFLNK`, `stat` it and find `S_IFREG`, read
+the target back, open straight through it, walk a path *through* a link
+in a non-final position, and get `EEXIST` and `EINVAL` in the two places
+Linux gives them. Those are exactly the operations Wine performs on the
+two links its drive table is made of.
+
+Host tests 38 + 30 + 64 + 52, and the whole existing suite unchanged.
+
+### Where Wine actually stands now, which is the honest part
+
+With a disk attached, `$HOME` is `/disk`, so Wine's prefix lands on real
+storage. With `symlinks off` — which is what `make test-wine` and
+`make test-wine-threads` now ask for explicitly — everything Milestone 31
+could do, it still does:
+
+```
+$ make test-wine            All 7 transcript assertion(s) passed.
+$ make test-wine-threads    All 11 transcript assertion(s) passed.
+```
+
+With symlinks **on**, which is the kernel's default because they are
+correct and because `fstest.elf` compares them against Linux, Wine stops
+falling back and does what it does on a real machine. A disk built with
+`make WINE_PREFIX_DIR=... wine-disk` gets it much further than any
+milestone before:
+
+- The DOS drive table exists. Wine names the prefix `Z:\disk\.wine`
+  instead of reporting that it cannot find a DOS drive for the working
+  directory — which is what Milestones 30 and 31 both got, and what
+  Milestone 30's write-up identified as the missing piece.
+- `wineserver` starts, the handshake completes, `wineboot` runs, and
+  `services.exe` starts and works through the auto-start service list,
+  starting a process per service.
+- Wine's PE builtins load **off the disk**. `sum` on
+  `/disk/.wine/drive_c/windows/system32/gdi32.dll` inside Novaris gives
+  `fnv1a 0x966bebe6` over 514,062 bytes, which is byte for byte what the
+  host computes for the same file. The filesystem is not the problem.
+
+And then `wineboot` stops. `shell32.dll` fails to import `gdi32.dll`,
+`shlwapi.dll` and `user32.dll` with `c000011f`
+(`STATUS_INVALID_IMAGE_FORMAT`), the delay-load of
+`SHGetFolderPathW` fails, Wine tries to start a debugger it does not
+have, and no Windows program runs. It is not the disk and it is not
+memory — the heap ceiling above was raised because of an *earlier*
+instance of this and it moved the failure rather than removing it. Which
+of the three loads fails first varies run to run, and that is the most
+useful fact about it: it is timing- or ordering-dependent, so it belongs
+to the loader or the address space rather than to the filesystem.
+
+`symlink()` is therefore a switch — `symlinks on|off` in the shell — and
+not because the code is doubtful. It is a switch because which of two
+startup paths Wine takes is a question worth being able to answer by
+trying both on one boot, and because a transcript test should say which
+path it is testing rather than depend on a default.
+
+### Honest scope
+
+- [x] **A real disk.** ATA PIO, both buses, IDENTIFY, LBA28, read, write
+      and flush. `df` shows the drive and the model string it reported.
+- [x] **A real filesystem.** FAT32 from scratch: files, directories,
+      long names, growth, truncation, rename, MBR or bare volume,
+      FSInfo. 64 host-test checks against an image built by a separate
+      implementation.
+- [x] **It survives a reboot.** `make test-qemu-disk` writes a file, a
+      directory and a symlink, syncs, powers the machine off, boots it
+      again and reads all three back.
+- [x] **Symbolic links**, on, and byte-identical to Linux across
+      thirteen comparisons in `fstest.elf`.
+- [x] **The initrd stopped being the ceiling.** A file on the disk costs
+      a node until something opens it, so a prefix of a thousand files
+      costs kilobytes rather than megabytes.
+- [x] **Wine's prefix lives on it**, and Wine finds it, names it by its
+      DOS path, and loads its builtins out of it.
+- [ ] **A Windows program does not yet run on that path.** With symlinks
+      on, wineboot stops in shell32's imports. Milestone 33.
+- [ ] **Novaris cannot build a prefix itself.** `wine.inf` needs
+      `rundll32` and setupapi's file-copy machinery, and the prefix used
+      here was built by the same Wine on a host. That is a real gap, not
+      a packaging detail.
+- [ ] **No page cache.** A mapped file's bytes are heap, and they are not
+      given back until the node is dropped. It is why the heap ceiling
+      had to move, and it is the obvious next thing the disk makes
+      worth building.
+- [ ] **No DMA, no interrupt-driven I/O.** Every sector is moved a word
+      at a time by the CPU, with the machine stopped. Fine at these
+      sizes; measurable at larger ones.
+- [ ] **One volume, no mount table.** `/disk` is where it goes.
+- [ ] **No GUI**, **no networking**, and `fork` still copies eagerly —
+      unchanged from Milestone 30.
+
+## Milestone 33 — a Windows program on Wine's real startup path (next)
+
+One question, named precisely by Milestone 32 rather than guessed at:
+**why does `shell32.dll` fail to import `gdi32.dll`, `shlwapi.dll` and
+`user32.dll` with `STATUS_INVALID_IMAGE_FORMAT`, once Wine has its DOS
+drives?**
+
+What is known:
+
+- It is not the filesystem. Those DLLs read back off the disk byte for
+  byte identical to the host, checked with `sum`.
+- It is not simply memory. Raising the heap ceiling from 48MB to 192MB
+  moved the failure from one DLL to another rather than removing it.
+- Which of the three fails first varies between runs of the same image,
+  so it depends on ordering or timing — the address space, or `mmap`
+  under fragmentation, or a MAP_FIXED that collides only sometimes.
+- It happens deep in `wineboot`, after `services.exe` has started
+  several processes, so the machine is busy and the address space is
+  full of mappings by the time it does.
+
+Worth trying, roughly in order of expected information per hour:
+`strace` on the failing process to see which `mmap2` returns what;
+counting the mappings a Wine process accumulates; and checking whether
+`mprotect` on a shared file mapping does what Wine assumes.
+
+Two things follow it, both made worth doing by the disk:
+
+- **A page cache**, so a mapped file's bytes are frames rather than
+  heap, and so unmapping gives them back.
+- **Building the prefix on Novaris**, which means `rundll32` and enough
+  of setupapi to run `wine.inf` — and which would make the disk image a
+  product of the machine rather than of a host.
 
 ## Later / open-ended
 
@@ -4345,6 +4618,17 @@ much each would widen what runs:
        --without-opengl && make -j4
    cd ../NovarisOS && make WINE_BUILD=../wine wine-initrd \
        test-wine test-wine-threads
+   ```
+
+   And, since Milestone 32, the disk. `make disk` makes an empty one and
+   `make run-disk` boots with it attached; `make test-qemu-disk` is the
+   write-reboot-read test. For Wine's real startup path you need a prefix,
+   and Novaris cannot build one yet, so it comes from the same Wine tree
+   on the host:
+
+   ```bash
+   WINEPREFIX=/tmp/pfx ../wine/loader/wine wineboot -u
+   make WINE_PREFIX_DIR=/tmp/pfx wine-disk test-wine-prefix
    ```
 
    `mingw-w64` builds the Windows test programs in `userland/pe_test/`;

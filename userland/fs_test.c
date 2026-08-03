@@ -47,6 +47,9 @@ static long sc3(long n, long a, long b, long c) {
 #define SYS_rename      38
 #define SYS_mkdir       39
 #define SYS_rmdir       40
+#define SYS_symlink     83
+#define SYS_readlink    85
+#define SYS_lstat64    196
 #define SYS_stat64     195
 #define SYS_fstat64    197
 #define SYS_ftruncate64 194
@@ -72,6 +75,8 @@ static long sc3(long n, long a, long b, long c) {
 #define S_IFMT  0170000
 #define S_IFREG 0100000
 #define S_IFDIR 0040000
+#define S_IFLNK 0120000
+#define EINVAL    -22
 
 /* --- a few bytes of libc ------------------------------------------------- */
 
@@ -97,10 +102,23 @@ static int memeq(const char* a, const char* b, unsigned n) {
 #define SUB   DIR "/sub"
 #define FILE1 DIR "/one.txt"
 #define FILE2 DIR "/two.txt"
+#define LINK1 DIR "/link-to-one"
+#define LINK2 DIR "/link-to-sub"
 
 static long stat_mode(const char* path, long* size_out) {
     unsigned char st[144];
     long r = sc2(SYS_stat64, (long)path, (long)st);
+    if (r < 0) return r;
+    if (size_out) *size_out = *(long*)(st + 44);
+    return *(unsigned*)(st + 16);
+}
+
+/* The same, without following a link in the final position. The whole of
+ * the difference between the two is one flag deep in the kernel, and it
+ * is the difference between seeing a link and seeing what it names. */
+static long lstat_mode(const char* path, long* size_out) {
+    unsigned char st[144];
+    long r = sc2(SYS_lstat64, (long)path, (long)st);
     if (r < 0) return r;
     if (size_out) *size_out = *(long*)(st + 44);
     return *(unsigned*)(st + 16);
@@ -113,6 +131,8 @@ static void scrub(void) {
     sc1(SYS_unlink, (long)FILE2);
     sc1(SYS_unlink, (long)(SUB "/inner.txt"));
     sc1(SYS_unlink, (long)(DIR "/hello.txt"));
+    sc1(SYS_unlink, (long)LINK1);
+    sc1(SYS_unlink, (long)LINK2);
     sc1(SYS_rmdir, (long)SUB);
     sc1(SYS_rmdir, (long)DIR);
 }
@@ -308,6 +328,67 @@ int main_(void) {
     check("a name that exists elsewhere does not shadow a miss here",
           sc3(SYS_open, (long)(DIR "/hello.txt"), O_RDONLY, 0) == ENOENT &&
           sc3(SYS_open, (long)(DIR "/readme.txt"), O_RDONLY, 0) == ENOENT);
+
+    /* 8a. Symbolic links.
+     *
+     * Milestone 32. Milestone 31 built these and switched them off again,
+     * because what they unlock - Wine's DOS drive table, and therefore
+     * its whole real startup path - needed a prefix, and a prefix needed
+     * a disk. The disk exists now.
+     *
+     * These are exactly the operations Wine performs on the two links its
+     * drive table is made of: create one with a relative target, lstat it
+     * to find out that it is a link, read the target back, and then reach
+     * the thing it names by opening straight through it. */
+    out("\n8a. symbolic links\n");
+    {
+        char buf[64];
+        long fd;
+
+        check("symlink to a file", sc2(SYS_symlink, (long)"one.txt",
+                                       (long)LINK1) == 0);
+        check("lstat says it is a link",
+              (lstat_mode(LINK1, 0) & S_IFMT) == S_IFLNK);
+        check("stat follows it and says regular file",
+              (stat_mode(LINK1, 0) & S_IFMT) == S_IFREG);
+
+        for (unsigned i = 0; i < sizeof(buf); i++) buf[i] = 0;
+        long n = sc3(SYS_readlink, (long)LINK1, (long)buf, sizeof(buf));
+        check("readlink gives back the target", n == 7 && memeq(buf, "one.txt", 7));
+
+        /* Reading through the link must give the file's bytes. FILE1 was
+         * left holding "hello, novaris" by an earlier section. */
+        fd = sc3(SYS_open, (long)LINK1, O_RDONLY, 0);
+        check("opening the link opens the file", fd >= 0);
+        if (fd >= 0) {
+            char rd[32];
+            for (unsigned i = 0; i < sizeof(rd); i++) rd[i] = 0;
+            long got = sc3(SYS_read, fd, (long)rd, sizeof(rd) - 1);
+            check("and reads the file's contents", got > 0 && rd[0] == 'h');
+            sc1(SYS_close, fd);
+        }
+
+        check("a link to a directory", sc2(SYS_symlink, (long)"sub",
+                                           (long)LINK2) == 0);
+        check("stat through it says directory",
+              (stat_mode(LINK2, 0) & S_IFMT) == S_IFDIR);
+        /* A path that walks *through* a link in a non-final position -
+         * which is what "dosdevices/c:/windows" is. */
+        check("a path continues through a link",
+              sc3(SYS_open, (long)(LINK2 "/inner.txt"), O_RDONLY, 0) >= 0);
+
+        check("symlink onto an existing name is EEXIST",
+              sc2(SYS_symlink, (long)"one.txt", (long)LINK1) == EEXIST);
+        check("readlink on something that is not a link is EINVAL",
+              sc3(SYS_readlink, (long)FILE1, (long)buf, sizeof(buf)) == EINVAL);
+
+        check("unlink removes the link and not its target",
+              sc1(SYS_unlink, (long)LINK1) == 0 &&
+              (stat_mode(FILE1, 0) & S_IFMT) == S_IFREG);
+        check("unlink removes a link to a directory too",
+              sc1(SYS_unlink, (long)LINK2) == 0 &&
+              (stat_mode(SUB, 0) & S_IFMT) == S_IFDIR);
+    }
 
     /* 9. Removing it all again. */
     out("\n9. unlink and rmdir\n");

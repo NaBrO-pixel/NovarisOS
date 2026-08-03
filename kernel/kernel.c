@@ -14,7 +14,9 @@
 #include "process.h"
 #include "scheduler.h"
 #include "vfs.h"
-#include "vfs.h"
+#include "ata.h"
+#include "blockdev.h"
+#include "fat32.h"
 #include "mouse.h"
 #include "serial.h"
 #include "win32.h"
@@ -234,6 +236,38 @@ void kernel_main(uint32_t magic, multiboot_info_t* mbi) {
     } else {
         terminal_writestring_color("[--] ", VGA_COLOR_LIGHT_RED);
         terminal_writestring("No initrd module found - filesystem commands won't have files\n");
+    }
+
+    /* Milestone 32: the disk. Probed after the ramfs is up, because the
+     * volume is mounted onto a directory in it - /disk, which ramfs_init
+     * makes whether or not there is anything to put there.
+     *
+     * A machine with no disk is not an error and says so quietly. This
+     * kernel still boots from a CD-ROM and still runs entirely out of the
+     * initrd when that is all there is; the disk adds somewhere for a
+     * Wine prefix to live, and adding it must not be a new way to fail
+     * to boot. */
+    uint32_t ndisks = ata_init();
+    if (ndisks) {
+        terminal_writestring_color("[OK] ", VGA_COLOR_LIGHT_GREEN);
+        print_uint(ndisks);
+        terminal_writestring(" ATA disk(s) found - ");
+        terminal_writestring(ata_model(0));
+        terminal_writestring("\n");
+
+        if (fat32_mount_auto() == 0) {
+            uint32_t total = 0, freec = 0;
+            fat32_space(&total, &freec);
+            terminal_writestring_color("[OK] ", VGA_COLOR_LIGHT_GREEN);
+            terminal_writestring("FAT32 volume mounted at /disk (");
+            print_uint((total - freec) / (1024u * 1024u / fat32_cluster_bytes()));
+            terminal_writestring("MB used of ");
+            print_uint(total / (1024u * 1024u / fat32_cluster_bytes()));
+            terminal_writestring("MB - try 'df')\n");
+        } else {
+            terminal_writestring_color("[--] ", VGA_COLOR_LIGHT_RED);
+            terminal_writestring("No FAT32 volume on any disk - /disk is empty\n");
+        }
     }
 
     /* Live smoke test: allocate, write through the pointer, free, then

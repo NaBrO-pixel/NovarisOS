@@ -8,3 +8,10 @@ screenshot.png
 # -fstack-usage output, produced when profiling kernel stack depth.
 *.su
 novaris-wine.iso
+
+# Disk images (Milestone 32). Deliberately not build output - a disk is
+# storage, and `make` does not rebuild it - but not something to commit
+# either: novaris-disk.img is whatever you have written to it, and
+# novaris-wine-disk.img is a couple of hundred megabytes of somebody
+# else's Wine prefix.
+*.img

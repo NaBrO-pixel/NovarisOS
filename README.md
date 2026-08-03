@@ -14,7 +14,7 @@ bootloader hands off to a kernel, and the kernel grows from there. Over time
 you can shape it to *feel* like whichever OS inspires you (windowing system,
 shell conventions, UI style) without copying anyone's code.
 
-## Current status: Milestone 31 complete ✅
+## Current status: Milestone 32 complete ✅
 
 - [x] Multiboot bootloader handoff (via GRUB), 32-bit protected mode
 - [x] Freestanding C kernel — no libc, we own the whole stack
@@ -78,6 +78,13 @@ shell conventions, UI style) without copying anyone's code.
 - [x] **Windows-style windowing**: caption buttons, eight-way resizing,
       Aero-style edge snapping, Alt+Tab, and a taskbar with live window
       previews — see below
+- [x] **A real disk and a real filesystem** — an ATA PIO driver and FAT32
+      written from scratch, mounted at `/disk`. Files written on one boot
+      are there on the next; `make test-qemu-disk` is exactly that test.
+      The image is an ordinary FAT32 volume, so it can be mounted and
+      inspected on the host — see below
+- [x] **Symbolic links**, on disk and in RAM, byte-identical to Linux —
+      which is what Wine's DOS drive table is made of
 
 See `ROADMAP.md` for the full history and what's next, in order.
 
@@ -285,14 +292,78 @@ the full account — the six things `MAP_SHARED` was hiding, why a Wine
 thread cannot inherit one TLS descriptor when Linux gives it three, and
 why `poll` waking on the wrong socket looked like threads being slow.
 
-**What does not work yet**: there is no Wine *prefix*, because
-`wineboot` cannot run `wine.inf` — so there is no `C:\windows`, no real
-console, and no drive letters worth having. Symbolic links are written
-and tested and would give Wine its DOS drives, but the startup path they
-unlock needs the prefix, so they are deliberately not enabled; see
-Milestone 31. That whole knot is one missing subsystem: a real
-filesystem on a real disk, which is Milestone 32. Beyond it, still: no
-GUI (there is no display backend) and no networking.
+**Since Milestone 32 there is a disk, and Wine's prefix lives on it.**
+With a disk attached, `$HOME` is `/disk`, so a prefix is real storage
+rather than a few hundred nodes that vanish at the next boot. Symbolic
+links are on, so Wine has its DOS drive table: it names the prefix
+`Z:\disk\.wine` instead of reporting that it cannot find a DOS drive for
+the working directory, which is what every milestone before this one
+got. It starts `wineserver`, runs `wineboot`, starts `services.exe`, and
+loads its PE builtins straight off the disk — `sum` on
+`/disk/.wine/drive_c/windows/system32/gdi32.dll` inside Novaris gives the
+same checksum the host does, over the same 514,062 bytes.
+
+**And then it stops.** `shell32.dll` fails to import `gdi32.dll`,
+`shlwapi.dll` and `user32.dll` with `STATUS_INVALID_IMAGE_FORMAT`, and
+no Windows program runs on that path. It is not the filesystem and it is
+not simply memory, and which of the three fails first varies between runs
+of the same image — so it belongs to the loader or the address space.
+That question *is* Milestone 33, and `ROADMAP.md` sets out what is
+already known about it.
+
+So `symlink()` is a switch. `symlinks off` in the shell restores the
+older path — Wine falls back to the Windows directory, and `hellowin.exe`
+and `threads.exe` run exactly as shown above — which is what `make
+test-wine` and `make test-wine-threads` ask for explicitly rather than
+leaving to a default. `make test-wine-prefix` is the other half: it
+asserts how far the new path gets, so the progress is a test and not a
+claim.
+
+Novaris still cannot *build* a prefix — `wine.inf` needs `rundll32` and
+setupapi's file-copy machinery — so the one used here was built by the
+same Wine on a host and written to the image with `make wine-disk`. That
+is a real gap, not a packaging detail. Beyond it, still: no GUI (there is
+no display backend) and no networking.
+
+## The disk
+
+```
+novaris> df
+  ata0  256MB  QEMU HARDDISK
+  /disk  FAT32 on ata0 label "NOVARIS"
+         12MB used, 243MB free, 4096 bytes/cluster
+  sectors read 1841, written 96
+
+novaris> mkdir /disk/notes
+novaris> cp readme.txt /disk/notes/kept.txt
+novaris> ln -s notes/kept.txt /disk/shortcut
+linked /disk/shortcut -> notes/kept.txt
+novaris> sync
+synced
+```
+
+Reboot, and all three are still there. `make test-qemu-disk` is that
+sentence as a test: it boots, writes, syncs, powers the machine off,
+boots again and reads everything back.
+
+The filesystem is ordinary FAT32, so the image can be mounted and read on
+any other machine — which is most of why FAT32 was chosen, since a driver
+agreeing with itself is not evidence. `tools/mkfat32.py` builds an image
+from a directory tree and is a completely separate implementation of the
+format from the kernel's; `tests/fat32_host_test.c` links the *real*
+driver into a host binary, points it at an image the tool wrote, and runs
+64 checks through it including an unmount and remount.
+
+```bash
+make disk          # an empty 256MB FAT32 volume, novaris-disk.img
+make run-disk      # boot the ISO with it attached
+make test-qemu-disk
+```
+
+A file on the disk costs a VFS node until something opens it, and only
+then its bytes — which is the whole point. The initrd charged forty
+megabytes for every file whether or not anything read it; a Wine prefix
+of a thousand files costs a few hundred kilobytes until it is used.
 
 ## Project layout
 
@@ -327,6 +398,10 @@ novaris/
 │   ├── posix_signal.c         # signal delivery, sigframes, ucontext
 │   ├── posix_thread.c         # clone, futex, TLS
 │   ├── socket.c               # Unix domain sockets, SCM_RIGHTS, pipes
+│   ├── ata.c                  # ATA PIO driver: the disk
+│   ├── blockdev.c             # The block-device registry under FAT32
+│   ├── fat32.c                # FAT32: files, directories, long names
+│   ├── ramfs.c                # The in-memory filesystem, and path walking
 │   ├── process.c / process_asm.s    # Ring 0 <-> ring 3
 │   ├── scheduler.c / scheduler_asm.s # Preemptive multitasking
 │   ├── elf.c                  # ELF32 loader
@@ -346,6 +421,7 @@ novaris/
 ├── tools/
 │   ├── gen_font.py            # Generates the 8x16 terminal font
 │   ├── gen_uifont.py          # Generates the antialiased UI faces
+│   ├── mkfat32.py             # Builds a FAT32 image from a directory
 │   └── qemu_test.py           # Boots the ISO and drives the shell
 ├── tests/                     # Host-side tests of kernel code
 ├── linker.ld                  # Places the kernel at the 1MB mark
@@ -368,6 +444,10 @@ apt-get install nasm grub-pc-bin grub-common xorriso mtools \
 — the kernel itself has no such dependency. `gcc-multilib` is only needed
 for the host-side tests.
 
+Nothing extra is needed for the disk: `tools/mkfat32.py` is plain Python
+with no dependencies, and QEMU's built-in IDE controller is what the ATA
+driver talks to.
+
 ```bash
 make          # builds build/novaris.bin and novaris.iso
 ```
@@ -376,6 +456,7 @@ make          # builds build/novaris.bin and novaris.iso
 
 ```bash
 make run                 # opens a QEMU window (needs a display)
+make run-disk            # ... with a FAT32 disk attached at /disk
 qemu-system-i386 -cdrom novaris.iso   # same thing, manually
 ```
 
@@ -394,11 +475,13 @@ qemu-system-i386 -cdrom novaris.iso -display none -serial stdio
 ## Testing
 
 ```bash
-make test        # host-side tests: the printf engine and the PE loader
+make test        # host-side tests: printf, the PE loader, FAT32, the WM
 make test-qemu   # boots the ISO, drives the shell, asserts on the output
+make test-qemu-disk      # writes to the disk, reboots, reads it back
 make test-posix  # runs ten binaries on Linux AND Novaris, diffs the two
 make test-wine   # boots novaris-wine.iso, asserts a Windows .exe's output
 make test-wine-threads   # ... and a *threaded* Windows .exe's
+make test-wine-prefix    # ... and how far Wine's real startup path gets
 ```
 
 `make test-posix` is the strongest of these, and the one the POSIX work
@@ -416,6 +499,15 @@ is run against the real mingw-built binaries, including verifying every
 entry in a relocation table it applied. `make test-qemu` boots the ISO in
 QEMU, types commands through the QEMU monitor, and matches the serial
 transcript against expected output (`tools/qemu_test.py`).
+
+The FAT32 half of `make test` works the same way and is worth a sentence
+of its own: the real driver is linked into a host binary and pointed at
+an image built by `tools/mkfat32.py`, which is an independent
+implementation of the format. It reads what the other one wrote, then
+writes, truncates, grows a directory past its first cluster, renames
+across directories, unlinks a long-named file, and unmounts and remounts
+to check that all of it survived — 64 checks. `make test-qemu-disk` is the
+same question asked of the real machine: write, power off, boot, read.
 
 You can also burn `novaris.iso` to a USB stick with a tool like `dd` or Rufus
 and boot a **real PC** from it — that's genuinely how far this goes.
