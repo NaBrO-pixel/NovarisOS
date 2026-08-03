@@ -56,8 +56,7 @@ KERNEL = $(BUILD_DIR)/novaris.bin
 ISO = novaris.iso
 
 .PHONY: all clean run run-nographic iso test test-qemu test-posix test-wine \
-        test-wine-threads test-qemu-disk test-wine-prefix zip wine-initrd \
-        disk wine-disk
+        test-wine-threads test-qemu-disk test-wine-prefix zip disk
 
 all: $(ISO)
 
@@ -351,11 +350,13 @@ HOST_LIB32 ?= /lib32
 #   git clone --depth 1 -b stable https://github.com/wine-mirror/wine
 #   cd wine && CC="gcc -m32" ./configure --enable-archs=i386 #       --disable-tests --without-x --without-freetype ...
 #   make -j4
-#   cd ../NovarisOS && make WINE_BUILD=../wine wine-initrd
+#   cd ../NovarisOS && make WINE_BUILD=../wine
 #
-# With WINE_BUILD set, `make wine-initrd` builds an ISO carrying Wine's
-# loader, ntdll.so and the two files glibc's getpwuid needs. See
-# ROADMAP.md Milestone 27 for exactly how far that gets.
+# With WINE_BUILD set, the ordinary `make` installs Wine into the OS image
+# it builds - see tools/install_wine.sh and the initrd rule below. Without
+# it, the same `make` builds the same OS with no Wine in it. Switching
+# back needs a `make clean`: the staging directory is built up rather than
+# rebuilt, so an install already in it stays until it is wiped.
 WINE_BUILD ?=
 WINE_STRIP ?= 1
 
@@ -569,8 +570,35 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
 	cp $(BUILD_DIR)/user/qsorttest.exe $(BUILD_DIR)/initrd_staging/qsorttest.exe
 	cp $(BUILD_DIR)/user/threads.exe $(BUILD_DIR)/initrd_staging/threads.exe
 
-$(BUILD_DIR)/initrd.img: $(BUILD_DIR)/initrd_staging/helloelf.elf userland/mkinitrd.py
-	python3 userland/mkinitrd.py $(BUILD_DIR)/initrd_staging $@
+# Wine, installed into the OS image rather than bolted onto a second one.
+#
+# Milestone 35. Through Milestone 34 there were two ISOs: novaris.iso, and
+# a novaris-wine.iso built by a separate target that dumped Wine's files
+# at the root of a flat initrd. That is Wine as a tool you carry around
+# next to an OS. An operating system that runs Windows programs has Wine
+# *installed in it*, at /usr/lib/wine and /usr/share/wine, the way any
+# other Unix does - which is also, not coincidentally, the only layout
+# Wine's own path arithmetic gets right. See tools/install_wine.sh.
+#
+# One image, then. With WINE_BUILD pointing at a built Wine tree, `make`
+# produces a novaris.iso with Wine in it; without, it produces the same
+# OS without Wine, and the `wine` command in the shell says so rather
+# than failing three layers down. Nothing else about the build changes.
+$(BUILD_DIR)/wine-installed.stamp: $(BUILD_DIR)/initrd_staging/helloelf.elf \
+                                   tools/install_wine.sh
+ifeq ($(strip $(WINE_BUILD)),)
+	@echo "No WINE_BUILD set - building without Wine."
+	@echo "  (set WINE_BUILD=/path/to/a/built/wine to install it into the OS)"
+	@touch $@
+else
+	HOST_LIB32=$(HOST_LIB32) sh tools/install_wine.sh \
+	    $(WINE_BUILD) $(BUILD_DIR)/initrd_staging $(WINE_STRIP)
+	@touch $@
+endif
+
+$(BUILD_DIR)/initrd.img: $(BUILD_DIR)/wine-installed.stamp userland/mkinitrd.py
+	python3 userland/mkinitrd.py $(BUILD_DIR)/initrd_staging $@ > $(BUILD_DIR)/initrd.list
+	@echo "initrd: $$(grep -c '^  ' $(BUILD_DIR)/initrd.list) files, $$(du -h $@ | cut -f1)"
 
 $(KERNEL): $(OBJS) linker.ld
 	$(LD) $(LDFLAGS) -o $@ $(OBJS)
@@ -723,7 +751,7 @@ test-posix: $(ISO) $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf
 
 test-qemu: $(ISO)
 	python3 tools/qemu_test.py --iso $(ISO) --script tools/tests/win32_smoke.txt \
-	    --boot-wait 16 --settle 5 \
+	    --memory 512 --boot-wait 22 --settle 5 \
 	    --expect "Hello from a real Windows .exe running on Novaris" \
 	    --expect "floats:     3\.141593 2\.50 1\.234568e\+04 0\.0001" \
 	    --expect "fib\(20\):    6765" \
@@ -750,166 +778,48 @@ ZIP_CONTENTS = boot include kernel tests tools userland Makefile linker.ld \
                grub.cfg README.md ROADMAP.md .gitignore \
                docs-proof-of-boot.png docs-desktop.png
 
-# Builds a *separate* ISO carrying Wine on top of the ordinary initrd.
-# Separate on purpose: novaris.iso must stay reproducible from this tree
-# alone, and Wine is not in this tree.
-wine-initrd: $(BUILD_DIR)/initrd.img $(KERNEL)
-	@test -n "$(WINE_BUILD)" || \
-	    { echo "set WINE_BUILD=/path/to/a/built/wine (see the comment in the Makefile)"; exit 1; }
-	@test -f "$(WINE_BUILD)/loader/wine-preloader" || \
-	    { echo "$(WINE_BUILD) does not look like a built Wine tree"; exit 1; }
-	rm -rf $(BUILD_DIR)/wine_staging $(BUILD_DIR)/wine_iso
-	mkdir -p $(BUILD_DIR)/wine_staging $(BUILD_DIR)/wine_iso/boot/grub
-	cp $(BUILD_DIR)/initrd_staging/* $(BUILD_DIR)/wine_staging/
-	cp $(WINE_BUILD)/loader/wine-preloader $(BUILD_DIR)/wine_staging/preload.elf
-	cp $(WINE_BUILD)/loader/wine $(BUILD_DIR)/wine_staging/wineldr.elf
-	cp $(WINE_BUILD)/dlls/ntdll/ntdll.so $(BUILD_DIR)/wine_staging/ntdll.so
-	# Milestone 29: wineserver, which is the process Wine forks and execs
-	# before it can do anything with a handle. Until fork/execve/waitpid
-	# existed there was no point carrying it.
-	cp $(WINE_BUILD)/server/wineserver $(BUILD_DIR)/wine_staging/wineserver
-	# Also under the names Wine's own path logic derives. init_paths()
-	# takes the directory ntdll.so was loaded from and looks for "wine"
-	# and "wine-preloader" beside it, and the initrd is flat - so those
-	# are the names re-exec finds. Both sets ship: the documented
-	# `run preload.elf wineldr.elf --version` still works, and Wine
-	# re-execing itself finds what it expects without being told.
-	cp $(WINE_BUILD)/loader/wine $(BUILD_DIR)/wine_staging/wine
-	cp $(WINE_BUILD)/loader/wine-preloader $(BUILD_DIR)/wine_staging/wine-preloader
-	# The NLS tables. Not decoration and not optional: wineserver calls
-	# fatal_error() if it cannot load l_intl.nls, and kernelbase's
-	# init_locale walks sortdefault.nls without checking that it got it -
-	# with that one missing it parsed whatever pointer was left over,
-	# read a zero count, indexed to "the last of nothing" and took an
-	# access violation twenty-four bytes before the mapping.
-	#
-	# The whole directory rather than a hand-picked list, for exactly
-	# that reason: a missing table does not announce itself.
-	cp $(WINE_BUILD)/nls/*.nls $(BUILD_DIR)/wine_staging/
-	# --- Wine's Windows side (Milestone 30) ---------------------------
-	#
-	# The PE builtins. Everything above this line is Wine's *Unix* half;
-	# these are the DLLs it loads as Windows modules once the server
-	# handshake is done, and without them the loader gets as far as
-	# "failed to load start.exe" and stops.
-	#
-	# Not all 601 of them: a console program needs the core plus what
-	# ntdll's loader touches on the way, and the initrd is read into RAM
-	# whole. They are stripped on the way in - debug information is three
-	# quarters of the bytes and nothing here reads it.
-	#
-	# The initrd is flat, so these land at the root and the last-component
-	# fallback resolves Wine's "<dir>/i386-windows/ntdll.dll" to them.
-	for d in $(WINE_PE_DLLS); do \
-	    cp $(WINE_BUILD)/dlls/$$d/i386-windows/$$d.dll \
-	       $(BUILD_DIR)/wine_staging/$$d.dll 2>/dev/null || true; \
-	done
-	for p in $(WINE_PE_PROGS); do \
-	    cp $(WINE_BUILD)/programs/$$p/i386-windows/$$p.exe \
-	       $(BUILD_DIR)/wine_staging/$$p.exe 2>/dev/null || true; \
-	done
-	# The Unix halves of the builtins above - see WINE_UNIX_DLLS.
-	for d in $(WINE_UNIX_DLLS); do \
-	    cp $(WINE_BUILD)/dlls/$$d/$$d.so \
-	       $(BUILD_DIR)/wine_staging/$$d.so 2>/dev/null || true; \
-	done
-	test -z "$(WINE_STRIP)" || i686-w64-mingw32-strip \
-	    $(BUILD_DIR)/wine_staging/*.dll \
-	    $(BUILD_DIR)/wine_staging/*.exe 2>/dev/null || true
-	strip $(BUILD_DIR)/wine_staging/ntdll.so $(BUILD_DIR)/wine_staging/*.so \
-	      $(BUILD_DIR)/wine_staging/wineserver 2>/dev/null || true
-	# glibc's getpwuid() needs these, and Wine dereferences its result
-	# without checking. The initrd is flat, so they land at the root and
-	# the last-component fallback resolves /etc/passwd to them.
-	printf 'root:x:0:0:root:/:/bin/sh\n' > $(BUILD_DIR)/wine_staging/passwd
-	printf 'passwd: files\ngroup: files\n' > $(BUILD_DIR)/wine_staging/nsswitch.conf
-	# Milestone 31. glibc unwinds a thread out of itself with
-	# _Unwind_ForcedUnwind, which lives in libgcc_s.so.1 and is reached by
-	# dlopen()ing it the first time pthread_exit() is called - so a
-	# library nothing links against is a hard requirement for a *thread*
-	# to end. Without it glibc prints "libgcc_s.so.1 must be installed
-	# for pthread_exit to work" and aborts, which is what every Wine
-	# worker thread did the moment it returned. Copied from the host
-	# toolchain, like ld-linux.so.2 and libc.so.6 and for the same
-	# reasons.
-	cp $(HOST_LIB32)/libgcc_s.so.1 $(BUILD_DIR)/wine_staging/libgcc_s.so.1
-	# Milestone 32. Every other shared library anything here links
-	# against, worked out rather than listed.
-	#
-	# The hand-written list was wrong and had been for two milestones:
-	# win32u.so needs libm.so.6 and nothing shipped it, so the Unix half
-	# of win32u could not be dlopen'd - and win32u is the Unix backend
-	# for both gdi32 and user32. Wine said so, once, in a warning inside
-	# a trace channel nobody had turned on:
-	#
-	#   warn:module:get_builtin_unix_funcs failed to load
-	#     "//i386-unix/win32u.so": libm.so.6: cannot open shared object file
-	#
-	# The same lesson as the NLS tables above, so the same answer: ask the
-	# binaries what they need instead of remembering. objdump reports the
-	# DT_NEEDED entries; anything already staged is skipped, and anything
-	# that is not in HOST_LIB32 is left to announce itself at run time
-	# rather than silently breaking the build.
-	@for f in $(BUILD_DIR)/wine_staging/*.so $(BUILD_DIR)/wine_staging/wineserver \
-	          $(BUILD_DIR)/wine_staging/wine $(BUILD_DIR)/wine_staging/preload.elf; do \
-	    objdump -p $$f 2>/dev/null | awk '/NEEDED/ { print $$2 }'; \
-	done | sort -u | while read lib; do \
-	    test -f $(BUILD_DIR)/wine_staging/$$lib && continue; \
-	    test -f $(HOST_LIB32)/$$lib || continue; \
-	    echo "  + $$lib (needed by a Wine .so)"; \
-	    cp $(HOST_LIB32)/$$lib $(BUILD_DIR)/wine_staging/$$lib; \
-	done
-	python3 userland/mkinitrd.py $(BUILD_DIR)/wine_staging \
-	    $(BUILD_DIR)/wine_iso/boot/initrd.img
-	cp $(BUILD_DIR)/novaris.bin $(BUILD_DIR)/wine_iso/boot/novaris.bin
-	cp grub.cfg $(BUILD_DIR)/wine_iso/boot/grub/grub.cfg
-	grub-mkrescue -o novaris-wine.iso $(BUILD_DIR)/wine_iso 2>/dev/null
-	@echo "Wrote novaris-wine.iso - try: run wine-preloader wine hellowin.exe"
-
-# Boots novaris-wine.iso and asserts that a real Windows .exe runs under
-# real Wine. Separate from `make test-qemu` for the same reason
-# novaris-wine.iso is separate from novaris.iso: it needs a built Wine
-# tree, and this repository must stay buildable without one.
+# Boots the OS and asserts that a real Windows .exe runs under real Wine.
 #
-#   make WINE_BUILD=../wine wine-initrd test-wine
+# Since Milestone 35 this is the *default* configuration and the test says
+# so by asking for nothing: one ISO, no disk, no setup commands, symbolic
+# links on, and `wine hellowin.exe` typed at the shell. Wine is installed
+# in the image at /usr/lib/wine and /usr/share/wine, so it finds wine.inf,
+# builds its own prefix in /root/.wine, starts wineserver, runs wineboot
+# and services.exe, and runs the program.
 #
-# 768MB because the initrd carries Wine's PE builtins and the NLS tables
-# and is read into RAM whole, and because a fork of a Wine process copies
-# its address space eagerly.
-# `symlinks off` first, and it is the interesting line in this file.
+# Two lines of the transcript are worth knowing about because they look
+# like failures and are not. "err:winediag:nodrv_CreateWindow" is Wine
+# having no display backend to load, which is true and is a milestone of
+# its own. "err:environ:run_wineboot boot event wait timed out" is
+# wineboot taking longer than the five minutes Wine allows it - the run
+# then carries on and works.
 #
-# Milestone 32 built symbolic links and switched them on, because what
-# they unlock - Wine's DOS drive table, and with it the startup path a
-# real installation takes - was waiting on a disk and a prefix, and both
-# now exist. Turning them on is what the milestone was for.
+# `argv[0]: Z:\hellowin.exe` is the assertion that says the prefix really
+# was used: `Z:\` is the DOS drive table, built out of symbolic links in
+# the prefix. Every milestone before 34 got `C:\windows\hellowin.exe`,
+# which is the fallback Wine takes when it has no drives at all.
 #
-# It is also what stops this test. With drives, Wine stops falling back to
-# the Windows directory and does what it does on a real machine: it finds
-# the prefix, starts wineserver, starts services.exe, loads its builtins
-# off the disk - and then wineboot stops inside shell32's delay-load of
-# SHGetFolderPathW and does not come back. The Windows program never runs.
-#
-# So this test says which of the two paths it is testing instead of
-# leaving it to a default. The kernel's default is that symlinks work,
-# because they do and because userland/fs_test.c compares them against
-# Linux byte for byte; the transcript test that needs Wine's *older* path
-# asks for it. `make test-wine-prefix` is the other half - it asserts how
-# far the new path gets, so the progress is a test rather than a claim.
-#
-# Milestone 33 is what removes this line. See ROADMAP.md.
-test-wine:
-	@test -f novaris-wine.iso || \
-	    { echo "run 'make WINE_BUILD=/path/to/wine wine-initrd' first"; exit 1; }
-	python3 tools/qemu_test.py --iso novaris-wine.iso --memory 768 \
-	    --boot-wait 30 --settle 200 \
-	    --setup "symlinks off" \
-	    --cmd "run wine-preloader wine hellowin.exe" \
-	    --expect "Hello from a real Windows \.exe running on Novaris" \
-	    --expect "compiled by mingw-w64, linked against msvcrt\.dll" \
+# 768MB because the initrd carries Wine and is read into RAM whole, and
+# because a fork of a Wine process copies its address space eagerly.
+# Fifteen minutes of settle with --stop-when-matched, so only a failing
+# run ever spends it.
+test-wine: $(ISO)
+	@python3 tools/check_wine_installed.py $(BUILD_DIR)/initrd_staging
+	python3 tools/qemu_test.py --iso $(ISO) --memory 768 \
+	    --boot-wait 30 --settle 900 --timeout 1000 --stop-when-matched \
+	    --cmd "wine hellowin.exe" \
 	    --expect "floats:     3\.141593 2\.50 1\.234568e\+04 0\.0001" \
 	    --expect "fib\(20\):    6765" \
-	    --expect "argv\[0\]: C:.windows.hellowin\.exe" \
+	    --expect "argv\[0\]: Z:.hellowin\.exe" \
 	    --expect "Exiting with code 0" \
+	    --reject "No Wine installed" \
+	    --reject "could not load ntdll\.so" \
+	    --reject "wine\.inf not found" \
+	    --reject "\[fat32\] cannot create" \
+	    --reject "\[ata\]" \
+	    --reject "Failed to get shared session object" \
+	    --reject "Too many open files" \
+	    --reject "unimplemented syscall" \
 	    --reject "KERNEL PANIC"
 
 # Milestone 31: the same, for a *threaded* Windows program. threads.exe is
@@ -933,18 +843,22 @@ test-wine:
 # somewhere. It is a latency defect and the counters above prove it is
 # not a correctness one; asserting its absence would be asserting
 # something that is not reliably true. See ROADMAP.md Milestone 31.
-# `symlinks off` for the reason spelled out above test-wine.
-test-wine-threads:
-	@test -f novaris-wine.iso || \
-	    { echo "run 'make WINE_BUILD=/path/to/wine wine-initrd' first"; exit 1; }
-	python3 tools/qemu_test.py --iso novaris-wine.iso --memory 768 \
-	    --boot-wait 30 --settle 200 \
-	    --setup "symlinks off" \
-	    --cmd "run wine-preloader wine threads.exe" \
+# Same default configuration as test-wine - see the comment there.
+#
+# The three "worker N starting, GetCurrentThreadId() = ..." lines are
+# deliberately *not* asserted, though they are printed. Several Wine
+# processes share COM1 and a line from one lands in the middle of a line
+# from another, and the ones most likely to be cut in half are the ones
+# printed while the other threads are still noisy - a run containing
+# "  worker 1 star0024:err:sync:RtlpWaitForCriticalSection ..." is a run
+# that worked. The two counters below are the proof that all three ran
+# anyway: the interlocked one only reaches 60 if every increment landed.
+test-wine-threads: $(ISO)
+	@python3 tools/check_wine_installed.py $(BUILD_DIR)/initrd_staging
+	python3 tools/qemu_test.py --iso $(ISO) --memory 768 \
+	    --boot-wait 30 --settle 900 --timeout 1000 --stop-when-matched \
+	    --cmd "wine threads.exe" \
 	    --expect "Win32 threads test - real CreateThread on Novaris" \
-	    --expect "worker 1 starting, GetCurrentThreadId" \
-	    --expect "worker 2 starting, GetCurrentThreadId" \
-	    --expect "worker 3 starting, GetCurrentThreadId" \
 	    --expect "all 3 workers joined" \
 	    --expect "worker 3 exit code 300" \
 	    --expect "interlocked counter: 60, expected 60  -> ok" \
@@ -987,7 +901,7 @@ test-qemu-disk: $(ISO)
 	rm -f $(BUILD_DIR)/persist.img
 	python3 tools/mkfat32.py $(BUILD_DIR)/persist.img --size 64M --label PERSIST
 	python3 tools/qemu_test.py --iso $(ISO) --disk $(BUILD_DIR)/persist.img \
-	    --boot-wait 16 --settle 3 --timeout 40 \
+	    --memory 512 --boot-wait 22 --settle 3 --timeout 50 \
 	    --cmd "mkdir /disk/afterboot" \
 	    --cmd "cp readme.txt /disk/afterboot/kept.txt" \
 	    --cmd "ln -s afterboot/kept.txt /disk/shortcut" \
@@ -996,7 +910,7 @@ test-qemu-disk: $(ISO)
 	    --expect "^synced" \
 	    --reject "KERNEL PANIC"
 	python3 tools/qemu_test.py --iso $(ISO) --disk $(BUILD_DIR)/persist.img \
-	    --boot-wait 16 --settle 3 --timeout 40 \
+	    --memory 512 --boot-wait 22 --settle 3 --timeout 50 \
 	    --cmd "ls /disk" \
 	    --cmd "ls /disk/afterboot" \
 	    --cmd "cat /disk/shortcut" \
@@ -1009,105 +923,71 @@ test-qemu-disk: $(ISO)
 	    --expect "label \\\"PERSIST\\\"" \
 	    --reject "KERNEL PANIC"
 
-# Builds a disk carrying a Wine prefix, from a prefix directory built
-# elsewhere. There is no way to build one on Novaris yet - that is what
-# Milestone 33 is about - so the prefix comes from a host that has the
-# same Wine tree:
-#
-#   WINEPREFIX=/tmp/pfx ../wine/loader/wine wineboot -u
-#   make WINE_PREFIX_DIR=/tmp/pfx wine-disk
-#
-# 512MB because a 32-bit prefix is a little over 200MB once the PE files
-# are stripped, and a filesystem wants room to write in.
-WINE_PREFIX_DIR =
-WINE_DISK_IMAGE = novaris-wine-disk.img
-WINE_DISK_SIZE  = 512M
+# Milestone 35 removed `make wine-disk` and WINE_PREFIX_DIR. They existed
+# because Novaris could not build a Wine prefix and one had to be built by
+# the same Wine on a host and written into a disk image. It can now: with
+# Wine installed in the OS, wineboot finds wine.inf and runs rundll32 over
+# it exactly as it would anywhere else. A disk is still where a prefix
+# ought to live, because a prefix is an installation - but it is Wine that
+# puts it there now, on first use, and `make disk` is all it takes to have
+# somewhere for it to go.
 
-wine-disk:
-	@test -n "$(WINE_PREFIX_DIR)" || \
-	    { echo "set WINE_PREFIX_DIR=/path/to/a/wine/prefix (see the Makefile)"; exit 1; }
-	@test -d "$(WINE_PREFIX_DIR)/drive_c" || \
-	    { echo "$(WINE_PREFIX_DIR) does not look like a Wine prefix"; exit 1; }
-	rm -rf $(BUILD_DIR)/disk_staging
-	mkdir -p $(BUILD_DIR)/disk_staging
-	cp -a $(WINE_PREFIX_DIR) $(BUILD_DIR)/disk_staging/.wine
-	# Stripped for the same reason the initrd's builtins would be: debug
-	# information is three quarters of the bytes and nothing here reads
-	# it. 700MB becomes 220MB, and the difference is a disk image that
-	# can be moved between machines.
-	find $(BUILD_DIR)/disk_staging -name '*.dll' -o -name '*.exe' \
-	    -o -name '*.drv' -o -name '*.sys' \
-	    | xargs -r -n 40 i686-w64-mingw32-strip 2>/dev/null || true
-	python3 tools/mkfat32.py $(WINE_DISK_IMAGE) $(BUILD_DIR)/disk_staging \
-	    --size $(WINE_DISK_SIZE) --label WINEDISK
-	@echo "Wrote $(WINE_DISK_IMAGE) - the prefix lands at /disk/.wine, which"
-	@echo "is where HOME points when a disk is mounted."
-
-# How far Wine's *real* startup path gets, with symlinks on and a prefix
-# on the disk. Separate from test-wine because it asserts something
-# different: not that a Windows program runs - it does not yet - but that
-# every step before the one that stops is now reached.
+# The same thing on a disk, and the difference is that the prefix is an
+# installation rather than something rebuilt at every boot.
 #
-# What it proves, in order: the drive table exists (Wine names the prefix
-# as Z:\disk\.wine rather than reporting that it cannot find a DOS drive
-# for the working directory, which is what Milestones 30 and 31 got);
-# wineserver starts; services.exe starts and works through the auto-start
-# list; and Wine's PE builtins load out of the prefix on the disk.
+# `make test-wine` runs with no disk, so $HOME is /root and Wine builds
+# its prefix in RAM - correct, and gone when the machine is switched off.
+# Here the disk is an *empty* FAT32 volume, $HOME is /disk, and Wine
+# builds /disk/.wine on it. Milestone 35 is what made that possible: until
+# it, a prefix had to be built by the same Wine on a host and written into
+# a disk image with a `make wine-disk` target that no longer exists.
 #
-# The four --reject lines are Milestone 34's, and each one is a thing this
-# transcript used to say every time:
+# So this asserts something test-wine cannot: that the prefix Wine builds
+# lands on a real filesystem. "wine: created the configuration directory
+# '/disk/.wine'" is Wine's own account of doing it, on the FAT32 volume,
+# and the program running afterwards is the same prefix being used.
 #
-#   "Failed to get shared session object for window class" - sixteen times
-#   in a Milestone 33 run, once per NtUserRegisterClassExWOW, because a
-#   client's read-only MAP_PRIVATE view of wineserver's session file was a
-#   snapshot rather than the file. Private file mappings are copy-on-write
-#   now and the message is gone.
+# Two things it used to assert and no longer can, because they were both
+# *failure* messages: Wine naming the prefix in "failed to update ...,
+# wine.inf not found", and the "scmdatabase_autostart_services" fixme a
+# service prints when it does not start. Neither line appears any more.
 #
-#   "failed to create desktop window" - seventeen times, and the direct
-#   consequence of the first.
+# The --reject lines are the things this transcript used to say every
+# time, each of which was a milestone:
 #
+#   "could not find DOS drive" - no prefix at all, through Milestone 31.
+#   "wine.inf not found" - Wine installed nowhere in particular, so it
+#     could not find its own data directory (Milestone 35).
+#   "cannot create" - the FAT32 driver refusing to make a directory,
+#     which is what one missing ATA timeout looked like (Milestone 35).
+#   "Failed to get shared session object" - a client's read-only
+#     MAP_PRIVATE view of wineserver's session file was a snapshot rather
+#     than the file, so there was no desktop window (Milestone 34).
 #   "Too many open files" and the c000011f cascade under it - a process
-#   that ran out of the 128 descriptors it was allowed while loading DLLs,
-#   and reported that upwards as an invalid image format.
+#     out of descriptors while loading DLLs, reported upwards as an
+#     invalid image format (Milestone 34).
 #
-# And since Milestone 34 it asserts the thing itself: the .exe runs, on
-# the real path, and reports its own name as `Z:\hellowin.exe`. That last
-# detail is the point of the whole test - `Z:\` means the DOS drive table
-# built out of symbolic links in the prefix is what resolved the path,
-# where `make test-wine` gets `C:\windows\hellowin.exe` from the fallback
-# that runs when Wine has no drives at all.
-#
-# The *end* of the program's output rather than the start of it, and that
-# is deliberate. Several Wine processes share COM1 here and a line from
-# one can land in the middle of a line from another - a run where
-# "Hello from a real Windows .exe..." has a preloader warning spliced
-# through it is a run that worked. By the time the program reaches its
-# last few lines the others have gone quiet, so those are the lines worth
-# holding it to.
-#
-# Fifteen minutes of settle, and `--stop-when-matched` so that only a
-# failing run ever spends it. wineboot takes longer than the five minutes
-# Wine allows for its own boot event, so a *successful* run really does
-# contain "err:environ:run_wineboot" and then carries on and works, and how
-# much longer than that it takes varies by a lot between machines. Making
-# it quick is a separate problem from making it work.
-test-wine-prefix:
-	@test -f novaris-wine.iso || \
-	    { echo "run 'make WINE_BUILD=/path/to/wine wine-initrd' first"; exit 1; }
-	@test -f $(WINE_DISK_IMAGE) || \
-	    { echo "run 'make WINE_PREFIX_DIR=/path/to/prefix wine-disk' first"; exit 1; }
-	cp $(WINE_DISK_IMAGE) $(BUILD_DIR)/wine-disk-run.img
-	python3 tools/qemu_test.py --iso novaris-wine.iso \
-	    --disk $(BUILD_DIR)/wine-disk-run.img --memory 768 \
+# The *end* of the program's output is what is asserted rather than the
+# start, and that is deliberate: several Wine processes share COM1 here
+# and a line from one can land in the middle of a line from another. A run
+# where "Hello from a real Windows .exe..." has a preloader warning
+# spliced through it is a run that worked. By the time the program reaches
+# its last few lines the others have gone quiet.
+test-wine-prefix: $(ISO)
+	@python3 tools/check_wine_installed.py $(BUILD_DIR)/initrd_staging
+	rm -f $(BUILD_DIR)/wine-prefix.img
+	python3 tools/mkfat32.py $(BUILD_DIR)/wine-prefix.img --size 512M --label WINEDISK
+	python3 tools/qemu_test.py --iso $(ISO) \
+	    --disk $(BUILD_DIR)/wine-prefix.img --memory 768 \
 	    --boot-wait 30 --settle 900 --timeout 1000 --stop-when-matched \
 	    --cmd "wine hellowin.exe" \
 	    --expect "FAT32 volume mounted at /disk" \
-	    --expect "Z:.*disk.*wine" \
-	    --expect "scmdatabase_autostart_services" \
+	    --expect "created the configuration directory '/disk/\.wine'" \
 	    --expect "fib\(20\):    6765" \
 	    --expect "argv\[0\]: Z:.hellowin\.exe" \
 	    --expect "Exiting with code 0" \
 	    --reject "could not find DOS drive" \
+	    --reject "wine\.inf not found" \
 	    --reject "Failed to get shared session object" \
 	    --reject "failed to create desktop window" \
 	    --reject "Too many open files" \

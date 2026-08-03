@@ -150,8 +150,12 @@ def main():
         return 1
 
     guest = subprocess.run(
+        # 512MB and a longer boot wait since Milestone 35: the OS image
+        # carries Wine now, so the initrd GRUB reads into RAM is tens of
+        # megabytes rather than a few, and 128MB was sized for the latter.
         [sys.executable, os.path.join(HERE, "qemu_test.py"),
-         "--iso", args.iso, "--cmd", "run " + args.name],
+         "--iso", args.iso, "--memory", "512", "--boot-wait", "22",
+         "--cmd", "run " + args.name],
         capture_output=True, text=True, timeout=900)
     guest_lines = extract(guest.stdout, start, end)
     if not guest_lines:

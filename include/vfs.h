@@ -152,6 +152,16 @@ typedef struct vfs_node {
     uint8_t* data_base;
     int      mappable;
 
+    /* When the file was last written, as a Unix time. Milestone 35: the
+     * VFS had no timestamps at all and `stat` reported zeroes, which was
+     * fine until Wine started *installing* things. Every file setupapi
+     * copies into a prefix gets its times set afterwards, and a kernel
+     * that answers utimensat with -ENOSYS turns each of those into a
+     * "Converting errno 38 to STATUS_UNSUCCESSFUL" and a file copy that
+     * reports failure. One number per node, set when the file changes and
+     * settable from user space, is the whole of what that needs. */
+    uint32_t mtime;
+
     /* Open descriptors and shared mappings referring to this node, and
      * whether its name has been removed while they existed. Milestone 30
      * needed both: a program that creates a temporary file, opens it,
@@ -244,6 +254,11 @@ void vfs_node_unref(vfs_node_t* node);
  * is nothing to keep coherent. The cost is that growing a mapped file
  * moves it - see the note in ramfs.c. Returns 0 if memory ran out. */
 int vfs_make_mappable(vfs_node_t* node, uint32_t bytes);
+
+/* Stamps a node with the current time. Writes and truncates do it
+ * themselves; this is for utimensat, and for a caller that has changed a
+ * file some other way. */
+void vfs_touch(vfs_node_t* node);
 vfs_node_t* vfs_resolve_parent(const char* path, const char** leaf_out);
 
 /* Brings a disk-backed file's bytes into memory so they can be executed

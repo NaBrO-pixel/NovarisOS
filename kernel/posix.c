@@ -1271,10 +1271,22 @@ static int32_t sys_lseek(int fd, int32_t offset, int whence) {
  * The syscall trace is what found it - the host maps libc with five
  * mmap2 calls after the stat, and Novaris went straight from stat to
  * close. */
+/* st_atime / st_mtime / st_ctime. The three are one number here: the VFS
+ * records when a file was last written and nothing else, which is the one
+ * of the three that anybody reads. Milestone 35 - before it they were all
+ * zero, and a Wine prefix full of files dated 1970 is a prefix wineboot
+ * decides to reinstall on every boot. */
+#define ST_ATIME_OFFSET 64
+#define ST_MTIME_OFFSET 72
+#define ST_CTIME_OFFSET 80
+
 static int32_t stat_common(uint8_t* st, uint32_t size, uint32_t mode,
-                           uint32_t ino) {
+                           uint32_t ino, uint32_t mtime) {
     if (!st) return -EFAULT;
     kmemset(st, 0, 96);
+    *(uint32_t*)(st + ST_ATIME_OFFSET) = mtime;
+    *(uint32_t*)(st + ST_MTIME_OFFSET) = mtime;
+    *(uint32_t*)(st + ST_CTIME_OFFSET) = mtime;
     *(uint32_t*)(st + ST_DEV_OFFSET) = NOVARIS_INITRD_DEV;
     *(uint32_t*)(st + ST_INO32_OFFSET) = ino;
     /* `mode` arrives with both halves already in it: the file type from
@@ -1306,13 +1318,13 @@ static int32_t sys_fstat64(int fd, uint8_t* st) {
     if (e->kind == FD_CONSOLE) {
         /* The three console descriptors are one character device, and
          * distinct from every file. */
-        return stat_common(st, 0, S_IFCHR | 0620, 1u + (uint32_t)fd);
+        return stat_common(st, 0, S_IFCHR | 0620, 1u + (uint32_t)fd, 0);
     }
     uint32_t mode = (e->node->flags & VFS_DIRECTORY) ? S_IFDIR
                   : (e->node->flags & VFS_SOCKET)    ? S_IFSOCK
                                                      : S_IFREG;
     return stat_common(st, e->node->length, mode | (e->node->mode & 07777),
-                       node_ino(e->node));
+                       node_ino(e->node), e->node->mtime);
 }
 
 static int32_t sys_stat64(const char* path, uint8_t* st) {
@@ -1321,6 +1333,59 @@ static int32_t sys_stat64(const char* path, uint8_t* st) {
     int32_t r = sys_fstat64(fd, st);
     sys_close(fd);
     return r;
+}
+
+/* utimensat(dirfd, path, times[2], flags), and the three older calls that
+ * ask the same question.
+ *
+ * `times` is two timespecs - access time then modification time - and two
+ * nanosecond values are special: UTIME_NOW means "now" and UTIME_OMIT
+ * means "leave this one alone". A NULL `times` means now for both.
+ *
+ * This filesystem keeps one time per file rather than three (see
+ * vfs_node_t.mtime), so the modification time is the one that is stored
+ * and the access time is accepted and dropped. That is a real
+ * simplification and it is the right one here: nothing reads an access
+ * time, and a filesystem that tracked one would rewrite a node on every
+ * read.
+ *
+ * Milestone 35. Wine's setupapi sets the times on every file it copies
+ * into a prefix; before this each of those was -ENOSYS, and Wine turned
+ * each -ENOSYS into "Converting errno 38 to STATUS_UNSUCCESSFUL" and a
+ * copy that reported failure. Seventy-six of them in one wineboot. */
+#define UTIME_NOW  0x3fffffff
+#define UTIME_OMIT 0x3ffffffe
+
+static int32_t set_node_times(vfs_node_t* n, const uint32_t* times) {
+    if (!n) return -ENOENT;
+    if (!times) { vfs_touch(n); return 0; }
+
+    /* times[2] and times[3] are the modification time's seconds and
+     * nanoseconds; times[0] and [1] are the access time's, and this
+     * filesystem has nowhere to put those. */
+    uint32_t nsec = times[3];
+    if (nsec == UTIME_OMIT) return 0;
+    n->mtime = (nsec == UTIME_NOW) ? rtc_unix_time() : times[2];
+    return 0;
+}
+
+static int32_t sys_utimensat(int dirfd, const char* path,
+                             const uint32_t* times, int flags) {
+    (void)flags;
+    /* No path: the descriptor itself is the file. That is futimens(), and
+     * glibc spells it exactly this way. */
+    if (!path) {
+        fd_entry_t* e = fd_get(dirfd);
+        if (!e || e->kind != FD_FILE) return -EBADF;
+        return set_node_times(e->node, times);
+    }
+
+    char joined[PATH_JOIN_MAX];
+    const char* abs = abs_into(path, joined, sizeof(joined));
+    vfs_node_t* n = vfs_lookup(abs);
+    if (!n) n = resolve_for_read(path);
+    if (!n) return -ENOENT;
+    return set_node_times(n, times);
 }
 
 /* The file type a node reports, which is the one thing lstat and stat can
@@ -1354,7 +1419,7 @@ static int32_t sys_lstat64(const char* path, uint8_t* st) {
         if (!n) return -ENOENT;
     }
     return stat_common(st, n->length, node_type(n) | (n->mode & 07777),
-                       node_ino(n));
+                       node_ino(n), n->mtime);
 }
 
 /* getcwd. Real since Milestone 29: the working directory is per process,
@@ -2255,6 +2320,10 @@ static const char* syscall_name(uint32_t n) {
         case SYS_mkdirat: return "mkdirat";
         case SYS_rmdir: return "rmdir";
         case SYS_rename: return "rename";
+        case SYS_utimensat: return "utimensat";
+        case SYS_utimes: return "utimes";
+        case SYS_futimesat: return "futimesat";
+        case SYS_utime: return "utime";
         case SYS_renameat: return "renameat";
         case SYS_renameat2: return "renameat2";
         case SYS_getdents64: return "getdents64";
@@ -2294,6 +2363,9 @@ static const char* syscall_name(uint32_t n) {
         case SYS_getxattr: return "getxattr";
         case SYS_lgetxattr: return "lgetxattr";
         case SYS_fgetxattr: return "fgetxattr";
+        case SYS_removexattr: return "removexattr";
+        case SYS_lremovexattr: return "lremovexattr";
+        case SYS_fremovexattr: return "fremovexattr";
         case SYS_set_thread_area: return "set_thread_area";
         case SYS_clone: return "clone";
         case SYS_futex: return "futex";
@@ -2417,6 +2489,41 @@ void posix_syscall(registers_t* regs) {
             if (!fe || fe->kind != FD_FILE) { r = -EBADF; break; }
             fe->node->mode = b & 07777;
             r = 0;
+            break;
+        }
+        case SYS_utimensat:
+            /* (dirfd, path, times, flags). AT_FDCWD and a real descriptor
+             * both work: a relative path is joined onto the working
+             * directory either way, which is what every caller here
+             * passes. */
+            r = sys_utimensat((int)a, (const char*)b, (const uint32_t*)c, (int)d);
+            break;
+        case SYS_utime:
+            /* (path, {actime, modtime}) - two plain seconds, no
+             * nanoseconds, so it is reshaped into the modern form. */
+            if (b) {
+                uint32_t t[4] = { ((const uint32_t*)b)[0], 0,
+                                  ((const uint32_t*)b)[1], 0 };
+                r = sys_utimensat(-100, (const char*)a, t, 0);
+            } else {
+                r = sys_utimensat(-100, (const char*)a, 0, 0);
+            }
+            break;
+        case SYS_utimes:
+        case SYS_futimesat: {
+            /* utimes(path, timeval[2]) and futimesat(dirfd, path,
+             * timeval[2]) - microseconds rather than nanoseconds, and
+             * this filesystem's resolution is a second either way. */
+            int dfd = (n == SYS_futimesat) ? (int)a : -100;
+            const char* p = (n == SYS_futimesat) ? (const char*)b : (const char*)a;
+            const uint32_t* tv = (n == SYS_futimesat) ? (const uint32_t*)c
+                                                      : (const uint32_t*)b;
+            if (tv) {
+                uint32_t t[4] = { tv[0], 0, tv[2], 0 };
+                r = sys_utimensat(dfd, p, t, 0);
+            } else {
+                r = sys_utimensat(dfd, p, 0, 0);
+            }
             break;
         }
         case SYS_rename:   r = sys_rename((const char*)a, (const char*)b); break;
@@ -2749,6 +2856,9 @@ void posix_syscall(registers_t* regs) {
         case SYS_setxattr:
         case SYS_lsetxattr:
         case SYS_fsetxattr:
+        case SYS_removexattr:
+        case SYS_lremovexattr:
+        case SYS_fremovexattr:
             r = -EOPNOTSUPP;
             break;
 

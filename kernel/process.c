@@ -457,8 +457,14 @@ static void env_defaults(void) {
      * files that wine.inf builds, a registry it rewrites, and a drive
      * table made of symbolic links. On the ramfs that is a node table
      * away from full and gone at the next boot. On the disk it is an
-     * installation. */
-    process_env_set(fat32_mounted() ? "HOME=/disk" : "HOME=/");
+     * installation.
+     *
+     * /root rather than / when there is no disk, since Milestone 35. The
+     * old answer put Wine's prefix at /.wine, which is a directory tree
+     * dumped in the root of the filesystem - the same "installed nowhere
+     * in particular" that having Wine's own files at / was. The directory
+     * ships in the image; see tools/install_wine.sh. */
+    process_env_set(fat32_mounted() ? "HOME=/disk" : "HOME=/root");
     for (uint32_t i = 0; i < sizeof(defaults) / sizeof(defaults[0]); i++) {
         process_env_set(defaults[i]);
     }
