@@ -466,6 +466,9 @@ int vfs_make_mappable(vfs_node_t* n, uint32_t bytes) {
     if (bytes == 0) bytes = 1;
 
     uint32_t cap = (bytes + 4095u) & ~4095u;
+    /* The growth reserve, for files this kernel's own memory backs. See
+     * VFS_MAPPING_RESERVE. */
+    if (!n->ops && cap < VFS_MAPPING_RESERVE) cap = VFS_MAPPING_RESERVE;
     if (n->mappable && n->capacity >= cap) return 1;
 
     uint8_t* raw = (uint8_t*)kmalloc(cap + 4096u);

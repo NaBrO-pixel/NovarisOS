@@ -33,6 +33,29 @@
  * short name, which is not a filesystem anyone can use. */
 #define VFS_NAME_MAX  128
 
+/* How much storage a *growable* mapped file gets reserved up front.
+ *
+ * Milestone 32. The design note on vfs_make_mappable() says growing a
+ * mapped file moves its bytes and therefore breaks any mapping already
+ * handed out, and records it as a known cost. Wine turns out to depend on
+ * the opposite. wineserver's session mapping - the shared memory window
+ * classes and other user32 objects live in - is grown with ftruncate and
+ * then *extended* rather than remapped: the server maps only the new
+ * tail and keeps every earlier block where it is. Moving the storage
+ * under it is what "Failed to get shared session object for window class"
+ * was.
+ *
+ * A reserve does not make that impossible, it makes it rare: growth
+ * within the reserve costs nothing and moves nothing. It applies only to
+ * files whose bytes this kernel owns outright (ramfs), because those are
+ * the ones that grow - a DLL mapped off the disk is written once, at its
+ * final size, and reserving four megabytes for each of those would be
+ * four megabytes each of pure waste.
+ *
+ * The real answer is a page cache, where a file is a vector of frames and
+ * growth appends one. That is a milestone, not a constant. */
+#define VFS_MAPPING_RESERVE (4u * 1024u * 1024u)
+
 /* How long a symlink's target may be. Wine's are short ("../drive_c",
  * "/tmp/.wine-0/server-..."), and a bound keeps a corrupt on-disk node
  * from turning into an unbounded read. */
