@@ -15,6 +15,10 @@
 #include "vfs.h"
 #include "kheap.h"
 #include "kstring.h"
+#include "shell.h"
+#include "console.h"
+#include "desktop.h"
+#include "wm.h"
 
 #define SIDEBAR_W   158
 #define TOOLBAR_H   44
@@ -34,6 +38,14 @@ typedef struct {
     int scroll;         /* first visible row */
     int hover_row;
     int count;
+    /* Where the window is looking. Milestone 35: the filesystem has
+     * directories now - Wine is installed in /usr/lib/wine - and a browser
+     * that can only see the root is a browser that cannot reach most of
+     * the machine. `dir` is the directory being shown and `path` is its
+     * name, kept as a string because that is what has to be handed to
+     * whatever opens a file. */
+    vfs_node_t* dir;
+    char path[VFS_NAME_MAX * 2];
     vfs_node_t* nodes[MAX_FILES];
 } files_state_t;
 
@@ -41,7 +53,7 @@ static files_state_t files_state;
 
 /* --- file classification ----------------------------------------------- */
 
-enum { KIND_TEXT, KIND_EXE, KIND_ELF, KIND_BIN, KIND_OTHER };
+enum { KIND_TEXT, KIND_EXE, KIND_ELF, KIND_BIN, KIND_OTHER, KIND_DIR };
 
 static int kind_of(const char* name) {
     if (kstr_ends_with_ci(name, ".txt")) return KIND_TEXT;
@@ -53,6 +65,7 @@ static int kind_of(const char* name) {
 
 static const char* kind_label(int kind) {
     switch (kind) {
+        case KIND_DIR:  return "Folder";
         case KIND_TEXT: return "Plain Text";
         case KIND_EXE:  return "Windows Application";
         case KIND_ELF:  return "ELF Executable";
@@ -61,7 +74,17 @@ static const char* kind_label(int kind) {
     }
 }
 
+/* A directory is a kind of its own whatever it is called, so this rather
+ * than kind_of() wherever a node is in hand. */
+static int node_kind(const vfs_node_t* n) {
+    if (n->flags & VFS_DIRECTORY) return KIND_DIR;
+    return kind_of(n->name);
+}
+
 static int passes_filter(int filter, int kind) {
+    /* A folder is always shown: filtering it out would make the part of
+     * the tree behind it unreachable, which is not what a filter means. */
+    if (kind == KIND_DIR) return 1;
     if (filter == FILTER_ALL) return 1;
     if (filter == FILTER_PROGRAMS) {
         return kind == KIND_EXE || kind == KIND_ELF || kind == KIND_BIN;
@@ -69,13 +92,25 @@ static int passes_filter(int filter, int kind) {
     return kind == KIND_TEXT || kind == KIND_OTHER;
 }
 
+/* "/usr/lib" + "wine" -> "/usr/lib/wine", with the root's trailing slash
+ * handled so the result never has two. */
+static void path_of_entry(char* out, uint32_t size, const char* leaf) {
+    files_state_t* st = &files_state;
+    uint32_t w = 0;
+    for (const char* c = st->path; *c && w < size - 2; c++) out[w++] = *c;
+    if (w == 0 || out[w - 1] != '/') out[w++] = '/';
+    for (const char* c = leaf; *c && w < size - 1; c++) out[w++] = *c;
+    out[w] = '\0';
+}
+
 static void rebuild(files_state_t* st) {
     st->count = 0;
-    if (!vfs_root) return;
+    if (!st->dir) st->dir = vfs_root;
+    if (!st->dir) return;
     uint32_t idx = 0;
     vfs_node_t* node;
-    while ((node = vfs_readdir(vfs_root, idx)) && st->count < MAX_FILES) {
-        if (passes_filter(st->filter, kind_of(node->name))) {
+    while ((node = vfs_readdir(st->dir, idx)) && st->count < MAX_FILES) {
+        if (passes_filter(st->filter, node_kind(node))) {
             st->nodes[st->count++] = node;
         }
         idx++;
@@ -84,11 +119,34 @@ static void rebuild(files_state_t* st) {
     if (st->scroll > st->count - 1) st->scroll = 0;
 }
 
+/* Moves the window to a directory and remembers how to say where it is.
+ * `..` is the parent, which is how the root gets back what it lost by
+ * being the only thing this window used to show. */
+static void enter_dir(vfs_node_t* dir) {
+    files_state_t* st = &files_state;
+    if (!dir || !(dir->flags & VFS_DIRECTORY)) return;
+    st->dir = dir;
+    if (!vfs_path_of(dir, st->path, sizeof(st->path))) {
+        kstrcpy(st->path, "/");
+    }
+    st->selected = 0;
+    st->scroll = 0;
+    st->hover_row = -1;
+    rebuild(st);
+}
+
 /* --- icons -------------------------------------------------------------- */
 
 /* Drawn rather than stored: at 20x20 a procedural icon costs a dozen
  * lines and no bytes of image data. */
 static void draw_icon(int x, int y, int kind) {
+    if (kind == KIND_DIR) {
+        /* A folder: the tab, then the body over it. */
+        gfx_round_rect(x + 1, y + 2, 8, 4, 1, GFX_RGB(0xE8, 0xB3, 0x4A));
+        gfx_round_rect(x + 1, y + 4, 18, 13, 2, GFX_RGB(0xF5, 0xC5, 0x5C));
+        gfx_round_frame(x + 1, y + 4, 18, 13, 2, 1, GFX_RGB(0xD3, 0xA0, 0x38));
+        return;
+    }
     if (kind == KIND_TEXT || kind == KIND_OTHER) {
         gfx_round_rect(x + 2, y, 16, 20, 2, GFX_RGB(0xFF, 0xFF, 0xFF));
         gfx_round_frame(x + 2, y, 16, 20, 2, 1, GFX_RGB(0xB8, 0xB8, 0xC0));
@@ -148,7 +206,10 @@ static void files_paint(window_t* win) {
     int lx = SIDEBAR_W;
     int lw = cw - SIDEBAR_W;
     gfx_fill(lx, 0, lw, TOOLBAR_H, GFX_RGB(0xFA, 0xFA, 0xFC));
-    gfx_text(&uifont_bold, lx + 16, 13, filter_names[st->filter], UI_TEXT);
+    /* Where you are, rather than which filter is selected - the filter is
+     * already lit in the sidebar, and with directories the answer to
+     * "where am I" is the thing that changes. */
+    gfx_text_ellipsized(&uifont_bold, lx + 16, 13, lw - 120, st->path, UI_TEXT);
 
     char count[32], num[12];
     ui_fmt_uint(num, (uint32_t)st->count);
@@ -175,7 +236,7 @@ static void files_paint(window_t* win) {
             if (index >= st->count) break;
             vfs_node_t* node = st->nodes[index];
             int y = list_y + i * ROW_H;
-            int kind = kind_of(node->name);
+            int kind = node_kind(node);
 
             uint32_t text_color = UI_TEXT, dim = UI_TEXT_DIM;
             if (index == st->selected) {
@@ -193,7 +254,8 @@ static void files_paint(window_t* win) {
                                 node->name, text_color);
 
             char size[24];
-            ui_fmt_bytes(size, node->length);
+            if (kind == KIND_DIR) kstrcpy(size, "--");
+            else ui_fmt_bytes(size, node->length);
             gfx_text(&uifont_small, lx + lw - 250, y + 8, size, dim);
             gfx_text(&uifont_small, lx + lw - 170, y + 8, kind_label(kind), dim);
         }
@@ -208,8 +270,11 @@ static void files_paint(window_t* win) {
     gfx_fill(lx, ch - 22, lw, 22, GFX_RGB(0xF5, 0xF5, 0xF8));
     gfx_fill(lx, ch - 22, lw, 1, UI_SEPARATOR);
     gfx_text(&uifont_small, lx + 12, ch - 19,
-             "Double-click to open " UI_BULLET
-             " programs run in the Terminal window", UI_TEXT_FAINT);
+             shell_wine_installed()
+                 ? "Double-click to open " UI_BULLET
+                   " .exe files run under Wine, in the Terminal window"
+                 : "Double-click to open " UI_BULLET
+                   " programs run in the Terminal window", UI_TEXT_FAINT);
 }
 
 /* --- interaction --------------------------------------------------------- */
@@ -230,20 +295,81 @@ static int sidebar_at(int x, int y) {
     return -1;
 }
 
+/* --- opening a file ------------------------------------------------------
+ *
+ * One place, because there are three ways to ask for it - a double-click
+ * in this window, an icon on the desktop, and a hit in the Start menu's
+ * search - and they should not be able to disagree about what opening a
+ * file means.
+ *
+ * A .exe goes to **Wine** when Wine is installed, which since Milestone 35
+ * it is by default. Before that this built a `run` command, which is the
+ * hand-written Win32 layer: about five hundred APIs, enough for the test
+ * programs in userland/pe_test and not for a Windows program in general.
+ * Double-clicking a .exe should do the thing that actually runs Windows
+ * programs, and `run` is still there for the built-in layer and still what
+ * `make test-qemu` asserts.
+ *
+ * The first Wine launch of a boot takes minutes, because Wine builds its
+ * prefix before it runs anything. Nothing here can make that quick, so it
+ * says so instead: the Terminal is opened and the line printed *before*
+ * the program starts, and terminal_sink() pushes frames out as output
+ * arrives, so the window fills in rather than the desktop appearing to
+ * hang. */
+void app_open_path(const char* path) {
+    if (!path || !*path) return;
+
+    /* The leaf, for the messages - a path is what runs, but "starting
+     * hellowin.exe" reads better than the whole of it. */
+    const char* leaf = path;
+    for (const char* p = path; *p; p++) if (*p == '/') leaf = p + 1;
+
+    int kind = kind_of(leaf);
+    if (kind == KIND_TEXT || kind == KIND_OTHER) {
+        textview_open(path);
+        return;
+    }
+
+    char command[VFS_NAME_MAX + 32];
+    int wine = (kind == KIND_EXE) && shell_wine_installed();
+
+    window_t* win = terminal_open();
+    if (win) wm_focus(win);
+    if (wine) {
+        terminal_writestring_color("[desktop] ", VGA_COLOR_LIGHT_CYAN);
+        terminal_writestring("starting ");
+        terminal_writestring(leaf);
+        terminal_writestring(" under Wine. The first run of a boot builds\n"
+                             "          the Wine prefix and takes a few "
+                             "minutes; output appears below.\n");
+        kstrcpy(command, "wine ");
+    } else {
+        kstrcpy(command, "run ");
+    }
+    kstrcat(command, path);
+
+    if (win) {
+        wm_invalidate(win);
+        desktop_pump_output();     /* show the message before blocking */
+    }
+    shell_run_line(command);
+    if (win) wm_invalidate(win);
+}
+
 static void open_selected(window_t* win) {
     files_state_t* st = &files_state;
     if (st->selected < 0 || st->selected >= st->count) return;
     vfs_node_t* node = st->nodes[st->selected];
 
-    int kind = kind_of(node->name);
-    if (kind == KIND_TEXT || kind == KIND_OTHER) {
-        textview_open(node->name);
+    if (node->flags & VFS_DIRECTORY) {
+        enter_dir(node);
+        wm_invalidate(win);
         return;
     }
-    char command[96];
-    kstrcpy(command, "run ");
-    kstrcat(command, node->name);
-    terminal_run(command);
+
+    char path[VFS_NAME_MAX * 2];
+    path_of_entry(path, sizeof(path), node->name);
+    app_open_path(path);
     (void)win;
 }
 
@@ -297,6 +423,14 @@ static void files_key(window_t* win, const key_event_t* ev) {
         case KEY_UP:   if (st->selected > 0) st->selected--; break;
         case KEY_DOWN: if (st->selected < st->count - 1) st->selected++; break;
         case KEY_ENTER: open_selected(win); return;
+        case '\b':
+            /* Up a level, which is what Backspace does in every file
+             * browser and what the root has no answer for. */
+            if (files_state.dir && files_state.dir->parent) {
+                enter_dir(files_state.dir->parent);
+                wm_invalidate(win);
+            }
+            return;
         default: return;
     }
     if (st->selected < st->scroll) st->scroll = st->selected;
@@ -315,6 +449,10 @@ window_t* files_open(void) {
         return existing;
     }
     files_state.filter = FILTER_ALL;
+    /* Opens at the root, with a path to show. enter_dir() sets the
+     * selection to the first row; a freshly opened window should have
+     * nothing selected, so that goes back afterwards. */
+    enter_dir(vfs_root);
     files_state.selected = -1;
     files_state.hover_row = -1;
     files_state.scroll = 0;

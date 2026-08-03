@@ -4651,6 +4651,40 @@ the wrong prefix before the transcript gave it away - and `fsync()` now
 pushes the disk's FSInfo block out instead of reporting that there is
 nothing behind the filesystem.
 
+### Double-clicking a .exe
+
+Which was the other half of "part of the OS": Wine that only a shell
+command can reach is still something you have to know about.
+
+The File Explorer's double-click used to build a `run` command - the
+hand-written Win32 layer, about five hundred APIs, enough for the test
+programs in `userland/pe_test` and not for a Windows program in general.
+It goes to Wine now when Wine is installed, and `run` is still there for
+the built-in layer and still what `make test-qemu` asserts.
+
+`app_open_path()` is the one place that decides, because there are three
+ways to ask - a double-click in the File Explorer, a hit in the Start
+menu's search, `Enter` on a selected row - and they should not be able to
+disagree. It also prints what it is about to do *before* it does it: the
+first Wine launch of a boot takes minutes while the prefix is built, and
+`terminal_sink()` pushes frames out as output arrives, so the window fills
+in rather than the desktop appearing to hang.
+
+The File Explorer also learned directories, which it needed the moment
+Wine was installed into `/usr/lib/wine`: a browser that can only see the
+root cannot reach most of the machine. Folders sort as their own kind,
+double-clicking one enters it, Backspace goes up, and the toolbar shows
+the path instead of the filter name.
+
+**`make test-desktop` is three mouse gestures and no keyboard**: double-
+click the File Explorer icon, click maximize, double-click `hellowin.exe`,
+and assert the program's own output comes back. `tools/qemu_test.py` grew
+`--click` for it - absolute positioning by slamming the pointer into the
+corner and moving out, because QEMU's `mouse_move` is relative for the
+PS/2 mouse that is the only kind Novaris has a driver for. The
+coordinates are a screen layout and therefore brittle, and there is no way
+around that: they are what a user's hand does.
+
 ### Still open: the shared session object
 
 `NtUserRegisterClassExWOW` fails in every process with "Failed to get
@@ -5145,6 +5179,25 @@ and only a failing run spends it.
   `$HOME` is `/root` and `/root` is a ramfs. With a disk it is built once
   and stays - which is what `make test-wine-prefix` sets up, and what
   anybody actually using this would do.
+- **A black band across the screen during a long run**, and it is worth
+  recording precisely because it is localized and not yet explained.
+  Screen rows 656-671 - sixteen rows, the height of one console text line
+  - go pure black, full width, and stay that way. It appears while a Wine
+  program runs and not otherwise: a screenshot after boot, after opening
+  the File Explorer, after maximizing it, or after double-clicking an
+  *ELF* is clean, and one taken during or after `wine hellowin.exe` is
+  not. It is not the double-click path - typing the command at the shell
+  with no File Explorer open reproduces it exactly.
+  <br>Sixteen rows of black at a fixed screen position is the shape of
+  `fb_scroll_one_line()`, the *framebuffer* console scrolling and clearing
+  its last line - which writes straight to the framebuffer rather than
+  through the compositor's back buffer, so anything it draws survives in
+  every rectangle the compositor does not repaint. What has not been found
+  is who calls it while the desktop is up, since `putchar_plain()` returns
+  to the window sink before it can and `console_set_sink(0)` has exactly
+  one caller, the out-of-memory path in `desktop_start()`. That is the
+  next thing to look at, and the answer is probably a fourth writer to the
+  framebuffer that nobody has gone looking for.
 - **Networking.** Unchanged, and still the reason `nsiproxy` and `NDIS`
   fail to start.
 

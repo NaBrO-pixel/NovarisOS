@@ -21,6 +21,11 @@ void shell_feed_char(char c);
  * Files window when you open a program. */
 void shell_run_line(const char* line);
 
+/* Non-zero when Wine is installed in this image - i.e. when the OS was
+ * built with WINE_BUILD set. The desktop needs to know before it decides
+ * what double-clicking a .exe does. */
+int shell_wine_installed(void);
+
 /* The blocking loop, still used when there's no framebuffer to put a
  * desktop on: reads the keyboard directly and never returns. */
 void shell_run(void);

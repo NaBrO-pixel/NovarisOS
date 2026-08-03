@@ -98,6 +98,9 @@ shell conventions, UI style) without copying anyone's code.
       it. Which is what lets Wine find `wine.inf` and **build its own
       prefix on Novaris**: `wine hellowin.exe`, on a fresh boot, with no
       disk and nothing set up beforehand
+- [x] **Double-clicking a `.exe` runs it under Wine** — in the File
+      Explorer, which browses directories now. `make test-desktop` is
+      three mouse gestures and no keyboard at all
 
 See `ROADMAP.md` for the full history and what's next, in order.
 
@@ -214,6 +217,7 @@ Seven shell commands drive it:
 | --- | --- |
 | `run prog.exe` | Loads and runs a program (also handles ELF and flat binaries) |
 | `wine prog.exe` | Runs it under *real* Wine instead, through the copy installed at `/usr/bin/wine` |
+| *(double-click)* | The File Explorer and the Start menu's search do the same thing without the typing — a `.exe` goes to Wine when Wine is installed |
 | `peinfo prog.exe` | Dumps a PE's headers and shows, per symbol, which imports resolve |
 | `winapi [module]` | Lists the emulated DLLs, or one module's exports |
 | `strace prog [args]` | The same as `run`, with every syscall logged |
@@ -604,7 +608,8 @@ make test-posix  # runs ten binaries on Linux AND Novaris, diffs the two
 make test-wine   # types 'wine hellowin.exe' at the shell and asserts the output
 make test-wine-threads   # ... and a *threaded* Windows .exe's
 make test-wine-prefix    # ... on an empty disk, where Wine builds its prefix
-                         #     (the three Wine tests need WINE_BUILD set when the ISO was built)
+make test-desktop        # ... by double-clicking it, with the mouse, on the desktop
+                         #     (the Wine tests need WINE_BUILD set when the ISO was built)
 ```
 
 `userland/mmap_test.c` is worth singling out among the `test-posix`

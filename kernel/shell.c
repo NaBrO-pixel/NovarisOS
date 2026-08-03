@@ -307,6 +307,13 @@ static void cmd_run(const char* line) {
  * arguments the user gave. */
 #define WINE_LOADER "/usr/bin/wine"
 
+/* Whether this OS was built with Wine in it. The desktop asks, because
+ * double-clicking a .exe means something different in each case: real
+ * Wine when it is here, the built-in Win32 layer when it is not. */
+int shell_wine_installed(void) {
+    return vfs_lookup(WINE_LOADER) != 0;
+}
+
 static void cmd_wine(const char* args) {
     static char cmdline[CMD_BUFFER_SIZE + 24];
 
