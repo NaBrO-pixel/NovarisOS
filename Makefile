@@ -56,7 +56,8 @@ KERNEL = $(BUILD_DIR)/novaris.bin
 ISO = novaris.iso
 
 .PHONY: all clean run run-nographic iso test test-qemu test-posix test-wine \
-        test-wine-threads test-qemu-disk test-wine-prefix zip disk
+        test-wine-threads test-qemu-disk test-wine-prefix test-desktop \
+        zip disk
 
 all: $(ISO)
 
@@ -931,6 +932,39 @@ test-qemu-disk: $(ISO)
 # ought to live, because a prefix is an installation - but it is Wine that
 # puts it there now, on first use, and `make disk` is all it takes to have
 # somewhere for it to go.
+
+# Double-clicking a .exe, which is the one thing no amount of typing at
+# the shell can test.
+#
+# Three pointer gestures, no keyboard at all: double-click the File
+# Explorer icon on the desktop, click the maximize button so the whole
+# listing fits, and double-click hellowin.exe. What has to come back is the
+# program's own output - which means the desktop routed the double-click to
+# app_open_path(), app_open_path() saw a .exe and Wine installed, and Wine
+# ran it.
+#
+# The coordinates are a screen layout and therefore brittle, and there is
+# no way around that: they are what a user's hand does. They were read off
+# a screenshot, and that is how to redo them if the desktop moves -
+# `qemu-system-i386 ... -monitor tcp:...` and `screendump out.ppm` at the
+# monitor prompt gives the picture the numbers came from.
+#
+#   60,233   the File Explorer desktop icon (third in the left column)
+#   881,66   the maximize button on the window it opens
+#   300,478  the hellowin.exe row in the maximized listing
+test-desktop: $(ISO)
+	@python3 tools/check_wine_installed.py $(BUILD_DIR)/initrd_staging
+	python3 tools/qemu_test.py --iso $(ISO) --memory 768 \
+	    --boot-wait 30 --settle 900 --timeout 1000 --stop-when-matched \
+	    --click-settle 3 \
+	    --click "60,233,double" \
+	    --click "881,66" \
+	    --click "300,478,double" \
+	    --expect "starting hellowin\.exe under Wine" \
+	    --expect "fib\(20\):    6765" \
+	    --expect "argv\[0\]: Z:.hellowin\.exe" \
+	    --expect "Exiting with code 0" \
+	    --reject "KERNEL PANIC"
 
 # The same thing on a disk, and the difference is that the prefix is an
 # installation rather than something rebuilt at every boot.

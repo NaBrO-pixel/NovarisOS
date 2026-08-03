@@ -36,6 +36,13 @@ window_t* about_open(void);
 extern const app_t app_textview;
 window_t* textview_open(const char* filename);
 
+/* Opens whatever `path` names, the way double-clicking it would: a text
+ * file in the viewer, a .exe under Wine when Wine is installed and under
+ * the built-in Win32 layer when it is not, anything else executable
+ * through the shell's `run`. One entry point so that the File Explorer,
+ * the desktop and the Start menu cannot disagree. */
+void app_open_path(const char* path);
+
 /* A modal-looking alert panel. Not actually modal - it's a window like
  * any other, it just looks the part. */
 extern const app_t app_alert;

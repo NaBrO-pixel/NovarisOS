@@ -82,6 +82,44 @@ class Monitor:
         self.send("sendkey " + name)
         time.sleep(delay)
 
+    def mouse_to(self, x, y):
+        """Puts the pointer at an absolute screen position.
+
+        QEMU's `mouse_move` is *relative* for a PS/2 mouse, which is the
+        only kind Novaris has a driver for, so absolute positioning means
+        slamming the pointer into the top-left corner first and then
+        moving out by the coordinates. The corner slam is one big negative
+        move; the driver clamps, so overshooting is how you get there.
+
+        The moves are split into chunks because a PS/2 packet carries a
+        signed 9-bit delta per axis, and a single huge move would be
+        truncated rather than clamped."""
+        for _ in range(4):
+            self.send("mouse_move -400 -400")
+        time.sleep(0.15)
+        remaining_x, remaining_y = x, y
+        while remaining_x > 0 or remaining_y > 0:
+            dx = min(120, remaining_x)
+            dy = min(120, remaining_y)
+            self.send("mouse_move %d %d" % (dx, dy))
+            remaining_x -= dx
+            remaining_y -= dy
+        time.sleep(0.25)
+
+    def click(self, double=False):
+        """A click, and optionally a second one close enough to be a
+        double. Novaris's window manager decides that by the gap between
+        the two presses, so the pause here is deliberately short."""
+        self.send("mouse_button 1")
+        time.sleep(0.05)
+        self.send("mouse_button 0")
+        if double:
+            time.sleep(0.08)
+            self.send("mouse_button 1")
+            time.sleep(0.05)
+            self.send("mouse_button 0")
+        time.sleep(0.4)
+
     def type(self, text, delay):
         for ch in text:
             key = KEYMAP.get(ch)
@@ -147,7 +185,8 @@ def wait_for(serial_path, seconds, patterns):
 
 
 def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
-        memory=128, disk=None, setup=(), stop_when=()):
+        memory=128, disk=None, setup=(), stop_when=(), clicks=(),
+        click_settle=1.5):
     serial_path = keep_serial or tempfile.mktemp(suffix=".log", prefix="novaris-serial-")
     port = 45000 + (os.getpid() % 10000)
 
@@ -203,6 +242,24 @@ def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
             mon.type(cmd + "\n", key_delay)
             time.sleep(3.0)
 
+        # Pointer work before anything is typed. "340,300,double" means
+        # move there and double-click.
+        for spec in clicks:
+            parts = spec.split(",")
+            x, y = int(parts[0]), int(parts[1])
+            double = len(parts) > 2 and parts[2].strip() == "double"
+            mon.mouse_to(x, y)
+            mon.click(double)
+            time.sleep(click_settle)
+
+        if not commands:
+            # Clicks only. The settle is still needed - what was clicked
+            # may take minutes to say anything.
+            if stop_when:
+                wait_for(serial_path, settle, stop_when)
+            else:
+                time.sleep(settle)
+
         for i, cmd in enumerate(commands):
             mon.type(cmd + "\n", key_delay)
             last = (i == len(commands) - 1)
@@ -252,6 +309,14 @@ def main():
                     help="regex that must appear in the transcript (repeatable)")
     ap.add_argument("--reject", action="append", default=[],
                     help="regex that must NOT appear in the transcript (repeatable)")
+    ap.add_argument("--click", action="append", default=[],
+                    help="X,Y[,double] - move the pointer there and click, "
+                         "before the --cmd lines are typed (repeatable). "
+                         "This is how the desktop itself is driven: "
+                         "double-clicking a .exe in the File Explorer is a "
+                         "thing no amount of typing can test.")
+    ap.add_argument("--click-settle", type=float, default=1.5,
+                    help="seconds to wait after each --click")
     ap.add_argument("--stop-when-matched", action="store_true",
                     help="end the last command's settle as soon as every "
                          "--expect pattern has appeared, instead of always "
@@ -267,7 +332,8 @@ def main():
     transcript = run(args.iso, commands, args.boot_wait, args.key_delay,
                      args.settle, args.timeout, args.serial_log, args.memory,
                      args.disk, args.setup,
-                     args.expect if args.stop_when_matched else ())
+                     args.expect if args.stop_when_matched else (),
+                     args.click, args.click_settle)
     sys.stdout.write(transcript)
 
     failures = []

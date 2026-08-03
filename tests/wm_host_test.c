@@ -138,6 +138,15 @@ const app_t app_alert    = { "Novaris",       demo_paint, 0, 0, 0, 0 };
 window_t* terminal_open(void) { return 0; }
 void terminal_app_init(void) { }
 void terminal_run(const char* command) { (void)command; }
+/* The one place a file gets opened from, recorded rather than performed
+ * so the test can check that the Start menu's search hits go through it
+ * (see kernel/app_files.c). */
+char last_opened[256];
+void app_open_path(const char* path) {
+    unsigned i = 0;
+    while (path[i] && i < sizeof(last_opened) - 1) { last_opened[i] = path[i]; i++; }
+    last_opened[i] = '\0';
+}
 window_t* files_open(void) { return 0; }
 window_t* monitor_open(void) { return 0; }
 window_t* about_open(void) { return 0; }

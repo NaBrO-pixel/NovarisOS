@@ -832,14 +832,11 @@ static void start_activate(int index) {
     start_hide();
 
     if (e.action == ACT_OPEN_FILE) {
-        if (kstr_ends_with_ci(e.file, ".txt")) {
-            textview_open(e.file);
-        } else {
-            char command[96];
-            kstrcpy(command, "run ");
-            kstrcat(command, e.file);
-            terminal_run(command);
-        }
+        /* The same route a double-click in the File Explorer takes - see
+         * app_open_path(). A search hit that ran a .exe through the
+         * built-in Win32 layer while double-clicking the same file ran it
+         * under Wine would be two answers to one question. */
+        app_open_path(e.file);
         return;
     }
     run_action(e.action, 0);
