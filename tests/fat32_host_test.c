@@ -446,6 +446,13 @@ int main(int argc, char** argv) {
     test_persistence(argv[1]);
     test_full_volume();
 
+    /* Leave the volume tidy: the FSInfo block's free-cluster count is a
+     * hint the format lets drift, and pushing it out here means
+     * `fsck.vfat -n` on the image this test leaves behind finds nothing
+     * at all to correct - which is a stronger statement than "the driver
+     * agrees with itself". */
+    fat32_sync();
+
     printf("\n%d check(s), %d failure(s)\n", checks, failures);
     return failures ? 1 : 0;
 }

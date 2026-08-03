@@ -816,6 +816,17 @@ static int32_t fat_write(vfs_node_t* node, uint32_t offset, uint32_t size,
         }
     }
 
+    /* The FAT before the directory entry, and the order is the whole
+     * point. ensure_chain() marks new clusters in the cached FAT sector;
+     * dirent_update() makes the entry point at them. Write the entry
+     * first and a machine that stops in between leaves a file whose
+     * directory entry names a cluster the FAT still calls free - which is
+     * exactly what `fsck.vfat -n` found here ("/AFTER.TXT contains a free
+     * cluster"), and which on a reused volume would be two files sharing
+     * one cluster. This way round the worst case is a chain nothing
+     * points at: space lost until the volume is checked, rather than data
+     * lost. */
+    if (fat_cache_flush() != 0) return -EIO;
     if (dirent_update(node) != 0) return -EIO;
     return done;
 }
@@ -872,6 +883,11 @@ static int32_t fat_truncate(vfs_node_t* node, uint32_t length) {
     }
 
     node->length = length;
+    /* Same order, same reason - see fat_write(). On a shrink it means the
+     * chain is cut before the size follows, so an interrupted truncate
+     * leaves a file longer than its chain; a checker resolves that by
+     * shortening the file, which is what the operation was doing. */
+    if (fat_cache_flush() != 0) return -EIO;
     if (dirent_update(node) != 0) return -EIO;
     return 0;
 }
@@ -1151,10 +1167,25 @@ static vfs_node_t* fat_create(vfs_node_t* dir, const char* name,
         dir_pos_t p;
         uint8_t tmp[DIRENT_SIZE];
 
+        /* A date of zero is not "no date", it is month 0 and day 0 - an
+         * impossible date that a checker reports. These two entries are
+         * written by hand rather than through dir_write_entries(), so
+         * they need the stamp applying by hand too. */
+        rtc_time_t t;
+        rtc_read(&t);
+        uint16_t fdate = (uint16_t)((((uint32_t)t.year - 1980u) & 0x7Fu) << 9 |
+                                    ((uint32_t)t.month & 0x0Fu) << 5 |
+                                    ((uint32_t)t.day & 0x1Fu));
+        uint16_t ftime = (uint16_t)(((uint32_t)t.hour & 0x1Fu) << 11 |
+                                    ((uint32_t)t.minute & 0x3Fu) << 5 |
+                                    (((uint32_t)t.second / 2u) & 0x1Fu));
+
         kmemset(ent, 0, DIRENT_SIZE);
         kmemset(ent, ' ', 11);
         ent[0] = '.';
         ent[11] = ATTR_DIRECTORY;
+        wr16(ent + 14, ftime); wr16(ent + 16, fdate); wr16(ent + 18, fdate);
+        wr16(ent + 22, ftime); wr16(ent + 24, fdate);
         wr16(ent + 20, (uint16_t)(cluster >> 16));
         wr16(ent + 26, (uint16_t)(cluster & 0xFFFF));
         if (dir_entry_at(cluster, 0, tmp, &p) == 0) dir_entry_put(&p, ent);
@@ -1164,6 +1195,8 @@ static vfs_node_t* fat_create(vfs_node_t* dir, const char* name,
         kmemset(ent, ' ', 11);
         ent[0] = '.'; ent[1] = '.';
         ent[11] = ATTR_DIRECTORY;
+        wr16(ent + 14, ftime); wr16(ent + 16, fdate); wr16(ent + 18, fdate);
+        wr16(ent + 22, ftime); wr16(ent + 24, fdate);
         wr16(ent + 20, (uint16_t)(up >> 16));
         wr16(ent + 26, (uint16_t)(up & 0xFFFF));
         if (dir_entry_at(cluster, 1, tmp, &p) == 0) dir_entry_put(&p, ent);

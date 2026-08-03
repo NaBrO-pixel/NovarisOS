@@ -672,6 +672,20 @@ test: $(BUILD_DIR)/test/format_test $(BUILD_DIR)/test/pe_test \
 	@# be mounted on the host and looked at.
 	@cp $(BUILD_DIR)/test/fat32.img $(BUILD_DIR)/test/fat32-work.img
 	@$(BUILD_DIR)/test/fat32_test $(BUILD_DIR)/test/fat32-work.img
+	@# And then let somebody else's checker look at what the driver wrote.
+	@# This is the strongest single statement available about the driver:
+	@# fsck.vfat has no idea Novaris exists, and it walks every cluster
+	@# chain, every directory entry and every long-name checksum on a
+	@# volume that has been written, truncated, renamed, grown and filled
+	@# to capacity. Skipped rather than failed when dosfstools is not
+	@# installed - it is a check, not a build dependency.
+	@if command -v fsck.vfat >/dev/null 2>&1; then \
+	    echo "--- fsck.vfat on the volume the driver wrote ---"; \
+	    fsck.vfat -n $(BUILD_DIR)/test/fat32-work.img; \
+	else \
+	    echo "(fsck.vfat not installed - skipping the independent check;"; \
+	    echo " apt-get install dosfstools)"; \
+	fi
 	@echo
 	@echo "=== window manager / desktop shell ==="
 	@$(BUILD_DIR)/test/wm_test --shots $(BUILD_DIR)/test
@@ -1030,8 +1044,9 @@ test-wine-prefix:
 	    --boot-wait 30 --settle 200 --timeout 260 \
 	    --cmd "run wine-preloader wine hellowin.exe" \
 	    --expect "FAT32 volume mounted at /disk" \
-	    --expect "Z:..disk..wine" \
+	    --expect "Z:.*disk.*wine" \
 	    --expect "scmdatabase_autostart_services" \
+	    --expect "C:.*windows.*system32" \
 	    --reject "could not find DOS drive" \
 	    --reject "KERNEL PANIC"
 

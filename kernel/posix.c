@@ -9,6 +9,7 @@
 #include "pmm.h"
 #include "scheduler.h"
 #include "vfs.h"
+#include "fat32.h"
 #include "kstring.h"
 #include "rtc.h"
 #include "pit.h"
@@ -2154,8 +2155,18 @@ void posix_syscall(registers_t* regs) {
             r = sys_getdents64((int)a, (uint8_t*)b, c);
             break;
         case SYS_fsync:
-            /* There is nothing behind the filesystem to flush to. */
-            r = fd_get((int)a) ? 0 : -EBADF;
+            /* Since Milestone 32 there *is* something behind the
+             * filesystem to flush to. Every metadata change is already
+             * written through - a create writes its directory entry
+             * before it returns, and a write flushes the FAT before it
+             * updates the size - so the only thing left is the FSInfo
+             * block, which the format calls a hint and which this pushes
+             * out so a checker finds nothing to correct.
+             *
+             * A ramfs file has nothing behind it and still answers 0,
+             * which is what a program calling fsync() on /tmp expects. */
+            if (!fd_get((int)a)) { r = -EBADF; break; }
+            r = fat32_sync() == 0 ? 0 : -EIO;
             break;
         case SYS_chdir:
             /* Honoured since Milestone 29: the working directory is per

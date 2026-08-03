@@ -4405,10 +4405,16 @@ $ make test
 === printf/dtoa engine ===   38 check(s), 0 failure(s)
 === PE loader ===            30 check(s), 0 failure(s)
 === FAT32 driver ===         64 check(s), 0 failure(s)
+    fsck.vfat on the volume the driver wrote:
+    build/test/fat32-work.img: 75 files, 479/129022 clusters   (clean)
 === window manager ===       52 checks, 0 failures
 
 $ make test-qemu-disk
 All 7 transcript assertion(s) passed.   (write, reboot, read back)
+$ fsck.vfat -n build/persist.img
+build/persist.img: 4 files, 8/129022 clusters                  (clean)
+
+$ make test-wine-prefix     All 6 transcript assertion(s) passed.
 
 $ make test-posix
  41 lines, 20 checks  posixtest.elf     60 lines, 45 checks  uctest.elf
@@ -4425,6 +4431,18 @@ $ make test-wine-threads    All 11 transcript assertion(s) passed.
 `fstest.elf` grew from 45 checks to 58, and the thirteen new ones are the
 symbolic-link section - all of them compared line for line against what
 the same binary printed on Linux.
+
+`fsck.vfat` is the strongest single line in that list, and it is in `make
+test` for that reason. It has no idea Novaris exists; it walks every
+cluster chain, every directory entry and every long-name checksum on a
+volume this driver has written, truncated, renamed, grown past a cluster
+boundary and filled to capacity - and on one the *kernel* wrote inside
+QEMU. It also found a real defect the driver's own tests could not:
+`fat_write()` updated a file's directory entry before flushing the FAT
+sector holding its new clusters, so a machine stopping in between left an
+entry pointing at a cluster the table still called free. The two are now
+ordered the other way round, where the worst case is a chain nothing
+points at - space lost until a check, rather than data lost.
 
 The FAT32 host test is the substantial one. It mounts an image built by
 `mkfat32.py`, reads what the *other* implementation wrote, then writes,

@@ -352,7 +352,10 @@ agreeing with itself is not evidence. `tools/mkfat32.py` builds an image
 from a directory tree and is a completely separate implementation of the
 format from the kernel's; `tests/fat32_host_test.c` links the *real*
 driver into a host binary, points it at an image the tool wrote, and runs
-64 checks through it including an unmount and remount.
+64 checks through it including an unmount and remount. Then `fsck.vfat`
+looks at the result, which is the strongest check available here — it has
+never heard of Novaris, and it walks every cluster chain, directory entry
+and long-name checksum on the volume.
 
 ```bash
 make disk          # an empty 256MB FAT32 volume, novaris-disk.img
