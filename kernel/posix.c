@@ -949,6 +949,7 @@ static int32_t sys_lseek(int fd, int32_t offset, int whence) {
 #define S_IFCHR 0020000
 #define S_IFDIR 0040000
 #define S_IFSOCK 0140000
+#define S_IFLNK 0120000
 
 /* The device every initrd file claims to be on. Any non-zero value does;
  * it only has to be consistent and not collide with 0. */
@@ -1020,6 +1021,40 @@ static int32_t sys_stat64(const char* path, uint8_t* st) {
     return r;
 }
 
+/* The file type a node reports, which is the one thing lstat and stat can
+ * disagree about. */
+static uint32_t node_type(const vfs_node_t* n) {
+    if (n->flags & VFS_DIRECTORY) return S_IFDIR;
+    if (n->flags & VFS_SOCKET)    return S_IFSOCK;
+    if (n->flags & VFS_SYMLINK)   return S_IFLNK;
+    return S_IFREG;
+}
+
+/* lstat. Real since Milestone 32, because symlinks are: the difference
+ * between it and stat is exactly whether the last component is followed,
+ * and until there was something to follow the two could not differ.
+ *
+ * It matters to Wine twice over. Its client lstat()s the wineserver
+ * socket path to know the server is up, and its ntdll builds the DOS
+ * drive table by lstat()ing every name in dosdevices/ and reading the
+ * ones that are links - which is where C: and Z: come from. */
+static int32_t sys_lstat64(const char* path, uint8_t* st) {
+    if (!path) return -EFAULT;
+    char joined[PATH_JOIN_MAX];
+    const char* abs = abs_into(path, joined, sizeof(joined));
+
+    vfs_node_t* n = vfs_lookup_nofollow(abs);
+    if (!n) {
+        /* The initrd is flat, so a path naming a file that only exists at
+         * the root still resolves on its last component - the same
+         * fallback open() uses, and for the same reason. */
+        n = resolve_for_read(path);
+        if (!n) return -ENOENT;
+    }
+    return stat_common(st, n->length, node_type(n) | (n->mode & 07777),
+                       node_ino(n));
+}
+
 /* getcwd. Real since Milestone 29: the working directory is per process,
  * survives fork and exec, and is what a relative path resolves against.
  * Linux returns the length including the NUL and writes the string into
@@ -1046,10 +1081,16 @@ static int32_t sys_chdir(const char* path) {
     return 0;
 }
 
-/* readlink. There are no symlinks, so the only link that resolves is the
- * one every Unix program expects to find: /proc/self/exe. Wine reads it
- * to work out where it was installed, and answering -EINVAL ("not a
- * symlink") for everything else is what Linux does for a real file. */
+/* readlink. /proc/self/exe is answered specially - it is a link this
+ * kernel synthesises rather than one that exists on any filesystem, and
+ * Wine reads it to work out where it was installed. Everything else is a
+ * real lookup that does *not* follow the last component, because
+ * following it is precisely what readlink must not do.
+ *
+ * -EINVAL ("not a symbolic link") for an ordinary file is what Linux
+ * answers, and programs depend on the distinction from -ENOENT: it is how
+ * "this exists but is not a link" is told apart from "this is not
+ * there". */
 static int path_is(const char* a, const char* b) {
     while (*a && *b) { if (*a != *b) return 0; a++; b++; }
     return *a == *b;
@@ -1059,14 +1100,59 @@ static int32_t sys_readlink(const char* path, char* buf, uint32_t size) {
     if (!path || !buf) return -EFAULT;
     int is_self_exe =
         path_is(path, "/proc/self/exe") || path_is(path, "/proc/curproc/file");
-    if (!is_self_exe) {
-        return resolve_for_read(path) ? -EINVAL : -ENOENT;
+    if (is_self_exe) {
+        const char* exe = posix_current()->exe_path;
+        uint32_t n = kstrlen(exe);
+        if (n > size) n = size;
+        kmemcpy(buf, exe, n);
+        return (int32_t)n;  /* not NUL-terminated, exactly as Linux leaves it */
     }
-    const char* exe = posix_current()->exe_path;
-    uint32_t n = kstrlen(exe);
-    if (n > size) n = size;
-    kmemcpy(buf, exe, n);
-    return (int32_t)n;   /* not NUL-terminated, exactly as Linux leaves it */
+
+    char joined[PATH_JOIN_MAX];
+    const char* abs = abs_into(path, joined, sizeof(joined));
+    vfs_node_t* n = vfs_lookup_nofollow(abs);
+    if (!n) return resolve_for_read(path) ? -EINVAL : -ENOENT;
+    if (!(n->flags & VFS_SYMLINK)) return -EINVAL;
+    return vfs_readlink(n, buf, size);
+}
+
+/* symlink. Milestone 31 built this and Milestone 32 turned it on - see
+ * the comment where the syscall used to answer -EPERM.
+ *
+ * Wine needs it for one thing above all others: `create_config_dir()` in
+ * its ntdll makes `dosdevices/c:` and `dosdevices/z:` as symbolic links,
+ * and those two links *are* the DOS drive table. Without them Wine cannot
+ * find a DOS drive for the working directory, resolves every program's
+ * path to the Windows directory instead, and never gets a real console. */
+/* Whether symlink() works, or answers -EPERM the way it did before
+ * Milestone 32.
+ *
+ * A switch rather than a constant, because what symlinks change is not
+ * one call: they are how Wine builds its DOS drive table, and a Wine with
+ * drives takes an entirely different startup path from a Wine without
+ * them. Milestone 31 chose to refuse them for exactly that reason.
+ * Milestone 32 turns them on because the disk and the prefix they were
+ * waiting for now exist - but "which of these two paths does Wine take"
+ * is a question worth being able to answer by trying both, on one boot,
+ * without rebuilding. `symlinks off` in the shell is that.
+ *
+ * -EPERM rather than -ENOSYS when off: the operation is understood and
+ * refused, not unknown, and Wine carries on when it fails. */
+static int symlinks_enabled = 1;
+
+void posix_set_symlinks(int on) { symlinks_enabled = on ? 1 : 0; }
+int posix_symlinks_enabled(void) { return symlinks_enabled; }
+
+static int32_t sys_symlink(const char* target, const char* linkpath) {
+    if (!symlinks_enabled) return -EPERM;
+    if (!target || !linkpath) return -EFAULT;
+    char joined[PATH_JOIN_MAX];
+    const char* abs = abs_into(linkpath, joined, sizeof(joined));
+
+    const char* leaf = 0;
+    vfs_node_t* dir = vfs_resolve_parent(abs, &leaf);
+    if (!dir) return -ENOENT;
+    return vfs_symlink(dir, leaf, target);
 }
 
 /* --- the writable half (Milestone 26) -----------------------------------
@@ -1355,7 +1441,14 @@ static int32_t sys_execve(const char* path, uint32_t uargv, uint32_t uenvp,
      * which is equally reachable.
      *
      * Both survive the teardown below for the same reason: neither is in
-     * the half of the address space that is about to be emptied. */
+     * the half of the address space that is about to be emptied.
+     *
+     * A file on the disk has no bytes in memory at all, so it is read in
+     * here - once, into the kernel heap, which is the same place a
+     * written file's bytes already live. That is what vfs_materialize()
+     * does, and it is why exec'ing off /disk costs the size of the image
+     * and nothing more. */
+    vfs_materialize(node);
     uint8_t* image = node->data;
     uint32_t size = node->length;
     uint8_t* owned = 0;
@@ -1893,6 +1986,11 @@ static const char* syscall_name(uint32_t n) {
         case SYS_faccessat: return "faccessat";
         case SYS_faccessat2: return "faccessat2";
         case SYS_readlinkat: return "readlinkat";
+        case SYS_symlink: return "symlink";
+        case SYS_symlinkat: return "symlinkat";
+        case SYS_getxattr: return "getxattr";
+        case SYS_lgetxattr: return "lgetxattr";
+        case SYS_fgetxattr: return "fgetxattr";
         case SYS_set_thread_area: return "set_thread_area";
         case SYS_clone: return "clone";
         case SYS_futex: return "futex";
@@ -2311,16 +2409,39 @@ void posix_syscall(registers_t* regs) {
         case SYS_clone3:          r = -ENOSYS; break;
         case SYS_membarrier:      r = -ENOSYS; break;
 
-        /* Genuinely absent, and answered rather than reported: there are
-         * no symlinks and no statx, and glibc falls back to fstat64. */
+        /* Extended attributes, answered rather than reported. Wine looks
+         * for "user.DOSATTRIB" on every file it opens - that is where it
+         * and Samba both keep the DOS attribute bits - so on a filesystem
+         * without them this is not an unusual call, it is one per file.
+         *
+         * -EOPNOTSUPP is the specific answer Linux gives for a filesystem
+         * mounted without xattr support, and it is what Wine's
+         * get_file_xattr() checks for before falling back to deriving the
+         * attributes from the name. -ENOSYS would have been a different
+         * claim - "this kernel has no such call" - and would have printed
+         * a line of noise per file opened. */
+        case SYS_getxattr:
+        case SYS_lgetxattr:
+        case SYS_fgetxattr:
+        case SYS_setxattr:
+        case SYS_lsetxattr:
+        case SYS_fsetxattr:
+            r = -EOPNOTSUPP;
+            break;
+
+        /* Genuinely absent, and answered rather than reported: there is
+         * no statx, and glibc falls back to fstat64. */
         case SYS_fstatat64:
             /* (dirfd, path, statbuf, flags). AT_EMPTY_PATH (0x1000) means
              * "stat the descriptor itself", which is how glibc's fstat is
-             * routed on a kernel new enough to have this; otherwise the
-             * path is relative to a directory, and the initrd is flat so
-             * there is only one. */
+             * routed on a kernel new enough to have this; AT_SYMLINK_NOFOLLOW
+             * (0x100) is how its lstat is. Otherwise the path is relative
+             * to a directory, and it has already been joined onto the
+             * process's working directory. */
             if (d & 0x1000u) {
                 r = sys_fstat64((int)a, (uint8_t*)c);
+            } else if (d & 0x100u) {
+                r = sys_lstat64((const char*)b, (uint8_t*)c);
             } else {
                 r = sys_stat64((const char*)b, (uint8_t*)c);
             }
@@ -2452,22 +2573,24 @@ void posix_syscall(registers_t* regs) {
         }
 
         case SYS_symlink:
+            /* On since Milestone 32. Milestone 31 built symlinks and then
+             * held them back, because switching them on gives Wine its
+             * DOS drive table and therefore its full startup path - which
+             * then needs a prefix, and a prefix needs a real filesystem.
+             * Milestone 32 built the filesystem, so the reason to hold
+             * them back is gone. */
+            r = sys_symlink((const char*)a, (const char*)b);
+            break;
         case SYS_symlinkat:
-            /* There are no symlinks in this filesystem. Milestone 31
-             * built them - a VFS node holding a path, resolution that
-             * walks through one, real lstat and readlink, verified
-             * byte-identical to Linux - and then took them back out,
-             * because what they unlock is a milestone rather than a
-             * feature. See ROADMAP.md Milestone 31.
-             *
-             * -EPERM rather than -ENOSYS: the operation is understood and
-             * refused, not unknown, and Wine carries on when it fails. */
-            r = -EPERM;
+            /* (target, newdirfd, linkpath) - the dirfd is ignored for the
+             * same reason every other *at variant here ignores it: glibc
+             * passes AT_FDCWD, and a relative path is joined onto the
+             * process's working directory before it gets this far. */
+            r = sys_symlink((const char*)a, (const char*)c);
             break;
 
         case SYS_lstat64:
-            /* No symlinks, so lstat and stat cannot differ. */
-            r = sys_stat64((const char*)a, (uint8_t*)b);
+            r = sys_lstat64((const char*)a, (uint8_t*)b);
             break;
 
         case SYS_fchdir: {

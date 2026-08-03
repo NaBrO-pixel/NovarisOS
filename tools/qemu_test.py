@@ -98,23 +98,43 @@ class Monitor:
 
 
 def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
-        memory=128):
+        memory=128, disk=None, setup=()):
     serial_path = keep_serial or tempfile.mktemp(suffix=".log", prefix="novaris-serial-")
     port = 45000 + (os.getpid() % 10000)
 
+    argv = [
+        "qemu-system-i386",
+        # 128MB is plenty for novaris.iso. The Wine ISO carries an
+        # initrd of PE builtins that is read into RAM whole, so those
+        # runs ask for more.
+        "-m", "%dM" % memory,
+        "-cdrom", iso,
+        "-display", "none",
+        "-serial", "file:" + serial_path,
+        "-monitor", "tcp:127.0.0.1:%d,server,nowait" % port,
+        "-no-reboot",
+    ]
+    if disk:
+        # Milestone 32. QEMU's -cdrom is IDE index 2 (secondary master),
+        # so the disk goes at index 0 (primary master) - which is the
+        # first slot the kernel's ATA probe looks at.
+        #
+        # `format=raw` is not optional: without it QEMU guesses the format
+        # from the contents, prints a warning about doing so, and would
+        # guess wrong on an image whose first sector resembled something
+        # else.
+        #
+        # `-boot d` goes with it. A FAT32 volume has 0x55AA in its boot
+        # sector - that is part of the format - so SeaBIOS considers the
+        # disk bootable and tries it before the CD, and the machine stops
+        # on a boot sector that contains no boot code. The ISO is what
+        # boots; the disk is only storage.
+        argv += ["-drive",
+                 "file=%s,format=raw,if=ide,index=0,media=disk" % disk,
+                 "-boot", "d"]
+
     qemu = subprocess.Popen(
-        [
-            "qemu-system-i386",
-            # 128MB is plenty for novaris.iso. The Wine ISO carries an
-            # initrd of PE builtins that is read into RAM whole, so those
-            # runs ask for more.
-            "-m", "%dM" % memory,
-            "-cdrom", iso,
-            "-display", "none",
-            "-serial", "file:" + serial_path,
-            "-monitor", "tcp:127.0.0.1:%d,server,nowait" % port,
-            "-no-reboot",
-        ],
+        argv,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
@@ -124,6 +144,15 @@ def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
         # GRUB counts down before handing control to the kernel; the kernel
         # then runs its whole boot self-test before the shell prompts.
         time.sleep(boot_wait)
+
+        # Setup commands configure the machine before the run proper and
+        # are not what is being measured, so they get a short fixed pause
+        # rather than the settle the real commands need. Without the
+        # split, a `symlinks off` in front of a Wine run would cost the
+        # same three minutes the Wine run does.
+        for cmd in setup:
+            mon.type(cmd + "\n", key_delay)
+            time.sleep(3.0)
 
         for cmd in commands:
             mon.type(cmd + "\n", key_delay)
@@ -161,6 +190,10 @@ def main():
     ap.add_argument("--iso", default="novaris.iso")
     ap.add_argument("--cmd", action="append", default=[],
                     help="a shell command to type (repeatable)")
+    ap.add_argument("--setup", action="append", default=[],
+                    help="a shell command to type before the run proper, "
+                         "with a short pause rather than the full settle "
+                         "(repeatable)")
     ap.add_argument("--script", help="file with one shell command per line")
     ap.add_argument("--boot-wait", type=float, default=14.0)
     ap.add_argument("--key-delay", type=float, default=0.035)
@@ -170,6 +203,10 @@ def main():
     ap.add_argument("--serial-log", help="keep the raw serial capture at this path")
     ap.add_argument("--memory", type=int, default=128,
                     help="guest RAM in MB")
+    ap.add_argument("--disk",
+                    help="raw disk image to attach as an IDE hard disk. "
+                         "Written to in place, so pass a copy when the "
+                         "original matters.")
     ap.add_argument("--expect", action="append", default=[],
                     help="regex that must appear in the transcript (repeatable)")
     ap.add_argument("--reject", action="append", default=[],
@@ -183,7 +220,8 @@ def main():
                          if ln.strip() and not ln.startswith("#")]
 
     transcript = run(args.iso, commands, args.boot_wait, args.key_delay,
-                     args.settle, args.timeout, args.serial_log, args.memory)
+                     args.settle, args.timeout, args.serial_log, args.memory,
+                     args.disk, args.setup)
     sys.stdout.write(transcript)
 
     failures = []

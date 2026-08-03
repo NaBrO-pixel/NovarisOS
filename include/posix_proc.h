@@ -35,7 +35,10 @@
  * far enough to start services.exe and a helper of its own, and the
  * exhaustion was silent from outside: fork returned -EAGAIN, Wine
  * reported nothing, and the Windows program simply never ran. */
-#define POSIX_MAX_PROCS 24
+/* Raised from 24 in Milestone 32: with a prefix on the disk, wineboot
+ * reaches services.exe, and services.exe starts a process per service on
+ * top of the loader, the server, explorer and conhost. */
+#define POSIX_MAX_PROCS 40
 /* 128 since Milestone 30. Thirty-two was a shell's worth and wineserver
  * is not a shell: it holds its listening socket, a connection, a request
  * pipe, a reply pipe and a wait pipe per client, and an open descriptor
@@ -44,7 +47,11 @@
  * turned into "invalid image format" - a true statement about the wrong
  * thing. */
 #define POSIX_MAX_FDS   128
-#define POSIX_PATH_MAX  128
+/* Milestone 32 raised this from 128, for the same reason VFS_NAME_MAX
+ * went up: a path inside a Wine prefix on the disk
+ * ("/disk/.wine/drive_c/windows/winsxs/<91 characters>/...") does not fit
+ * in 128 bytes, and a truncated path is a file not found. */
+#define POSIX_PATH_MAX  256
 
 typedef enum {
     FD_FREE = 0,

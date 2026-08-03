@@ -6,6 +6,9 @@
 #include "pmm.h"
 #include "process.h"
 #include "vfs.h"
+#include "blockdev.h"
+#include "ata.h"
+#include "fat32.h"
 #include "kheap.h"
 #include "paging.h"
 #include "posix.h"
@@ -64,10 +67,19 @@ static void print_hex(uint32_t n, int width) {
     terminal_writestring(buf);
 }
 
-/* Reads a file off the initrd into a kmalloc'd buffer. Returns 0 and
- * prints the reason on failure; the caller owns the buffer. */
+/* Reads a file into a kmalloc'd buffer. Returns 0 and prints the reason
+ * on failure; the caller owns the buffer.
+ *
+ * Milestone 32 made this take a path. It used to look only at the root's
+ * children, which was honest when the only filesystem was a flat initrd
+ * and cost nothing to say. With a disk mounted at /disk it made `sum
+ * /disk/.../gdi32.dll` - the exact question "did this file come off the
+ * disk intact?" - unanswerable. The bare-name form still works, because
+ * the initrd is still flat and every existing use of it passes one. */
 static uint8_t* read_file(const char* name, uint32_t* out_size) {
-    vfs_node_t* node = vfs_root ? vfs_finddir(vfs_root, name) : 0;
+    vfs_node_t* node = vfs_lookup(name);
+    if (!node && vfs_root) node = vfs_finddir(vfs_root, name);
+    if (node && (node->flags & VFS_DIRECTORY)) node = 0;
     if (!node) {
         terminal_writestring_color("File not found: ", VGA_COLOR_LIGHT_RED);
         terminal_writestring(name);
@@ -554,6 +566,8 @@ static void run_command(char* line) {
         terminal_writestring("  meminfo - physical memory frame usage\n");
         terminal_writestring("  ls [dir] / cat / cp / rm / mkdir - the filesystem,\n");
         terminal_writestring("            writable since Milestone 26\n");
+        terminal_writestring("  df / sync / ln -s <target> <link> - the disk at /disk,\n");
+        terminal_writestring("            a real FAT32 volume since Milestone 32\n");
         terminal_writestring("  sockinfo - Unix socket traffic (Milestone 28)\n");
         terminal_writestring("  futexinfo - futex waiting: how many waits blocked\n");
         terminal_writestring("            rather than spun (Milestone 25)\n");
@@ -670,6 +684,23 @@ static void run_command(char* line) {
         terminal_writestring(" total (");
         print_uint(pmm_free_frames() * 4);
         terminal_writestring("KB free)\n");
+        /* The kernel heap, which since Milestone 32 is where a mapped
+         * file's bytes live - so "how much of it is gone" is the question
+         * behind every "failed to load library" Wine prints. */
+        uint32_t hused = 0, htotal = 0;
+        kheap_stats(&hused, &htotal);
+        terminal_writestring("Kernel heap: ");
+        print_uint(hused / 1024u);
+        terminal_writestring("KB used of ");
+        print_uint(htotal / 1024u);
+        terminal_writestring("KB mapped, ceiling ");
+        print_uint(KHEAP_MAX_SIZE / (1024u * 1024u));
+        terminal_writestring("MB\n");
+        terminal_writestring("VFS nodes: ");
+        print_uint(vfs_node_count());
+        terminal_writestring(", file bytes held: ");
+        print_uint(vfs_heap_bytes() / 1024u);
+        terminal_writestring("KB\n");
         if (pmm_double_frees()) {
             /* Never expected, and worth shouting about: a frame freed
              * twice may already belong to somebody else, and the damage
@@ -737,6 +768,16 @@ static void run_command(char* line) {
                 terminal_writestring(n->name);
                 if (n->flags & VFS_DIRECTORY) {
                     terminal_writestring("/  (directory)\n");
+                } else if (n->flags & VFS_SYMLINK) {
+                    /* Shown the way `ls -l` shows one, because a link that
+                     * looks like an ordinary file is a link nobody
+                     * notices is there. */
+                    char target[VFS_SYMLINK_MAX];
+                    int32_t tn = vfs_readlink(n, target, sizeof(target) - 1);
+                    target[tn > 0 ? tn : 0] = '\0';
+                    terminal_writestring(" -> ");
+                    terminal_writestring(target);
+                    terminal_writestring("\n");
                 } else {
                     terminal_writestring("  (");
                     print_uint(n->length);
@@ -757,6 +798,104 @@ static void run_command(char* line) {
             terminal_writestring_color("mkdir failed: ", VGA_COLOR_LIGHT_RED);
             terminal_writestring(p);
             terminal_writestring("\n");
+        }
+    } else if (starts_with(line, "ln -s ")) {
+        /* Milestone 32. `ln -s target name` - the shell's way of proving
+         * that the symlinks Wine's DOS drive table is built out of are
+         * real and survive a reboot. */
+        char target[VFS_SYMLINK_MAX], linkpath[128];
+        const char* p = line + 6;
+        while (*p == ' ') p++;
+        uint32_t i = 0;
+        while (*p && *p != ' ' && i < sizeof(target) - 1) target[i++] = *p++;
+        target[i] = '\0';
+        while (*p == ' ') p++;
+        i = 0;
+        while (*p && i < sizeof(linkpath) - 1) linkpath[i++] = *p++;
+        linkpath[i] = '\0';
+
+        const char* leaf = 0;
+        vfs_node_t* dir = linkpath[0] ? vfs_resolve_parent(linkpath, &leaf) : 0;
+        if (!target[0] || !linkpath[0]) {
+            terminal_writestring("usage: ln -s <target> <linkpath>\n");
+        } else if (!dir || vfs_symlink(dir, leaf, target) != 0) {
+            terminal_writestring_color("ln failed: ", VGA_COLOR_LIGHT_RED);
+            terminal_writestring(linkpath);
+            terminal_writestring("\n");
+        } else {
+            terminal_writestring("linked ");
+            terminal_writestring(linkpath);
+            terminal_writestring(" -> ");
+            terminal_writestring(target);
+            terminal_writestring("\n");
+        }
+    } else if (streq(line, "df")) {
+        /* Milestone 32. What is on the disk, and how much of it is left.
+         * The block counters are here rather than in `meminfo` because
+         * they answer a question nothing else can: whether a file that
+         * appeared instantly came off the disk or out of the node cache. */
+        if (!blockdev_count()) {
+            terminal_writestring("No block devices. Boot with -drive to attach one.\n");
+        }
+        for (uint32_t i = 0; i < blockdev_count(); i++) {
+            blockdev_t* d = blockdev_get(i);
+            if (!d) continue;
+            terminal_writestring("  ");
+            terminal_writestring(d->name);
+            terminal_writestring("  ");
+            print_uint(d->sectors / 2048u);
+            terminal_writestring("MB  ");
+            terminal_writestring(ata_model(i));
+            terminal_writestring("\n");
+        }
+        if (fat32_mounted()) {
+            uint32_t total = 0, freec = 0;
+            fat32_space(&total, &freec);
+            uint32_t per_mb = 1024u * 1024u / fat32_cluster_bytes();
+            terminal_writestring("  /disk  FAT32 on ");
+            terminal_writestring(fat32_device_name());
+            terminal_writestring(" label \"");
+            terminal_writestring(fat32_volume_label());
+            terminal_writestring("\"\n         ");
+            print_uint((total - freec) / per_mb);
+            terminal_writestring("MB used, ");
+            print_uint(freec / per_mb);
+            terminal_writestring("MB free, ");
+            print_uint(fat32_cluster_bytes());
+            terminal_writestring(" bytes/cluster\n");
+        } else {
+            terminal_writestring("  /disk  nothing mounted\n");
+        }
+        uint32_t reads = 0, writes = 0;
+        blockdev_stats(&reads, &writes);
+        terminal_writestring("  sectors read ");
+        print_uint(reads);
+        terminal_writestring(", written ");
+        print_uint(writes);
+        terminal_writestring("\n");
+    } else if (starts_with(line, "symlinks")) {
+        /* Milestone 32. Symbolic links decide which of two startup paths
+         * Wine takes - with them it finds its DOS drives and does what a
+         * real installation does; without them it falls back. Being able
+         * to try both on one boot is worth a command. */
+        const char* p = line + 8;
+        while (*p == ' ') p++;
+        if (streq(p, "on")) posix_set_symlinks(1);
+        else if (streq(p, "off")) posix_set_symlinks(0);
+        else if (*p) { terminal_writestring("usage: symlinks [on|off]\n"); }
+        terminal_writestring("symlink() is ");
+        terminal_writestring(posix_symlinks_enabled() ? "enabled\n"
+                                                      : "refused (-EPERM)\n");
+    } else if (streq(line, "sync")) {
+        /* Pushes the one thing that is not already written through: the
+         * FAT sector the allocator is working in. Worth having as a
+         * command because "reboot and see whether it is still there" is
+         * the only real test of a filesystem, and it should not depend on
+         * having been lucky about cache eviction. */
+        if (fat32_sync() == 0) {
+            terminal_writestring("synced\n");
+        } else {
+            terminal_writestring_color("sync failed\n", VGA_COLOR_LIGHT_RED);
         }
     } else if (starts_with(line, "rm ")) {
         const char* p = line + 2;

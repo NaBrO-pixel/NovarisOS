@@ -131,6 +131,16 @@
 #define SYS_gettimeofday    78
 #define SYS_symlink         83
 #define SYS_symlinkat      304
+/* Extended attributes. Wine asks for one on every file it opens - it is
+ * where Samba and Wine both keep the DOS attribute bits - and this
+ * filesystem has none. See the dispatch for why they are answered rather
+ * than reported. */
+#define SYS_getxattr       229
+#define SYS_lgetxattr      230
+#define SYS_fgetxattr      231
+#define SYS_setxattr       226
+#define SYS_lsetxattr      227
+#define SYS_fsetxattr      228
 #define SYS_sched_yield    158
 #define SYS_madvise        219
 #define SYS_lstat64        196
@@ -205,6 +215,8 @@
 #define ELOOP    40
 #define ENAMETOOLONG 36
 #define E2BIG     7
+#define EIO       5    /* Milestone 32: a disk that would not answer */
+#define EBUSY    16
 
 /* --- poll / select (Milestone 29) ---------------------------------------
  *
@@ -579,6 +591,13 @@ void posix_request_retry(void);
  * traces side by side. */
 void posix_set_trace(int on);
 int  posix_trace_enabled(void);
+
+/* Milestone 32's symlink switch. symlink() answering or refusing is what
+ * decides which of two startup paths Wine takes, so it is worth being
+ * able to try both on one boot rather than in two builds. See the comment
+ * on symlinks_enabled in kernel/posix.c. */
+void posix_set_symlinks(int on);
+int  posix_symlinks_enabled(void);
 
 /* How many syscalls this program made that Novaris does not implement,
  * for the same reason the Win32 layer counts missing APIs: a program that

@@ -41,6 +41,7 @@ OBJS = $(BUILD_DIR)/boot.o $(BUILD_DIR)/kernel.o \
        $(BUILD_DIR)/posix_proc.o \
        $(BUILD_DIR)/process.o $(BUILD_DIR)/process_asm.o \
        $(BUILD_DIR)/user_hello_blob.o $(BUILD_DIR)/vfs.o $(BUILD_DIR)/ramfs.o $(BUILD_DIR)/socket.o \
+       $(BUILD_DIR)/blockdev.o $(BUILD_DIR)/ata.o $(BUILD_DIR)/fat32.o \
        $(BUILD_DIR)/elf.o $(BUILD_DIR)/pe.o $(BUILD_DIR)/kstring.o \
        $(BUILD_DIR)/rtc.o \
        $(BUILD_DIR)/win32.o $(BUILD_DIR)/win32_kernel32.o \
@@ -55,7 +56,8 @@ KERNEL = $(BUILD_DIR)/novaris.bin
 ISO = novaris.iso
 
 .PHONY: all clean run run-nographic iso test test-qemu test-posix test-wine \
-        test-wine-threads zip wine-initrd
+        test-wine-threads test-qemu-disk test-wine-prefix zip wine-initrd \
+        disk wine-disk
 
 all: $(ISO)
 
@@ -156,6 +158,17 @@ $(BUILD_DIR)/ramfs.o: kernel/ramfs.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/socket.o: kernel/socket.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Milestone 32: the disk. blockdev.c is the seam between the two, which is
+# what lets tests/fat32_host_test.c drive fat32.c against a file.
+$(BUILD_DIR)/blockdev.o: kernel/blockdev.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ata.o: kernel/ata.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fat32.o: kernel/fat32.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/elf.o: kernel/elf.c $(HEADERS) | $(BUILD_DIR)
@@ -603,6 +616,33 @@ $(BUILD_DIR)/test/pe_test: tests/pe_host_test.c kernel/pe.c kernel/kstring.c $(H
 	mkdir -p $(BUILD_DIR)/test
 	$(CC) $(HOST_CFLAGS) -o $@ tests/pe_host_test.c kernel/pe.c kernel/kstring.c
 
+# Milestone 32. The FAT32 driver, the VFS it plugs into and the block
+# layer under it, all linked into a host binary and pointed at a real
+# image built by tools/mkfat32.py. See the comment at the top of the test.
+FAT_TEST_SRCS = kernel/fat32.c kernel/ramfs.c kernel/vfs.c kernel/blockdev.c \
+                kernel/kstring.c
+
+$(BUILD_DIR)/test/fat32_test: tests/fat32_host_test.c $(FAT_TEST_SRCS) $(HEADERS)
+	mkdir -p $(BUILD_DIR)/test
+	$(CC) $(HOST_CFLAGS) -o $@ tests/fat32_host_test.c $(FAT_TEST_SRCS)
+
+# The image the test runs against, and the staging tree it is built from.
+# Symbolic links are part of the tree on purpose: they are what Milestone
+# 32 switched on, and a link that only ever exists in RAM proves nothing
+# about the on-disk representation.
+$(BUILD_DIR)/test/fat32.img: tools/mkfat32.py | $(BUILD_DIR)
+	rm -rf $(BUILD_DIR)/test/fatstage
+	mkdir -p $(BUILD_DIR)/test/fatstage/sub/deeper
+	printf 'hello from the disk\n' > $(BUILD_DIR)/test/fatstage/readme.txt
+	printf 'a long file name lives here\n' \
+	    > "$(BUILD_DIR)/test/fatstage/a-very-long-file-name-indeed.dat"
+	printf 'nested\n' > $(BUILD_DIR)/test/fatstage/sub/deeper/note.txt
+	python3 -c "import sys; sys.stdout.buffer.write(bytes((i*31+(i>>8))&0xff for i in range(200000)))" \
+	    > $(BUILD_DIR)/test/fatstage/blob.bin
+	ln -sf ../readme.txt $(BUILD_DIR)/test/fatstage/sub/link-to-readme
+	ln -sf /disk $(BUILD_DIR)/test/fatstage/rootlink
+	python3 tools/mkfat32.py $@ $(BUILD_DIR)/test/fatstage --size 64M
+
 # The window manager and the desktop shell, driven on the host. desktop.c
 # is #included by the test (it needs the shell's file-scope state), so it
 # is a prerequisite but not a source on the command line.
@@ -616,7 +656,7 @@ $(BUILD_DIR)/test/wm_test: tests/wm_host_test.c kernel/desktop.c \
 
 # The PE test loads binaries out of build/user, so they have to exist.
 test: $(BUILD_DIR)/test/format_test $(BUILD_DIR)/test/pe_test \
-        $(BUILD_DIR)/test/wm_test \
+        $(BUILD_DIR)/test/wm_test $(BUILD_DIR)/test/fat32_test \
         $(BUILD_DIR)/user/hellowin.exe $(BUILD_DIR)/user/lowbase.exe \
         $(BUILD_DIR)/user/guiapp.exe $(BUILD_DIR)/user/hello64.exe
 	@echo "=== printf/dtoa engine ==="
@@ -624,6 +664,14 @@ test: $(BUILD_DIR)/test/format_test $(BUILD_DIR)/test/pe_test \
 	@echo
 	@echo "=== PE loader ==="
 	@$(BUILD_DIR)/test/pe_test
+	@echo
+	@echo "=== FAT32 driver ==="
+	@$(MAKE) --no-print-directory $(BUILD_DIR)/test/fat32.img >/dev/null
+	@# On a copy, because the test writes to the volume and has to start
+	@# from a known one every run. The pristine image stays put so it can
+	@# be mounted on the host and looked at.
+	@cp $(BUILD_DIR)/test/fat32.img $(BUILD_DIR)/test/fat32-work.img
+	@$(BUILD_DIR)/test/fat32_test $(BUILD_DIR)/test/fat32-work.img
 	@echo
 	@echo "=== window manager / desktop shell ==="
 	@$(BUILD_DIR)/test/wm_test --shots $(BUILD_DIR)/test
@@ -788,11 +836,33 @@ wine-initrd: $(BUILD_DIR)/initrd.img $(KERNEL)
 # 768MB because the initrd carries Wine's PE builtins and the NLS tables
 # and is read into RAM whole, and because a fork of a Wine process copies
 # its address space eagerly.
+# `symlinks off` first, and it is the interesting line in this file.
+#
+# Milestone 32 built symbolic links and switched them on, because what
+# they unlock - Wine's DOS drive table, and with it the startup path a
+# real installation takes - was waiting on a disk and a prefix, and both
+# now exist. Turning them on is what the milestone was for.
+#
+# It is also what stops this test. With drives, Wine stops falling back to
+# the Windows directory and does what it does on a real machine: it finds
+# the prefix, starts wineserver, starts services.exe, loads its builtins
+# off the disk - and then wineboot stops inside shell32's delay-load of
+# SHGetFolderPathW and does not come back. The Windows program never runs.
+#
+# So this test says which of the two paths it is testing instead of
+# leaving it to a default. The kernel's default is that symlinks work,
+# because they do and because userland/fs_test.c compares them against
+# Linux byte for byte; the transcript test that needs Wine's *older* path
+# asks for it. `make test-wine-prefix` is the other half - it asserts how
+# far the new path gets, so the progress is a test rather than a claim.
+#
+# Milestone 33 is what removes this line. See ROADMAP.md.
 test-wine:
 	@test -f novaris-wine.iso || \
 	    { echo "run 'make WINE_BUILD=/path/to/wine wine-initrd' first"; exit 1; }
 	python3 tools/qemu_test.py --iso novaris-wine.iso --memory 768 \
 	    --boot-wait 30 --settle 200 \
+	    --setup "symlinks off" \
 	    --cmd "run wine-preloader wine hellowin.exe" \
 	    --expect "Hello from a real Windows \.exe running on Novaris" \
 	    --expect "compiled by mingw-w64, linked against msvcrt\.dll" \
@@ -823,11 +893,13 @@ test-wine:
 # somewhere. It is a latency defect and the counters above prove it is
 # not a correctness one; asserting its absence would be asserting
 # something that is not reliably true. See ROADMAP.md Milestone 31.
+# `symlinks off` for the reason spelled out above test-wine.
 test-wine-threads:
 	@test -f novaris-wine.iso || \
 	    { echo "run 'make WINE_BUILD=/path/to/wine wine-initrd' first"; exit 1; }
 	python3 tools/qemu_test.py --iso novaris-wine.iso --memory 768 \
 	    --boot-wait 30 --settle 200 \
+	    --setup "symlinks off" \
 	    --cmd "run wine-preloader wine threads.exe" \
 	    --expect "Win32 threads test - real CreateThread on Novaris" \
 	    --expect "worker 1 starting, GetCurrentThreadId" \
@@ -839,6 +911,128 @@ test-wine-threads:
 	    --expect "guarded counter:     60, expected 60  -> ok" \
 	    --expect "threads test done" \
 	    --reject "libgcc_s\.so\.1 must be installed" \
+	    --reject "KERNEL PANIC"
+
+# --- The disk (Milestone 32) ----------------------------------------------
+#
+# `make disk` builds a small empty FAT32 volume; `make run-disk` boots the
+# ordinary ISO with it attached, which is all it takes to have somewhere
+# that survives a reboot.
+#
+# The image is *not* a build product of the ISO and is deliberately not
+# rebuilt by `make`: it is storage, and rebuilding storage on a `make`
+# would be the one behaviour nobody wants from a disk. Delete it to start
+# over.
+DISK_IMAGE = novaris-disk.img
+DISK_SIZE  = 256M
+
+disk:
+	@test -f $(DISK_IMAGE) || \
+	    python3 tools/mkfat32.py $(DISK_IMAGE) --size $(DISK_SIZE) --label NOVARIS
+	@echo "$(DISK_IMAGE) is ready - boot with: make run-disk"
+
+.PHONY: run-disk
+run-disk: $(ISO) disk
+	qemu-system-i386 -cdrom $(ISO) -boot d \
+	    -drive file=$(DISK_IMAGE),format=raw,if=ide,index=0,media=disk
+
+# The only test of a filesystem that means anything: write, reboot, look.
+#
+# Two boots of the same image, and the second one is where the assertions
+# are. The first writes a file, a directory, a nested file and a symbolic
+# link and syncs; the second reads them back on a machine that has been
+# switched off and on in between, so nothing can have been served out of a
+# cache that did not survive.
+test-qemu-disk: $(ISO)
+	rm -f $(BUILD_DIR)/persist.img
+	python3 tools/mkfat32.py $(BUILD_DIR)/persist.img --size 64M --label PERSIST
+	python3 tools/qemu_test.py --iso $(ISO) --disk $(BUILD_DIR)/persist.img \
+	    --boot-wait 16 --settle 3 --timeout 40 \
+	    --cmd "mkdir /disk/afterboot" \
+	    --cmd "cp readme.txt /disk/afterboot/kept.txt" \
+	    --cmd "ln -s afterboot/kept.txt /disk/shortcut" \
+	    --cmd "sync" \
+	    --expect "linked /disk/shortcut" \
+	    --expect "^synced" \
+	    --reject "KERNEL PANIC"
+	python3 tools/qemu_test.py --iso $(ISO) --disk $(BUILD_DIR)/persist.img \
+	    --boot-wait 16 --settle 3 --timeout 40 \
+	    --cmd "ls /disk" \
+	    --cmd "ls /disk/afterboot" \
+	    --cmd "cat /disk/shortcut" \
+	    --cmd "df" \
+	    --expect "FAT32 volume mounted at /disk" \
+	    --expect "afterboot/  \\(directory\\)" \
+	    --expect "shortcut -> afterboot/kept\\.txt" \
+	    --expect "kept\\.txt" \
+	    --expect "Novaris" \
+	    --expect "label \\\"PERSIST\\\"" \
+	    --reject "KERNEL PANIC"
+
+# Builds a disk carrying a Wine prefix, from a prefix directory built
+# elsewhere. There is no way to build one on Novaris yet - that is what
+# Milestone 33 is about - so the prefix comes from a host that has the
+# same Wine tree:
+#
+#   WINEPREFIX=/tmp/pfx ../wine/loader/wine wineboot -u
+#   make WINE_PREFIX_DIR=/tmp/pfx wine-disk
+#
+# 512MB because a 32-bit prefix is a little over 200MB once the PE files
+# are stripped, and a filesystem wants room to write in.
+WINE_PREFIX_DIR =
+WINE_DISK_IMAGE = novaris-wine-disk.img
+WINE_DISK_SIZE  = 512M
+
+wine-disk:
+	@test -n "$(WINE_PREFIX_DIR)" || \
+	    { echo "set WINE_PREFIX_DIR=/path/to/a/wine/prefix (see the Makefile)"; exit 1; }
+	@test -d "$(WINE_PREFIX_DIR)/drive_c" || \
+	    { echo "$(WINE_PREFIX_DIR) does not look like a Wine prefix"; exit 1; }
+	rm -rf $(BUILD_DIR)/disk_staging
+	mkdir -p $(BUILD_DIR)/disk_staging
+	cp -a $(WINE_PREFIX_DIR) $(BUILD_DIR)/disk_staging/.wine
+	# Stripped for the same reason the initrd's builtins would be: debug
+	# information is three quarters of the bytes and nothing here reads
+	# it. 700MB becomes 220MB, and the difference is a disk image that
+	# can be moved between machines.
+	find $(BUILD_DIR)/disk_staging -name '*.dll' -o -name '*.exe' \
+	    -o -name '*.drv' -o -name '*.sys' \
+	    | xargs -r -n 40 i686-w64-mingw32-strip 2>/dev/null || true
+	python3 tools/mkfat32.py $(WINE_DISK_IMAGE) $(BUILD_DIR)/disk_staging \
+	    --size $(WINE_DISK_SIZE) --label WINEDISK
+	@echo "Wrote $(WINE_DISK_IMAGE) - the prefix lands at /disk/.wine, which"
+	@echo "is where HOME points when a disk is mounted."
+
+# How far Wine's *real* startup path gets, with symlinks on and a prefix
+# on the disk. Separate from test-wine because it asserts something
+# different: not that a Windows program runs - it does not yet - but that
+# every step before the one that stops is now reached.
+#
+# What it proves, in order: the drive table exists (Wine names the prefix
+# as Z:\disk\.wine rather than reporting that it cannot find a DOS drive
+# for the working directory, which is what Milestones 30 and 31 got);
+# wineserver starts; services.exe starts and works through the auto-start
+# list; and Wine's PE builtins load out of the prefix on the disk.
+#
+# What it deliberately does not assert is the absence of the failures
+# after that point. wineboot stops in shell32's delay-load of
+# SHGetFolderPathW and the transcript says so. Asserting a clean run would
+# be asserting something untrue; asserting the failure line would freeze
+# in place the exact thing Milestone 33 has to change.
+test-wine-prefix:
+	@test -f novaris-wine.iso || \
+	    { echo "run 'make WINE_BUILD=/path/to/wine wine-initrd' first"; exit 1; }
+	@test -f $(WINE_DISK_IMAGE) || \
+	    { echo "run 'make WINE_PREFIX_DIR=/path/to/prefix wine-disk' first"; exit 1; }
+	cp $(WINE_DISK_IMAGE) $(BUILD_DIR)/wine-disk-run.img
+	python3 tools/qemu_test.py --iso novaris-wine.iso \
+	    --disk $(BUILD_DIR)/wine-disk-run.img --memory 768 \
+	    --boot-wait 30 --settle 200 --timeout 260 \
+	    --cmd "run wine-preloader wine hellowin.exe" \
+	    --expect "FAT32 volume mounted at /disk" \
+	    --expect "Z:..disk..wine" \
+	    --expect "scmdatabase_autostart_services" \
+	    --reject "could not find DOS drive" \
 	    --reject "KERNEL PANIC"
 
 zip:

@@ -29,8 +29,20 @@
 
 /* Raised in Milestone 30 for the same reason the descriptor table was:
  * wineserver plus two clients is already a dozen sockets and pipes, and
- * every Windows handle backed by a file is another descriptor in flight. */
-#define MAX_SOCKETS   64
+ * every Windows handle backed by a file is another descriptor in flight.
+ *
+ * Raised again in Milestone 32, and this time the number came from a
+ * failure rather than an estimate. With a real prefix on the disk,
+ * wineboot gets far enough to start services.exe, which starts a *process
+ * per service* - PlugPlay, Eventlog, nsiproxy, NDIS - and each of those
+ * is a wineserver connection plus a request pipe plus a reply pipe, with
+ * the other end of every one of them held by the server. Sixty-four ran
+ * out four services in, and every service after that failed with "pipe:
+ * Too many open files in system".
+ *
+ * The cost is small: the 16KB receive buffer is allocated per socket in
+ * use, so an unused entry is about 250 bytes of table and nothing else. */
+#define MAX_SOCKETS   256
 #define SOCK_BUF_SIZE 16384      /* per direction */
 #define MAX_BACKLOG   8
 #define MAX_PASSED_FDS 16
