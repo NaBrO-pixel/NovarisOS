@@ -609,6 +609,7 @@ make test-wine   # types 'wine hellowin.exe' at the shell and asserts the output
 make test-wine-threads   # ... and a *threaded* Windows .exe's
 make test-wine-prefix    # ... on an empty disk, where Wine builds its prefix
 make test-desktop        # ... by double-clicking it, with the mouse, on the desktop
+make test-wine-persist   # ... twice, across a reboot, on a prefix that survived
                          #     (the Wine tests need WINE_BUILD set when the ISO was built)
 ```
 

@@ -1761,6 +1761,9 @@ void desktop_start(void) {
     gfx_set_target(screen);
     render_wallpaper();
 
+    /* From here the framebuffer is the compositor's; see framebuffer.c. */
+    fb_set_compositor_owned(1);
+
     mouse_set_bounds(screen_w, screen_h);
     cursor_x = prev_cursor_x = screen_w / 2;
     cursor_y = prev_cursor_y = screen_h / 2;

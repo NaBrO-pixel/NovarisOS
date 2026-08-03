@@ -5177,27 +5177,52 @@ and only a failing run spends it.
   the page cache above.
 - **The prefix is rebuilt at every boot when there is no disk**, because
   `$HOME` is `/root` and `/root` is a ramfs. With a disk it is built once
-  and stays - which is what `make test-wine-prefix` sets up, and what
-  anybody actually using this would do.
-- **A black band across the screen during a long run**, and it is worth
-  recording precisely because it is localized and not yet explained.
-  Screen rows 656-671 - sixteen rows, the height of one console text line
-  - go pure black, full width, and stay that way. It appears while a Wine
-  program runs and not otherwise: a screenshot after boot, after opening
-  the File Explorer, after maximizing it, or after double-clicking an
-  *ELF* is clean, and one taken during or after `wine hellowin.exe` is
-  not. It is not the double-click path - typing the command at the shell
-  with no File Explorer open reproduces it exactly.
-  <br>Sixteen rows of black at a fixed screen position is the shape of
-  `fb_scroll_one_line()`, the *framebuffer* console scrolling and clearing
-  its last line - which writes straight to the framebuffer rather than
-  through the compositor's back buffer, so anything it draws survives in
-  every rectangle the compositor does not repaint. What has not been found
-  is who calls it while the desktop is up, since `putchar_plain()` returns
-  to the window sink before it can and `console_set_sink(0)` has exactly
-  one caller, the out-of-memory path in `desktop_start()`. That is the
-  next thing to look at, and the answer is probably a fourth writer to the
-  framebuffer that nobody has gone looking for.
+  and stays, which is what `make test-wine-persist` now proves: two boots
+  of one image, the first building the prefix and the second running the
+  program without building anything. That second boot rejects "created the
+  configuration directory", because a prefix rebuilt every time is not an
+  installation.
+- **Building the prefix is intermittent; using one is not.** Once in about
+  four runs, `make test-wine-threads` - which has no disk, so Wine builds
+  a prefix in RAM every time - dies during the build with
+
+  ```
+  err:module:loader_init "user32.dll" failed to initialize, aborting
+  err:module:loader_init Initializing dlls for
+      L"C:\windows\system32\rundll32.exe" failed, status c0000005
+  ```
+
+  and passes on a re-run. That is `rundll32` taking an access violation
+  while installing `wine.inf`, which is the heaviest thing Wine does here
+  and the newest: Milestone 35 is the first time it ran at all.
+
+  Worth separating from "Wine works", because the two halves behave
+  differently. Every run that *has* a prefix has been reliable -
+  `make test-wine-persist`'s second boot, which skips the install
+  entirely, and every `make test-wine-prefix`. It is the install that is
+  not solid yet, and a disk turns it into a once-ever event rather than a
+  once-per-boot one.
+
+- **The pointer leaves a black trail.** Sweeping the mouse horizontally
+  across the desktop turns a sixteen-pixel-tall band, the full width of
+  the screen, pure black, and it stays black. It has *nothing to do with
+  Wine*: it was found in a screenshot taken after a Wine run, and it
+  reproduces on a freshly booted desktop with no program running at all -
+  boot, move the pointer from one side to the other, screendump. About
+  ninety seconds, which is the useful part of this entry.
+
+  Four things are ruled out. It is not the framebuffer console writing
+  behind the compositor: `fb_set_compositor_owned()` makes
+  `kernel/framebuffer.c` report the first such write by name, and it never
+  fires. It is not `render_wallpaper()`, which fills every row. It is not
+  `gfx_copy_region()`, `gfx_present()` or `fb_blit()`, all of which clamp
+  correctly. And it is not the double-click path or any program's output.
+
+  What is left is the damage bookkeeping between `damage_cursor()`,
+  `wm_take_damage()` and `compose()`. The two numbers to explain are the
+  height - sixteen, where the cursor's own damage rect is forty-three -
+  and the colour, pure black, which is what a `gfx_surface_create()`
+  allocation reads as before anything has been drawn into it.
 - **Networking.** Unchanged, and still the reason `nsiproxy` and `NDIS`
   fail to start.
 
