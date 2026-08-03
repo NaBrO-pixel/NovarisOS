@@ -46,6 +46,15 @@ int32_t rtc_days_from_civil(int32_t y, uint32_t m, uint32_t d) {
     (void)y; (void)m; (void)d; return 0;
 }
 
+/* The console the kernel would print to. ramfs.c reports one thing this
+ * way - a mapped file whose storage had to move out from under its
+ * mappings - and it goes to stderr here rather than being swallowed, so a
+ * host test that provokes it says so too. */
+void terminal_writestring(const char* s) { fputs(s, stderr); }
+void terminal_writestring_color(const char* s, uint8_t color) {
+    (void)color; fputs(s, stderr);
+}
+
 /* --- a block device that is a file ------------------------------------ */
 
 static FILE* disk_file = 0;

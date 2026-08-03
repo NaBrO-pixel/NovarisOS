@@ -529,6 +529,14 @@ void posix_deliver_pending(registers_t* regs);
  * the process should die instead. */
 int posix_handle_fault_signal(registers_t* regs, uint32_t vector);
 
+/* A page fault that is not an error at all: a write to a page a private
+ * file mapping shares with the file (see PAGE_COW). Gives the page its
+ * own copy and returns 1, meaning the faulting instruction should simply
+ * be retried; 0 for every other fault, which the caller then handles as
+ * one. Checked before anything else on vector 14, because it is the one
+ * page fault that is a normal part of running a program. */
+int posix_handle_cow_fault(registers_t* regs);
+
 /* Raises a signal against the running process. si_code is SI_USER and
  * si_pid zero; posix_raise_from() names both, which is what separates a
  * tgkill (SI_TKILL) from a kill in the siginfo_t the handler sees. */

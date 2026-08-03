@@ -4690,6 +4690,250 @@ Two other things are worth saying honestly about the current state:
   explorer, on a machine with two gigabytes free. `fork` copies the
   address space eagerly, and that is the obvious suspect.
 
+## Milestone 34 — the shared session object, and what it really was ✅ DONE
+
+Milestone 33 ended on one sentence: *"the client maps wineserver's session
+file successfully and then reads an object header that is not the one the
+server says it wrote, so the two processes' `MAP_SHARED` views of one file
+disagree."*
+
+Every word of that is true except the last two. The client's view was
+never `MAP_SHARED`.
+
+### `MAP_PRIVATE` is not a snapshot
+
+Wine maps a read-only view of a section with `MAP_PRIVATE`, on purpose,
+and says why in a comment in `dlls/ntdll/unix/virtual.c`:
+
+```c
+/* changes to the file are not guaranteed to be visible in read-only
+ * MAP_PRIVATE mappings, but they are on Linux so we take advantage of it */
+#ifdef __linux__
+    flags |= MAP_PRIVATE;
+```
+
+That is the whole bug. On Linux a private file mapping is not a copy of
+the file: it is the file's own pages, and it stops being them one page at
+a time, when this process writes to that page. Until then a writer
+elsewhere shows through it. Novaris answered `MAP_PRIVATE` by allocating
+pages and reading the bytes in — behaviourally correct about every
+question `userland/mmap_test.c` had ever asked it, and a snapshot taken at
+the instant of the call.
+
+So win32u mapped the session block, read the objects wineserver had
+written *so far*, and never saw another one. `NtUserRegisterClassExWOW`
+looked for a window class whose object the server had created after the
+mapping existed, found the header of whatever had been at that offset
+before, and reported the id mismatch. Sixteen times in a run, once per
+class, in every process — and no desktop window, because
+`get_desktop_window` registers a class first.
+
+Nothing about the search in Milestone 33 was wrong, and its conclusion was
+sound: *the mapping mechanism itself is not at fault*. It was looking at
+the wrong mapping.
+
+### Copy-on-write
+
+Two page-table bits, both from the three the CPU leaves to the OS:
+
+- `PAGE_COW` (bit 11): this page is a private view of memory that belongs
+  to a file. It carries `PAGE_SHARED` too, so no teardown path frees the
+  frame.
+- `PAGE_COW_RW` (bit 10): the mapping it belongs to permits writes. Both
+  kinds have `PAGE_RW` clear, because both have to *fault* on a write —
+  one to be given its copy, the other because writing to a read-only
+  mapping is an access violation. Bit 10 is `PAGE_RESERVED`, which only
+  ever means anything on an entry that is not present; a COW page is
+  present, so the readings never overlap.
+
+`paging_break_cow()` allocates a frame, copies the page through a page of
+BSS (the destination cannot be mapped anywhere else while the source is
+still at the only address that reaches it), remaps and drops all three
+bits. `handle_user_fault()` calls it before the program is told anything,
+because this is the one page fault that is a normal part of running a
+program — a Wine client takes hundreds.
+
+`fork` needed no change: it already shared `PAGE_SHARED` pages verbatim
+rather than copying them, which is exactly right for a COW page, and both
+sides then break it independently.
+
+Three other things had to move with it:
+
+- **`mprotect` on a COW page** changes what the program may do, not whose
+  frame it is. The page keeps faulting on a write however writable it has
+  been made; what changes is `PAGE_COW_RW`, and therefore what the fault
+  does. This is not a corner: Wine maps every section view writable and
+  mprotects it down afterwards, so a shared session block spends its whole
+  life as a page that has been through here.
+- **Anonymous `MAP_FIXED` over a file's frames** has to *replace* them. It
+  used to keep the frame and apply the new protection, which was a
+  harmless waste when a private file mapping was a copy and is corruption
+  of somebody else's file now that it is not. A dynamic linker does this
+  every time it maps a library: data segment from the file, then the
+  `.bss` tail over the end of it with `MAP_FIXED|MAP_ANONYMOUS`.
+- **The kernel's own writes.** A ring-3 write to a COW page faults; a
+  ring-0 write does not, because this is an i386 with `CR0.WP` clear. So
+  `read()` into a buffer inside a private file mapping would go straight
+  into the file. Nothing Wine does lands there, and
+  `break_cow_for_kernel_write()` is called by `read`, `pread64` and
+  `getdents64` anyway, because "nothing does it today" is not a property
+  this kernel can check.
+
+`userland/mmap_test.c` sections 4a and 4b are the test, and they are the
+usual kind: run the same binary on Linux and on Novaris and diff. Before
+the change Novaris failed exactly three checks — a store through a shared
+mapping showing through a private one, the same from another process, and
+a page that was never written still tracking the file. After it, all
+forty-three match.
+
+### Two bugs found on the way, both mine
+
+Both were introduced by the change above and both were found the same way,
+by making the kernel say something it had not been saying.
+
+**A growth reserve, re-decided.** `vfs_make_mappable()` gives a mapped
+file page-aligned storage, and gives a file that this kernel's own memory
+backs four megabytes of headroom so that growing it later does not move
+it — wineserver's session file is what that was measured against. A file
+out of the initrd cannot grow, and since private mappings became
+copy-on-write *every* library a dynamic linker maps comes through here, so
+four megabytes each for Wine's few dozen is a hundred megabytes of heap
+spent on headroom for growth that cannot happen. Excluding initrd files
+was right and the test for it was wrong: `from_initrd` is cleared by the
+copy that makes the file mappable, so the *second* mapping of the same
+library found a file that no longer looked like an initrd one, took the
+reserve, and reallocated — moving every byte while the mapping made a
+moment earlier still pointed at the old frames. ld.so maps a library four
+times over (the whole file, then each segment), and what it read out of
+the second mapping was the third one's memory:
+
+```
+wine: could not load ntdll.so: eh\xdd\xdd\xdd: cannot open shared object file
+```
+
+— a `DT_NEEDED` name read out of a freed heap block. The reserve is a
+decision made once now, when the storage is first laid out and nothing can
+be mapped through it yet. `vfs_make_mappable` also says so out loud when
+it replaces storage that was already mappable, because silently that
+arrives as a corrupt file three subsystems away.
+
+And separately: sizing a file's storage to *the mapping* rather than to
+the file was wrong for the same reason. A mapping routinely runs past the
+end of the file it is of — a loader maps a segment rounded up to a page,
+or a section whose tail is bss — and asking for storage that far grows the
+buffer and moves it. Sized to the file, the first mapping settles the
+storage and no later one can move it; the pages past the end get ordinary
+zeroed memory, which is what they read as anyway.
+
+**A loop variable.** `mprotect` cleared `PAGE_RW` from the flags it was
+about to apply, inside the loop, so the first COW page in a range decided
+how every ordinary page after it was mapped. One `mprotect(0x7bf13000,
+0x2000, PROT_READ|PROT_WRITE)` therefore left the second of its two pages
+read-only, and a write to it arrived in Wine as `Unhandled exception code
+c0000005 addr 0x7bf7f5cd`. What found it was a new `[fault]` line under
+`strace`: vector, eip, address, direction, and the page table entry.
+`pte=0x0444aa25` reads as present, user, read-only, shared, COW, and *not*
+`PAGE_COW_RW` — which is the whole answer, in a line the kernel had never
+printed before.
+
+### The second cause behind `c000011f`
+
+Milestone 33 said the remaining invalid-image-format reports were "almost
+certainly a second cause" and that they moved between runs. They were, and
+this is it:
+
+```
+err:winediag:NtCreateFile Too many open files, ulimit -n probably needs
+    to be increased
+```
+
+`POSIX_MAX_FDS` was 128. Once the desktop window existed, wineboot got as
+far as explorer, services.exe, svchost and winemenubuilder — which walks
+the Start menu writing an icon file per entry — and 128 was gone again.
+Every DLL that then failed to open was reported upwards as an invalid
+image format, which is why the failures would not stay still: a limit is
+reached at a different point every run. 512 now, sixteen kilobytes per
+process slot.
+
+`ugetrlimit`/`prlimit64` also tell the truth about `RLIMIT_NOFILE` now
+rather than answering "unlimited". Unlimited is not generous, it is a lie
+the caller acts on: wineserver sizes its own table from it and the client
+caches descriptors up to it, so `EMFILE` arrives at a Wine that has
+already decided it cannot happen.
+
+`kmalloc` says so once when the heap is exhausted, for the same reason —
+this kernel has no page cache, a mapped nine-megabyte DLL costs nine
+megabytes of heap and keeps costing it, and running out arrives everywhere
+else as something else entirely.
+
+### What that bought
+
+Against the same prefix image, on the same Wine, the error profile of a
+whole run:
+
+| | Milestone 33 | Milestone 34 |
+| --- | --- | --- |
+| `Failed to get shared session object` | 16 | 0 |
+| `failed to create desktop window` | 17 | 0 |
+| `service ... failed to start` (timeout) | 4 | 0 |
+| `Loading library ... failed (c000011f)` | yes | 0 |
+| `unimplemented function shell32.SHGetFolderPathW` | aborts the run | not reached |
+
+Wine registers its window classes, creates its desktop window, starts its
+services, runs explorer — **and a Windows program runs to completion on
+the real path**, with the prefix on the disk and symbolic links on:
+
+```
+novaris> wine hellowin.exe
+Hello from a real Windows .exe running on Novaris!
+  compiled by mingw-w64, linked against msvcrt.dll
+...
+fib(20):    6765
+argc:       1, argv[0]: Z:\hellowin.exe
+
+Exiting with code 0.
+```
+
+`Z:\hellowin.exe` is the line that matters. Every earlier milestone got
+`C:\windows\hellowin.exe`, which is the fallback Wine takes when it has no
+DOS drives at all; `Z:\` means the drive table built out of symbolic links
+in the prefix is what resolved the path. `make test-wine-prefix` asserts
+that transcript and rejects every line in the table above, so the progress
+is a test rather than a claim, and `make test-wine` and
+`make test-wine-threads` still assert what they always did.
+
+### Seamless: `wine hellowin.exe`
+
+The shell has a `wine` command. `run wine-preloader wine hellowin.exe`
+still works and is what `make test-wine` uses on purpose — a test that
+spells out the whole invocation tests one layer fewer — but the three
+names in it are the preloader that reserves the low address space, the
+loader it hands control to, and the program, and only the last is the
+user's business. On the ordinary `novaris.iso`, which carries no Wine,
+`wine` says so and points at `run` instead of failing three layers down.
+
+### Still open
+
+- **Novaris still cannot build or update a prefix.** wineboot reaches
+  `update_wineprefix()`, which is `rundll32` over `wine.inf` and
+  setupapi's file-copy machinery. A prefix therefore still has to be built
+  by the same Wine on a host and written to the image with `make
+  wine-disk`. What is new is that it is only the *building* that is
+  missing now: given a prefix, using one works.
+- **It is slow.** wineboot takes longer than the five minutes Wine allows
+  for its own boot event, so a successful run contains
+  `err:environ:run_wineboot` — Wine giving up on waiting and carrying on.
+  Most of that is this kernel having no page cache: a mapped DLL is read
+  off an ATA PIO disk and copied into the heap in full, per file, and
+  wineboot touches a lot of files. Making it quick is a separate problem
+  from making it work, and this milestone did the second one.
+- **No GUI and no networking.** There is no display backend for Wine to
+  drive (`winex11.drv` and friends do not load), and the services that
+  want a network — `nsiproxy`, `NDIS` — fail as they should.
+- **A mapped file's storage is never given back.** It is the heap, it is
+  the whole file, and nothing evicts it. That is the price of having no
+  page cache, and it is now paid by private mappings too.
+
 ## Later / open-ended
 
 - Networking (a NIC driver + a minimal TCP/IP stack) — big undertaking.
@@ -4758,6 +5002,12 @@ much each would widen what runs:
    WINEPREFIX=/tmp/pfx ../wine/loader/wine wineboot -u
    make WINE_PREFIX_DIR=/tmp/pfx wine-disk test-wine-prefix
    ```
+
+   `test-wine-prefix` is the long one: it boots a whole Wine on an
+   emulated machine and a run takes minutes, most of it wineboot. It stops
+   as soon as its assertions are all satisfied, so a passing run is much
+   shorter than its fifteen-minute budget and only a failing one spends
+   the lot.
 
    `mingw-w64` builds the Windows test programs in `userland/pe_test/`;
    `gcc-multilib` builds the host-side tests in `tests/`. Since Milestone

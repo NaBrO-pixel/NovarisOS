@@ -45,8 +45,21 @@
  * for every file any client has mapped. It ran out while opening
  * ntdll.dll and reported STATUS_TOO_MANY_OPENED_FILES, which the client
  * turned into "invalid image format" - a true statement about the wrong
- * thing. */
-#define POSIX_MAX_FDS   128
+ * thing.
+ *
+ * 512 since Milestone 34, and it is the same story one prefix further on.
+ * Once the desktop window existed, wineboot got as far as explorer,
+ * services.exe, svchost and winemenubuilder - which walks the Start menu
+ * writing an icon file per entry - and 128 was gone again. Wine said so
+ * this time ("Too many open files, ulimit -n probably needs to be
+ * increased"), and underneath it every DLL that failed to open was
+ * reported upwards as c000011f, an invalid image format. That is the
+ * *second* cause ROADMAP.md Milestone 33 suspected behind the c000011f
+ * reports that would not stay still between runs, and it is why they
+ * moved: a limit is reached at a different point every time.
+ *
+ * Sixteen kilobytes per process slot, which is the whole cost. */
+#define POSIX_MAX_FDS   512
 /* Milestone 32 raised this from 128, for the same reason VFS_NAME_MAX
  * went up: a path inside a Wine prefix on the disk
  * ("/disk/.wine/drive_c/windows/winsxs/<91 characters>/...") does not fit

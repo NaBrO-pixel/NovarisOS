@@ -391,7 +391,7 @@ uint32_t posix_unimplemented_count(void) {
 static int map_range(uint32_t base, uint32_t bytes, uint32_t flags) {
     for (uint32_t va = base; va < base + bytes; va += PAGE_SIZE) {
         uint32_t pte = paging_get_entry(va);
-        if (pte & PAGE_PRESENT) {
+        if ((pte & PAGE_PRESENT) && !(pte & PAGE_SHARED)) {
             /* Already mapped - which is the normal case for MAP_FIXED, and
              * exactly what a dynamic linker does: reserve the whole span
              * of a library with one PROT_NONE anonymous mapping, then map
@@ -399,18 +399,54 @@ static int map_range(uint32_t base, uint32_t bytes, uint32_t flags) {
              * segment actually wants. Keeping the frame but *not* applying
              * the new flags would leave every one of those segments with
              * the reservation's permissions, so a write to the GOT would
-             * fault. Keep the page, take the new protection - and keep
-             * PAGE_SHARED, which is not a protection but a fact about who
-             * owns the frame. */
-            paging_map_page(va, pte & ~0xFFFu, flags | (pte & PAGE_SHARED));
+             * fault. Keep the page, take the new protection. */
+            paging_map_page(va, pte & ~0xFFFu, flags);
             continue;
         }
+        /* A frame that belongs to a file, being mapped over with memory
+         * that belongs to this process: it has to be replaced, not
+         * reused. Keeping it and then zeroing it - which is what the
+         * caller does next for anonymous memory - would write zeroes into
+         * the file, and into every other process mapping it.
+         *
+         * A dynamic linker does exactly this, every time: it maps a
+         * library's data segment from the file and then maps the .bss
+         * tail over the end of it with MAP_FIXED|MAP_ANONYMOUS. Nothing
+         * noticed while a private file mapping was a private copy;
+         * Milestone 34 made those frames the file's, which is what turned
+         * this from a leak of somebody else's page into corruption of it. */
+        if (pte & PAGE_PRESENT) paging_unmap_page(va);
         uint32_t phys = pmm_alloc_frame();
         if (!phys) return 0;
         paging_map_page(va, phys, flags);
         kmemset((void*)va, 0, PAGE_SIZE); /* anonymous memory reads as zero */
     }
     return 1;
+}
+
+/* Breaks copy-on-write over a range the *kernel* is about to write into.
+ *
+ * A write from ring 3 to a COW page faults, and the fault is where the
+ * page is given its private copy (see PAGE_COW). A write from ring 0 does
+ * not fault at all: this is an i386 with CR0.WP clear, where a supervisor
+ * write ignores the read-only bit. So a read() into a buffer that happens
+ * to be part of a private file mapping would go straight into the file's
+ * own frames - and into every other process mapping that file - instead
+ * of into this process's copy.
+ *
+ * Called by the syscalls that write into a buffer the caller named.
+ * Nothing Wine does lands here today; the reason to do it anyway is that
+ * "nothing does it today" is not something this kernel can check, and the
+ * failure it would produce is a corrupted file three subsystems away. It
+ * costs one page-table read per page, and does nothing at all unless the
+ * pages really are copy-on-write. */
+static void break_cow_for_kernel_write(uint32_t addr, uint32_t len) {
+    if (!len) return;
+    uint32_t end = addr + len;
+    if (end < addr) return;                    /* wrapped */
+    for (uint32_t va = addr & ~(PAGE_SIZE - 1); va < end; va += PAGE_SIZE) {
+        paging_break_cow(va);
+    }
 }
 
 static void unmap_range(uint32_t base, uint32_t bytes) {
@@ -478,6 +514,100 @@ static int32_t mmap_fail(const char* why, uint32_t addr, uint32_t len,
 static int32_t mmap_refuse(const char* why, uint32_t addr, uint32_t len,
                            int flags, int32_t err) {
     return mmap_report(why, addr, len, flags, err, posix_trace_enabled());
+}
+
+/* Hands `bytes` of a file's own storage to user space at `base`.
+ *
+ * MAP_SHARED and MAP_PRIVATE differ here by two bits and nothing else.
+ * Both map the frames the file's bytes are actually in - that is what
+ * makes a mapping the file rather than a copy of it - and the private one
+ * adds PAGE_COW, so that the first write to a page is given a private
+ * frame with the same contents instead of reaching the file. Until that
+ * write the two are the same mapping, which is exactly the property Wine
+ * relies on. See PAGE_COW.
+ *
+ * Returns 1 on success, 0 if the file could not be made mappable, and -1
+ * if its storage turned out not to be resident - three outcomes because
+ * the caller reports them as three different things. On a failure the
+ * range is left as it was found. */
+static int map_file_range(uint32_t base, uint32_t bytes, vfs_node_t* node,
+                          uint32_t off, uint32_t pte_flags, int cow) {
+    /* Give the file page-aligned storage covering *the file*, and then
+     * hand over the frames that storage is made of.
+     *
+     * The file, and not the mapping, and that distinction is the whole of
+     * a bug Milestone 34 spent an afternoon on. A mapping routinely runs
+     * past the end of the file it is of - a loader maps a segment rounded
+     * up to a page, or a whole section whose last part is bss - and
+     * asking for storage that far would *grow* the file's buffer. Growing
+     * it means reallocating it, and reallocating it moves every byte to a
+     * new address while other mappings of the same file still point at
+     * the old frames.
+     *
+     * What that looks like is a library whose bytes are somebody else's:
+     * "wine: could not load ntdll.so: eh\xdd\xdd\xdd: cannot open shared
+     * object file", ld.so reading a DT_NEEDED name out of a freed heap
+     * block, because the mapping it read through had been made before a
+     * later mapping of the same file reallocated it.
+     *
+     * Sized to the file, this is stable: the first mapping settles the
+     * storage and no later one can move it. The pages past the end are
+     * handled below. */
+    uint32_t need = off + bytes;
+    if (need > node->length) need = node->length;
+    if (!vfs_make_mappable(node, need)) return 0;
+
+    for (uint32_t p = 0; p < bytes; p += PAGE_SIZE) {
+        /* MAP_FIXED over something this process already had: that frame
+         * is going out of use here and now, so give it back rather than
+         * leaking it. */
+        uint32_t old = paging_get_entry(base + p);
+        if ((old & PAGE_PRESENT) && !(old & PAGE_SHARED)) {
+            pmm_free_frame(old & ~0xFFFu);
+        }
+
+        /* Past the end of the file's storage there is nothing to share.
+         * Linux answers a read there with SIGBUS; Novaris answers it with
+         * a page of zeroes, which is what this kernel has always done and
+         * what the bss tail of a data segment wants. Ordinary memory, so
+         * no PAGE_SHARED and no copy-on-write.
+         *
+         * `here < off` is the wrap: mmap2's page offset comes from user
+         * space and can be anything, and an offset that overflows must
+         * land here rather than back inside the file. */
+        uint32_t here = off + p;
+        if (here < off || here >= node->capacity) {
+            uint32_t frame = pmm_alloc_frame();
+            if (!frame) {
+                unmap_range(base, p);
+                return -1;
+            }
+            paging_map_page(base + p, frame, pte_flags | PAGE_RW | PAGE_USER);
+            kmemset((void*)(base + p), 0, PAGE_SIZE);
+            paging_map_page(base + p, frame, pte_flags);
+            continue;
+        }
+
+        uint32_t kva = (uint32_t)node->data + here;
+        uint32_t kpte = paging_get_entry(kva);
+        if (!(kpte & PAGE_PRESENT)) {
+            unmap_range(base, p);
+            return -1;
+        }
+
+        uint32_t f = pte_flags | PAGE_SHARED;
+        if (cow) {
+            /* Every write to a private view has to fault: the writable
+             * kind so the page can be copied first, the read-only kind
+             * because writing to a read-only mapping is an access
+             * violation. PAGE_COW_RW is which of the two this is. */
+            f &= ~PAGE_RW;
+            f |= PAGE_COW;
+            if (pte_flags & PAGE_RW) f |= PAGE_COW_RW;
+        }
+        paging_map_page(base + p, kpte & ~0xFFFu, f);
+    }
+    return 1;
 }
 
 /* Finds `bytes` of free address space in the process's mmap arena.
@@ -627,31 +757,14 @@ static int32_t sys_mmap2(uint32_t addr, uint32_t length, int prot,
         if (!e || e->kind != FD_FILE) return -EBADF;
         uint32_t off = pgoff * PAGE_SIZE;
 
-        /* Give the file page-aligned storage covering the mapping, then
-         * hand over the frames that storage is made of. */
-        if (!vfs_make_mappable(e->node, off + bytes)) {
+        int r = map_file_range(base, bytes, e->node, off, pte_flags, 0);
+        if (r == 0) {
             return mmap_fail("cannot make file mappable", base, bytes,
                              flags, -ENOMEM);
         }
-
-        for (uint32_t p = 0; p < bytes; p += PAGE_SIZE) {
-            uint32_t kva = (uint32_t)e->node->data + off + p;
-            uint32_t kpte = paging_get_entry(kva);
-            if (!(kpte & PAGE_PRESENT)) {
-                unmap_range(base, p);
-                return mmap_fail("file storage not resident", base, bytes,
-                                 flags, -ENOMEM);
-            }
-
-            /* MAP_FIXED over something this process already had: that
-             * frame is going out of use here and now, so give it back
-             * rather than leaking it. */
-            uint32_t old = paging_get_entry(base + p);
-            if ((old & PAGE_PRESENT) && !(old & PAGE_SHARED)) {
-                pmm_free_frame(old & ~0xFFFu);
-            }
-            paging_map_page(base + p, kpte & ~0xFFFu,
-                            pte_flags | PAGE_SHARED);
+        if (r < 0) {
+            return mmap_fail("file storage not resident", base, bytes,
+                             flags, -ENOMEM);
         }
 
         /* The mapping keeps the file alive. Wine closes the descriptor
@@ -660,6 +773,37 @@ static int32_t sys_mmap2(uint32_t addr, uint32_t length, int prot,
          * while its frames were still mapped into two processes. */
         posix_pin_mapped(e->node);
         return (int32_t)base;
+    }
+
+    if (file_backed) {
+        /* MAP_PRIVATE on a file, which is the same mapping with two more
+         * bits in it - see PAGE_COW. The frames are the file's until
+         * something writes to one, and then only that page becomes this
+         * process's own.
+         *
+         * This is what a snapshot could not do, and what Wine's shared
+         * session block needs: a client maps its read-only view of
+         * wineserver's session file with MAP_PRIVATE, and every object the
+         * server writes after that has to show through it. See
+         * userland/mmap_test.c section 4a.
+         *
+         * The copy below is still here as a fallback rather than as the
+         * normal path: making a file mappable means page-aligned storage
+         * for the whole of it, and a large file on a full heap can fail
+         * that. Then a snapshot is a worse mapping than none. */
+        fd_entry_t* e = fd_get(fd);
+        if (!e || e->kind != FD_FILE) return -EBADF;
+        uint32_t off = pgoff * PAGE_SIZE;
+
+        int r = map_file_range(base, bytes, e->node, off, pte_flags, 1);
+        if (r > 0) {
+            posix_pin_mapped(e->node);
+            return (int32_t)base;
+        }
+        if (r < 0) {
+            return mmap_fail("file storage not resident", base, bytes,
+                             flags, -ENOMEM);
+        }
     }
 
     if (!map_range(base, bytes, pte_flags)) {
@@ -735,7 +879,27 @@ static int32_t sys_mprotect(uint32_t addr, uint32_t length, int prot) {
          * permission here like any other (see prot_to_pte): the page
          * stays mapped and stops being the program's, so the bytes are
          * still there when it asks for them back. */
-        paging_map_page(va, pte & ~0xFFFu, flags | (pte & PAGE_SHARED));
+        /* Per page, and not the loop's `flags`: a range being reprotected
+         * is a mixture, and one COW page in it must not decide how the
+         * ordinary ones after it are mapped. */
+        uint32_t page_flags = flags;
+        uint32_t keep = pte & (PAGE_SHARED | PAGE_COW);
+        if (pte & PAGE_COW) {
+            /* A private view of a file stays one: mprotect changes what
+             * the program may do with the page, not whose frame it is.
+             * The page therefore has to keep faulting on a write however
+             * writable it has just been made - what changes is what the
+             * fault then does, and PAGE_COW_RW is that.
+             *
+             * Wine is why this path exists rather than being theory: it
+             * maps a section view writable and mprotects it down to the
+             * protection the section actually asked for, so a shared
+             * session block spends its whole life as a page that has been
+             * through here. */
+            keep |= (page_flags & PAGE_RW) ? PAGE_COW_RW : 0;
+            page_flags &= ~PAGE_RW;
+        }
+        paging_map_page(va, pte & ~0xFFFu, page_flags | keep);
     }
     return 0;
 }
@@ -988,6 +1152,8 @@ static int32_t sys_read(int fd, char* buf, uint32_t count) {
         if (fd != 0) return -EBADF;
         return -ENOSYS;
     }
+    break_cow_for_kernel_write((uint32_t)buf, count);
+
     if (e->kind == FD_SOCKET) return socket_read(e->sock, buf, count, cur_regs);
 
     if (e->offset >= e->node->length) return 0; /* EOF */
@@ -1369,6 +1535,7 @@ static int32_t sys_getdents64(int fd, uint8_t* buf, uint32_t count) {
     if (e->kind == FD_CONSOLE || !(e->node->flags & VFS_DIRECTORY)) {
         return -ENOTDIR;
     }
+    break_cow_for_kernel_write((uint32_t)buf, count);
 
     uint32_t written = 0;
     for (;;) {
@@ -2318,6 +2485,7 @@ void posix_syscall(registers_t* regs) {
             if (off >= e->node->length) { r = 0; break; }
             uint32_t left = e->node->length - off;
             uint32_t n = c < left ? c : left;
+            break_cow_for_kernel_write(b, n);
             r = (int32_t)vfs_read(e->node, off, n, (uint8_t*)b);
             break;
         }
@@ -2487,10 +2655,19 @@ void posix_syscall(registers_t* regs) {
 
         case SYS_ugetrlimit: {
             /* struct rlimit { rlim_cur, rlim_max }. glibc reads RLIMIT_STACK
-             * (resource 3) to size its own guard pages. */
+             * (resource 3) to size its own guard pages, and Wine reads
+             * RLIMIT_NOFILE (resource 7) to decide how many descriptors it
+             * may spend - wineserver sizes its own table from it and the
+             * client caches unix descriptors up to it. Answering
+             * "unlimited" there is not generous, it is a lie the caller
+             * acts on: it opens until the kernel says EMFILE, and EMFILE
+             * arrives at a Wine that has already decided that cannot
+             * happen. The truth is POSIX_MAX_FDS. */
             uint32_t* lim = (uint32_t*)b;
             if (!lim) { r = -EFAULT; break; }
-            lim[0] = (a == 3) ? ELF_STACK_BYTES : 0xFFFFFFFFu;
+            lim[0] = (a == 3) ? ELF_STACK_BYTES
+                   : (a == 7) ? POSIX_MAX_FDS
+                              : 0xFFFFFFFFu;
             lim[1] = lim[0];
             r = 0;
             break;
@@ -2652,14 +2829,18 @@ void posix_syscall(registers_t* regs) {
                 if (a && a != (uint32_t)posix_current()->pid) { r = -ESRCH; break; }
                 uint32_t* old = (uint32_t*)d;
                 if (old) {
-                    uint64_t v = (b == 3) ? ELF_STACK_BYTES : 0xFFFFFFFFFFFFFFFFull;
+                    uint64_t v = (b == 3) ? ELF_STACK_BYTES
+                               : (b == 7) ? POSIX_MAX_FDS
+                                          : 0xFFFFFFFFFFFFFFFFull;
                     ((uint64_t*)old)[0] = v;
                     ((uint64_t*)old)[1] = v;
                 }
             } else {
                 uint32_t* lim = (uint32_t*)b;
                 if (!lim) { r = -EFAULT; break; }
-                lim[0] = (a == 3) ? ELF_STACK_BYTES : 0xFFFFFFFFu;
+                lim[0] = (a == 3) ? ELF_STACK_BYTES
+                       : (a == 7) ? POSIX_MAX_FDS
+                                  : 0xFFFFFFFFu;
                 lim[1] = lim[0];
             }
             r = 0;

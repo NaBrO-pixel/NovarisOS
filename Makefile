@@ -1054,11 +1054,43 @@ wine-disk:
 # wineserver starts; services.exe starts and works through the auto-start
 # list; and Wine's PE builtins load out of the prefix on the disk.
 #
-# What it deliberately does not assert is the absence of the failures
-# after that point. wineboot stops in shell32's delay-load of
-# SHGetFolderPathW and the transcript says so. Asserting a clean run would
-# be asserting something untrue; asserting the failure line would freeze
-# in place the exact thing Milestone 33 has to change.
+# The four --reject lines are Milestone 34's, and each one is a thing this
+# transcript used to say every time:
+#
+#   "Failed to get shared session object for window class" - sixteen times
+#   in a Milestone 33 run, once per NtUserRegisterClassExWOW, because a
+#   client's read-only MAP_PRIVATE view of wineserver's session file was a
+#   snapshot rather than the file. Private file mappings are copy-on-write
+#   now and the message is gone.
+#
+#   "failed to create desktop window" - seventeen times, and the direct
+#   consequence of the first.
+#
+#   "Too many open files" and the c000011f cascade under it - a process
+#   that ran out of the 128 descriptors it was allowed while loading DLLs,
+#   and reported that upwards as an invalid image format.
+#
+# And since Milestone 34 it asserts the thing itself: the .exe runs, on
+# the real path, and reports its own name as `Z:\hellowin.exe`. That last
+# detail is the point of the whole test - `Z:\` means the DOS drive table
+# built out of symbolic links in the prefix is what resolved the path,
+# where `make test-wine` gets `C:\windows\hellowin.exe` from the fallback
+# that runs when Wine has no drives at all.
+#
+# The *end* of the program's output rather than the start of it, and that
+# is deliberate. Several Wine processes share COM1 here and a line from
+# one can land in the middle of a line from another - a run where
+# "Hello from a real Windows .exe..." has a preloader warning spliced
+# through it is a run that worked. By the time the program reaches its
+# last few lines the others have gone quiet, so those are the lines worth
+# holding it to.
+#
+# Fifteen minutes of settle, and `--stop-when-matched` so that only a
+# failing run ever spends it. wineboot takes longer than the five minutes
+# Wine allows for its own boot event, so a *successful* run really does
+# contain "err:environ:run_wineboot" and then carries on and works, and how
+# much longer than that it takes varies by a lot between machines. Making
+# it quick is a separate problem from making it work.
 test-wine-prefix:
 	@test -f novaris-wine.iso || \
 	    { echo "run 'make WINE_BUILD=/path/to/wine wine-initrd' first"; exit 1; }
@@ -1067,13 +1099,20 @@ test-wine-prefix:
 	cp $(WINE_DISK_IMAGE) $(BUILD_DIR)/wine-disk-run.img
 	python3 tools/qemu_test.py --iso novaris-wine.iso \
 	    --disk $(BUILD_DIR)/wine-disk-run.img --memory 768 \
-	    --boot-wait 30 --settle 200 --timeout 260 \
-	    --cmd "run wine-preloader wine hellowin.exe" \
+	    --boot-wait 30 --settle 900 --timeout 1000 --stop-when-matched \
+	    --cmd "wine hellowin.exe" \
 	    --expect "FAT32 volume mounted at /disk" \
 	    --expect "Z:.*disk.*wine" \
 	    --expect "scmdatabase_autostart_services" \
-	    --expect "C:.*windows.*system32" \
+	    --expect "fib\(20\):    6765" \
+	    --expect "argv\[0\]: Z:.hellowin\.exe" \
+	    --expect "Exiting with code 0" \
 	    --reject "could not find DOS drive" \
+	    --reject "Failed to get shared session object" \
+	    --reject "failed to create desktop window" \
+	    --reject "Too many open files" \
+	    --reject "c000011f" \
+	    --reject "kernel heap exhausted" \
 	    --reject "KERNEL PANIC"
 
 zip:

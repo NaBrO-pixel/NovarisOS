@@ -583,6 +583,13 @@ static int handle_user_fault(registers_t* regs) {
     if (!user_active) return 0;
     if ((regs->cs & 3) != 3) return 0; /* the kernel itself faulted */
 
+    /* Before anything else, and before the program is told about it at
+     * all: the one page fault that is not an error. A write to a page a
+     * private file mapping still shares with the file gets that page a
+     * copy of its own, and the instruction is simply retried. See
+     * PAGE_COW - a Wine client takes hundreds of these. */
+    if (regs->int_no == 14 && posix_handle_cow_fault(regs)) return 1;
+
     /* A Win32 program gets the more detailed, Windows-shaped report. */
     if (win32_process_active()) {
         return win32_handle_user_fault(regs); /* does not return */

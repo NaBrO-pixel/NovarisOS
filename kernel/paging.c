@@ -522,6 +522,48 @@ int paging_reserve_page(uint32_t virt_addr) {
     return 1;
 }
 
+/* The staging buffer for the copy below. A page cannot be copied to
+ * itself in place: the destination has to be reachable, and the only
+ * address the source is reachable at is the one about to be repointed at
+ * the destination. Copying out and back in is the whole trick, and it
+ * costs one page of BSS rather than a second scratch mapping. */
+static uint8_t cow_staging[4096];
+
+int paging_break_cow(uint32_t virt_addr) {
+    uint32_t va = virt_addr & ~0xFFFu;
+    uint32_t pte = paging_get_entry(va);
+
+    if (!(pte & PAGE_PRESENT) || !(pte & PAGE_COW)) return 0;
+
+    uint32_t frame = pmm_alloc_frame();
+    if (!frame) return 0;
+
+    /* One buffer, one copy at a time. A fault arrives through an interrupt
+     * gate with interrupts already off, but this is also called from
+     * syscalls that are about to write into a user buffer - and those run
+     * with interrupts on, where the timer could put another task into the
+     * middle of the same two loops. Cheaper than a buffer per task and
+     * far cheaper than finding out later. */
+    uint32_t flags_reg;
+    __asm__ __volatile__("pushf; pop %0; cli" : "=r"(flags_reg) :: "memory");
+
+    for (uint32_t i = 0; i < 4096; i++) cow_staging[i] = ((uint8_t*)va)[i];
+
+    /* The copy is this process's own memory now, so both the bit that
+     * said "do not free this frame" and the two that described the
+     * sharing go, and the page becomes writable - which is what the
+     * faulting instruction is about to be retried against. */
+    uint32_t flags = (pte & 0xFFFu);
+    flags &= ~(PAGE_SHARED | PAGE_COW | PAGE_COW_RW);
+    flags |= PAGE_RW;
+    paging_map_page(va, frame, flags);
+
+    for (uint32_t i = 0; i < 4096; i++) ((uint8_t*)va)[i] = cow_staging[i];
+
+    __asm__ __volatile__("push %0; popf" :: "r"(flags_reg) : "memory", "cc");
+    return 1;
+}
+
 uint32_t paging_release_user_pages(void) {
     uint32_t freed = 0;
 

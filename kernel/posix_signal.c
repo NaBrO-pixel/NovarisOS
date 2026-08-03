@@ -56,6 +56,7 @@
 #include "fpu.h"
 #include "kstring.h"
 #include "process.h"
+#include "paging.h"
 
 /* --- per-process signal state -------------------------------------------
  *
@@ -484,6 +485,24 @@ void posix_deliver_pending(registers_t* regs) {
     }
 }
 
+int posix_handle_cow_fault(registers_t* regs) {
+    /* err_code bit 0 = the page was present, bit 1 = the access was a
+     * write, bit 2 = it came from ring 3. A copy-on-write fault is all
+     * three: a ring-3 write to a page that is there and is read-only. */
+    if ((regs->err_code & 0x7) != 0x7) return 0;
+
+    uint32_t cr2;
+    __asm__ __volatile__("mov %%cr2, %0" : "=r"(cr2));
+
+    uint32_t pte = paging_get_entry(cr2 & ~0xFFFu);
+    /* PAGE_COW alone is not enough: a read-only private mapping is a COW
+     * page too, and a write to one is a real access violation. The bit
+     * that separates them is PAGE_COW_RW. */
+    if (!(pte & PAGE_COW) || !(pte & PAGE_COW_RW)) return 0;
+
+    return paging_break_cow(cr2);
+}
+
 int posix_handle_fault_signal(registers_t* regs, uint32_t vector) {
     posix_proc_t* S = posix_current();
     int signo;
@@ -512,6 +531,35 @@ int posix_handle_fault_signal(registers_t* regs, uint32_t vector) {
             code = (regs->err_code & 1) ? SEGV_ACCERR : SEGV_MAPERR;
             break;
         default: return 0;
+    }
+
+    /* Under `strace`, say what faulted before handing it over. A program
+     * that handles its own faults - which is every Wine process - turns
+     * one of these into an exception several layers up, and "Unhandled
+     * exception code c0000005 addr 0x7bf7f5cd" says nothing about which
+     * page the kernel refused or why. The syscall trace it lands in the
+     * middle of is most of the answer. */
+    if (posix_trace_enabled()) {
+        char b[16];
+        terminal_writestring_color("[fault] ", VGA_COLOR_LIGHT_MAGENTA);
+        terminal_writestring("vector ");
+        ku32_to_dec(vector, b);
+        terminal_writestring(b);
+        terminal_writestring(" eip=0x");
+        ku32_to_hex(regs->eip, b, 0, 8);
+        terminal_writestring(b);
+        if (vector == 14) {
+            terminal_writestring(" addr=0x");
+            ku32_to_hex(cr2, b, 0, 8);
+            terminal_writestring(b);
+            terminal_writestring((regs->err_code & 2) ? " write" : " read");
+            terminal_writestring((regs->err_code & 1) ? " protection"
+                                                      : " not-mapped");
+            terminal_writestring(" pte=0x");
+            ku32_to_hex(paging_get_entry(cr2 & ~0xFFFu), b, 0, 8);
+            terminal_writestring(b);
+        }
+        terminal_writestring("\n");
     }
 
     /* Recorded whether or not a handler is installed and whether or not

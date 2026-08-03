@@ -251,6 +251,76 @@ int main_(void) {
         sc2(SYS_munmap, c, PAGE);
     }
 
+    /* 4a. ... but it is not a snapshot ------------------------------------
+     *
+     * Milestone 34, and the thing that stopped Wine's desktop. MAP_PRIVATE
+     * promises that *this* process's stores stay here. It does not promise
+     * a copy of the file taken at map time: until something writes to a
+     * page, the mapping is the file's own memory, so a writer elsewhere is
+     * visible through it.
+     *
+     * Wine depends on that deliberately. dlls/ntdll/unix/virtual.c maps a
+     * read-only view of a section with MAP_PRIVATE and says why in a
+     * comment - "changes to the file are not guaranteed to be visible in
+     * read-only MAP_PRIVATE mappings, but they are on Linux so we take
+     * advantage of it" - and win32u's shared session block is exactly such
+     * a view. A kernel that answers MAP_PRIVATE by allocating pages and
+     * reading the bytes in passes every check in section 4 and leaves
+     * every Wine client reading a session object that wineserver wrote
+     * after the client mapped it. */
+    out("\n4a. MAP_PRIVATE is not a snapshot\n");
+    {
+        long c = mmap2(0, 2 * PAGE, PROT_READ, MAP_PRIVATE, fd, 0);
+        check("mapped it private and read-only", mapped(c));
+        const char* pc = (const char*)c;
+        check("it starts out as the file", memeq(pc, "CCCCCCCC", 8));
+
+        fill(pa, 'I', 8);
+        check("a later store through a shared mapping shows through it",
+              memeq(pc, "IIIIIIII", 8));
+
+        /* And from a process that did not exist when the mapping was
+         * made - which is the wineserver case exactly. */
+        long pid = sc0(SYS_fork);
+        if (pid == 0) {
+            long cfd = sc3(SYS_open, (long)FILEPATH, O_RDWR, 0);
+            long cm = mmap2(0, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, cfd, 0);
+            if (!mapped(cm)) sc1(SYS_exit, 2);
+            fill((char*)cm, 'J', 8);
+            sc1(SYS_exit, 0);
+        }
+        sc3(SYS_waitpid, pid, (long)&status, 0);
+        check("and so does what another process wrote", memeq(pc, "JJJJJJJJ", 8));
+        sc2(SYS_munmap, c, 2 * PAGE);
+    }
+
+    /* 4b. the copy happens on the write, one page at a time --------------
+     *
+     * The other half of the same promise, and the half that says the
+     * sharing above is copy-on-write rather than just sharing: a page
+     * stops tracking the file the moment this process writes to it, and
+     * only that page does. Wine maps its section views writable and
+     * mprotects them down afterwards, so "writable but never written" is
+     * the state its shared session block is actually in. */
+    out("\n4b. MAP_PRIVATE copies on the write\n");
+    {
+        long c = mmap2(0, 2 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+        check("mapped it private and writable", mapped(c));
+        char* pc = (char*)c;
+        check("it starts out as the file", memeq(pc, "JJJJJJJJ", 8));
+
+        fill(pc, 'K', 8);                    /* the first page becomes ours */
+        check("a store through it does not reach the file",
+              memeq(pa, "JJJJJJJJ", 8));
+
+        fill(pa, 'L', 8);                    /* page 0, through the file */
+        fill(pa + PAGE, 'M', 8);             /* page 1, never written here */
+        check("the page it wrote is its own copy now", memeq(pc, "KKKKKKKK", 8));
+        check("the page it did not write still tracks the file",
+              memeq(pc + PAGE, "MMMMMMMM", 8));
+        sc2(SYS_munmap, c, 2 * PAGE);
+    }
+
     sc2(SYS_munmap, a, 2 * PAGE);
     sc2(SYS_munmap, b, 2 * PAGE);
 
