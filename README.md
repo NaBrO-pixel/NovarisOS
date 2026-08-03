@@ -303,13 +303,27 @@ loads its PE builtins straight off the disk — `sum` on
 `/disk/.wine/drive_c/windows/system32/gdi32.dll` inside Novaris gives the
 same checksum the host does, over the same 514,062 bytes.
 
-**And then it stops.** `shell32.dll` fails to import `gdi32.dll`,
-`shlwapi.dll` and `user32.dll` with `STATUS_INVALID_IMAGE_FORMAT`, and
-no Windows program runs on that path. It is not the filesystem and it is
-not simply memory, and which of the three fails first varies between runs
-of the same image — so it belongs to the loader or the address space.
-That question *is* Milestone 33, and `ROADMAP.md` sets out what is
-already known about it.
+**That failure is now understood.** It read as a problem with shell32 and
+was four problems elsewhere, none of them about image formats: a shared
+library (`libm.so.6`) that was never staged, so `win32u.so` could not be
+loaded and neither gdi32 nor user32 could initialise; an mmap arena that
+was a bump pointer and never reused an address, so long-lived processes
+ran out of address space and a PE loader reported that as an invalid
+image; an ELF stack at `0x40100000`, which made Wine conclude the stack
+was not near the top of memory and try to reserve into the kernel's half;
+and a four-entry, *global* table of shared-mapping references, past which
+a mapped file could be freed under a live mapping. All four are fixed and
+`ROADMAP.md` Milestone 33 has the full account of how each was found.
+
+**What stops it now is a different thing**: `NtUserRegisterClassExWOW`
+cannot get its shared session object, so there is no desktop window. The
+client maps wineserver's session file and reads an object header that is
+not the one the server wrote — two processes' `MAP_SHARED` views of one
+file disagreeing. The mapping mechanism itself has been ruled out by test
+(`userland/mmap_test.c` reproduces wineserver's exact grow-and-extend
+pattern, across two processes, and matches Linux); what has not been
+tested is the same thing through a descriptor passed over a Unix socket
+for a file that has already been unlinked.
 
 So `symlink()` is a switch. `symlinks off` in the shell restores the
 older path — Wine falls back to the Windows directory, and `hellowin.exe`
@@ -486,6 +500,16 @@ make test-wine   # boots novaris-wine.iso, asserts a Windows .exe's output
 make test-wine-threads   # ... and a *threaded* Windows .exe's
 make test-wine-prefix    # ... and how far Wine's real startup path gets
 ```
+
+`userland/mmap_test.c` is worth singling out among the `test-posix`
+programs. It is where the shared-mapping semantics Wine depends on are
+pinned down against Linux: a store through a mapping being visible to
+`read()`, two mappings of one file being one memory, a mapping surviving
+its file's name, and — since Milestone 33 — wineserver's own pattern of
+growing a file with `ftruncate` while it is mapped, mapping only the new
+tail at a non-zero offset, and a *separate process* writing through its
+own view. Ten checks, all compared line for line with what the same
+binary prints on Linux.
 
 `make test-posix` is the strongest of these, and the one the POSIX work
 is held to: ten programs written for Linux (raw `int $0x80`, built

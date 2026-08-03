@@ -170,6 +170,74 @@ int main_(void) {
               memeq(pa, "CCCCCCCC", 8));
     }
 
+    /* 3a. offsets, growth, and a second *process* ------------------------
+     *
+     * Milestone 32. This is the exact shape of wineserver's session
+     * mapping, and it is here because Wine failed on it while every test
+     * above passed. The server grows a file with ftruncate, maps only the
+     * newly added tail at a non-zero offset, and keeps every earlier
+     * block mapped where it was; clients then map their own views of the
+     * same file, at offsets of their own, and must see what the server
+     * wrote. Nothing above tests a non-zero offset, growth of a file that
+     * is already mapped, or two mappings made by two different processes
+     * rather than inherited across a fork. */
+    out("\n3a. offsets, growth, and a second process\n");
+    {
+        check("grow the file to four pages",
+              sc2(SYS_ftruncate, fd, 4 * PAGE) == 0);
+
+        /* The earlier mappings must still be the file after it grew. */
+        fill(pa, 'E', 8);
+        check("a mapping made before the growth still works",
+              memeq(pb, "EEEEEEEE", 8));
+
+        /* A mapping at a non-zero offset is a different part of the file,
+         * not another view of the start. */
+        long t = mmap2(0, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 2);
+        check("mapped at a page offset", mapped(t));
+        char* pt = (char*)t;
+        fill(pt, 'F', 8);
+        check("it is not an alias of offset zero", memeq(pa, "EEEEEEEE", 8));
+
+        sc3(SYS_lseek, fd, 2 * PAGE, 0);
+        n = sc3(SYS_read, fd, (long)buf, 8);
+        check("and read() at that offset sees what it wrote",
+              n == 8 && memeq(buf, "FFFFFFFF", 8));
+
+        /* Grow again, with three mappings outstanding, and map the new
+         * tail the way the server does. */
+        check("grow it again while mapped",
+              sc2(SYS_ftruncate, fd, 8 * PAGE) == 0);
+        long u = mmap2(0, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 6);
+        check("mapped the new tail", mapped(u));
+        fill((char*)u, 'G', 8);
+
+        check("the mappings from before the second growth still hold",
+              memeq(pa, "EEEEEEEE", 8) && memeq(pt, "FFFFFFFF", 8));
+
+        /* And now the client half: a *separate* process that opens the
+         * file itself and maps its own view, rather than inheriting one.
+         * What it writes has to arrive in a mapping this process made
+         * before that process existed. */
+        long pid = sc0(SYS_fork);
+        if (pid == 0) {
+            long cfd = sc3(SYS_open, (long)FILEPATH, O_RDWR, 0);
+            long cm = mmap2(0, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, cfd, 2);
+            if (!mapped(cm)) sc1(SYS_exit, 2);
+            fill((char*)cm, 'H', 8);
+            sc1(SYS_exit, memeq((char*)cm, "HHHHHHHH", 8) ? 0 : 3);
+        }
+        sc3(SYS_waitpid, pid, (long)&status, 0);
+        check("the child mapped the same file by name", (status >> 8) == 0);
+        check("and what it wrote is visible in a mapping made earlier",
+              memeq(pt, "HHHHHHHH", 8));
+
+        sc2(SYS_munmap, t, PAGE);
+        sc2(SYS_munmap, u, PAGE);
+        /* Back to what section 4 expects to find at offset 0. */
+        fill(pa, 'C', 8);
+    }
+
     /* 4. a private mapping is not shared ---------------------------------- */
     out("\n4. MAP_PRIVATE is private\n");
     {

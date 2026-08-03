@@ -833,6 +833,32 @@ wine-initrd: $(BUILD_DIR)/initrd.img $(KERNEL)
 	# toolchain, like ld-linux.so.2 and libc.so.6 and for the same
 	# reasons.
 	cp $(HOST_LIB32)/libgcc_s.so.1 $(BUILD_DIR)/wine_staging/libgcc_s.so.1
+	# Milestone 32. Every other shared library anything here links
+	# against, worked out rather than listed.
+	#
+	# The hand-written list was wrong and had been for two milestones:
+	# win32u.so needs libm.so.6 and nothing shipped it, so the Unix half
+	# of win32u could not be dlopen'd - and win32u is the Unix backend
+	# for both gdi32 and user32. Wine said so, once, in a warning inside
+	# a trace channel nobody had turned on:
+	#
+	#   warn:module:get_builtin_unix_funcs failed to load
+	#     "//i386-unix/win32u.so": libm.so.6: cannot open shared object file
+	#
+	# The same lesson as the NLS tables above, so the same answer: ask the
+	# binaries what they need instead of remembering. objdump reports the
+	# DT_NEEDED entries; anything already staged is skipped, and anything
+	# that is not in HOST_LIB32 is left to announce itself at run time
+	# rather than silently breaking the build.
+	@for f in $(BUILD_DIR)/wine_staging/*.so $(BUILD_DIR)/wine_staging/wineserver \
+	          $(BUILD_DIR)/wine_staging/wine $(BUILD_DIR)/wine_staging/preload.elf; do \
+	    objdump -p $$f 2>/dev/null | awk '/NEEDED/ { print $$2 }'; \
+	done | sort -u | while read lib; do \
+	    test -f $(BUILD_DIR)/wine_staging/$$lib && continue; \
+	    test -f $(HOST_LIB32)/$$lib || continue; \
+	    echo "  + $$lib (needed by a Wine .so)"; \
+	    cp $(HOST_LIB32)/$$lib $(BUILD_DIR)/wine_staging/$$lib; \
+	done
 	python3 userland/mkinitrd.py $(BUILD_DIR)/wine_staging \
 	    $(BUILD_DIR)/wine_iso/boot/initrd.img
 	cp $(BUILD_DIR)/novaris.bin $(BUILD_DIR)/wine_iso/boot/novaris.bin

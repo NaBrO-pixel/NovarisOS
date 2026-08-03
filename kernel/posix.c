@@ -166,27 +166,47 @@ int posix_fd_import(uint32_t token) {
  *
  * Released at the end of the program run rather than at munmap, because
  * nothing here records which file a given address range came from. That
- * is a real limit and a small one - the reference costs a node, the run
- * ends, and the table is fixed at four because Wine uses one. */
-#define MAX_PINNED 4
-static vfs_node_t* pinned[MAX_PINNED];
+ * is a real limit and a small one - the reference costs a node and the
+ * run ends.
+ *
+ * Milestone 30 sized this table at four "because Wine uses one", and
+ * Milestone 32 found out what that costs once Wine has a prefix. Every
+ * process running under Wine maps several shared files - wineserver's
+ * session mapping alone is a fresh block every time it grows - and the
+ * table was *global* rather than per process, so four was shared between
+ * a dozen of them. Past the fourth, the old code took no reference at
+ * all: the descriptor was then closed (Wine closes it as soon as the
+ * mapping exists) and the name was already unlinked, so the node was
+ * freed and its storage reused while two processes still had its frames
+ * mapped. What that looks like from inside Wine is a shared object whose
+ * contents are somebody else's: "Session object id doesn't match expected
+ * id 1".
+ *
+ * Per process now, and thirty-two of them. Overflow keeps the reference
+ * instead of dropping it - a node held for the life of the machine is a
+ * leak, and a node freed under a live mapping is memory corruption. */
+#define MAX_PINNED 32
 
 static void posix_pin_mapped(vfs_node_t* node) {
+    posix_proc_t* p = posix_current();
     for (int i = 0; i < MAX_PINNED; i++) {
-        if (pinned[i] == node) return;      /* already held */
-        if (!pinned[i]) {
-            pinned[i] = node;
+        if (p->pinned[i] == node) return;      /* already held */
+        if (!p->pinned[i]) {
+            p->pinned[i] = node;
             vfs_node_ref(node);
             return;
         }
     }
+    /* Out of slots: take the reference anyway and never give it back. */
+    vfs_node_ref(node);
 }
 
 static void posix_unpin_all(void) {
+    posix_proc_t* p = posix_current();
     for (int i = 0; i < MAX_PINNED; i++) {
-        if (!pinned[i]) continue;
-        vfs_node_unref(pinned[i]);
-        pinned[i] = 0;
+        if (!p->pinned[i]) continue;
+        vfs_node_unref(p->pinned[i]);
+        p->pinned[i] = 0;
     }
 }
 
@@ -405,6 +425,104 @@ static void unmap_range(uint32_t base, uint32_t bytes) {
     }
 }
 
+/* Why an mmap failed, said out loud - at most a few dozen times, so a
+ * program that probes for a fit (Wine's preloader asks for two gigabytes
+ * and halves until something works) cannot flood the transcript.
+ *
+ * This exists because of how badly the failure reads from above. A PE
+ * loader that cannot map a section reports the *image* as invalid, so an
+ * address-space problem in this kernel arrived as "Loading library
+ * win32u.dll failed (error c000011f)" - a message about a file that was
+ * perfectly fine. One line here saying which request was refused and why
+ * is worth more than any amount of reasoning about the other end. */
+#define MMAP_FAIL_REPORTS 40
+static uint32_t mmap_fail_reported = 0;
+
+static int32_t mmap_report(const char* why, uint32_t addr, uint32_t len,
+                           int flags, int32_t err, int always) {
+    if (always && mmap_fail_reported < MMAP_FAIL_REPORTS) {
+        char buf[16];
+        mmap_fail_reported++;
+        terminal_writestring_color("[posix] mmap refused: ", VGA_COLOR_LIGHT_RED);
+        terminal_writestring(why);
+        terminal_writestring(" addr=0x");
+        ku32_to_hex(addr, buf, 0, 8);
+        terminal_writestring(buf);
+        terminal_writestring(" len=");
+        ku32_to_dec(len, buf);
+        terminal_writestring(buf);
+        terminal_writestring(" flags=0x");
+        ku32_to_hex((uint32_t)flags, buf, 0, 4);
+        terminal_writestring(buf);
+        terminal_writestring("\n");
+    }
+    return err;
+}
+
+/* A request the kernel could not satisfy: the arena is full, there are no
+ * frames, a page table could not be made. Always reported - none of these
+ * is a normal thing for a program to meet, and each one arrives somewhere
+ * else as a completely different-looking error. */
+static int32_t mmap_fail(const char* why, uint32_t addr, uint32_t len,
+                         int flags, int32_t err) {
+    return mmap_report(why, addr, len, flags, err, 1);
+}
+
+/* A request the kernel *refused on purpose*: an address above user space,
+ * a range belonging to the kernel, a MAP_FIXED_NOREPLACE onto something
+ * already there. These are the interface working, and programs provoke
+ * them deliberately - Wine's preloader halves its request until one fits,
+ * and userland/mmap_test.c asserts that NOREPLACE refuses. Reported only
+ * under `strace`, because a line here is an extra line in a transcript
+ * that is compared against Linux byte for byte. */
+static int32_t mmap_refuse(const char* why, uint32_t addr, uint32_t len,
+                           int flags, int32_t err) {
+    return mmap_report(why, addr, len, flags, err, posix_trace_enabled());
+}
+
+/* Finds `bytes` of free address space in the process's mmap arena.
+ *
+ * Milestone 32 replaced a bump pointer with this, and the bump pointer is
+ * worth describing because its failure was so hard to read. `mmap_next`
+ * only ever went up: munmap gave the frames back but never the
+ * *addresses*, so a process that mapped and unmapped repeatedly walked
+ * the pointer to the end of the arena and then had every anonymous
+ * mapping refused for ever. Wine's PE loader maps a header, maps each
+ * section, and unmaps the lot again for every DLL it merely *probes* - so
+ * wineboot, which probes dozens, ran the arena out while every
+ * shorter-lived process around it was fine. The same DLL loaded in eight
+ * processes and failed in the ninth, which is exactly what that looks
+ * like from outside.
+ *
+ * First fit from a rotating hint, and a page that is present *or
+ * reserved* counts as taken. The second half of that matters
+ * independently: a PROT_NONE reservation is somebody's plan for an
+ * address, and the bump pointer used to hand those addresses out to
+ * somebody else - Wine reserves the low 2GB at startup precisely so that
+ * Windows images can go there later. */
+static uint32_t arena_find(posix_proc_t* P, uint32_t bytes) {
+    if (!bytes || bytes > MMAP_ARENA_END - MMAP_ARENA_START) return 0;
+
+    uint32_t hint = P->mmap_next;
+    if (hint < MMAP_ARENA_START || hint >= MMAP_ARENA_END) {
+        hint = MMAP_ARENA_START;
+    }
+
+    for (int pass = 0; pass < 2; pass++) {
+        uint32_t from = (pass == 0) ? hint : MMAP_ARENA_START;
+        uint32_t to   = (pass == 0) ? MMAP_ARENA_END : hint;
+        uint32_t run = from;
+        for (uint32_t a = from; a < to; a += PAGE_SIZE) {
+            if (paging_get_entry(a) & (PAGE_PRESENT | PAGE_RESERVED)) {
+                run = a + PAGE_SIZE;
+                continue;
+            }
+            if (a + PAGE_SIZE - run >= bytes) return run;
+        }
+    }
+    return 0;
+}
+
 /* mmap2(addr, length, prot, flags, fd, pgoffset). Only anonymous private
  * mappings are supported - file-backed mmap needs a page cache, which
  * this kernel does not have. */
@@ -440,8 +558,12 @@ static int32_t sys_mmap2(uint32_t addr, uint32_t length, int prot,
         /* The range has to exist and has to be the program's. Wine's
          * preloader asks for two gigabytes at a time and halves until
          * something fits, so both of these are answers it expects. */
-        if (addr + bytes < addr) return -ENOMEM;            /* wrapped */
-        if (addr + bytes > USER_SPACE_END) return -ENOMEM;  /* the kernel's */
+        if (addr + bytes < addr) {
+            return mmap_refuse("wrapped", addr, bytes, flags, -ENOMEM);
+        }
+        if (addr + bytes > USER_SPACE_END) {
+            return mmap_refuse("above user space", addr, bytes, flags, -ENOMEM);
+        }
         /* MAP_FIXED_NOREPLACE differs from MAP_FIXED in exactly one way,
          * and it is the way that matters to a loader: it refuses rather
          * than evicting. A reservation counts as occupied - it is
@@ -449,7 +571,8 @@ static int32_t sys_mmap2(uint32_t addr, uint32_t length, int prot,
         if (flags & MAP_FIXED_NOREPLACE) {
             for (uint32_t p = 0; p < bytes; p += PAGE_SIZE) {
                 if (paging_get_entry(addr + p) & (PAGE_PRESENT | PAGE_RESERVED)) {
-                    return -EEXIST;
+                    return mmap_refuse("occupied (NOREPLACE)", addr, bytes,
+                                     flags, -EEXIST);
                 }
             }
         }
@@ -463,12 +586,17 @@ static int32_t sys_mmap2(uint32_t addr, uint32_t length, int prot,
          * program's to take), and a caller that cannot have the range it
          * asked for is told so rather than being given a machine that
          * stops. See ROADMAP.md Milestone 27. */
-        if (paging_region_conflict(addr, addr + bytes)) return -ENOMEM;
+        if (paging_region_conflict(addr, addr + bytes)) {
+            return mmap_refuse("kernel region", addr, bytes, flags, -ENOMEM);
+        }
         base = addr;
     } else {
-        if (P->mmap_next + bytes > MMAP_ARENA_END) return -ENOMEM;
-        base = P->mmap_next;
-        P->mmap_next += bytes;
+        base = arena_find(P, bytes);
+        if (!base) return mmap_fail("arena full", 0, bytes, flags, -ENOMEM);
+        /* Where to start looking next time. Not a bump pointer any more -
+         * arena_find() will wrap past it - but starting from the last
+         * allocation keeps the common case one short scan. */
+        P->mmap_next = base + bytes;
     }
 
     /* PROT_NONE with nothing behind it is a *reservation*, and it costs a
@@ -486,7 +614,7 @@ static int32_t sys_mmap2(uint32_t addr, uint32_t length, int prot,
             }
             if (!paging_reserve_page(base + p)) {
                 unmap_range(base, p);
-                return -ENOMEM;
+                return mmap_fail("no page table", base, bytes, flags, -ENOMEM);
             }
         }
         return (int32_t)base;
@@ -501,12 +629,19 @@ static int32_t sys_mmap2(uint32_t addr, uint32_t length, int prot,
 
         /* Give the file page-aligned storage covering the mapping, then
          * hand over the frames that storage is made of. */
-        if (!vfs_make_mappable(e->node, off + bytes)) return -ENOMEM;
+        if (!vfs_make_mappable(e->node, off + bytes)) {
+            return mmap_fail("cannot make file mappable", base, bytes,
+                             flags, -ENOMEM);
+        }
 
         for (uint32_t p = 0; p < bytes; p += PAGE_SIZE) {
             uint32_t kva = (uint32_t)e->node->data + off + p;
             uint32_t kpte = paging_get_entry(kva);
-            if (!(kpte & PAGE_PRESENT)) { unmap_range(base, p); return -ENOMEM; }
+            if (!(kpte & PAGE_PRESENT)) {
+                unmap_range(base, p);
+                return mmap_fail("file storage not resident", base, bytes,
+                                 flags, -ENOMEM);
+            }
 
             /* MAP_FIXED over something this process already had: that
              * frame is going out of use here and now, so give it back
@@ -529,7 +664,7 @@ static int32_t sys_mmap2(uint32_t addr, uint32_t length, int prot,
 
     if (!map_range(base, bytes, pte_flags)) {
         unmap_range(base, bytes);
-        return -ENOMEM;
+        return mmap_fail("out of frames", base, bytes, flags, -ENOMEM);
     }
 
     if (!file_backed) {

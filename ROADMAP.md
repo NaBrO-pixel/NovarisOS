@@ -4547,38 +4547,148 @@ path it is testing rather than depend on a default.
 - [ ] **No GUI**, **no networking**, and `fork` still copies eagerly —
       unchanged from Milestone 30.
 
-## Milestone 33 — a Windows program on Wine's real startup path (next)
+## Milestone 33 — Wine's real startup path (in progress)
 
-One question, named precisely by Milestone 32 rather than guessed at:
-**why does `shell32.dll` fail to import `gdi32.dll`, `shlwapi.dll` and
-`user32.dll` with `STATUS_INVALID_IMAGE_FORMAT`, once Wine has its DOS
-drives?**
+Milestone 32 ended by naming one question: **why does `shell32.dll` fail
+to import `gdi32.dll`, `shlwapi.dll` and `user32.dll` with
+`STATUS_INVALID_IMAGE_FORMAT`, once Wine has its DOS drives?**
 
-What is known:
+It had four answers, none of which was about shell32, gdi32 or image
+formats. Each was found by making the kernel or Wine say something it had
+not been saying, rather than by reasoning about the message.
 
-- It is not the filesystem. Those DLLs read back off the disk byte for
-  byte identical to the host, checked with `sum`.
-- It is not simply memory. Raising the heap ceiling from 48MB to 192MB
-  moved the failure from one DLL to another rather than removing it.
-- Which of the three fails first varies between runs of the same image,
-  so it depends on ordering or timing — the address space, or `mmap`
-  under fragmentation, or a MAP_FIXED that collides only sometimes.
-- It happens deep in `wineboot`, after `services.exe` has started
-  several processes, so the machine is busy and the address space is
-  full of mappings by the time it does.
+### 1. A shared library that was never shipped
 
-Worth trying, roughly in order of expected information per hour:
-`strace` on the failing process to see which `mmap2` returns what;
-counting the mappings a Wine process accumulates; and checking whether
-`mprotect` on a shared file mapping does what Wine assumes.
+Wine's builtins come in halves: a PE `.dll` the Windows program links
+against, and a Unix `.so` it reaches through `__wine_init_unix_call()`.
+Milestone 31 learned that shipping only the first half breaks the DLL and
+listed the three `.so` files to copy. It did not list what *those* link
+against, and `win32u.so` needs `libm.so.6`.
 
-Two things follow it, both made worth doing by the disk:
+`win32u` is the Unix backend for **both gdi32 and user32**. Without it
+neither can initialise, and shell32 imports both. So the reported failure
+was three DLLs deep from a missing maths library, and Wine said so
+exactly once, in a warning on a trace channel nobody had turned on:
 
-- **A page cache**, so a mapped file's bytes are frames rather than
-  heap, and so unmapping gives them back.
-- **Building the prefix on Novaris**, which means `rundll32` and enough
-  of setupapi to run `wine.inf` — and which would make the disk image a
-  product of the machine rather than of a host.
+```
+warn:module:get_builtin_unix_funcs failed to load "//i386-unix/win32u.so":
+    libm.so.6: cannot open shared object file: No such file or directory
+```
+
+The fix is not "also copy libm". `wine-initrd` now runs `objdump -p` over
+everything it stages and copies whatever the binaries say they need -
+the same answer Milestone 30 reached about the NLS tables, for the same
+reason: a missing file does not announce itself.
+
+### 2. An mmap arena that never gave anything back
+
+`mmap_next` only ever went up. `munmap` returned the frames and kept the
+*addresses*, so a process that mapped and unmapped repeatedly walked the
+pointer to the end of the 96MB arena and had every anonymous mapping
+refused from then on.
+
+A PE loader maps a header, maps each section and unmaps the lot again for
+every DLL it merely *probes* - so `wineboot`, which probes dozens, ran the
+arena out while every shorter-lived process around it was fine. That is
+why the same DLL loaded in eight processes and failed in the ninth, and
+why the failure moved when unrelated things changed.
+
+`mmap` now does first fit from a rotating hint, and a page that is
+present *or reserved* counts as taken. The second half matters on its
+own: a PROT_NONE reservation is somebody's plan for an address, and the
+bump pointer had been handing those addresses out to somebody else.
+
+### 3. A stack in the wrong place
+
+Wine's `mmap_init()` takes the address of a local variable and asks
+whether the stack is above `0x7FFE0000`. On Linux/i386 it is - the
+initial stack sits just under `0xC0000000` - and Wine reserves the space
+*below* the stack for Windows images and stops at `0xC0000000`.
+
+Novaris put an ELF program's stack at `0x40100000`, so the answer was no,
+and Wine instead tried to reserve everything from `0x7FFE0000` to the top
+of the 32-bit address space: straight into the kernel's half, refused
+page after page, ending with no reserved area to place images in at all.
+The kernel now says so out loud when it refuses a mapping, and a boot log
+full of
+
+```
+[posix] mmap refused: above user space addr=0xc0040000 len=65536
+```
+
+is what that had looked like from here all along. An ELF program's stack
+now goes where Linux puts it, `0xBFFF0000`.
+
+### 4. A four-entry table shared between a dozen processes
+
+A shared mapping has to outlive both the descriptor it was made from and
+the file's *name* - creating a file, opening it, unlinking it and mapping
+it is how anonymous shared memory is made on Unix, and it is what
+wineserver does. Milestone 30 held a reference for each such node in a
+table it sized at four "because Wine uses one".
+
+The table was global rather than per process, and past the fourth entry
+the old code took **no reference at all**. The descriptor was then closed
+- Wine closes it as soon as the mapping exists - and with the name
+already gone the node was freed and its storage reused while two
+processes still had its frames mapped.
+
+Per process now, thirty-two of them, and an overflow keeps the reference
+instead of dropping it: a node held for the life of the machine is a
+leak, and a node freed under a live mapping is memory corruption.
+
+### What that bought
+
+The shell32 cascade is gone. Wine gets through its builtins, `wineboot`
+runs past the point it used to stop at, `services.exe` works through the
+auto-start list, and `explorer.exe` starts. `make test-wine-prefix`
+asserts the path as far as it reliably goes.
+
+Two other bugs turned up on the way and are fixed: `setenv` used to
+*replace* the environment rather than add to it, so the first `setenv` in
+a session silently discarded `HOME` - which sent a whole debugging run to
+the wrong prefix before the transcript gave it away - and `fsync()` now
+pushes the disk's FSInfo block out instead of reporting that there is
+nothing behind the filesystem.
+
+### Still open: the shared session object
+
+`NtUserRegisterClassExWOW` fails in every process with "Failed to get
+shared session object for window class", and without it there is no
+desktop window and no GUI. Traced, the message under it is:
+
+```
+warn:winstation:find_shared_session_object Session object id doesn't
+    match expected id 1
+```
+
+The client maps wineserver's session file successfully and then reads an
+object header that is not the one the server says it wrote. So the two
+processes' `MAP_SHARED` views of one file disagree.
+
+What is already ruled out: the mapping mechanism itself.
+`userland/mmap_test.c` gained a section that reproduces wineserver's
+exact pattern - grow a file with `ftruncate` while it is mapped, map only
+the newly added tail at a non-zero offset, keep the earlier mappings, and
+have a *separate process* open the same file and write through its own
+view - and Novaris matches Linux on all ten checks. The remaining
+difference between that test and wineserver is how the second process
+gets the file: by name in the test, and as a descriptor passed over a
+Unix socket, for a file that has already been unlinked, in Wine.
+
+That is the next thing to test, and the test is the obvious one: teach
+`sock_test.c` to pass a descriptor for a mapped, unlinked file over
+`SCM_RIGHTS` and check coherence through it.
+
+Two other things are worth saying honestly about the current state:
+
+- **The failures vary between runs of the same image.** Which DLL fails,
+  and how many do, is not stable. Something is still timing- or
+  ordering-dependent, and the remaining `c000011f` reports are almost
+  certainly a second cause rather than noise from the first.
+- **`CreateProcess` still reports `STATUS_NO_MEMORY`** when starting
+  explorer, on a machine with two gigabytes free. `fork` copies the
+  address space eagerly, and that is the obvious suspect.
 
 ## Later / open-ended
 

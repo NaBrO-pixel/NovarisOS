@@ -37,6 +37,27 @@ uint32_t user_fs_selector = 0x23;
 #define PIE_BASE     0x56000000u
 #define INTERP_BASE  0x5A000000u
 
+/* Where an ELF program's stack goes, and it is not where a flat binary's
+ * goes (USER_STACK_TOP, just above its 0x40000000 load address).
+ *
+ * Linux/i386 puts the initial stack at the very top of user space, a
+ * little under 0xC0000000, and Milestone 32 found out that this is not
+ * cosmetic - real programs have heuristics keyed to it. Wine's
+ * mmap_init() takes the address of a local variable and asks whether the
+ * stack is above 0x7FFE0000. On Linux it is, and Wine reserves the space
+ * below the stack for Windows images and stops at 0xC0000000. With the
+ * stack at 0x40100000 the answer was no, and Wine instead tried to
+ * reserve everything from 0x7FFE0000 to the top of the 32-bit address
+ * space - walking straight into the kernel's half, being refused page
+ * after page, and ending up with no reserved area to place images in at
+ * all. `mmap refused: above user space addr=0xc0040000` in a boot log,
+ * over and over, is what that looked like from here.
+ *
+ * 16KB below the top rather than exactly at it, so that the argv/envp
+ * block build_initial_stack() writes has somewhere to live and a
+ * one-page overrun faults instead of wrapping. */
+#define ELF_STACK_TOP 0xBFFF0000u
+
 /* Non-zero between entering ring 3 and coming back out of it. Only the
  * fault path reads it, and only to decide whether a CPU exception belongs
  * to a user program or to the kernel. */
@@ -383,7 +404,7 @@ int process_load_elf_image(const uint8_t* image, uint32_t size,
      * and each of those needs somewhere to put a stack of its own out of
      * its mmap arena, but the main thread's own frames also get deeper
      * once there is a real program on top. */
-    for (uint32_t va = USER_STACK_TOP - ELF_STACK_SIZE; va < USER_STACK_TOP;
+    for (uint32_t va = ELF_STACK_TOP - ELF_STACK_SIZE; va < ELF_STACK_TOP;
          va += PAGE_SIZE) {
         if (paging_get_entry(va) & PAGE_PRESENT) continue;
         uint32_t phys = pmm_alloc_frame();
@@ -401,7 +422,7 @@ int process_load_elf_image(const uint8_t* image, uint32_t size,
     if (argc < 1 || !argv) { argc = 1; argv = default_argv; }
 
     *out_entry = start;
-    *out_esp = build_initial_stack(USER_STACK_TOP, argc, argv, envc, envp,
+    *out_esp = build_initial_stack(ELF_STACK_TOP, argc, argv, envc, envp,
                                    &info, interp_base);
     return 1;
 }
@@ -423,6 +444,10 @@ static void env_defaults(void) {
     };
     env_count = 0;
     env_used = 0;
+    /* Set before the process_env_set() calls below, not after: those call
+     * back in here through the `if (!env_ready)` guard, and a flag raised
+     * at the end of this function would make that recursion unbounded. */
+    env_ready = 1;
     /* HOME follows the disk. Milestone 32: a home directory is where a
      * program puts the things it means to keep, and until there was a
      * disk the only honest answer was "/" - the root of a filesystem that
@@ -437,11 +462,20 @@ static void env_defaults(void) {
     for (uint32_t i = 0; i < sizeof(defaults) / sizeof(defaults[0]); i++) {
         process_env_set(defaults[i]);
     }
-    env_ready = 1;
 }
 
 int process_env_set(const char* assignment) {
-    if (!env_ready) { env_ready = 1; env_count = 0; env_used = 0; }
+    /* Seed the defaults rather than start from nothing. The old line here
+     * was `if (!env_ready) { env_ready = 1; env_count = 0; ... }`, which
+     * made the *first* `setenv` in a session silently discard HOME, PATH,
+     * USER, TMPDIR and SHELL - so `setenv WINEDEBUG=+module` did not add
+     * a variable, it replaced the whole environment with one.
+     *
+     * Found the way these things are: a Wine run under tracing built its
+     * prefix in `/.wine` instead of `/disk/.wine` and nothing else in the
+     * transcript explained why. HOME had been thrown away by the command
+     * that turned tracing on. */
+    if (!env_ready) env_defaults();
     if (!assignment || !*assignment) return 0;
 
     uint32_t len = kstrlen(assignment) + 1;
