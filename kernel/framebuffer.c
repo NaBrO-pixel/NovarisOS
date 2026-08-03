@@ -1,4 +1,5 @@
 #include "framebuffer.h"
+#include "serial.h"
 
 static uint8_t* fb_base = 0;
 static uint32_t fb_pitch = 0;   /* bytes per scanline */
@@ -29,7 +30,41 @@ uint32_t fb_rgb(uint8_t r, uint8_t g, uint8_t b) {
     return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 }
 
+/* --- who is allowed to write here (Milestone 36) -------------------------
+ *
+ * Once the desktop is up the framebuffer belongs to the compositor: every
+ * frame is built in an off-screen surface and pushed out one damaged
+ * rectangle at a time by fb_blit(). Anything else that writes here writes
+ * *behind* that, and what it draws survives in every rectangle the
+ * compositor does not happen to repaint - which is a stripe of stale
+ * pixels sitting on the screen for ever.
+ *
+ * That is not hypothetical: a black band sixteen pixels tall appeared at
+ * a fixed place during Wine runs and stayed there, and finding out who
+ * drew it took a day of wrong guesses. So the framebuffer says so itself
+ * now, once, naming the call. Cheap, and it turns "there is a mark on the
+ * screen" into a line of text.
+ *
+ * fb_blit() is the compositor's own path and is deliberately not
+ * reported. */
+static int fb_owned_by_compositor = 0;
+static int fb_trespass_reported = 0;
+
+void fb_set_compositor_owned(int owned) {
+    fb_owned_by_compositor = owned ? 1 : 0;
+}
+
+static void fb_trespass(const char* who) {
+    if (!fb_owned_by_compositor || fb_trespass_reported) return;
+    fb_trespass_reported = 1;
+    serial_writestring("[fb] ");
+    serial_writestring(who);
+    serial_writestring(" wrote to the framebuffer while the compositor "
+                       "owned it - see kernel/framebuffer.c\n");
+}
+
 void fb_put_pixel(uint32_t x, uint32_t y, uint32_t color) {
+    fb_trespass("fb_put_pixel");
     if (x >= fb_w || y >= fb_h) return;
     uint8_t* p = fb_base + y * fb_pitch + x * fb_bytes_per_pixel;
     p[0] = (uint8_t)(color & 0xFF);         /* B */
@@ -45,6 +80,7 @@ uint32_t fb_get_pixel(uint32_t x, uint32_t y) {
 }
 
 void fb_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color) {
+    fb_trespass("fb_fill_rect");
     uint32_t x_end = x + w;
     uint32_t y_end = y + h;
     if (x_end > fb_w) x_end = fb_w;
@@ -86,6 +122,7 @@ void fb_blit(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
 
 void fb_scroll_up(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t dy,
                    uint32_t bg_color) {
+    fb_trespass("fb_scroll_up");
     if (dy >= h) {
         fb_fill_rect(x, y, w, h, bg_color);
         return;

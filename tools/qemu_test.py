@@ -186,7 +186,7 @@ def wait_for(serial_path, seconds, patterns):
 
 def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
         memory=128, disk=None, setup=(), stop_when=(), clicks=(),
-        click_settle=1.5):
+        click_settle=1.5, post=()):
     serial_path = keep_serial or tempfile.mktemp(suffix=".log", prefix="novaris-serial-")
     port = 45000 + (os.getpid() % 10000)
 
@@ -268,6 +268,14 @@ def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
             else:
                 time.sleep(settle)
 
+        # Typed after the waiting is over rather than before it, so that a
+        # `sync` at the end of a run does not cost the run's whole settle.
+        # --stop-when-matched only shortens the *last* command's wait, and
+        # the last command is rarely the interesting one.
+        for cmd in post:
+            mon.type(cmd + "\n", key_delay)
+            time.sleep(4.0)
+
         mon.close()
     finally:
         try:
@@ -317,6 +325,9 @@ def main():
                          "thing no amount of typing can test.")
     ap.add_argument("--click-settle", type=float, default=1.5,
                     help="seconds to wait after each --click")
+    ap.add_argument("--post-cmd", action="append", default=[],
+                    help="a shell command typed after the settle has "
+                         "finished, with a short fixed pause (repeatable)")
     ap.add_argument("--stop-when-matched", action="store_true",
                     help="end the last command's settle as soon as every "
                          "--expect pattern has appeared, instead of always "
@@ -333,7 +344,7 @@ def main():
                      args.settle, args.timeout, args.serial_log, args.memory,
                      args.disk, args.setup,
                      args.expect if args.stop_when_matched else (),
-                     args.click, args.click_settle)
+                     args.click, args.click_settle, args.post_cmd)
     sys.stdout.write(transcript)
 
     failures = []

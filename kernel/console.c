@@ -259,7 +259,30 @@ static int  ansi_nparams;
 static int  ansi_private;
 
 static void ansi_erase_to_eol(void) {
-    if (!has_framebuffer) return;
+    /* Nothing at all when the console has been redirected, and that guard
+     * is Milestone 36's bug.
+     *
+     * Every other path out of this file checks `sink` before it touches
+     * the framebuffer, because once the desktop is up the framebuffer
+     * belongs to the compositor: it is composed in an off-screen surface
+     * and pushed out a damaged rectangle at a time, so anything written
+     * to it behind the compositor's back survives in every rectangle the
+     * compositor does not happen to repaint.
+     *
+     * This function did not check, and Wine's conhost emits `ESC [ K`
+     * between characters - see the note at the top of this section - so a
+     * Wine run painted a row of background-coloured glyphs straight into
+     * the framebuffer, over and over, at whatever `terminal_row` had been
+     * left at when the desktop took over. The result was a black band
+     * sixteen pixels tall (one CHAR_H) and the width of the old console's
+     * text area, at a fixed place on the screen, that appeared during a
+     * Wine run and never went away. Screen rows 656-671 of a 1280x800
+     * desktop, if you want to go and look at an old screenshot.
+     *
+     * The window terminal has no hardware cursor to erase from and its
+     * own idea of a line, so there is nothing to forward: swallowed, like
+     * every other sequence this console does not implement. */
+    if (sink || !has_framebuffer) return;
     uint32_t bg = palette_lookup((terminal_color >> 4) & 0xF);
     for (uint32_t c = terminal_column; c < cols; c++) {
         draw_glyph_px(area_x + c * CHAR_W, area_y + terminal_row * CHAR_H,

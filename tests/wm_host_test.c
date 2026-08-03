@@ -49,6 +49,8 @@ uint32_t fb_width(void) { return SCREEN_W; }
 uint32_t fb_height(void) { return SCREEN_H; }
 uint32_t fb_pitch(void) { return SCREEN_W * 4; }
 uint32_t fb_bpp(void) { return 32; }
+/* There is no framebuffer here to own - see kernel/framebuffer.c. */
+void fb_set_compositor_owned(int owned) { (void)owned; }
 int  fb_available(void) { return 1; }
 void fb_clear(uint32_t color) { (void)color; }
 void fb_blit(uint32_t x, uint32_t y, uint32_t w, uint32_t h,

@@ -57,6 +57,7 @@ ISO = novaris.iso
 
 .PHONY: all clean run run-nographic iso test test-qemu test-posix test-wine \
         test-wine-threads test-qemu-disk test-wine-prefix test-desktop \
+        test-wine-persist \
         zip disk
 
 all: $(ISO)
@@ -932,6 +933,47 @@ test-qemu-disk: $(ISO)
 # ought to live, because a prefix is an installation - but it is Wine that
 # puts it there now, on first use, and `make disk` is all it takes to have
 # somewhere for it to go.
+
+# The prefix is an installation, so: build one, switch the machine off,
+# switch it on, and use it.
+#
+# Two boots of one disk image, and the assertions are in the second. The
+# first is an empty FAT32 volume: Wine finds no prefix, builds one, runs
+# the program, and syncs. The second must run the program *without*
+# building anything - "created the configuration directory" is rejected,
+# because a prefix that is rebuilt every time is not an installation, it
+# is a cache with extra steps.
+#
+# It is also the run that shows what a prefix is worth: the second boot
+# does not run rundll32 over wine.inf, so it is several minutes shorter
+# than the first. Nothing asserts that, because a stopwatch is not a
+# property, but it is why this arrangement is the one a person would use.
+test-wine-persist: $(ISO)
+	@python3 tools/check_wine_installed.py $(BUILD_DIR)/initrd_staging
+	rm -f $(BUILD_DIR)/wine-persist.img
+	python3 tools/mkfat32.py $(BUILD_DIR)/wine-persist.img --size 512M --label WINEDISK
+	@echo "--- first boot: an empty disk, so Wine builds its prefix ---"
+	python3 tools/qemu_test.py --iso $(ISO) \
+	    --disk $(BUILD_DIR)/wine-persist.img --memory 768 \
+	    --boot-wait 30 --settle 900 --timeout 1000 --stop-when-matched \
+	    --cmd "wine hellowin.exe" \
+	    --post-cmd "sync" \
+	    --expect "created the configuration directory '/disk/\.wine'" \
+	    --expect "Exiting with code 0" \
+	    --reject "KERNEL PANIC"
+	@echo "--- second boot: the same disk, and the prefix is already there ---"
+	python3 tools/qemu_test.py --iso $(ISO) \
+	    --disk $(BUILD_DIR)/wine-persist.img --memory 768 \
+	    --boot-wait 30 --settle 900 --timeout 1000 --stop-when-matched \
+	    --cmd "wine hellowin.exe" \
+	    --expect "FAT32 volume mounted at /disk" \
+	    --expect "fib\(20\):    6765" \
+	    --expect "argv\[0\]: Z:.hellowin\.exe" \
+	    --expect "Exiting with code 0" \
+	    --reject "created the configuration directory" \
+	    --reject "wine\.inf not found" \
+	    --reject "\[fat32\] cannot create" \
+	    --reject "KERNEL PANIC"
 
 # Double-clicking a .exe, which is the one thing no amount of typing at
 # the shell can test.

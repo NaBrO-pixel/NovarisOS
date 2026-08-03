@@ -37,4 +37,10 @@ void fb_blit(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
 void fb_scroll_up(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t dy,
                    uint32_t bg_color);
 
+
+/* Marks the framebuffer as the compositor's. Anything that writes to it
+ * afterwards by a path other than fb_blit() is reported once - see the
+ * note in framebuffer.c. */
+void fb_set_compositor_owned(int owned);
+
 #endif
