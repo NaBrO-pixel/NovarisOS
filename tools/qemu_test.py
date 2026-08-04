@@ -120,6 +120,25 @@ class Monitor:
             self.send("mouse_button 0")
         time.sleep(0.4)
 
+    def screendump(self, path):
+        """Writes the framebuffer to a PPM.
+
+        QEMU answers `screendump` before the file is complete, so the
+        caller that wants to look at the image has to wait for it rather
+        than for the monitor."""
+        self.send("screendump " + path)
+        deadline = time.time() + 10.0
+        size = -1
+        while time.time() < deadline:
+            time.sleep(0.4)
+            try:
+                now = os.path.getsize(path)
+            except OSError:
+                continue
+            if now > 0 and now == size:
+                return
+            size = now
+
     def type(self, text, delay):
         for ch in text:
             key = KEYMAP.get(ch)
@@ -186,7 +205,7 @@ def wait_for(serial_path, seconds, patterns):
 
 def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
         memory=128, disk=None, setup=(), stop_when=(), clicks=(),
-        click_settle=1.5, post=()):
+        click_settle=1.5, post=(), screenshot=None, post_clicks=()):
     serial_path = keep_serial or tempfile.mktemp(suffix=".log", prefix="novaris-serial-")
     port = 45000 + (os.getpid() % 10000)
 
@@ -244,13 +263,17 @@ def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
 
         # Pointer work before anything is typed. "340,300,double" means
         # move there and double-click.
-        for spec in clicks:
-            parts = spec.split(",")
-            x, y = int(parts[0]), int(parts[1])
-            double = len(parts) > 2 and parts[2].strip() == "double"
-            mon.mouse_to(x, y)
-            mon.click(double)
-            time.sleep(click_settle)
+        def do_clicks(specs):
+            for spec in specs:
+                parts = spec.split(",")
+                x, y = int(parts[0]), int(parts[1])
+                what = parts[2].strip() if len(parts) > 2 else ""
+                mon.mouse_to(x, y)
+                if what != "move":
+                    mon.click(what == "double")
+                time.sleep(click_settle)
+
+        do_clicks(clicks)
 
         if not commands:
             # Clicks only. The settle is still needed - what was clicked
@@ -263,6 +286,13 @@ def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
         for i, cmd in enumerate(commands):
             mon.type(cmd + "\n", key_delay)
             last = (i == len(commands) - 1)
+            # Pointer work aimed at the command that is *running*, not at
+            # the shell before it. A program that draws a window and reads
+            # input can only be sent input while it is up, which is after
+            # the line that starts it and before the settle that waits on
+            # it - here.
+            if last:
+                do_clicks(post_clicks)
             if last and stop_when:
                 wait_for(serial_path, settle, stop_when)
             else:
@@ -275,6 +305,12 @@ def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
         for cmd in post:
             mon.type(cmd + "\n", key_delay)
             time.sleep(4.0)
+
+        # Last, so the picture is of the machine in the state the
+        # assertions were made about - and taken before `quit`, which is
+        # the only reason this is inside the try.
+        if screenshot:
+            mon.screendump(os.path.abspath(screenshot))
 
         mon.close()
     finally:
@@ -323,11 +359,21 @@ def main():
                          "This is how the desktop itself is driven: "
                          "double-clicking a .exe in the File Explorer is a "
                          "thing no amount of typing can test.")
+    ap.add_argument("--post-click", action="append", default=[],
+                    help="X,Y[,double|move] - the same, but done after the "
+                         "last --cmd has been typed, so it reaches the "
+                         "program that command started rather than the "
+                         "shell that started it (repeatable)")
     ap.add_argument("--click-settle", type=float, default=1.5,
                     help="seconds to wait after each --click")
     ap.add_argument("--post-cmd", action="append", default=[],
                     help="a shell command typed after the settle has "
                          "finished, with a short fixed pause (repeatable)")
+    ap.add_argument("--screenshot",
+                    help="write the framebuffer to this PPM at the end of "
+                         "the run. Some things are only true on screen: a "
+                         "window drawn by a ring-3 process leaves no trace "
+                         "in a serial transcript.")
     ap.add_argument("--stop-when-matched", action="store_true",
                     help="end the last command's settle as soon as every "
                          "--expect pattern has appeared, instead of always "
@@ -344,7 +390,8 @@ def main():
                      args.settle, args.timeout, args.serial_log, args.memory,
                      args.disk, args.setup,
                      args.expect if args.stop_when_matched else (),
-                     args.click, args.click_settle, args.post_cmd)
+                     args.click, args.click_settle, args.post_cmd,
+                     args.screenshot, args.post_click)
     sys.stdout.write(transcript)
 
     failures = []

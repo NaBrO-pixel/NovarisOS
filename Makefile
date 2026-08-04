@@ -31,6 +31,7 @@ OBJS = $(BUILD_DIR)/boot.o $(BUILD_DIR)/kernel.o \
        $(BUILD_DIR)/wm.o $(BUILD_DIR)/desktop.o $(BUILD_DIR)/cpu.o \
        $(BUILD_DIR)/app_terminal.o $(BUILD_DIR)/app_files.o \
        $(BUILD_DIR)/app_monitor.o $(BUILD_DIR)/app_about.o \
+       $(BUILD_DIR)/wmdev.o \
        $(BUILD_DIR)/gdt.o $(BUILD_DIR)/gdt_flush.o \
        $(BUILD_DIR)/idt.o $(BUILD_DIR)/idt_flush.o \
        $(BUILD_DIR)/isr.o $(BUILD_DIR)/pic.o \
@@ -214,6 +215,9 @@ $(BUILD_DIR)/app_files.o: kernel/app_files.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/app_monitor.o: kernel/app_monitor.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/wmdev.o: kernel/wmdev.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/app_about.o: kernel/app_about.c $(HEADERS) | $(BUILD_DIR)
@@ -443,6 +447,13 @@ $(BUILD_DIR)/user/sigtest.elf: userland/signal_test.c | $(BUILD_DIR)
 	$(CC) -m32 -static -nostdlib -ffreestanding -fno-builtin -O2 -Wall \
 	    -o $@ $<
 
+# Milestone 36: a ring-3 process that owns a window on the desktop, via
+# /dev/wm. The first thing outside the kernel ever to draw one.
+$(BUILD_DIR)/user/wmtest.elf: userland/wm_test.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(CC) -m32 -static -nostdlib -ffreestanding -fno-builtin -O2 -Wall \
+	    -o $@ $<
+
 $(BUILD_DIR)/user/hello_elf.elf: $(BUILD_DIR)/user/crt0.o $(BUILD_DIR)/user/hello_elf.o $(BUILD_DIR)/user/libc.o userland/user.ld
 	$(LD) -m elf_i386 -T userland/user.ld -nostdlib -o $@ \
 	    $(BUILD_DIR)/user/crt0.o $(BUILD_DIR)/user/hello_elf.o $(BUILD_DIR)/user/libc.o
@@ -533,7 +544,7 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
         $(BUILD_DIR)/user/pthtest.elf $(BUILD_DIR)/user/crashelf.elf \
         $(BUILD_DIR)/user/fstest.elf $(BUILD_DIR)/user/kmaptest.elf \
         $(BUILD_DIR)/user/socktest.elf $(BUILD_DIR)/user/forktest.elf \
-        $(BUILD_DIR)/user/mmaptest.elf \
+        $(BUILD_DIR)/user/mmaptest.elf $(BUILD_DIR)/user/wmtest.elf \
         $(BUILD_DIR)/user/glibc.elf $(BUILD_DIR)/user/dyn.elf \
         $(BUILD_DIR)/user/uctest.elf \
         $(BUILD_DIR)/user/ld-linux.so.2 $(BUILD_DIR)/user/libc.so.6 \
@@ -555,6 +566,7 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
 	cp $(BUILD_DIR)/user/socktest.elf $(BUILD_DIR)/initrd_staging/socktest.elf
 	cp $(BUILD_DIR)/user/forktest.elf $(BUILD_DIR)/initrd_staging/forktest.elf
 	cp $(BUILD_DIR)/user/mmaptest.elf $(BUILD_DIR)/initrd_staging/mmaptest.elf
+	cp $(BUILD_DIR)/user/wmtest.elf $(BUILD_DIR)/initrd_staging/wmtest.elf
 	cp $(BUILD_DIR)/user/crashelf.elf $(BUILD_DIR)/initrd_staging/crashelf.elf
 	cp $(BUILD_DIR)/user/glibc.elf $(BUILD_DIR)/initrd_staging/glibc.elf
 	cp $(BUILD_DIR)/user/dyn.elf $(BUILD_DIR)/initrd_staging/dyn.elf
@@ -750,6 +762,57 @@ test-posix: $(ISO) $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf
 	    --binary $(BUILD_DIR)/user/forktest.elf --name forktest.elf
 	python3 tools/posix_compare.py --iso $(ISO) \
 	    --binary $(BUILD_DIR)/user/mmaptest.elf --name mmaptest.elf
+
+# Milestone 36: a window on the desktop that the kernel did not draw.
+#
+# This is the only test here whose real assertion is a picture. The serial
+# transcript proves the mechanism - the device opened, the window was
+# created, its pixels mapped, a frame damaged, and input arrived - but it
+# cannot prove that anything appeared, and appearing is the point. So the
+# run ends with a screendump, and build/wm-test.ppm is the artifact.
+#
+# The pointer work is what generates the input: the window opens centered,
+# and moving the pointer across the middle of the screen crosses it, which
+# the window manager routes to the process as WM_EV_MOUSE. "events
+# received: 0" would mean a window nothing could reach.
+#
+# The program draws for a minute and then gives up on its own, so the run
+# is bounded whether or not anything closes it.
+test-wm: $(ISO)
+	python3 tools/qemu_test.py --iso $(ISO) --memory 512 \
+	    --boot-wait 30 --settle 40 --timeout 200 \
+	    --cmd "run wmtest.elf" \
+	    --post-click "640,400,move" \
+	    --post-click "660,410,move" \
+	    --post-click "620,390,move" \
+	    --click-settle 2 \
+	    --screenshot $(BUILD_DIR)/wm-test.ppm \
+	    --expect "opened /dev/wm" \
+	    --expect "created a window" \
+	    --expect "it is the size we asked for" \
+	    --expect "mapped its pixels" \
+	    --expect "showed the first frame" \
+	    --expect "input reached the window" \
+	    --reject "\[FAIL\]" \
+	    --reject "KERNEL PANIC"
+	@python3 tools/check_wm_window.py $(BUILD_DIR)/wm-test.ppm
+	@echo
+	@echo "--- and the same program, allowed to finish, twice ---"
+# Three seconds each rather than a minute, so the run reaches the exit
+# path: the descriptor closes, the node's last reference goes, the slot
+# is released and the window disappears. Twice, because the second open
+# has to be handed the slot the first one gave back - a leak here would
+# show up as the second run failing to create a window at all.
+	python3 tools/qemu_test.py --iso $(ISO) --memory 512 \
+	    --boot-wait 30 --settle 15 --timeout 200 \
+	    --cmd "run wmtest.elf 60" \
+	    --cmd "run wmtest.elf 20" \
+	    --expect "frames drawn: 60" \
+	    --expect "frames drawn: 20" \
+	    --expect "wm test done" \
+	    --expect "Back in the shell" \
+	    --reject "\[FAIL\]" \
+	    --reject "KERNEL PANIC"
 
 test-qemu: $(ISO)
 	python3 tools/qemu_test.py --iso $(ISO) --script tools/tests/win32_smoke.txt \

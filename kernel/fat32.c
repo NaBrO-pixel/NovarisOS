@@ -1381,6 +1381,8 @@ static const vfs_ops_t fat_ops = {
     fat_rename,
     fat_materialize,
     fat_forget,
+    0,              /* open: a file on disk is what it is */
+    0,              /* ioctl: not a device */
 };
 
 /* --- mounting ------------------------------------------------------------- */

@@ -99,6 +99,20 @@ typedef struct vfs_ops {
     /* Called when the node is about to be freed, so the driver can drop
      * whatever it hung off it. */
     void (*forget)(struct vfs_node* node);
+
+    /* --- devices (Milestone 36) ---------------------------------------
+     *
+     * `open` lets a node hand back a *different* node for the descriptor
+     * to hold, which is what makes /dev/wm work: opening it produces a
+     * private node with a window behind it, so two processes opening one
+     * path get two windows. Returning the node itself is the ordinary
+     * behaviour and NULL is "cannot open now".
+     *
+     * `ioctl` is the control channel a device needs and a file does not.
+     * Both are NULL for every filesystem here; only kernel/wmdev.c sets
+     * them. */
+    struct vfs_node* (*open)(struct vfs_node* node);
+    int32_t (*ioctl)(struct vfs_node* node, uint32_t request, void* arg);
 } vfs_ops_t;
 
 /* One node in the filesystem tree. `impl` is opaque storage for whichever

@@ -201,13 +201,34 @@ static void posix_pin_mapped(vfs_node_t* node) {
     vfs_node_ref(node);
 }
 
-static void posix_unpin_all(void) {
-    posix_proc_t* p = posix_current();
+/* Gives back the references one process's mappings hold. Its address
+ * space is going, so the mappings are going with it. */
+static void posix_unpin_proc(posix_proc_t* p) {
+    if (!p) return;
     for (int i = 0; i < MAX_PINNED; i++) {
         if (!p->pinned[i]) continue;
         vfs_node_unref(p->pinned[i]);
         p->pinned[i] = 0;
     }
+}
+
+/* Every process's, at the end of a program run.
+ *
+ * This walks the table rather than asking for the current process, and
+ * that is not belt and braces - posix_current() cannot answer here.
+ * posix_proc_exit() clears a process's page_directory so that a later
+ * process allocated the same frame can never be mistaken for it, which
+ * means that by the time a run ends, *nothing* claims the address space
+ * that is being torn down: posix_current() would register a fresh entry
+ * and dutifully unpin its empty table.
+ *
+ * That was a real leak with a visible symptom rather than a theoretical
+ * one. Milestone 36's /dev/wm frees a window when the last reference to
+ * its node goes, so a pin nobody gave back left a dead program's window
+ * on the desktop, still holding the keyboard focus - which is what
+ * finding this looked like from the outside. */
+static void posix_unpin_all(void) {
+    for (int i = 0; i < POSIX_MAX_PROCS; i++) posix_unpin_proc(posix_proc_at(i));
 }
 
 /* --- the process's address space ----------------------------------------
@@ -292,6 +313,14 @@ static void process_teardown(int status) {
         p->fds[i].kind = FD_FREE;
     }
 
+    /* And the mappings, which hold references of their own and are about
+     * to stop existing along with the address space below. Here rather
+     * than only in posix_process_end(), so that a node's last reference
+     * goes when the process that had it mapped exits - not when whatever
+     * started it finally returns. A /dev/wm window closes on that
+     * reference. */
+    posix_unpin_proc(p);
+
     /* Only if these pages are this process's to release - see
      * posix_proc_t::owns_memory. A task the POSIX layer merely met is
      * running in somebody else's address space. */
@@ -326,6 +355,7 @@ void posix_exit_process_group(int wstatus) {
         if (p->fds[i].kind == FD_FILE) vfs_node_unref(p->fds[i].node);
         p->fds[i].kind = FD_FREE;
     }
+    posix_unpin_proc(p);
     if (pd && p->owns_memory) paging_release_user_pages();
     vfork_release(p);
     int ppid = p->ppid;
@@ -1041,6 +1071,14 @@ static int32_t sys_open(const char* path, int flags, uint32_t mode) {
         if (want_write || (flags & O_CREAT)) return -EISDIR;
     } else if (flags & O_TRUNC) {
         if (want_write) vfs_truncate(node, 0);
+    }
+
+    /* A device may want a node of its own per descriptor - see
+     * vfs_ops_t.open, and /dev/wm, where each open is a window. */
+    if (node->ops && node->ops->open) {
+        vfs_node_t* opened = node->ops->open(node);
+        if (!opened) return -ENODEV;
+        node = opened;
     }
 
     int fd = fd_alloc();
@@ -3212,7 +3250,17 @@ void posix_syscall(registers_t* regs) {
          * draw was `--width 0 --height 676`, and a console zero columns
          * wide is not something a console program survives. Everything
          * else this kernel does not implement now says so. */
-        case SYS_ioctl:
+        case SYS_ioctl: {
+            /* A device's control channel, before the console's. Only
+             * /dev/wm has one; everything else falls through to the
+             * terminal ioctls below and then to -ENOTTY. */
+            fd_entry_t* ie = fd_get((int)a);
+            if (ie && ie->kind == FD_FILE && ie->node &&
+                ie->node->ops && ie->node->ops->ioctl) {
+                r = ie->node->ops->ioctl(ie->node, b, (void*)c);
+                break;
+            }
+        }
             if (a >= 3) { r = -ENOTTY; break; }
             if (b == TIOCGWINSZ) {
                 /* struct winsize { unsigned short ws_row, ws_col,
