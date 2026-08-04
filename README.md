@@ -127,11 +127,12 @@ the framebuffer. Input comes back the other way through
 `NtUserSendHardwareInput`, the same call X11 and Wayland make, so above
 the driver there is no difference between a click here and a click on X.
 
-It has no text in it, and it wears two title bars. Both are the same
-missing piece — this Wine is built `--without-freetype`, so there is no
-font engine — and `ROADMAP.md`'s Milestone 37 traces exactly how one
-missing font turns into a caption six and three quarter million pixels
-tall.
+The menu bar, the scroll bar and the status bar are real: Wine's own
+TrueType faces ship in the image and win32u rasterises them with
+FreeType. That mattered for more than the text — with no font engine
+Wine's caption metrics are uninitialised stack, and a window's *frame* is
+measured from them, so the first version of this had a title bar six and
+three quarter million pixels tall. `ROADMAP.md`'s Milestone 37 traces it.
 
 ## The desktop
 
