@@ -21,6 +21,20 @@ uint32_t pmm_alloc_frame(void);
 /* Marks a previously-allocated frame free again. */
 void pmm_free_frame(uint32_t phys_addr);
 
+/* `count` frames that are physically adjacent, or 0 if no such run is
+ * free. Milestone 38 needed it: a network card DMAs into a buffer the
+ * *card* addresses, so the buffer has to be one physical run and the
+ * kernel has to know where it is. Nothing before this cared - every
+ * other allocation here is virtual, and the page tables make scattered
+ * frames look contiguous.
+ *
+ * First fit, and no attempt at anything cleverer. The only caller asks
+ * once, at boot, for three runs totalling under 32KB. */
+uint32_t pmm_alloc_contiguous(uint32_t count);
+
+/* Gives back a run from pmm_alloc_contiguous(). */
+void pmm_free_contiguous(uint32_t phys_addr, uint32_t count);
+
 /* Marks every frame overlapping [start_addr, end_addr) as used, without
  * needing to know frame-aligned boundaries. Used to reserve things the
  * Multiboot memory map doesn't know are spoken for yet - e.g. an initrd

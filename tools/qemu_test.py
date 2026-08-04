@@ -220,6 +220,13 @@ def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
         "-serial", "file:" + serial_path,
         "-monitor", "tcp:127.0.0.1:%d,server,nowait" % port,
         "-no-reboot",
+        # Milestone 38. A network card, and QEMU's own user-mode stack
+        # behind it: a DHCP server at 10.0.2.2 that hands out 10.0.2.15, a
+        # DNS forwarder at 10.0.2.3, and the host reachable at 10.0.2.2.
+        # Always present rather than opt-in, because "the OS boots with a
+        # network card in it" is now part of what every test covers.
+        "-netdev", "user,id=n0",
+        "-device", "rtl8139,netdev=n0",
     ]
     if disk:
         # Milestone 32. QEMU's -cdrom is IDE index 2 (secondary master),

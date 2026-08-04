@@ -23,6 +23,10 @@
 #include "task_b.h"
 #include "task_c.h"
 #include "thread_demo.h"
+#include "net.h"
+#include "netdev.h"
+#include "dhcp.h"
+#include "pci.h"
 
 #define CMD_BUFFER_SIZE 128
 
@@ -241,6 +245,184 @@ static int split_args(const char* line, const char** argv_out[]) {
     }
     *argv_out = argv_ptr;
     return argc;
+}
+
+
+/* --- net ----------------------------------------------------------------
+ *
+ * Milestone 38. Four subcommands, and the split between them is the
+ * shape of the stack: `net` reports, `net up` gets an address, `net ping`
+ * proves a packet made a round trip, and `net pci` says what the bus has
+ * on it when none of the rest works.
+ *
+ * `net up` is separate from boot on purpose. DHCP takes seconds - three
+ * attempts with a timeout each - and a kernel that spends them every boot
+ * on a machine with no DHCP server is a kernel that boots slowly for no
+ * reason. */
+/* Two hex digits, no "0x" - a MAC address is six of these and a prefix
+ * on each would be six prefixes nobody wants to read. */
+static void print_hex2(uint8_t v) {
+    static const char* d = "0123456789abcdef";
+    char b[3] = { d[v >> 4], d[v & 15], 0 };
+    terminal_writestring(b);
+}
+
+static void print_ip(uint32_t ip) {
+    char buf[16];
+    net_format_ip(ip, buf);
+    terminal_writestring(buf);
+}
+
+static void cmd_net(const char* args) {
+    while (*args == ' ') args++;
+
+    if (streq(args, "pci")) {
+        uint32_t n = pci_device_count();
+        terminal_writestring("PCI devices: ");
+        print_uint(n);
+        terminal_writestring("\n");
+        for (uint32_t i = 0; i < n; i++) {
+            const pci_device_t* d = pci_device_at(i);
+            terminal_writestring("  ");
+            print_uint(d->bus); terminal_writestring(":");
+            print_uint(d->slot); terminal_writestring(".");
+            print_uint(d->func);
+            terminal_writestring("  vendor ");
+            print_hex(d->vendor, 4);
+            terminal_writestring(" device ");
+            print_hex(d->device, 4);
+            terminal_writestring("  class ");
+            print_hex(d->class_code, 2);
+            terminal_writestring("/");
+            print_hex(d->subclass, 2);
+            terminal_writestring(" irq ");
+            print_uint(d->irq);
+            terminal_writestring("\n");
+        }
+        return;
+    }
+
+    if (!net_available()) {
+        terminal_writestring_color("No network card. ", VGA_COLOR_LIGHT_RED);
+        terminal_writestring("'net pci' lists what is on the bus.\n"
+                             "QEMU needs '-device rtl8139' to have one.\n");
+        return;
+    }
+
+    const netdev_t* dev = netdev_get();
+
+    if (streq(args, "up")) {
+        terminal_writestring("Asking for an address (DHCP)...\n");
+        if (dhcp_configure(500)) {          /* five seconds */
+            const net_config_t* c = net_config();
+            terminal_writestring_color("[OK] ", VGA_COLOR_LIGHT_GREEN);
+            terminal_writestring("address ");
+            print_ip(c->ip);
+            terminal_writestring(", gateway ");
+            print_ip(c->gateway);
+            terminal_writestring(", dns ");
+            print_ip(c->dns);
+            terminal_writestring("\n");
+        } else {
+            terminal_writestring_color("[--] ", VGA_COLOR_LIGHT_RED);
+            terminal_writestring("no DHCP answer in five seconds\n");
+        }
+        return;
+    }
+
+    if (starts_with(args, "ping ")) {
+        uint32_t target = 0;
+        if (!net_parse_ip(args + 5, &target)) {
+            terminal_writestring("usage: net ping <a.b.c.d>\n");
+            return;
+        }
+        if (!net_config()->configured) {
+            terminal_writestring("No address yet - run 'net up' first.\n");
+            return;
+        }
+
+        uint32_t before = net_ping_replies();
+        for (uint16_t seq = 1; seq <= 4; seq++) {
+            /* The first send usually returns -2: the next hop's MAC is
+             * not known yet and an ARP request has just gone out. Poll
+             * and retry rather than reporting a failure that is really
+             * one round trip of latency. */
+            for (int attempt = 0; attempt < 200; attempt++) {
+                if (net_ping(target, seq) != -2) break;
+                net_poll();
+                __asm__ __volatile__("hlt");
+            }
+            for (int wait = 0; wait < 100; wait++) {
+                net_poll();
+                if (net_ping_replies() > before) break;
+                __asm__ __volatile__("hlt");
+            }
+            terminal_writestring("  seq ");
+            print_uint(seq);
+            if (net_ping_replies() > before) {
+                terminal_writestring(": reply in ");
+                print_uint(net_ping_last_ticks() * 10);
+                terminal_writestring("ms\n");
+                before = net_ping_replies();
+            } else {
+                terminal_writestring(": no reply\n");
+            }
+        }
+        terminal_writestring("Replies: ");
+        print_uint(net_ping_replies());
+        terminal_writestring("\n");
+        return;
+    }
+
+    /* No argument: report. */
+    const net_config_t* c = net_config();
+    const net_stats_t* st = net_stats();
+
+    terminal_writestring(dev->name);
+    terminal_writestring("  ");
+    for (int m = 0; m < 6; m++) {
+        print_hex2(dev->mac[m]);
+        if (m < 5) terminal_writestring(":");
+    }
+    terminal_writestring("\n");
+
+    terminal_writestring("  address  ");
+    if (c->configured) {
+        print_ip(c->ip);
+        terminal_writestring("  mask ");
+        print_ip(c->netmask);
+        terminal_writestring("\n  gateway  ");
+        print_ip(c->gateway);
+        terminal_writestring("  dns ");
+        print_ip(c->dns);
+        terminal_writestring("\n");
+    } else {
+        terminal_writestring("none - run 'net up'\n");
+    }
+
+    terminal_writestring("  rx       ");
+    print_uint(dev->rx_packets);
+    terminal_writestring(" frames (");
+    print_uint(st->rx_arp);
+    terminal_writestring(" arp, ");
+    print_uint(st->rx_ip);
+    terminal_writestring(" ip, ");
+    print_uint(st->rx_icmp);
+    terminal_writestring(" icmp, ");
+    print_uint(st->rx_udp);
+    terminal_writestring(" udp), ");
+    print_uint(dev->rx_errors);
+    terminal_writestring(" errors\n");
+
+    terminal_writestring("  tx       ");
+    print_uint(dev->tx_packets);
+    terminal_writestring(" frames, ");
+    print_uint(dev->tx_errors);
+    terminal_writestring(" errors\n");
+
+    terminal_writestring("  arp      ");
+    print_uint(net_arp_entries());
+    terminal_writestring(" cached\n");
 }
 
 static void cmd_run(const char* line) {
@@ -633,6 +815,7 @@ static void run_command(char* line) {
         terminal_writestring("            real Wine (novaris-wine.iso only)\n");
         terminal_writestring("  strace  - the same, with every syscall logged\n");
         terminal_writestring("  setenv NAME=VALUE, env - the environment programs are given\n");
+        terminal_writestring("  net, net up, net ping <ip>, net pci - the network\n");
         terminal_writestring("  ps      - the process table (fork gave it more than one row)\n");
         terminal_writestring("  sum <file> - size, checksum and first bytes, for comparing with a host\n");
         terminal_writestring("  vmtest  - prove per-process address spaces work:\n");
@@ -789,6 +972,8 @@ static void run_command(char* line) {
         print_uint((uint32_t)scheduler_blocked_count());
         terminal_writestring("\n");
         if (line[9]) posix_futex_stats_reset();
+    } else if (streq(line, "net") || starts_with(line, "net ")) {
+        cmd_net(line + 3);
     } else if (streq(line, "sockinfo")) {
         terminal_writestring("Unix sockets open: ");
         print_uint(socket_open_count());

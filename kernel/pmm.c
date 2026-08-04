@@ -104,6 +104,33 @@ uint32_t pmm_alloc_frame(void) {
     return 0; /* out of memory */
 }
 
+uint32_t pmm_alloc_contiguous(uint32_t count) {
+    if (count == 0) return 0;
+    if (count == 1) return pmm_alloc_frame();
+
+    for (uint32_t start = 0; start + count <= highest_frame + 1; start++) {
+        uint32_t i = 0;
+        while (i < count && !bitmap_test(start + i)) i++;
+        if (i < count) {
+            /* Resume past the frame that was taken rather than at
+             * start+1: every window overlapping it would fail the same
+             * way, and a boot-time scan of a 768MB bitmap is worth not
+             * doing 190,000 times over. */
+            start += i;
+            continue;
+        }
+        for (i = 0; i < count; i++) bitmap_set(start + i);
+        return start * PMM_FRAME_SIZE;
+    }
+    return 0;
+}
+
+void pmm_free_contiguous(uint32_t phys_addr, uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) {
+        pmm_free_frame(phys_addr + i * PMM_FRAME_SIZE);
+    }
+}
+
 /* Freeing a frame that is already free is the one memory bug this
  * allocator cannot survive quietly: the bit is simply cleared, and if the
  * frame was handed out again in between, two owners now share it and the

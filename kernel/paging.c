@@ -280,6 +280,38 @@ void paging_reserve_kernel_tables(uint32_t start, uint32_t end) {
     }
 }
 
+/* --- DMA ---------------------------------------------------------------
+ *
+ * A bump allocator over one 1MB window, because there is exactly one
+ * caller (kernel/rtl8139.c) asking three times at boot and never freeing.
+ * A device's buffers live as long as the machine does; a free list here
+ * would be a free list nothing ever called.
+ */
+static uint32_t dma_next = DMA_VIRTUAL_BASE;
+
+void* paging_alloc_dma(uint32_t bytes, uint32_t* phys_out) {
+    if (phys_out) *phys_out = 0;
+    if (!bytes) return 0;
+
+    uint32_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (dma_next + pages * PAGE_SIZE > DMA_VIRTUAL_BASE + DMA_VIRTUAL_MAX) {
+        return 0;
+    }
+
+    uint32_t phys = pmm_alloc_contiguous(pages);
+    if (!phys) return 0;
+
+    uint32_t virt = dma_next;
+    for (uint32_t i = 0; i < pages; i++) {
+        paging_map_page(virt + i * PAGE_SIZE, phys + i * PAGE_SIZE,
+                        PAGE_PRESENT | PAGE_RW);
+    }
+    dma_next += pages * PAGE_SIZE;
+
+    if (phys_out) *phys_out = phys;
+    return (void*)virt;
+}
+
 void paging_finalize_kernel_space(void) {
     /* Snapshot every directory entry that exists right now as "shared by
      * all address spaces". Doing it empirically rather than from a
