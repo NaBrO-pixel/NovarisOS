@@ -48,6 +48,11 @@
 #define WMIO_POLL    0x5703u   /* struct wm_event*   */
 #define WMIO_GETSIZE 0x5704u   /* struct wm_rect*, x/y zero */
 #define WMIO_TITLE   0x5705u   /* char[WM_DEV_TITLE_MAX] */
+/* The desktop's work area - what a maximized window fills, in screen
+ * coordinates. Answered by /dev/wm itself as well as by an open window,
+ * because a program needs it *before* it decides how big to be. Wine's
+ * driver reports it as the monitor rectangle. */
+#define WMIO_SCREEN  0x5706u   /* struct wm_rect* */
 
 #define WM_DEV_TITLE_MAX 64
 

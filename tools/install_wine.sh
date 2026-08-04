@@ -65,6 +65,13 @@ PE_PROGS="wineboot start conhost services explorer rundll32 cmd winepath
 # DLL whose process attach fails.
 UNIX_DLLS="win32u ws2_32 bcrypt"
 
+# Novaris's own display driver, built into the same tree by
+# tools/build_wine_driver.sh. Not in the lists above because it is not
+# one of Wine's - and because both its halves live in one directory
+# rather than in the two the loops below expect.
+DRV_PE=$WINE_BUILD/dlls/winenovaris.drv/i386-windows/winenovaris.drv
+DRV_UNIX=$WINE_BUILD/dlls/winenovaris.drv/winenovaris.so
+
 UNIXDIR=$ROOT/usr/lib/wine/i386-unix
 PEDIR=$ROOT/usr/lib/wine/i386-windows
 BINDIR=$ROOT/usr/bin
@@ -109,12 +116,46 @@ for p in $PE_PROGS; do
     cp "$WINE_BUILD/programs/$p/i386-windows/$p.exe" "$PEDIR/$p.exe" 2>/dev/null || true
 done
 
+# --- the display driver -------------------------------------------------
+#
+# Without one, every program with a window gets
+# "err:winediag:nodrv_CreateWindow ... The graphics driver is missing" and
+# exits: explorer.exe reaches load_graphics_driver(), tries each name in
+# HKCU\Software\Wine\Drivers\Graphics, and finds nothing to load. Novaris
+# has no X server and no Wayland compositor - it has its own window
+# manager, and winenovaris.drv is how Wine reaches it (wine/winenovaris.drv,
+# kernel/wmdev.c).
+#
+# Skipped rather than fatal when it has not been built: an OS with Wine
+# and no driver is exactly what every milestone up to 35 was, and it still
+# runs console programs.
+if [ -f "$DRV_PE" ] && [ -f "$DRV_UNIX" ]; then
+    cp "$DRV_PE"   "$PEDIR/winenovaris.drv"
+    cp "$DRV_UNIX" "$UNIXDIR/winenovaris.so"
+
+    # And tell Wine to use it. explorer.exe's default list is
+    # "mac,x11,wayland", none of which exists here; this key is the
+    # supported way to change it, and a prefix gets it when wineboot
+    # installs wine.inf. Added to the copy rather than to the Wine tree,
+    # so the tree stays a build input.
+    # Only the first AddReg list, which is [BaseInstall]'s: every install
+    # in the file needs it, and every install needs [BaseInstall].
+    sed -e '0,/^AddReg=\\$/s||AddReg=\\\n    NovarisDrivers,\\|' \
+        "$WINE_BUILD/loader/wine.inf" > "$DATADIR/wine.inf.tmp"
+    printf '\n[NovarisDrivers]\nHKCU,Software\\Wine\\Drivers,"Graphics",2,"novaris"\n' \
+        >> "$DATADIR/wine.inf.tmp"
+    WINE_INF=$DATADIR/wine.inf.tmp
+else
+    echo "  (no winenovaris.drv - build it with tools/build_wine_driver.sh)"
+fi
+
 # --- Wine's data --------------------------------------------------------
 #
 # wine.inf is the script rundll32 runs to populate a prefix: the registry
 # keys, the fake DLLs, the directory layout. Without it wineboot has
 # nothing to install and says so.
-cp "$WINE_BUILD/loader/wine.inf" "$DATADIR/wine.inf"
+cp "${WINE_INF:-$WINE_BUILD/loader/wine.inf}" "$DATADIR/wine.inf"
+rm -f "$DATADIR/wine.inf.tmp"
 # The NLS tables, whole rather than hand-picked: wineserver calls
 # fatal_error() if it cannot load l_intl.nls, and kernelbase's
 # init_locale walks sortdefault.nls without checking that it got it. A

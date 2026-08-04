@@ -239,7 +239,23 @@ static int32_t wmdev_create(wmdev_slot_t* s, const struct wm_create* c) {
     return 0;
 }
 
+/* The work area, which is a property of the desktop rather than of any
+ * window - so both the control node and an open window answer it. */
+static int32_t wmdev_screen(void* arg) {
+    struct wm_rect* r = (struct wm_rect*)arg;
+    if (!r) return -EFAULT;
+    gfx_rect_t work;
+    wm_work_area(&work);
+    r->x = work.x;
+    r->y = work.y;
+    r->w = work.w;
+    r->h = work.h;
+    return 0;
+}
+
 static int32_t wmdev_ioctl(vfs_node_t* node, uint32_t req, void* arg) {
+    if (req == WMIO_SCREEN) return wmdev_screen(arg);
+
     wmdev_slot_t* s = 0;
     for (int i = 0; i < WMDEV_MAX_SLOTS; i++) {
         if (slots[i].in_use && slots[i].node == node) { s = &slots[i]; break; }
@@ -340,10 +356,18 @@ static vfs_node_t* wmdev_open(vfs_node_t* control) {
     return 0;
 }
 
+/* /dev/wm itself answers exactly one question - how big the desktop is -
+ * because a program needs that before it has a window to ask. */
+static int32_t wmdev_control_ioctl(vfs_node_t* node, uint32_t req, void* arg) {
+    (void)node;
+    if (req == WMIO_SCREEN) return wmdev_screen(arg);
+    return -ENOTTY;
+}
+
 static const vfs_ops_t wmdev_control_ops = {
     0, 0, 0, 0, 0, 0, 0,
     wmdev_open,
-    0,              /* ioctl on the control node itself: nothing to do */
+    wmdev_control_ioctl,
 };
 
 void wmdev_init(void) {
