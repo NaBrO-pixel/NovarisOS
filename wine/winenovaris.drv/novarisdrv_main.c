@@ -75,7 +75,7 @@ UINT NOVARIS_UpdateDisplayDevices(const struct gdi_device_manager *manager, void
     struct pci_id pci_id = {0};
     UINT dpi = NtUserGetSystemDpiForProcess(NULL);
 
-    TRACE("%dx%d\n", novaris_screen.w, novaris_screen.h);
+    TRACE("reporting one %dx%d monitor\n", novaris_screen.w, novaris_screen.h);
 
     manager->add_gpu("Novaris framebuffer", &pci_id, NULL, param);
     manager->add_source("Novaris", DISPLAY_DEVICE_ATTACHED_TO_DESKTOP |

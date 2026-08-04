@@ -185,7 +185,9 @@ int posix_fd_import(uint32_t token) {
  * Per process now, and thirty-two of them. Overflow keeps the reference
  * instead of dropping it - a node held for the life of the machine is a
  * leak, and a node freed under a live mapping is memory corruption. */
-#define MAX_PINNED 32
+/* The count lives with the array, in include/posix_proc.h: fork has to
+ * walk it too (posix_proc_clone). */
+#define MAX_PINNED POSIX_MAX_PINNED
 
 static void posix_pin_mapped(vfs_node_t* node) {
     posix_proc_t* p = posix_current();

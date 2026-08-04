@@ -241,7 +241,16 @@ void NOVARIS_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     TRACE("hwnd %p %s style %08x visible %u %dx%d\n", hwnd,
           debugstr_window_rects(new_rects), style, visible, width, height);
 
-    if (visible && !data->mapped && !data->closing) window_create(data, width, height);
+    /* Clamped to the desktop, because a window may legitimately be bigger
+     * than the screen and /dev/wm allocates what it is asked for. Wine
+     * also resolves CW_USEDEFAULT against the screen it knows about, so a
+     * request far outside it is a sign the display devices are not
+     * reported yet rather than something to honour. */
+    if (width > novaris_screen.w) width = novaris_screen.w;
+    if (height > novaris_screen.h) height = novaris_screen.h;
+
+    if (visible && !data->mapped && !data->closing && width > 0 && height > 0)
+        window_create(data, width, height);
     else if (!visible && data->mapped) win_data_close(data);
 
     novaris_win_data_release(data);
@@ -412,15 +421,17 @@ BOOL NOVARIS_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_re
  * messages directly.
  */
 
-static void send_mouse_input(HWND hwnd, const struct novaris_win_data *data,
-                             const struct wm_event *ev)
+/* `origin` is the window's visible top-left in screen coordinates, taken
+ * under the lock and passed in rather than read here: NtUserSendHardwareInput
+ * can run a message loop, a message loop can call back into
+ * pProcessEvents, and this driver's mutex is not recursive. Nothing below
+ * this line touches shared state. */
+static void send_mouse_input(HWND hwnd, POINT origin, const struct wm_event *ev)
 {
     INPUT input = {.type = INPUT_MOUSE};
-    int screen_x = data->rects.visible.left + ev->a;
-    int screen_y = data->rects.visible.top + ev->b;
 
-    input.mi.dx = screen_x;
-    input.mi.dy = screen_y;
+    input.mi.dx = origin.x + ev->a;
+    input.mi.dy = origin.y + ev->b;
 
     switch (ev->c)
     {
@@ -553,23 +564,27 @@ BOOL NOVARIS_ProcessEvents(DWORD mask)
          * serialise every window in the process behind one. */
         while (ioctl(fd, WMIO_POLL, &ev) == 1)
         {
+            POINT origin;
+
             got_event = TRUE;
 
             if (!(data = novaris_win_data_get(hwnd))) break;
+            origin.x = data->rects.visible.left;
+            origin.y = data->rects.visible.top;
+            if (ev.type == WM_EV_CLOSE) data->closing = TRUE;
+            novaris_win_data_release(data);
 
+            /* Everything below runs with no lock held, because all of it
+             * can re-enter this driver through win32u. */
             switch (ev.type)
             {
             case WM_EV_MOUSE:
-                send_mouse_input(hwnd, data, &ev);
-                novaris_win_data_release(data);
+                send_mouse_input(hwnd, origin, &ev);
                 break;
             case WM_EV_KEY:
-                novaris_win_data_release(data);
                 send_key_input(hwnd, &ev);
                 break;
             case WM_EV_CLOSE:
-                data->closing = TRUE;
-                novaris_win_data_release(data);
                 TRACE("hwnd %p closed by the user\n", hwnd);
                 NtUserPostMessage(hwnd, WM_SYSCOMMAND, SC_CLOSE, 0);
                 break;
@@ -578,10 +593,8 @@ BOOL NOVARIS_ProcessEvents(DWORD mask)
                  * not follow it (see kernel/wmdev.c), so this is only
                  * worth telling Wine about once it can. */
                 TRACE("hwnd %p resized to %dx%d, not following\n", hwnd, ev.a, ev.b);
-                novaris_win_data_release(data);
                 break;
             default:
-                novaris_win_data_release(data);
                 break;
             }
         }

@@ -60,6 +60,34 @@ if ! grep -q 'WINE_CONFIG_MAKEFILE(dlls/winenovaris.drv)' "$WINE_SRC/configure.a
     NEED_CONFIGURE=1
 fi
 
+# And one line in explorer.
+#
+# explorer.exe decides which driver to load: it walks a comma-separated
+# list of names, loads the first `wine<name>.drv` it finds, and records it
+# in the registry for win32u to pick up. The list comes from
+# HKCU\Software\Wine\Drivers\Graphics, and falls back to a built-in
+# default of "mac,x11,wayland" - three drivers, none of which this OS has
+# or could have.
+#
+# tools/install_wine.sh sets that registry value, which is the supported
+# way to do this and the one a user could change. This is the other half:
+# a prefix that already exists - built by an earlier Wine, or living on a
+# disk from before the driver was written - has no such value, and the
+# default is what it gets. Putting "novaris" at the front of the default
+# means a driver that is installed is a driver that is used, registry or
+# no registry.
+#
+# One `sed`, and it is idempotent.
+if ! grep -q 'novaris,mac,x11,wayland' "$WINE_SRC/programs/explorer/desktop.c"; then
+    echo "adding novaris to explorer's default driver list"
+    sed -i 's|L"mac,x11,wayland"|L"novaris,mac,x11,wayland"|' \
+        "$WINE_SRC/programs/explorer/desktop.c"
+    grep -q 'novaris,mac,x11,wayland' "$WINE_SRC/programs/explorer/desktop.c" || {
+        echo "could not patch explorer's default driver list" >&2
+        exit 1
+    }
+fi
+
 # The generated Makefile is what `make` reads; it comes from configure,
 # which comes from configure.ac.
 if [ -n "$NEED_CONFIGURE" ] || [ ! -f "$WINE_SRC/dlls/winenovaris.drv/Makefile" ]; then
@@ -75,7 +103,8 @@ fi
 echo "building winenovaris.drv"
 (cd "$WINE_SRC" && make -j"$(nproc)" \
     dlls/winenovaris.drv/i386-windows/winenovaris.drv \
-    dlls/winenovaris.drv/winenovaris.so)
+    dlls/winenovaris.drv/winenovaris.so \
+    programs/explorer/i386-windows/explorer.exe)
 
 # What tools/install_wine.sh looks for.
 for f in "$WINE_SRC/dlls/winenovaris.drv/i386-windows/winenovaris.drv" \
