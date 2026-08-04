@@ -133,6 +133,14 @@ if [ -f "$DRV_PE" ] && [ -f "$DRV_UNIX" ]; then
     cp "$DRV_PE"   "$PEDIR/winenovaris.drv"
     cp "$DRV_UNIX" "$UNIXDIR/winenovaris.so"
 
+    # And a Windows program with a window, where a user will find it: the
+    # root of the filesystem is what the File Explorer opens on, and
+    # double-clicking a .exe there runs it under Wine (kernel/app_files.c).
+    # Until there was a display driver there was no reason to put a GUI
+    # program in front of anybody.
+    cp "$PEDIR/notepad.exe" "$ROOT/notepad.exe" 2>/dev/null || true
+    cp "$PEDIR/winemine.exe" "$ROOT/winemine.exe" 2>/dev/null || true
+
     # And tell Wine to use it. explorer.exe's default list is
     # "mac,x11,wayland", none of which exists here; this key is the
     # supported way to change it, and a prefix gets it when wineboot

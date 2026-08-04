@@ -1100,6 +1100,33 @@ test-wine-gui: $(ISO)
 	    --reject "KERNEL PANIC"
 	@python3 tools/check_wine_window.py $(BUILD_DIR)/wine-gui.ppm
 
+# The same thing, with nothing typed.
+#
+# This is the one the whole Wine effort was for: open the File Explorer,
+# double-click a .exe, and a Windows program opens in a window. No shell,
+# no command, no `wine` prefix - the desktop works out that a .exe is run
+# under Wine (kernel/app_files.c), and Wine works out that a window means
+# /dev/wm (wine/winenovaris.drv).
+#
+# The coordinates are the File Explorer desktop icon, the maximize button
+# on the window it opens, and notepad.exe in the alphabetical listing.
+# They are what they are because this is a pointer test: nothing about
+# double-clicking can be tested by typing.
+test-desktop-gui: $(ISO)
+	@python3 tools/check_wine_installed.py $(BUILD_DIR)/initrd_staging
+	python3 tools/qemu_test.py --iso $(ISO) --memory 768 \
+	    --boot-wait 30 --settle 900 --timeout 1000 \
+	    --click-settle 3 \
+	    --click "60,233,double" \
+	    --click "881,66" \
+	    --click "240,646,double" \
+	    --screenshot $(BUILD_DIR)/desktop-gui.ppm \
+	    --expect "starting notepad\.exe under Wine" \
+	    --reject "no driver could be loaded" \
+	    --reject "The graphics driver is missing" \
+	    --reject "KERNEL PANIC"
+	@python3 tools/check_wine_window.py $(BUILD_DIR)/desktop-gui.ppm
+
 # The same thing on a disk, and the difference is that the prefix is an
 # installation rather than something rebuilt at every boot.
 #
