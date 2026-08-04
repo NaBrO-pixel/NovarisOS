@@ -1124,11 +1124,28 @@ void shell_init(void) {
     print_prompt();
 }
 
+/* Whether a command is running right now.
+ *
+ * A command runs to completion inside the keystroke that started it, so
+ * until Milestone 36 the shell could not be typed at while one ran - the
+ * desktop's event loop was underneath it on the stack, blocked, and no
+ * keystroke was being dispatched. Now a ring-3 program with a window
+ * pumps that loop itself (see desktop_pump), so keystrokes *are*
+ * dispatched while a command runs, and a Return with the Terminal focused
+ * would start a second command on top of the first. One flag is the whole
+ * of what that needs: while a command runs, the shell's line editor is
+ * not accepting input. The keys still reach the focused window, which is
+ * the program that is running - which is where they belong. */
+static int shell_busy;
+
 void shell_feed_char(char c) {
+    if (shell_busy) return;
     if (c == '\n') {
         terminal_putchar('\n');
         line_buffer[line_len] = '\0';
+        shell_busy = 1;
         run_command(line_buffer);
+        shell_busy = 0;
         line_len = 0;
         print_prompt();
     } else if (c == '\b') {

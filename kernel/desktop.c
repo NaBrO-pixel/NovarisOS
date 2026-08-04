@@ -42,6 +42,7 @@
 #include "io.h"
 #include "console.h"
 #include "shell.h"
+#include "wmdev.h"
 
 /* --- layout ------------------------------------------------------------- */
 
@@ -1445,9 +1446,19 @@ static void compose(gfx_rect_t damage) {
     gfx_present(screen, damage.x, damage.y, damage.w, damage.h);
 }
 
+/* Compositing alone, with no input and no housekeeping: what a
+ * long-running command's output needs so that it streams instead of
+ * arriving all at once (see app_terminal.c). Kept separate from
+ * desktop_pump() below on purpose - printing must not be a route by which
+ * a keystroke gets dispatched. */
+static int composing;   /* see desktop_pump() */
+
 void desktop_pump_output(void) {
+    if (composing) return;
     gfx_rect_t damage;
+    composing = 1;
     if (wm_take_damage(&damage)) compose(damage);
+    composing = 0;
 }
 
 /* --- input -------------------------------------------------------------- */
@@ -1741,6 +1752,94 @@ static void handle_key(const key_event_t* ev) {
     wm_handle_key(ev);
 }
 
+/* --- the frame ----------------------------------------------------------
+ *
+ * One turn of the desktop: drain input, do the housekeeping that is due,
+ * and composite whatever is damaged. Returns whether anything was drawn,
+ * so the idle loop knows when it may `hlt`.
+ *
+ * This used to be the body of desktop_start()'s loop and nothing else
+ * could reach it, which was fine while every window was drawn by kernel
+ * code. Milestone 36 changed that. A ring-3 program that owns a window
+ * (see kernel/wmdev.c) runs *inside* a shell command, and a shell command
+ * runs inside this loop - so while such a program is drawing, the loop it
+ * needs is sitting on the stack underneath it, blocked. Its window would
+ * appear when the program exited, which is not a window.
+ *
+ * So the program's own ioctls turn the crank: "here is a new frame" and
+ * "give me my input" each pump the desktop once. That is not a
+ * concession, it is the right shape for a kernel with no preemption of
+ * its own event loop - the process gets exactly the frames it asks for,
+ * and a process that asks for none costs nothing.
+ *
+ * Reentrancy is the whole difficulty here, and it is worth being precise
+ * about which kind. Nesting *is* the point - the outer call is dispatching
+ * the keystroke that started the command whose syscall makes the inner
+ * call - so a guard around the whole function would make every nested
+ * pump a no-op, which is the same as not having one. What must not nest
+ * is compositing: a repaint prints, printing pumps output
+ * (app_terminal.c), and a compose inside a compose draws with another
+ * frame's clip and origin. So `composing` guards exactly that, and input
+ * dispatch is left free to nest.
+ *
+ * Which is safe because of two things that are not here. Every way the
+ * desktop starts a program goes through shell_run_line(), and the shell
+ * refuses to start a second command while one is running (shell_busy).
+ * And the window manager's own state - drags, focus, z-order - is touched
+ * only from these handlers, which run to completion before the syscall
+ * that nested them returns.
+ */
+int desktop_pump(void) {
+    mouse_event_t mev;
+    while (mouse_poll_event(&mev)) handle_mouse(&mev);
+
+    key_event_t kev;
+    while (keyboard_poll_event(&kev)) handle_key(&kev);
+
+    /* A window opening, closing or minimizing changes what the taskbar
+     * shows, and the taskbar is nowhere near the window that changed - so
+     * window damage alone would leave it stale. */
+    if (wm_generation() != last_generation) {
+        last_generation = wm_generation();
+        wm_damage(0, screen_h - TASKBAR_H, screen_w, TASKBAR_H);
+    }
+
+    uint32_t now = pit_get_ticks();
+    if (now - last_tick >= 10) {       /* ~10 Hz housekeeping */
+        last_tick = now;
+        wm_tick();
+
+        rtc_time_t clock;
+        rtc_read(&clock);
+        if (clock.minute != last_minute) {
+            last_minute = clock.minute;
+            wm_damage(0, screen_h - TASKBAR_H, screen_w, TASKBAR_H);
+        }
+        /* The hover preview appears on a timer, so the one frame it
+         * becomes due on has to be asked for - and only that one, or a
+         * stationary pointer would repaint it ten times a second for as
+         * long as it hovered. */
+        gfx_rect_t thumb;
+        int due = thumbnail_target(&thumb);
+        if (due && !thumb_shown) {
+            thumb_shown = 1;
+            wm_damage(thumb.x, thumb.y, thumb.w, thumb.h);
+        }
+    }
+
+    if (composing) return 0;
+
+    gfx_rect_t damage;
+    int drew = 0;
+    composing = 1;
+    if (wm_take_damage(&damage)) {
+        compose(damage);
+        drew = 1;
+    }
+    composing = 0;
+    return drew;
+}
+
 /* --- startup ------------------------------------------------------------ */
 
 void desktop_start(void) {
@@ -1772,6 +1871,12 @@ void desktop_start(void) {
      * area runs from the very top of the screen down to it. */
     wm_init(screen_w, screen_h, 0, TASKBAR_H);
     wm_set_sysmenu_handler(show_system_menu);
+
+    /* /dev/wm only means anything once there is a window manager to open
+     * a window in, so it is registered here rather than at boot: a
+     * headless boot has no desktop and should not advertise one. */
+    wmdev_init();
+
     desk_icons_layout();
     taskbar_layout();
 
@@ -1783,47 +1888,7 @@ void desktop_start(void) {
     last_tick = pit_get_ticks();
 
     for (;;) {
-        mouse_event_t mev;
-        while (mouse_poll_event(&mev)) handle_mouse(&mev);
-
-        key_event_t kev;
-        while (keyboard_poll_event(&kev)) handle_key(&kev);
-
-        /* A window opening, closing or minimizing changes what the
-         * taskbar shows, and the taskbar is nowhere near the window that
-         * changed - so window damage alone would leave it stale. */
-        if (wm_generation() != last_generation) {
-            last_generation = wm_generation();
-            wm_damage(0, screen_h - TASKBAR_H, screen_w, TASKBAR_H);
-        }
-
-        uint32_t now = pit_get_ticks();
-        if (now - last_tick >= 10) {       /* ~10 Hz housekeeping */
-            last_tick = now;
-            wm_tick();
-
-            rtc_time_t clock;
-            rtc_read(&clock);
-            if (clock.minute != last_minute) {
-                last_minute = clock.minute;
-                wm_damage(0, screen_h - TASKBAR_H, screen_w, TASKBAR_H);
-            }
-            /* The hover preview appears on a timer, so the one frame it
-             * becomes due on has to be asked for - and only that one,
-             * or a stationary pointer would repaint it ten times a
-             * second for as long as it hovered. */
-            gfx_rect_t thumb;
-            int due = thumbnail_target(&thumb);
-            if (due && !thumb_shown) {
-                thumb_shown = 1;
-                wm_damage(thumb.x, thumb.y, thumb.w, thumb.h);
-            }
-        }
-
-        gfx_rect_t damage;
-        if (wm_take_damage(&damage)) {
-            compose(damage);
-        } else {
+        if (!desktop_pump()) {
             /* Nothing to draw: sleep until the next interrupt rather than
              * spinning. The PIT alone wakes us 100 times a second. */
             __asm__ __volatile__("hlt");

@@ -5251,6 +5251,83 @@ and only a failing run spends it.
 - **Networking.** Unchanged, and still the reason `nsiproxy` and `NDIS`
   fail to start.
 
+## Milestone 36 — a window a program owns ✅ DONE
+
+Every window this desktop has ever drawn was drawn by kernel code. An app
+is a paint callback compiled into the kernel (`kernel/app_*.c`), and
+Milestone 11's note has stood since: the window manager *"is not reachable
+from `CreateWindowEx`"*. Milestone 35 finished with Wine running a console
+program and printing `err:winediag:nodrv_CreateWindow` for anything with a
+window, because Wine had no display driver to load.
+
+Those are the same sentence from two sides. This milestone is the piece
+underneath both: **`/dev/wm`**, a device any process can open to get a
+window on the desktop and a buffer to draw into.
+
+```
+fd = open("/dev/wm", O_RDWR);         a window slot of this process's own
+ioctl(fd, WMIO_CREATE, &create);      size and title; the window appears
+px = mmap(0, w*h*4, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+... draw into px, 0x00RRGGBB, w pixels per row ...
+ioctl(fd, WMIO_DAMAGE, &rect);        "this changed, show it"
+ioctl(fd, WMIO_POLL, &event);         input, or WM_EV_NONE
+close(fd);                            the window goes away
+```
+
+`userland/wm_test.c` is a freestanding Linux binary - raw `int $0x80`,
+`-nostdlib`, linked against nothing - that does exactly that, and
+`make test-wm` boots it and screendumps the result. The picture is the
+assertion; `tools/check_wm_window.py` reads the PPM and looks for the
+gradient, frame and marker the program draws, in a block one window wide.
+
+Three things are worth writing down.
+
+**The mmap needed no new code.** The device's per-open node points its
+`data` at the pixel buffer, so the ordinary `MAP_SHARED` path from
+Milestone 30 - the one that hands over the frames a file's bytes live in -
+gives the process the very memory the compositor reads. A frame is one
+`gfx_blit` and no copies.
+
+**The event loop had to become callable.** A ring-3 program runs inside a
+shell command, and a shell command runs inside the desktop's event loop -
+so while such a program draws, the loop it needs is on the stack beneath
+it, blocked. Its window would appear when it exited, which is not a
+window. So `desktop_pump()` is now a function rather than the body of a
+`for(;;)`, and the program's own ioctls turn the crank: a frame per
+damage, input per poll. Nesting is the point, so the guard is around
+compositing only, and `shell_busy` stops a keystroke dispatched from a
+nested pump starting a second command on top of the first.
+
+**It found a leak with a symptom.** A window is freed when the last
+reference to its node goes, so the first thing `/dev/wm` did was show that
+`mmap`'s references were never given back: `posix_unpin_all()` asked
+`posix_current()` for the process to unpin, but `posix_proc_exit()` clears
+a process's `page_directory` first - deliberately, so a later process
+allocated the same frame is never mistaken for it - and by then nothing
+claims that address space. `posix_current()` registered a *fresh* entry
+and unpinned its empty table. The pins are now dropped in
+`posix_exit_process()`, where the process is still known, and the sweep at
+the end of a run walks the table instead of asking. From the outside this
+looked like a dead program's window staying on the desktop, still holding
+the keyboard focus - so the shell stopped accepting commands after
+`run wmtest.elf`. A page-cache-shaped bug caught by a window manager.
+
+### What this does not do yet
+
+- **The buffer does not follow a resize.** The window resizes and the
+  process is told (`WM_EV_RESIZE`); the buffer keeps its size and the
+  paint letterboxes. Resizing the mapping means unmapping frames out from
+  under a process that is drawing into them.
+- **One window per open.** Wine's driver will want one per `HWND`. The
+  interface does not have to change for that; `kernel/wmdev.c` does.
+- **It is not a Wine driver yet.** That is the next step and the reason
+  this exists: `win32u` loads one Unix `.so` and asks it for a surface to
+  draw into (`pCreateWindowSurface`), tells it where the window went
+  (`pWindowPosChanged`) and pumps input through it (`pProcessEvents`).
+  Those three are the three ioctls above, which is not a coincidence -
+  it is why the interface is shaped this way rather than around what a
+  kernel app happens to need.
+
 ## Later / open-ended
 
 - Networking (a NIC driver + a minimal TCP/IP stack) — big undertaking.

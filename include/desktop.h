@@ -27,6 +27,17 @@ void desktop_start(void);
  * repaint. */
 void desktop_pump_output(void);
 
+/* One whole turn of the desktop: input drained and routed, housekeeping,
+ * and a composite of whatever is damaged. Returns 1 if it drew.
+ *
+ * The event loop is this called forever. It is public because Milestone
+ * 36 gave a ring-3 process a window (kernel/wmdev.c), and such a process
+ * runs *inside* a shell command - which runs inside the loop. Its window
+ * would never be drawn while it lived, so its ioctls pump the desktop
+ * themselves: a frame per damage, and input per poll. Self-guarded
+ * against reentry, so calling it from a repaint is harmless. */
+int desktop_pump(void);
+
 /* The strip along the bottom of the screen the taskbar owns. Everything
  * above it is the work area: what a maximized window fills. */
 int desktop_taskbar_height(void);

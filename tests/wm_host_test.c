@@ -149,6 +149,9 @@ void app_open_path(const char* path) {
     while (path[i] && i < sizeof(last_opened) - 1) { last_opened[i] = path[i]; i++; }
     last_opened[i] = '\0';
 }
+/* /dev/wm needs a VFS, and this test links none. Nothing here opens a
+ * window from ring 3, so the registration is a no-op. */
+void wmdev_init(void) { }
 window_t* files_open(void) { return 0; }
 window_t* monitor_open(void) { return 0; }
 window_t* about_open(void) { return 0; }

@@ -15,3 +15,4 @@ novaris-wine.iso
 # novaris-wine-disk.img is a couple of hundred megabytes of somebody
 # else's Wine prefix.
 *.img
+__pycache__/
