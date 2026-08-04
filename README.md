@@ -101,8 +101,37 @@ shell conventions, UI style) without copying anyone's code.
 - [x] **Double-clicking a `.exe` runs it under Wine** — in the File
       Explorer, which browses directories now. `make test-desktop` is
       three mouse gestures and no keyboard at all
+- [x] **A ring-3 process can own a window** — `/dev/wm`: open it, ask for
+      a size, `mmap` the pixels, and the compositor reads the memory the
+      process draws into. Every window before this one was drawn by kernel
+      code. `make test-wm`
+- [x] **A Windows program opens in a window** — Notepad, under real Wine,
+      through Novaris's own Wine display driver
+      (`wine/winenovaris.drv`, `make test-wine-gui`). Double-click it in
+      the File Explorer and it opens, with nothing typed — see below
 
 See `ROADMAP.md` for the full history and what's next, in order.
+
+## A Windows program, in a window
+
+![Notepad running under Wine on Novaris](docs-wine-notepad.png)
+
+*`make test-desktop-gui`: three mouse gestures, no keyboard. The File
+Explorer with `notepad.exe` selected, the Terminal behind it showing
+Wine building its prefix, and Notepad — a real Windows binary, run by
+real Wine — in a window the Novaris compositor drew.*
+
+Every pixel of that window went: GDI → a window surface → the driver's
+`flush()` → a `MAP_SHARED` mapping of `/dev/wm` → the compositor's blit →
+the framebuffer. Input comes back the other way through
+`NtUserSendHardwareInput`, the same call X11 and Wayland make, so above
+the driver there is no difference between a click here and a click on X.
+
+It has no text in it, and it wears two title bars. Both are the same
+missing piece — this Wine is built `--without-freetype`, so there is no
+font engine — and `ROADMAP.md`'s Milestone 37 traces exactly how one
+missing font turns into a caption six and three quarter million pixels
+tall.
 
 ## The desktop
 

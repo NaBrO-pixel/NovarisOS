@@ -5335,6 +5335,12 @@ with a title bar reading "Untitled - Notepad", a taskbar button, and a
 client area Wine draws into. `make test-wine-gui` boots it and asserts it
 from the screendump.
 
+`notepad.exe` and `winemine.exe` are also installed at the root of the
+filesystem, which is what the File Explorer opens on - so double-clicking
+one runs it under Wine and a window appears, with nothing typed. That is
+the whole of Milestone 33's "double-clicking a .exe" and Milestone 37's
+window in one gesture.
+
 Milestone 35 ended with the sentence this milestone deletes:
 
 ```
@@ -5531,8 +5537,21 @@ much each would widen what runs:
        --disable-tests --without-x --without-freetype --without-vulkan \
        --without-opengl && make -j4
    cd ../NovarisOS && make WINE_BUILD=../wine
-   make test-wine test-wine-threads
+   make test-wine test-wine-threads test-wine-gui
    ```
+
+   `--without-freetype` is what the host makes possible rather than what
+   is wanted: with 32-bit FreeType development files, drop it, and
+   Milestone 37's two remaining flaws - no text in a window, and a window
+   with two title bars - both go. See that milestone for why they are the
+   same flaw.
+
+   `make` also builds Novaris's Wine display driver and installs it, by
+   grafting `wine/winenovaris.drv/` into the Wine tree
+   (`tools/build_wine_driver.sh`). That modifies the tree - one
+   `WINE_CONFIG_MAKEFILE` line in `configure.ac`, one `sed` in
+   `programs/explorer/desktop.c` - and both edits are idempotent, so a
+   second `make` is an incremental build rather than a reconfigure.
 
    Since Milestone 35 there is one ISO and Wine is installed into it, so
    `WINE_BUILD` is a variable to `make` rather than an argument to a
