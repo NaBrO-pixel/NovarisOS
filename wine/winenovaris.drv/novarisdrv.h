@@ -141,5 +141,7 @@ void     NOVARIS_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint,
                                   const struct window_rects *new_rects,
                                   struct window_surface *surface);
 void     NOVARIS_SetWindowText(HWND hwnd, LPCWSTR text);
+BOOL     NOVARIS_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style,
+                                     UINT *style_mask, UINT *ex_style_mask);
 
 #endif /* __WINE_NOVARISDRV_H */

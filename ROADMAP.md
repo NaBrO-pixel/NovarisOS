@@ -5374,8 +5374,10 @@ same call X11 and Wayland make, so from `user32` upwards there is no
 difference between a click on a Novaris window and a click on an X11 one -
 no special cases anywhere above the driver.
 
-There is a fifth, `pGetWindowStyleMasks`, and it is *not* implemented -
-for a reason worth knowing, below.
+`pGetWindowStyleMasks` is the fifth, and it is about *not* doing
+something: it tells win32u that `WS_CAPTION`, `WS_DLGFRAME` and
+`WS_THICKFRAME` are drawn by the host. Getting it to work took two goes
+and a font engine - see below.
 
 ### Three things that had to be true first
 
@@ -5415,13 +5417,14 @@ Wine's own, from `nodrv_CreateWindow` and X11's `is_window_managed`: the
 desktop must be its parent, and it must look like something a user would
 drag.
 
-### The thing underneath the two remaining flaws: there is no font
+### The window frame is measured in glyphs
 
-A window here has no text in it, and it wears two title bars - its own,
-drawn by Wine inside the client area, and the one Novaris drew around it.
-Those look like two unrelated cosmetic problems. They are one problem.
+The first Notepad had no text in it, and it wore two title bars - its
+own, drawn by Wine inside the client area, and the one Novaris drew
+around it. Those looked like two unrelated cosmetic problems. They were
+one problem, and it was not a cosmetic one.
 
-This Wine is configured `--without-freetype`, because the host has no
+That Wine was configured `--without-freetype`, because the host had no
 32-bit FreeType to link against. No font engine means no font, and no
 font means `get_text_metr_size()` fills a `TEXTMETRICW` with whatever was
 on the stack. `normalize_nonclientmetrics()` then does:
@@ -5431,9 +5434,9 @@ get_text_metr_size( hdc, &pncm->lfCaptionFont, &tm, NULL );
 pncm->iCaptionHeight = max( pncm->iCaptionHeight, 2 + tm.tmHeight );
 ```
 
-On Novaris `tm.tmHeight` comes out at about six and three quarter
-million, so `SM_CYCAPTION` is six and three quarter million, and so is
-every rectangle computed from it. That is what finding this looked like:
+`tm.tmHeight` came out at about six and three quarter million, so
+`SM_CYCAPTION` was six and three quarter million, and so was every
+rectangle computed from it:
 
 ```
 DBG hwnd 0x10050 style 04cf0000 win (0,0)-(960,570)
@@ -5443,18 +5446,34 @@ DBG hwnd 0x10050 style 04cf0000 win (0,0)-(960,570)
 The window rect is right; the client rect is a strip one pixel tall at
 y=6750323.
 
-Which is why `pGetWindowStyleMasks` is not implemented. It is the correct
-fix for the double title bar - it tells win32u that the host draws the
-caption and the frame - but win32u turns the answer into a rectangle with
+That is why implementing `pGetWindowStyleMasks` - the correct fix for the
+double title bar, since it tells win32u the host draws the caption -
+made Notepad disappear entirely, with a transcript that still passed
+every assertion. win32u turns the mask into a rectangle with
 `NtUserAdjustWindowRect`, and that rectangle is built from
-`SM_CYCAPTION`. Implementing it produced a Notepad window 952 pixels wide
-and 1 pixel tall: invisible, with a transcript full of nothing. The entry
-point is written up in `wine/winenovaris.drv/window.c` where it would go,
-with this explanation, and it waits on fonts.
+`SM_CYCAPTION`. The window came out 952 pixels wide and one tall.
 
-Fonts wait on a Wine built with FreeType, which waits on a build host with
-32-bit FreeType development files. Wine's own `fonts/*.ttf` are only
-484KB - the bytes are not the problem, the rasteriser is.
+So: `apt-get install libfreetype-dev:i386`, reconfigure Wine
+`--with-freetype`, and `tools/install_wine.sh` ships three things it did
+not before -
+
+- Wine's thirteen bundled `.ttf` faces into `/usr/share/wine/fonts`,
+  which is where `get_fonts_data_dir_path()` looks. 484KB.
+- `libfreetype.so.6` and what it needs (`libpng16`, `libz`, `libbz2`,
+  `libbrotlidec`, `libbrotlicommon`) into `/lib32`. Named explicitly,
+  because win32u `dlopen`s FreeType by SONAME - it is in no binary's
+  `NEEDED` list, so the "ask the binaries what they need" loop that
+  ships every other library cannot see it.
+- and `pGetWindowStyleMasks` is now implemented, because the numbers it
+  depends on are real.
+
+Notepad now has a menu bar reading File / Edit / Format / View / Help, a
+white document area with a scroll bar, a status bar saying "Ln 1, Col 1",
+and exactly one title bar. `tools/check_wine_window.py` was rewritten
+around that: it used to look for one flat block of `COLOR_3DFACE`, which
+is what a window with no font engine looks like, and it now wants a white
+`COLOR_WINDOW` document area *with* grey chrome around it - the shape of
+a window that works rather than one that merely exists.
 
 ### What it does not do yet
 
@@ -5470,8 +5489,6 @@ Fonts wait on a Wine built with FreeType, which waits on a build host with
 - **The keyboard is a table, not a layout.** `vkey_for()` maps Novaris's
   character-plus-code to a virtual key well enough to type; a real
   keyboard needs `pKbdLayerDescriptor` and a `KBDTABLES`.
-- **No fonts, so no text and two title bars.** See above - one cause, and
-  it is a Wine build option rather than anything in this repository.
 - **No OpenGL, no Vulkan, no clipboard, no IME, no cursor shapes, no
   display-mode changes.** All optional entry points, all absent, and
   win32u has sensible behaviour for a driver that does not fill them in.
@@ -5534,17 +5551,17 @@ much each would widen what runs:
    ```bash
    git clone --depth 1 -b stable https://github.com/wine-mirror/wine
    cd wine && CC="gcc -m32" ./configure --enable-archs=i386 \
-       --disable-tests --without-x --without-freetype --without-vulkan \
+       --disable-tests --without-x --with-freetype --without-vulkan \
        --without-opengl && make -j4
    cd ../NovarisOS && make WINE_BUILD=../wine
    make test-wine test-wine-threads test-wine-gui
    ```
 
-   `--without-freetype` is what the host makes possible rather than what
-   is wanted: with 32-bit FreeType development files, drop it, and
-   Milestone 37's two remaining flaws - no text in a window, and a window
-   with two title bars - both go. See that milestone for why they are the
-   same flaw.
+   `--with-freetype` is not optional if you want windows: without a font
+   engine Wine's caption metrics are uninitialised stack, and the window
+   frame is measured from them. `apt-get install libfreetype-dev:i386`
+   first (`dpkg --add-architecture i386` if it is not enabled). See
+   Milestone 37.
 
    `make` also builds Novaris's Wine display driver and installs it, by
    grafting `wine/winenovaris.drv/` into the Wine tree

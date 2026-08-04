@@ -104,6 +104,7 @@ static const struct user_driver_funcs novarisdrv_funcs =
 {
     .pCreateWindowSurface = NOVARIS_CreateWindowSurface,
     .pDestroyWindow = NOVARIS_DestroyWindow,
+    .pGetWindowStyleMasks = NOVARIS_GetWindowStyleMasks,
     .pProcessEvents = NOVARIS_ProcessEvents,
     .pSetWindowText = NOVARIS_SetWindowText,
     .pUpdateDisplayDevices = NOVARIS_UpdateDisplayDevices,
