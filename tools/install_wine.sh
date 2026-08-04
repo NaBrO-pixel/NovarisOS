@@ -52,12 +52,13 @@ HOST_LIB32=${HOST_LIB32:-/lib32}
 PE_DLLS="ntdll apisetschema kernel32 kernelbase win32u user32 gdi32 advapi32
          sechost rpcrt4 msvcrt ucrtbase ws2_32 setupapi version
          imm32 combase ole32 oleaut32 shell32 shlwapi shcore winex11
-         wow64cpu cryptbase bcrypt userenv coml2 wininet mpr"
+         wow64cpu cryptbase bcrypt userenv coml2 wininet mpr
+         comctl32 comdlg32 winspool.drv"
 # rundll32 and the setupapi machinery behind it are what wineboot needs to
 # *update* a prefix from wine.inf - which is how a prefix comes to exist
 # at all. Milestone 35 is the first time they have had wine.inf to read.
 PE_PROGS="wineboot start conhost services explorer rundll32 cmd winepath
-          reg regsvr32"
+          reg regsvr32 notepad winemine"
 # A Wine builtin is two halves: a PE .dll the Windows program links
 # against, and a Unix .so it reaches through __wine_init_unix_call().
 # Shipping only the first half is not "that feature is missing" - it is a
