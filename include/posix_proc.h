@@ -132,7 +132,8 @@ typedef struct posix_proc {
     /* Files this process has a shared mapping of, holding a reference so
      * the node outlives both its name and the descriptor it was mapped
      * from. Per process since Milestone 32 - see posix_pin_mapped(). */
-    struct vfs_node* pinned[32];
+#define POSIX_MAX_PINNED 32
+    struct vfs_node* pinned[POSIX_MAX_PINNED];
 
     /* The path readlink("/proc/self/exe") answers with, and the working
      * directory every relative path resolves against. Both are per

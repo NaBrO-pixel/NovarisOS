@@ -135,6 +135,21 @@ posix_proc_t* posix_proc_clone(const posix_proc_t* src, uint32_t pd) {
             if (p->fds[f].kind == FD_SOCKET) socket_ref(p->fds[f].sock);
             if (p->fds[f].kind == FD_FILE) vfs_node_ref(p->fds[f].node);
         }
+        /* And the same for the nodes the parent's *mappings* hold, which
+         * the copy above duplicated the pointers to. The child's address
+         * space is a copy of the parent's, so those mappings are real in
+         * it and the references have to be too.
+         *
+         * This was a leak until Milestone 36 and then briefly a
+         * use-after-free. Nothing ever gave a pin back - posix_unpin_all()
+         * asked posix_current(), which by then answered with a fresh
+         * process and an empty table - so an unreferenced duplicate cost
+         * nothing. Making the unpin work is what made the duplicate
+         * matter: a forked child exiting dropped references it had never
+         * taken, and freed a node the parent still had mapped. */
+        for (int i2 = 0; i2 < POSIX_MAX_PINNED; i2++) {
+            if (p->pinned[i2]) vfs_node_ref(p->pinned[i2]);
+        }
         return p;
     }
     return 0;
