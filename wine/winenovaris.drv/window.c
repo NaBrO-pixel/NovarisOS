@@ -139,6 +139,46 @@ void novaris_win_data_destroy(HWND hwnd)
     novaris_win_data_release(data);
 }
 
+/* --- which windows get one ----------------------------------------------
+ *
+ * Not every HWND is a window somebody should see. Wine creates a desktop
+ * window, a message-only window per thread, child controls, and tool
+ * windows that are never meant to be managed - and the first version of
+ * this driver gave every one of them a /dev/wm slot, which is why a
+ * screenshot of Notepad had four empty black windows behind it.
+ *
+ * The test is Wine's own, from nodrv_CreateWindow and X11's
+ * is_window_managed: a window is ours if the desktop is its parent and it
+ * looks like something a user would drag - a caption, a resizable frame,
+ * or the explicit "this is an application window" flag. Everything else
+ * is drawn by whoever owns it, into a surface nobody shows.
+ */
+static BOOL should_manage(HWND hwnd)
+{
+    UINT style, ex_style;
+    HWND parent;
+
+    if (!hwnd || hwnd == NtUserGetDesktopWindow()) return FALSE;
+
+    parent = NtUserGetAncestor(hwnd, GA_PARENT);
+    if (!parent) return FALSE;                              /* a desktop */
+    if (parent == UlongToHandle(NtUserGetThreadInfo()->msg_window))
+        return FALSE;                                       /* HWND_MESSAGE */
+    if (parent != NtUserGetDesktopWindow()) return FALSE;   /* a child */
+
+    style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
+    if ((style & (WS_CHILD | WS_POPUP)) == WS_CHILD) return FALSE;
+    if ((style & WS_CAPTION) == WS_CAPTION) return TRUE;
+    if (style & WS_THICKFRAME) return TRUE;
+
+    ex_style = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
+    if (ex_style & WS_EX_APPWINDOW) return TRUE;
+    /* A popup with a system menu is a dialog in everything but name. */
+    if ((style & WS_POPUP) && (style & WS_SYSMENU)) return TRUE;
+
+    return FALSE;
+}
+
 /* --- getting a window onto the desktop ---------------------------------- */
 
 /* The title, as a /dev/wm expects it: 7-bit, NUL-terminated, short.
@@ -232,6 +272,15 @@ void NOVARIS_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     BOOL visible = (style & WS_VISIBLE) && !(style & WS_MINIMIZE);
     int width, height;
 
+    /* A window that is not ours never gets a slot in the first place, but
+     * one that *was* ours and has stopped being (a window can lose its
+     * caption) has to give its slot back. */
+    if (!should_manage(hwnd))
+    {
+        novaris_win_data_destroy(hwnd);   /* a no-op if it never had one */
+        return;
+    }
+
     if (!(data = novaris_win_data_get_or_create(hwnd))) return;
 
     data->rects = *new_rects;
@@ -255,6 +304,34 @@ void NOVARIS_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 
     novaris_win_data_release(data);
 }
+
+/* Not implemented, and the reason is worth writing down.
+ *
+ * pGetWindowStyleMasks is how a driver says "the host draws the caption
+ * and the frame, do not draw them yourself". Implementing it is the
+ * obvious fix for the one cosmetic flaw here: Notepad draws its own blue
+ * title bar inside the client area of the one Novaris has already drawn
+ * around it.
+ *
+ * It cannot be used yet, and the reason is not in this file. win32u turns
+ * the mask into a rectangle with NtUserAdjustWindowRect, whose caption
+ * height comes from SM_CYCAPTION, which comes from
+ * normalize_nonclientmetrics():
+ *
+ *     get_text_metr_size( hdc, &pncm->lfCaptionFont, &tm, NULL );
+ *     pncm->iCaptionHeight = max( pncm->iCaptionHeight, 2 + tm.tmHeight );
+ *
+ * This Wine is configured --without-freetype, so there is no font engine,
+ * no font, and tm.tmHeight is whatever was on the stack. On Novaris it is
+ * about six and three quarter million, and the visible rectangle win32u
+ * hands back is a window-wide strip one pixel tall at y=6750323. A window
+ * that size is invisible, which is exactly what implementing this
+ * produced: no Notepad at all, and a passing transcript.
+ *
+ * So this waits on fonts, and fonts wait on a Wine built with FreeType.
+ * The same missing font engine is why a Windows program's window here has
+ * no text in it.
+ */
 
 /**********************************************************************
  *      SetWindowText

@@ -5328,6 +5328,154 @@ the keyboard focus - so the shell stopped accepting commands after
   it is why the interface is shaped this way rather than around what a
   kernel app happens to need.
 
+## Milestone 37 — a Windows program with a window ✅ DONE
+
+`wine notepad.exe`, and Notepad opens on the Novaris desktop: a window
+with a title bar reading "Untitled - Notepad", a taskbar button, and a
+client area Wine draws into. `make test-wine-gui` boots it and asserts it
+from the screendump.
+
+Milestone 35 ended with the sentence this milestone deletes:
+
+```
+err:winediag:nodrv_CreateWindow Application tried to create a window,
+    but no driver could be loaded.
+err:winediag:nodrv_CreateWindow L"The graphics driver is missing.
+    Check your build!"
+```
+
+Wine had no display backend. Milestone 36 built the thing a display
+backend would need - `/dev/wm`, a window and its pixels for any process -
+and this is the driver that uses it: **`wine/winenovaris.drv`**, in this
+repository, grafted into a Wine tree and built there by
+`tools/build_wine_driver.sh`.
+
+### The whole driver, in four entry points
+
+`win32u` draws a window into a *window surface*: a plain top-down 32-bit
+DIB. A display driver gets that DIB onto a screen and sends input back.
+
+| Wine asks for | Novaris answers with |
+| --- | --- |
+| `pUpdateDisplayDevices` | one monitor, the desktop work area (`WMIO_SCREEN`) |
+| `pCreateWindowSurface` | a `window_surface` over an ordinary DIB |
+| `pWindowPosChanged` | `open("/dev/wm")`, `WMIO_CREATE`, `mmap` |
+| the surface's `flush` | the dirty rows copied in, then `WMIO_DAMAGE` |
+| `pProcessEvents` | `WMIO_POLL`, into `NtUserSendHardwareInput` |
+
+That last one matters more than it looks. Input goes back through the
+same call X11 and Wayland make, so from `user32` upwards there is no
+difference between a click on a Novaris window and a click on an X11 one -
+no special cases anywhere above the driver.
+
+There is a fifth, `pGetWindowStyleMasks`, and it is *not* implemented -
+for a reason worth knowing, below.
+
+### Three things that had to be true first
+
+**explorer has to be able to find the driver.** It walks a list of names
+from `HKCU\Software\Wine\Drivers\Graphics` and falls back to a built-in
+`"mac,x11,wayland"`. `tools/install_wine.sh` sets that registry value
+through `wine.inf`, which is the supported way and the one a user could
+change - but a prefix that already exists never sees it, and a prefix here
+is built by a `wineboot` that does not always finish. So
+`tools/build_wine_driver.sh` also puts `novaris` at the front of
+explorer's default: one `sed`, idempotent, and an installed driver becomes
+a used driver whatever state the prefix is in.
+
+**fork has to count the references its mappings hold.** This one was
+already there and had never mattered. `posix_proc_clone()` copies the
+whole process structure and then takes a reference for every *descriptor* -
+but not for the nodes in `pinned[]`, where a shared mapping's reference
+lives. Nothing ever gave a pin back either, because `posix_unpin_all()`
+asked `posix_current()` for the process to unpin and `posix_proc_exit()`
+had already cleared the `page_directory` that identifies one - so it
+registered a fresh entry and unpinned its empty table. A leak balanced by
+another leak.
+
+Milestone 36 needed the unpin to work, because a `/dev/wm` window is freed
+when the last reference to its node goes. Making it work turned the pair
+of leaks into a use-after-free: a forked child exiting dropped references
+it had never taken and freed nodes its parent still had mapped. Wine
+forks constantly, and the prefix build went from "fails one run in four"
+to "faults every run" at two stable addresses. The fix is one loop in
+`posix_proc_clone()`.
+
+**Not every HWND is a window.** Wine creates a desktop window, a
+message-only window per thread, child controls and tool windows. The first
+version of this driver gave all of them a `/dev/wm` slot, and the first
+screenshot of Notepad had four empty black windows behind it. The test is
+Wine's own, from `nodrv_CreateWindow` and X11's `is_window_managed`: the
+desktop must be its parent, and it must look like something a user would
+drag.
+
+### The thing underneath the two remaining flaws: there is no font
+
+A window here has no text in it, and it wears two title bars - its own,
+drawn by Wine inside the client area, and the one Novaris drew around it.
+Those look like two unrelated cosmetic problems. They are one problem.
+
+This Wine is configured `--without-freetype`, because the host has no
+32-bit FreeType to link against. No font engine means no font, and no
+font means `get_text_metr_size()` fills a `TEXTMETRICW` with whatever was
+on the stack. `normalize_nonclientmetrics()` then does:
+
+```c
+get_text_metr_size( hdc, &pncm->lfCaptionFont, &tm, NULL );
+pncm->iCaptionHeight = max( pncm->iCaptionHeight, 2 + tm.tmHeight );
+```
+
+On Novaris `tm.tmHeight` comes out at about six and three quarter
+million, so `SM_CYCAPTION` is six and three quarter million, and so is
+every rectangle computed from it. That is what finding this looked like:
+
+```
+DBG hwnd 0x10050 style 04cf0000 win (0,0)-(960,570)
+    cli (4,6750323)-(956,6750323) vis (4,6750323)-(956,6750324)
+```
+
+The window rect is right; the client rect is a strip one pixel tall at
+y=6750323.
+
+Which is why `pGetWindowStyleMasks` is not implemented. It is the correct
+fix for the double title bar - it tells win32u that the host draws the
+caption and the frame - but win32u turns the answer into a rectangle with
+`NtUserAdjustWindowRect`, and that rectangle is built from
+`SM_CYCAPTION`. Implementing it produced a Notepad window 952 pixels wide
+and 1 pixel tall: invisible, with a transcript full of nothing. The entry
+point is written up in `wine/winenovaris.drv/window.c` where it would go,
+with this explanation, and it waits on fonts.
+
+Fonts wait on a Wine built with FreeType, which waits on a build host with
+32-bit FreeType development files. Wine's own `fonts/*.ttf` are only
+484KB - the bytes are not the problem, the rasteriser is.
+
+### What it does not do yet
+
+- **The window does not resize.** `/dev/wm` cannot resize a mapping under
+  a process that is drawing into it, so the window keeps the size it
+  opened at and win32u's surface is clipped into it. The driver is told
+  about the resize (`WM_EV_RESIZE`) and ignores it, on purpose.
+- **There is a copy per frame.** `flush` memcpy's the dirty rows from the
+  surface's DIB into the `/dev/wm` mapping. It could hand the mapping to
+  `window_surface_create()` as the bitmap's bits and have GDI draw
+  straight into the window - but only once resizing works, because a
+  surface is recreated on every size change.
+- **The keyboard is a table, not a layout.** `vkey_for()` maps Novaris's
+  character-plus-code to a virtual key well enough to type; a real
+  keyboard needs `pKbdLayerDescriptor` and a `KBDTABLES`.
+- **No fonts, so no text and two title bars.** See above - one cause, and
+  it is a Wine build option rather than anything in this repository.
+- **No OpenGL, no Vulkan, no clipboard, no IME, no cursor shapes, no
+  display-mode changes.** All optional entry points, all absent, and
+  win32u has sensible behaviour for a driver that does not fill them in.
+- **And `chrome.exe` is still not reachable.** A browser needs a 64-bit
+  Wine build (this one is 32-bit only), networking (there is none), a font
+  rasteriser, a GPU, a sandbox built on NT APIs this kernel does not have,
+  and far more than the 33 of Wine's 601 DLLs that ship here. What works
+  is a Windows program with a window - `notepad.exe`, `winemine.exe` - and
+  that is a different sentence from "Windows programs work".
+
 ## Later / open-ended
 
 - Networking (a NIC driver + a minimal TCP/IP stack) — big undertaking.

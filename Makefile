@@ -1073,6 +1073,33 @@ test-desktop: $(ISO)
 	    --expect "Exiting with code 0" \
 	    --reject "KERNEL PANIC"
 
+# Milestone 37: a Windows program with a window, under real Wine.
+#
+# Everything `make test-wine` asserts is about a *console* program - what
+# it printed, and which prefix it printed it from. This is the other kind,
+# and the only place its result exists is on the screen: winenovaris.drv
+# hands Wine a surface, GDI draws into it, the driver copies it into a
+# /dev/wm mapping and the compositor blits it. Nothing in that chain
+# prints anything.
+#
+# So the run ends with a screendump, and tools/check_wine_window.py looks
+# for the one thing no other part of this desktop is: a large solid block
+# of 0xD4D0C8, COLOR_3DFACE, the grey behind every Win32 dialog.
+#
+# The transcript still has one thing to say, and it is the line this whole
+# milestone is about not seeing: "no driver could be loaded".
+test-wine-gui: $(ISO)
+	@python3 tools/check_wine_installed.py $(BUILD_DIR)/initrd_staging
+	python3 tools/qemu_test.py --iso $(ISO) --memory 768 \
+	    --boot-wait 30 --settle 900 --timeout 1000 \
+	    --cmd "wine notepad.exe" \
+	    --screenshot $(BUILD_DIR)/wine-gui.ppm \
+	    --reject "no driver could be loaded" \
+	    --reject "The graphics driver is missing" \
+	    --reject "refused a .* window" \
+	    --reject "KERNEL PANIC"
+	@python3 tools/check_wine_window.py $(BUILD_DIR)/wine-gui.ppm
+
 # The same thing on a disk, and the difference is that the prefix is an
 # installation rather than something rebuilt at every boot.
 #
