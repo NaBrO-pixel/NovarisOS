@@ -1,0 +1,9 @@
+MODULE = winenovaris.drv
+UNIXLIB = winenovaris.so
+UNIX_LIBS = -lwin32u
+IMPORTS = user32 win32u
+
+SOURCES = \
+	dllmain.c \
+	novarisdrv_main.c \
+	window.c

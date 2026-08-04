@@ -599,12 +599,14 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
 # OS without Wine, and the `wine` command in the shell says so rather
 # than failing three layers down. Nothing else about the build changes.
 $(BUILD_DIR)/wine-installed.stamp: $(BUILD_DIR)/initrd_staging/helloelf.elf \
-                                   tools/install_wine.sh
+                                   tools/install_wine.sh tools/build_wine_driver.sh \
+                                   $(wildcard wine/winenovaris.drv/*)
 ifeq ($(strip $(WINE_BUILD)),)
 	@echo "No WINE_BUILD set - building without Wine."
 	@echo "  (set WINE_BUILD=/path/to/a/built/wine to install it into the OS)"
 	@touch $@
 else
+	sh tools/build_wine_driver.sh $(WINE_BUILD)
 	HOST_LIB32=$(HOST_LIB32) sh tools/install_wine.sh \
 	    $(WINE_BUILD) $(BUILD_DIR)/initrd_staging $(WINE_STRIP)
 	@touch $@
