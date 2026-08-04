@@ -5161,16 +5161,41 @@ and only a failing run spends it.
 
 ### Still open
 
-- **No display backend.** `err:winediag:nodrv_CreateWindow` is honest -
-  there is no `winex11.drv` equivalent for Novaris's own window manager,
-  so a Windows program can have a console and not a window. That is the
-  next thing worth building, and Milestone 11's compositor is what it
-  would be built on.
+- **No display backend, and it is the only thing between here and a
+  Windows program with a window.** Measured rather than assumed: Wine's
+  own `notepad.exe` was staged and run, and it loads, initialises its
+  DLLs, and gets all the way to creating its window before stopping on
+
+  ```
+  err:winediag:nodrv_CreateWindow Application tried to create a window,
+      but no driver could be loaded.
+  err:winediag:nodrv_CreateWindow L"The graphics driver is missing."
+  ```
+
+  Everything before that point works. What is missing is a driver:
+  win32u loads one Unix `.so` and calls `__wine_set_user_driver()` with a
+  `struct user_driver_funcs` (`include/wine/gdi_driver.h`). Wine builds
+  four - `winex11.drv`, `winewayland.drv`, `winemac.drv`,
+  `wineandroid.drv` - and every one of them needs a display server that
+  does not exist here. A `winenovaris.drv` would talk to `kernel/wm.c`
+  instead, which is what Milestone 11's compositor was built for.
+
+  The interesting part is how *little* of that struct is load-bearing.
+  `pCreateWindowSurface` hands back a buffer the program draws into,
+  `pWindowPosChanged` says where it goes, and `pProcessEvents` pumps
+  input; the keyboard, IME, clipboard, systray, Vulkan and OpenGL
+  entry points can all be null. The rest of the work is not in Wine at
+  all - it is a way for a ring-3 process to get a window from a window
+  manager that currently only serves kernel code.
+
+  One thing to decide before starting: a driver is *Wine* source, and
+  this project has kept Wine as an untouched build input. Either it is
+  built out-of-tree against Wine's headers, or the tree acquires a patch.
 - **It is slow.** wineboot takes longer than the five minutes Wine allows
   for its own boot event, so a successful run contains
   `err:environ:run_wineboot`. Most of it is having no page cache: a mapped
   DLL is read in full and copied into the heap, per file.
-- **The DLL set is curated.** 29 of Wine's 601, so parts of `wine.inf`
+- **The DLL set is curated.** 33 of Wine's 601, so parts of `wine.inf`
   have nothing to install and say so (`SetupDefaultQueueCallbackW copy
   error 1812`, `register_fake_dll failed to create IRegistrar`). Widening
   it is a question of how big an initrd may be, which is a question about
