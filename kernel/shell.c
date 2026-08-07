@@ -27,6 +27,9 @@
 #include "netdev.h"
 #include "dhcp.h"
 #include "pci.h"
+#include "tcp.h"
+#include "dns.h"
+#include "http.h"
 
 #define CMD_BUFFER_SIZE 128
 
@@ -330,6 +333,25 @@ static void cmd_net(const char* args) {
         return;
     }
 
+    if (starts_with(args, "dns ")) {
+        if (!net_config()->configured) {
+            terminal_writestring("No address yet - run 'net up' first.\n");
+            return;
+        }
+        uint32_t ip = 0;
+        if (dns_resolve(args + 4, &ip, 500)) {
+            terminal_writestring(args + 4);
+            terminal_writestring(" is ");
+            print_ip(ip);
+            terminal_writestring("\n");
+        } else {
+            terminal_writestring_color("could not resolve ", VGA_COLOR_LIGHT_RED);
+            terminal_writestring(args + 4);
+            terminal_writestring("\n");
+        }
+        return;
+    }
+
     if (starts_with(args, "ping ")) {
         uint32_t target = 0;
         if (!net_parse_ip(args + 5, &target)) {
@@ -423,6 +445,128 @@ static void cmd_net(const char* args) {
     terminal_writestring("  arp      ");
     print_uint(net_arp_entries());
     terminal_writestring(" cached\n");
+}
+
+
+/* --- fetch --------------------------------------------------------------
+ *
+ * Milestone 39. `fetch <url> [file]` - the first thing this OS has ever
+ * done that reaches outside the machine.
+ *
+ * With no file, the body is printed. With one, it is written to the VFS,
+ * which is what makes this the bottom half of an updater: everything
+ * `update` needs is a URL, a place to put what comes back, and a way to
+ * tell truncation from completion.
+ */
+#define FETCH_MAX (4u * 1024u * 1024u)
+
+static void cmd_fetch(const char* args) {
+    while (*args == ' ') args++;
+    if (!*args) {
+        terminal_writestring("usage: fetch <url> [file]\n"
+                             "  fetch http://10.0.2.2:8000/hello.txt\n"
+                             "  fetch http://example.com/x.bin /disk/x.bin\n");
+        return;
+    }
+
+    /* Split the URL from an optional destination path. */
+    static char url[256], dest[128];
+    uint32_t n = 0;
+    while (*args && *args != ' ' && n < sizeof(url) - 1) url[n++] = *args++;
+    url[n] = '\0';
+    while (*args == ' ') args++;
+    n = 0;
+    while (*args && n < sizeof(dest) - 1) dest[n++] = *args++;
+    dest[n] = '\0';
+
+    if (!net_config()->configured) {
+        terminal_writestring("No address yet - run 'net up' first.\n");
+        return;
+    }
+
+    uint8_t* body = (uint8_t*)kmalloc(FETCH_MAX);
+    if (!body) {
+        terminal_writestring_color("Out of memory.\n", VGA_COLOR_LIGHT_RED);
+        return;
+    }
+
+    http_result_t res;
+    int err = http_get(url, body, FETCH_MAX, &res);
+
+    if (err != HTTP_OK) {
+        terminal_writestring_color("fetch failed: ", VGA_COLOR_LIGHT_RED);
+        terminal_writestring(http_error_string(err));
+        terminal_writestring("\n");
+        kfree(body);
+        return;
+    }
+
+    terminal_writestring("HTTP ");
+    print_uint((uint32_t)res.status);
+    terminal_writestring(", ");
+    print_uint(res.body_len);
+    terminal_writestring(" bytes");
+    if (res.content_length) {
+        terminal_writestring(" of ");
+        print_uint(res.content_length);
+    }
+    terminal_writestring(" from ");
+    print_ip(res.server_ip);
+    terminal_writestring("\n");
+
+    if (res.truncated) {
+        terminal_writestring_color("  (truncated - larger than 4MB)\n",
+                                   VGA_COLOR_LIGHT_BROWN);
+    }
+    if (res.content_length && res.body_len < res.content_length) {
+        terminal_writestring_color("  (short - the connection ended early)\n",
+                                   VGA_COLOR_LIGHT_RED);
+    }
+
+    if (dest[0]) {
+        const char* leaf = 0;
+        vfs_node_t* dir = vfs_resolve_parent(dest, &leaf);
+        vfs_node_t* to = dir ? vfs_finddir(dir, leaf) : 0;
+        if (dir && !to) to = vfs_create(dir, leaf, VFS_FILE);
+        if (!to) {
+            terminal_writestring_color("Could not create ", VGA_COLOR_LIGHT_RED);
+            terminal_writestring(dest);
+            terminal_writestring("\n");
+        } else {
+            vfs_truncate(to, 0);
+            int32_t wrote = vfs_write(to, 0, res.body_len, body);
+            if (wrote < 0 || (uint32_t)wrote != res.body_len) {
+                terminal_writestring_color("Short write to ", VGA_COLOR_LIGHT_RED);
+                terminal_writestring(dest);
+                terminal_writestring("\n");
+            } else {
+                terminal_writestring("Wrote ");
+                print_uint(res.body_len);
+                terminal_writestring(" bytes to ");
+                terminal_writestring(dest);
+                terminal_writestring("\n");
+            }
+        }
+    } else {
+        /* Printed, with a bound: a shell that dumps four megabytes into a
+         * terminal is a shell nobody can use afterwards. */
+        uint32_t show = res.body_len < 2048 ? res.body_len : 2048;
+        for (uint32_t i = 0; i < show; i++) {
+            char c = (char)body[i];
+            if (c == '\n' || c == '\t' || (c >= 32 && c < 127)) {
+                terminal_putchar(c);
+            }
+        }
+        if (show < res.body_len) {
+            terminal_writestring("\n... (");
+            print_uint(res.body_len - show);
+            terminal_writestring(" more bytes; give a filename to keep them)\n");
+        } else {
+            terminal_writestring("\n");
+        }
+    }
+
+    kfree(body);
 }
 
 static void cmd_run(const char* line) {
@@ -815,7 +959,8 @@ static void run_command(char* line) {
         terminal_writestring("            real Wine (novaris-wine.iso only)\n");
         terminal_writestring("  strace  - the same, with every syscall logged\n");
         terminal_writestring("  setenv NAME=VALUE, env - the environment programs are given\n");
-        terminal_writestring("  net, net up, net ping <ip>, net pci - the network\n");
+        terminal_writestring("  net, net up, net ping <ip>, net dns <name>, net pci\n");
+        terminal_writestring("  fetch <url> [file] - download over HTTP\n");
         terminal_writestring("  ps      - the process table (fork gave it more than one row)\n");
         terminal_writestring("  sum <file> - size, checksum and first bytes, for comparing with a host\n");
         terminal_writestring("  vmtest  - prove per-process address spaces work:\n");
@@ -972,6 +1117,8 @@ static void run_command(char* line) {
         print_uint((uint32_t)scheduler_blocked_count());
         terminal_writestring("\n");
         if (line[9]) posix_futex_stats_reset();
+    } else if (starts_with(line, "fetch")) {
+        cmd_fetch(line + 5);
     } else if (streq(line, "net") || starts_with(line, "net ")) {
         cmd_net(line + 3);
     } else if (streq(line, "sockinfo")) {

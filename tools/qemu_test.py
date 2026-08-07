@@ -205,7 +205,8 @@ def wait_for(serial_path, seconds, patterns):
 
 def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
         memory=128, disk=None, setup=(), stop_when=(), clicks=(),
-        click_settle=1.5, post=(), screenshot=None, post_clicks=()):
+        click_settle=1.5, post=(), screenshot=None, post_clicks=(),
+        http_forward=None):
     serial_path = keep_serial or tempfile.mktemp(suffix=".log", prefix="novaris-serial-")
     port = 45000 + (os.getpid() % 10000)
 
@@ -225,6 +226,18 @@ def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
         # DNS forwarder at 10.0.2.3, and the host reachable at 10.0.2.2.
         # Always present rather than opt-in, because "the OS boots with a
         # network card in it" is now part of what every test covers.
+        # QEMU's user-mode stack: DHCP hands out 10.0.2.15, the host is
+        # 10.0.2.2, DNS forwards from 10.0.2.3.
+        #
+        # 10.0.2.2 is both the guest's default gateway and this machine,
+        # so a server bound on the host is reachable from the guest with
+        # no forwarding rule at all - which matters, because QEMU's
+        # `guestfwd` proxy serves one connection and then stops, and a
+        # test that fetches twice would fail the second time for reasons
+        # that have nothing to do with the OS.
+        #
+        # Binding the server to 0.0.0.0 rather than loopback is what makes
+        # 10.0.2.2 answer: slirp connects out from the host's stack.
         "-netdev", "user,id=n0",
         "-device", "rtl8139,netdev=n0",
     ]
@@ -381,11 +394,30 @@ def main():
                          "the run. Some things are only true on screen: a "
                          "window drawn by a ring-3 process leaves no trace "
                          "in a serial transcript.")
+    ap.add_argument("--http-dir",
+                    help="serve this directory to the guest. The port is "
+                         "chosen per run and substituted for $HTTP in every "
+                         "--cmd, so a test writes "
+                         "'fetch http://10.0.2.2:$HTTP/x'. The guest has no "
+                         "route to the outside world here, and a test that "
+                         "needed one would fail when the outside world did - "
+                         "so the server it fetches from is this machine.")
     ap.add_argument("--stop-when-matched", action="store_true",
                     help="end the last command's settle as soon as every "
                          "--expect pattern has appeared, instead of always "
                          "waiting it out")
     args = ap.parse_args()
+
+    # The server the guest fetches from, if the test asked for one.
+    http_proc = None
+    http_forward = None
+    if args.http_dir:
+        http_forward = 34000 + (os.getpid() % 20000)
+        http_proc = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(http_forward),
+             "--bind", "0.0.0.0", "--directory", args.http_dir],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.5)
 
     commands = list(args.cmd)
     if args.script:
@@ -393,12 +425,21 @@ def main():
             commands += [ln.strip() for ln in fh
                          if ln.strip() and not ln.startswith("#")]
 
+    if http_forward:
+        commands = [c.replace("$HTTP", str(http_forward)) for c in commands]
+        args.post_cmd = [c.replace("$HTTP", str(http_forward))
+                         for c in args.post_cmd]
+
     transcript = run(args.iso, commands, args.boot_wait, args.key_delay,
                      args.settle, args.timeout, args.serial_log, args.memory,
                      args.disk, args.setup,
                      args.expect if args.stop_when_matched else (),
                      args.click, args.click_settle, args.post_cmd,
-                     args.screenshot, args.post_click)
+                     args.screenshot, args.post_click, http_forward)
+    if http_proc:
+        http_proc.terminate()
+        http_proc.wait()
+
     sys.stdout.write(transcript)
 
     failures = []

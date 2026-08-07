@@ -20,6 +20,7 @@
 #include "net.h"
 #include "netdev.h"
 #include "rtl8139.h"
+#include "tcp.h"
 #include "kstring.h"
 #include "pit.h"
 #include "console.h"
@@ -568,9 +569,15 @@ int net_available(void) { return dev != 0 && dev->up; }
 
 int net_init(void) {
     if (!rtl8139_init()) return 0;
+    tcp_init();
     return net_available();
 }
 
 void net_poll(void) {
+    /* Drain the card, then let TCP retransmit whatever has timed out.
+     * Both here rather than in two callers, because "turn the crank" is
+     * one idea and a caller that remembered one and forgot the other
+     * would have a stack that receives and never recovers. */
     rtl8139_poll();
+    tcp_tick();
 }

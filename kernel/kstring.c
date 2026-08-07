@@ -64,6 +64,17 @@ int kstrncmp(const char* a, const char* b, uint32_t n) {
     return 0;
 }
 
+int kstrncasecmp(const char* a, const char* b, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+        if (ca != cb) return (int)(unsigned char)ca - (int)(unsigned char)cb;
+        if (!ca) return 0;
+    }
+    return 0;
+}
+
 static char lower(char c) {
     return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
 }

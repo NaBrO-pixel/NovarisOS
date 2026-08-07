@@ -25,6 +25,10 @@ uint32_t kstrlen(const char* s);
 uint32_t kstrnlen(const char* s, uint32_t max);
 int   kstrcmp(const char* a, const char* b);
 int   kstrncmp(const char* a, const char* b, uint32_t n);
+/* Case-insensitive, ASCII only. Milestone 39: HTTP header names are
+ * case-insensitive by specification, and a server that answers
+ * "content-length" in lower case is not a server that is wrong. */
+int   kstrncasecmp(const char* a, const char* b, uint32_t n);
 /* ASCII case-insensitive - Win32 module and export lookups are
  * case-insensitive, and import tables spell DLL names every which way
  * ("KERNEL32.dll", "kernel32.DLL", ...). */

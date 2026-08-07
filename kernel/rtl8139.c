@@ -60,16 +60,18 @@
 #define ISR_RER         0x0002
 #define ISR_TOK         0x0004  /* a frame went out */
 #define ISR_TER         0x0008
+#define ISR_RXOVW       0x0010  /* the ring filled before it was drained */
+#define ISR_FOVW        0x0040  /* the card's own FIFO filled */
 
 /* Accept broadcast, multicast, unicast-to-us and runt/error frames off,
  * with an 8KB ring, unlimited DMA burst and the WRAP bit. */
 #define RXCFG_ACCEPT    0x0000000F
 #define RXCFG_WRAP      0x00000080
-#define RXCFG_8K        0x00000000  /* bits 12:11 = 00 -> 8K + 16 */
+#define RXCFG_64K       0x00001800  /* bits 12:11 = 11 -> 64K + 16 */
 #define RXCFG_MXDMA     0x00000700  /* unlimited */
 #define RXCFG_RXFTH     0x0000E000  /* no threshold: whole frames */
 
-#define RX_BUF_LEN      8192
+#define RX_BUF_LEN      65536
 /* The slack the WRAP bit needs, plus the 16 bytes the card's own
  * bookkeeping wants past the end. */
 #define RX_BUF_PAD      (16 + 1536)
@@ -150,15 +152,24 @@ static int rtl_send(netdev_t* dev, const uint8_t* frame, uint32_t len) {
     uint32_t status_reg = nic.io + REG_TXSTATUS0 + slot * 4;
 
     /* Bit 13 (OWN) is set by the card when it has finished with the
-     * buffer. Spinning here rather than queueing: four buffers deep is
-     * already more than this stack has in flight, and a queue would need
-     * a lock the interrupt handler also takes. */
-    for (uint32_t spin = 0; spin < 1000000; spin++) {
-        if (inl(status_reg) & 0x2000) break;
-        if (spin == 999999) {
-            nic.dev.tx_errors++;
-            return -1;
-        }
+     * buffer. If it is not set, all four buffers are busy - and this
+     * *drops the frame* rather than waiting for one.
+     *
+     * That is not laziness, it is the fix for the bug that made a 200KB
+     * download stop at 45KB. rtl_send() is reached from the interrupt
+     * handler: a received segment is acknowledged, and the acknowledgement
+     * is a frame. A send that spins waiting for a transmit buffer
+     * therefore spins *inside the interrupt handler*, with the receive
+     * ring filling behind it and further interrupts blocked - so the
+     * cure for a busy transmitter was to stop receiving.
+     *
+     * Dropping is safe precisely because of what is being sent. A lost
+     * acknowledgement is followed by another one; a lost data segment is
+     * retransmitted. TCP is built for a link that drops things, and this
+     * is a link that drops things. */
+    if (!(inl(status_reg) & 0x2000)) {
+        nic.dev.tx_errors++;
+        return -1;
     }
 
     kmemcpy(nic.tx[slot], frame, len);
@@ -191,6 +202,16 @@ static void rtl_interrupt(registers_t* regs) {
     if (status & ISR_ROK) rx_drain();
     if (status & ISR_RER) nic.dev.rx_errors++;
     if (status & ISR_TER) nic.dev.tx_errors++;
+
+    if (status & (ISR_RXOVW | ISR_FOVW)) {
+        /* The ring filled. Whatever is in it is still framed correctly,
+         * so drain it first - the frames are real - and then tell the
+         * card where the read pointer is, which is what un-stalls the
+         * receiver. */
+        nic.dev.rx_dropped++;
+        rx_drain();
+        outw(nic.io + REG_CAPR, (uint16_t)(nic.rx_offset - 16));
+    }
 }
 
 /* --- bring-up ----------------------------------------------------------- */
@@ -231,9 +252,14 @@ int rtl8139_init(void) {
     /* Receive and transmit OK, and their error twins. Deliberately not
      * every bit the card can raise: a cable-unplugged interrupt this
      * kernel has nothing to do about is an interrupt storm. */
-    outw(nic.io + REG_IMR, ISR_ROK | ISR_RER | ISR_TOK | ISR_TER);
+    /* Overflow included. Leaving it masked does not mean overflows do
+     * not happen - it means they happen silently and the receiver stops,
+     * which from userland is a download that stalls with no error
+     * anywhere. */
+    outw(nic.io + REG_IMR,
+         ISR_ROK | ISR_RER | ISR_TOK | ISR_TER | ISR_RXOVW | ISR_FOVW);
     outl(nic.io + REG_RXCONFIG,
-         RXCFG_ACCEPT | RXCFG_WRAP | RXCFG_8K | RXCFG_MXDMA | RXCFG_RXFTH);
+         RXCFG_ACCEPT | RXCFG_WRAP | RXCFG_64K | RXCFG_MXDMA | RXCFG_RXFTH);
     outl(nic.io + REG_TXCONFIG, 0x03000700);   /* default IFG, unlimited DMA */
 
     outb(nic.io + REG_CMD, CMD_TX_ENABLE | CMD_RX_ENABLE);
