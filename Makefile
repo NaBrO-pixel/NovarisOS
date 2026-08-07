@@ -35,6 +35,7 @@ OBJS = $(BUILD_DIR)/boot.o $(BUILD_DIR)/kernel.o \
        $(BUILD_DIR)/pci.o $(BUILD_DIR)/rtl8139.o \
        $(BUILD_DIR)/net.o $(BUILD_DIR)/dhcp.o \
        $(BUILD_DIR)/tcp.o $(BUILD_DIR)/dns.o $(BUILD_DIR)/http.o \
+       $(BUILD_DIR)/update.o \
        $(BUILD_DIR)/gdt.o $(BUILD_DIR)/gdt_flush.o \
        $(BUILD_DIR)/idt.o $(BUILD_DIR)/idt_flush.o \
        $(BUILD_DIR)/isr.o $(BUILD_DIR)/pic.o \
@@ -230,6 +231,9 @@ $(BUILD_DIR)/net.o: kernel/net.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/dhcp.o: kernel/dhcp.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/update.o: kernel/update.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/tcp.o: kernel/tcp.c $(HEADERS) | $(BUILD_DIR)

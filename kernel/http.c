@@ -148,7 +148,15 @@ int http_get(const char* url, uint8_t* body, uint32_t body_max,
     int status = 0;
     uint32_t content_length = 0;
 
-    uint32_t deadline = pit_get_ticks() + 3000;      /* thirty seconds */
+    /* An *idle* deadline, reset every time bytes arrive, rather than a
+     * total one. A total timeout is a maximum download size in disguise:
+     * thirty seconds at any rate is a limit on the file, not on the
+     * server, and an updater that fetches a 48MB initrd would fail
+     * against a server that was working perfectly. Thirty seconds of
+     * silence is a dead connection; thirty seconds of transfer is a
+     * transfer. */
+    const uint32_t idle_ticks = 3000;                /* thirty seconds */
+    uint32_t deadline = pit_get_ticks() + idle_ticks;
 
     while (pit_get_ticks() < deadline) {
         net_poll();
@@ -157,6 +165,7 @@ int http_get(const char* url, uint8_t* body, uint32_t body_max,
         uint8_t chunk[512];
         int n = tcp_recv(conn, chunk, sizeof(chunk));
         if (n > 0) {
+            deadline = pit_get_ticks() + idle_ticks;
             uint32_t take = (uint32_t)n;
             if (head_len + take > sizeof(head)) take = sizeof(head) - head_len;
             kmemcpy(head + head_len, chunk, take);
@@ -198,6 +207,7 @@ int http_get(const char* url, uint8_t* body, uint32_t body_max,
         int n = tcp_recv(conn, body + result->body_len,
                          body_max - result->body_len);
         if (n > 0) {
+            deadline = pit_get_ticks() + idle_ticks;
             result->body_len += (uint32_t)n;
             if (result->body_len >= body_max) { result->truncated = 1; break; }
             continue;

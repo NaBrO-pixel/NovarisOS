@@ -30,6 +30,7 @@
 #include "tcp.h"
 #include "dns.h"
 #include "http.h"
+#include "update.h"
 
 #define CMD_BUFFER_SIZE 128
 
@@ -569,6 +570,81 @@ static void cmd_fetch(const char* args) {
     kfree(body);
 }
 
+
+/* --- update -------------------------------------------------------------
+ *
+ * Milestone 40. `update <manifest-url>` fetches a manifest, says what it
+ * would do, and - with `apply` - downloads both images, verifies each
+ * against the manifest, and writes them to /disk/boot.
+ *
+ * Checking and applying are separate words on purpose. An updater that
+ * installs whatever it finds the moment it is run is one nobody trusts
+ * enough to run.
+ */
+static void cmd_update(const char* args) {
+    while (*args == ' ') args++;
+
+    int apply = 0;
+    if (starts_with(args, "apply")) {
+        apply = 1;
+        args += 5;
+        while (*args == ' ') args++;
+    }
+
+    if (!*args) {
+        terminal_writestring("This is Novaris ");
+        terminal_writestring(update_current_name());
+        terminal_writestring(" (version ");
+        print_uint(update_current_version());
+        terminal_writestring(")\n\n"
+            "usage: update <manifest-url>        - see what is available\n"
+            "       update apply <manifest-url>  - download and install it\n\n"
+            "The manifest is plain text; see include/update.h. The download\n"
+            "is checked against the sizes and checksums it gives, and\n"
+            "nothing checks the manifest itself - over plain HTTP, this\n"
+            "trusts the network.\n");
+        return;
+    }
+
+    if (!net_config()->configured) {
+        terminal_writestring("No address yet - run 'net up' first.\n");
+        return;
+    }
+
+    static update_manifest_t m;
+    if (!update_check(args, &m)) return;
+
+    terminal_writestring("Available: ");
+    terminal_writestring(m.name[0] ? m.name : "(unnamed)");
+    terminal_writestring(" (version ");
+    print_uint(m.version);
+    terminal_writestring(")\nInstalled: ");
+    terminal_writestring(update_current_name());
+    terminal_writestring(" (version ");
+    print_uint(update_current_version());
+    terminal_writestring(")\n");
+
+    if (m.version <= update_current_version()) {
+        terminal_writestring_color("Already up to date.\n", VGA_COLOR_LIGHT_GREEN);
+        if (!apply) return;
+        terminal_writestring("Installing it anyway, since you asked.\n");
+    }
+
+    if (!apply) {
+        terminal_writestring("Run 'update apply ");
+        terminal_writestring(args);
+        terminal_writestring("' to install it.\n");
+        return;
+    }
+
+    if (update_apply(&m)) {
+        terminal_writestring_color("[OK] ", VGA_COLOR_LIGHT_GREEN);
+        terminal_writestring("Update installed to /disk/boot.\n"
+                             "Run 'sync', then reboot: the bootloader "
+                             "prefers the disk's copy when it is newer.\n");
+    }
+}
+
 static void cmd_run(const char* line) {
     const char** argv = 0;
     int argc = split_args(line, &argv);
@@ -961,6 +1037,7 @@ static void run_command(char* line) {
         terminal_writestring("  setenv NAME=VALUE, env - the environment programs are given\n");
         terminal_writestring("  net, net up, net ping <ip>, net dns <name>, net pci\n");
         terminal_writestring("  fetch <url> [file] - download over HTTP\n");
+        terminal_writestring("  update [apply] <manifest-url> - update the OS\n");
         terminal_writestring("  ps      - the process table (fork gave it more than one row)\n");
         terminal_writestring("  sum <file> - size, checksum and first bytes, for comparing with a host\n");
         terminal_writestring("  vmtest  - prove per-process address spaces work:\n");
@@ -1117,6 +1194,8 @@ static void run_command(char* line) {
         print_uint((uint32_t)scheduler_blocked_count());
         terminal_writestring("\n");
         if (line[9]) posix_futex_stats_reset();
+    } else if (starts_with(line, "update")) {
+        cmd_update(line + 6);
     } else if (starts_with(line, "fetch")) {
         cmd_fetch(line + 5);
     } else if (streq(line, "net") || starts_with(line, "net ")) {
