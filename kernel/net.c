@@ -357,6 +357,14 @@ int net_udp_recv(uint16_t port, udp_datagram_t* out) {
     return 0;
 }
 
+int net_udp_pending(uint16_t port) {
+    for (int i = 0; i < UDP_PORTS; i++) {
+        udp_port_t* p = &udp_ports[i];
+        if (p->bound && p->port == port) return p->tail != p->head;
+    }
+    return 0;
+}
+
 static void udp_deliver(uint32_t src_ip, uint16_t src_port, uint16_t dest_port,
                         const uint8_t* data, uint32_t len) {
     for (int i = 0; i < UDP_PORTS; i++) {

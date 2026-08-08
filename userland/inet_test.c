@@ -48,9 +48,12 @@ static long sc3(long n, long a, long b, long c) {
 #define SC_GETPEERNAME  7
 #define SC_SEND         9
 #define SC_RECV        10
+#define SC_SENDTO      11
+#define SC_RECVFROM    12
 
 #define AF_INET       2
 #define SOCK_STREAM   1
+#define SOCK_DGRAM    2
 
 struct sockaddr_in {
     unsigned short sin_family;
@@ -123,13 +126,109 @@ static unsigned parse_uint(const char* s) {
 
 static char buf[4096];
 
+/* --- a DNS query, by hand ------------------------------------------------
+ *
+ * The point of this half is UDP, and the reason UDP is worth having from
+ * a process is that a resolver needs it. So rather than echo bytes at a
+ * port, this builds a real DNS question and reads a real answer: one
+ * datagram out, one back, which is the shape of every resolver ever
+ * written.
+ *
+ * Only the header and the question are constructed; the answer is
+ * checked for "this is a reply to my query and it has at least one
+ * record", which is as much as a socket test should care about. */
+
+static unsigned char dnsbuf[512];
+
+/* "example.com" -> "\7example\3com\0", which is how a name goes on the
+ * wire: each label preceded by its length, terminated by a zero. */
+static unsigned encode_name(const char* name, unsigned char* out) {
+    unsigned w = 0;
+    while (*name) {
+        unsigned start = w++;              /* room for the length byte */
+        unsigned n = 0;
+        while (*name && *name != '.') { out[w++] = (unsigned char)*name++; n++; }
+        out[start] = (unsigned char)n;
+        if (*name == '.') name++;
+    }
+    out[w++] = 0;
+    return w;
+}
+
+static int dns_query(unsigned server_ip, const char* name) {
+    long a[6];
+
+    a[0] = AF_INET; a[1] = SOCK_DGRAM; a[2] = 0;
+    long fd = sc2(SYS_socketcall, SC_SOCKET, (long)a);
+    if (fd < 0) { out("[--] udp socket failed: "); out_int(fd); out("\n"); return 1; }
+    out("[ok] udp socket\n");
+
+    /* The header: one question, recursion desired. */
+    unsigned w = 0;
+    dnsbuf[w++] = 0x2b; dnsbuf[w++] = 0x1d;      /* id, any value will do */
+    dnsbuf[w++] = 0x01; dnsbuf[w++] = 0x00;      /* RD */
+    dnsbuf[w++] = 0x00; dnsbuf[w++] = 0x01;      /* one question */
+    dnsbuf[w++] = 0; dnsbuf[w++] = 0;            /* no answers */
+    dnsbuf[w++] = 0; dnsbuf[w++] = 0;            /* no authority */
+    dnsbuf[w++] = 0; dnsbuf[w++] = 0;            /* no additional */
+    w += encode_name(name, dnsbuf + w);
+    dnsbuf[w++] = 0; dnsbuf[w++] = 1;            /* A */
+    dnsbuf[w++] = 0; dnsbuf[w++] = 1;            /* IN */
+
+    struct sockaddr_in to;
+    for (unsigned i = 0; i < sizeof(to.sin_zero); i++) to.sin_zero[i] = 0;
+    to.sin_family = AF_INET;
+    to.sin_port = hton16(53);
+    to.sin_addr = hton32(server_ip);
+
+    a[0] = fd; a[1] = (long)dnsbuf; a[2] = w; a[3] = 0;
+    a[4] = (long)&to; a[5] = sizeof(to);
+    long r = sc2(SYS_socketcall, SC_SENDTO, (long)a);
+    if (r != (long)w) {
+        out("[--] sendto returned "); out_int(r); out("\n");
+        sc1(SYS_close, fd);
+        return 1;
+    }
+    out("[ok] sent a DNS question for ");
+    out(name);
+    out("\n");
+
+    struct sockaddr_in from;
+    unsigned fromlen = sizeof(from);
+    a[0] = fd; a[1] = (long)dnsbuf; a[2] = sizeof(dnsbuf); a[3] = 0;
+    a[4] = (long)&from; a[5] = (long)&fromlen;
+    r = sc2(SYS_socketcall, SC_RECVFROM, (long)a);
+    if (r < 12) {
+        out("[--] recvfrom returned "); out_int(r); out("\n");
+        sc1(SYS_close, fd);
+        return 1;
+    }
+
+    /* Bit 15 of the flags word is QR: this is a response. The answer
+     * count is the pair of bytes at offset 6. */
+    unsigned answers = ((unsigned)dnsbuf[6] << 8) | dnsbuf[7];
+    if (!(dnsbuf[2] & 0x80)) {
+        out("[--] that is not a DNS response\n");
+        sc1(SYS_close, fd);
+        return 1;
+    }
+    out("[ok] a reply from port ");
+    out_uint(hton16(from.sin_port));
+    out(" with ");
+    out_uint(answers);
+    out(" answer(s)\n");
+
+    sc1(SYS_close, fd);
+    return answers ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
     const char* host = argc > 1 ? argv[1] : "10.0.2.2";
     unsigned port = argc > 2 ? parse_uint(argv[2]) : 80;
 
     unsigned ip = parse_ip(host);
     if (!ip || !port) {
-        out("usage: inet_test.elf <dotted-quad> <port>\n");
+        out("usage: inet_test.elf <ip> <port> [dns-ip] [name]\n");
         return 2;
     }
 
@@ -239,6 +338,19 @@ int main(int argc, char** argv) {
 
     sc1(SYS_close, fd);
     out("[ok] close\n");
+
+    /* The datagram half, against whatever resolver was named. Skipped
+     * rather than failed when there is no third argument, so the TCP
+     * half stays usable on its own. */
+    if (argc > 3) {
+        unsigned dns_ip = parse_ip(argv[3]);
+        if (!dns_ip) {
+            out("[--] third argument is not a dotted quad\n");
+            return 1;
+        }
+        if (dns_query(dns_ip, argc > 4 ? argv[4] : "example.com") != 0) return 1;
+    }
+
     out("inet_test: a process opened a TCP connection\n");
     return 0;
 }

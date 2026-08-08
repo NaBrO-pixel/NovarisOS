@@ -1011,7 +1011,10 @@ run-disk: $(ISO) disk
 # switched off and on in between, so nothing can have been served out of a
 # cache that did not survive.
 # Milestone 41. The one test that has to be run rather than reasoned
-# about: a ring-3 process opening a TCP connection.
+# about: a ring-3 process opening a TCP connection, and then asking a
+# real nameserver a real question over UDP. 10.0.2.3 is QEMU's own DNS
+# forwarder, so the second half needs a working resolver on this machine
+# and nothing more.
 #
 # The server is this machine. tools/qemu_test.py serves --http-dir from
 # the build host, which QEMU's user-mode stack presents to the guest as
@@ -1027,9 +1030,11 @@ test-inet: $(ISO)
 	    --boot-wait 40 --settle 60 --timeout 260 \
 	    --http-dir $(BUILD_DIR)/test/www \
 	    --setup "net up" \
-	    --cmd 'run inettest.elf 10.0.2.2 $$HTTP' \
+	    --cmd 'run inettest.elf 10.0.2.2 $$HTTP 10.0.2.3 example.com' \
 	    --expect "\\[ok\\] connect" \
 	    --expect "\\[ok\\] HTTP/1.0 200 OK" \
+	    --expect "\\[ok\\] udp socket" \
+	    --expect "answer\\(s\\)" \
 	    --expect "a process opened a TCP connection" \
 	    --reject "KERNEL PANIC" \
 	    --stop-when-matched

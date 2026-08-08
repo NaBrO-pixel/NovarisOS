@@ -48,6 +48,7 @@
 #define SHUT_RDWR 2
 
 #define IPPROTO_TCP  6
+#define IPPROTO_UDP 17
 
 #define SO_ERROR     4
 #define SO_REUSEADDR 2

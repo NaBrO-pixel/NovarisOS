@@ -101,6 +101,9 @@ int  net_udp_bind(uint16_t port);
 void net_udp_unbind(uint16_t port);
 /* The oldest datagram for a bound port, or 0. */
 int  net_udp_recv(uint16_t port, udp_datagram_t* out);
+/* Whether there is one, without taking it. What poll() needs: asking by
+ * receiving would consume the thing being asked about. */
+int  net_udp_pending(uint16_t port);
 
 /* --- ICMP --------------------------------------------------------------- */
 

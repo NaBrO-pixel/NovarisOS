@@ -118,9 +118,10 @@ shell conventions, UI style) without copying anyone's code.
       disk's copy on the next reboot. `tools/tests/update_e2e.sh` proves
       it the only way an updater can be proven: by rebooting into the
       version it installed
-- [x] **Sockets a program can call** — `AF_INET`/`SOCK_STREAM` over the
-      same i386 `socketcall` ABI, so a Linux binary built against nothing
-      that has heard of Novaris opens a TCP connection from ring 3.
+- [x] **Sockets a program can call** — `AF_INET`, streams and datagrams
+      both, over the same i386 `socketcall` ABI. A Linux binary built
+      against nothing that has heard of Novaris opens a TCP connection
+      from ring 3, and asks a real nameserver a real question over UDP.
       `make test-inet`
 
 See `ROADMAP.md` for the full history and what's next, in order.
@@ -482,10 +483,11 @@ contains `err:environ:run_wineboot`. Most of that is having no page cache
 
 And `nsiproxy` and `NDIS` still fail to start, which is worth stating
 precisely rather than as "no networking". Since Milestone 41 a process
-*can* open a TCP connection — `AF_INET` through the same `socketcall`
-ABI as the Unix sockets wineserver runs on. What those two want is not
-BSD sockets but NT device objects and an `AFD` driver, so this is a step
-toward Wine networking rather than the arrival of it.
+*can* open a TCP connection and send a UDP datagram — `AF_INET` through
+the same `socketcall` ABI as the Unix sockets wineserver already runs on.
+What those two want is not BSD sockets but NT device objects and an `AFD`
+driver, so this is a step toward Wine networking rather than the arrival
+of it.
 
 ## The disk
 
@@ -778,7 +780,8 @@ make test-wine-persist   # ... twice, across a reboot, on a prefix that survived
 make test-wine-gui       # ... and asserts the *window* from a screendump
 make test-desktop-gui    # ... opened by double-clicking, with nothing typed
 
-make test-inet           # a ring-3 process opens a TCP connection
+make test-inet           # a ring-3 process opens a TCP connection,
+                         #   then resolves a name over UDP
 sh tools/tests/update_e2e.sh   # installs a new version and reboots into it
 ```
 

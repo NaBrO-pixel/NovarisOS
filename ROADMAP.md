@@ -5666,17 +5666,55 @@ a wait and back to how they were after. Changing the gate to a trap gate
 would have fixed it too, and would have quietly changed the conditions
 every other syscall in the kernel has always run under.
 
+### And datagrams, which is what a resolver needs
+
+`SOCK_DGRAM` too, over net.c's existing UDP ports: `sendto`, `recvfrom`,
+`bind`, and a `connect` that connects to nothing and simply records where
+send and recv should default to. A datagram that does not fit the
+caller's buffer is truncated rather than kept, because that is what makes
+it a datagram and not a stream.
+
+The test is a **DNS query built by hand** - header, encoded name,
+question - sent to QEMU's forwarder at 10.0.2.3 and read back:
+
+```
+[ok] udp socket
+[ok] sent a DNS question for example.com
+[ok] a reply from port 53 with 2 answer(s)
+```
+
+One datagram out and one back is the shape of every resolver ever
+written, which is the point: the kernel has had a resolver since
+Milestone 39, but a *program* could not ask anything until now.
+
+Two bugs, both of which produced a plausible partial success rather than
+an obvious failure:
+
+- **A datagram send is the first packet to an address.** net_send_ip()
+  returns short while ARP resolves, and the caller is expected to poll
+  and retry - which TCP never had to notice, because its first packet is
+  a SYN that gets retransmitted anyway. A resolver's first query is the
+  first thing anyone sends to a nameserver, so it failed with "network
+  down" against a network that was working perfectly.
+
+- **`net_udp_bind` returns 1 for success, not 0.** Reading that backwards
+  meant every real success looked like a failure: the loop kept trying
+  ports until it had filled net.c's whole table, and then treated the one
+  genuine failure as success. The query went out from a port that had
+  never been bound and the answer was delivered to nobody. It looked
+  exactly like a nameserver that did not reply.
+
 ### What is deliberately not here
 
 - **No listening sockets.** `bind`, `listen` and `accept` on an AF_INET
-  socket return EOPNOTSUPP. Accepting needs a table of listening ports in
-  tcp.c and a queue under it; refusing plainly beats letting the
-  Unix-domain path read a `sockaddr_in` as a path.
-- **No UDP, no raw sockets, no IPv6.**
-- **No DNS from a process.** The resolver is in the kernel and `connect`
-  takes an address, not a name. A program that wants `getaddrinfo` needs
-  a libc that has one and a socket to ask over, and that is a different
-  piece of work.
+  *stream* socket return EOPNOTSUPP. Accepting needs a table of listening
+  ports in tcp.c and a queue under it; refusing plainly beats letting the
+  Unix-domain path read a `sockaddr_in` as a path. (`bind` does work on a
+  datagram socket, which needs no such table.)
+- **No raw sockets, no IPv6.**
+- **No `getaddrinfo`.** A process can now ask a nameserver itself, which
+  is the hard half, but the parsing and the `/etc/resolv.conf` reading
+  belong in a libc rather than in a kernel.
 - **A blocking call still holds the whole machine.** There is one event
   loop and no other thread to turn the crank, so a read that waits is a
   read the desktop waits behind. Every one of them therefore takes a
@@ -5690,9 +5728,9 @@ toward Wine networking rather than the arrival of it.
 
 - ~~Networking (a NIC driver + a minimal TCP/IP stack)~~ — done in
   Milestones 38-41, up to and including AF_INET sockets a ring-3 process
-  can call. What is still missing above it: TLS, listening sockets
-  (bind/listen/accept return EOPNOTSUPP for AF_INET), UDP and raw
-  sockets, and a resolver a process can reach.
+  can call, streams and datagrams both. What is still missing above it:
+  TLS, listening sockets (bind/listen/accept return EOPNOTSUPP for a
+  stream), raw sockets, IPv6, and a libc with getaddrinfo in it.
 - SMP (multi-core) support.
 - Porting a real libc (newlib) instead of hand-rolling one.
 - A custom bootloader instead of relying on GRUB, if you want the whole
