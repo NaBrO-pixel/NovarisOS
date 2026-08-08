@@ -5748,9 +5748,31 @@ and on the host, `guest replied b'novaris\n'`.
   read the desktop waits behind. Every one of them therefore takes a
   deadline: ten seconds to connect, thirty of no progress to fail.
 
-And `nsiproxy` and `NDIS` still will not start under Wine. They want NT
-device objects and an `AFD` driver, not BSD sockets - so this is a step
-toward Wine networking rather than the arrival of it.
+### The part that was already true and nobody had checked
+
+A Windows program under Wine can use the network, and could as soon as
+this milestone landed. `userland/pe_test/winsock.c` is a mingw-built
+`.exe` linked against `ws2_32` that does `WSAStartup`, `connect`, `send`
+and `recv`; under Wine on Novaris it fetches a page and reads 579 bytes.
+
+Wine's `ws2_32` implements `AFD` on top of ordinary BSD sockets, so the
+Windows side was already written - it only ever needed the Unix
+primitives underneath, which is what this milestone added. The write-up
+above (and README.md) claimed the opposite for a while, on the strength
+of a sentence that predated the socket layer.
+
+One real bug stood between the two, and it was in this file's own work
+rather than in Wine: the `socketcall` dispatcher sent `SENDMSG` and
+`RECVMSG` to the AF_UNIX implementation whatever the socket was. Wine's
+AFD writes with `send()` and reads with `recvmsg()`, so output took the
+inet route and input landed in an empty Unix ring buffer - whose "nothing
+here and no peer" answer is indistinguishable from end of stream. The
+program connected, sent its request, and read `0 bytes to end of stream`,
+which is precisely what a server that says nothing looks like.
+
+`nsiproxy` and `NDIS` do still fail to start, and that is narrower than
+it used to sound: they enumerate interfaces, addresses and routes through
+NT device objects, which is a different job from carrying a connection.
 
 ## Later / open-ended
 

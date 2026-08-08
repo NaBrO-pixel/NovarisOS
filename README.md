@@ -118,6 +118,9 @@ shell conventions, UI style) without copying anyone's code.
       disk's copy on the next reboot. `tools/tests/update_e2e.sh` proves
       it the only way an updater can be proven: by rebooting into the
       version it installed
+- [x] **A Windows program on the network** — a mingw-built `.exe` linked
+      against `ws2_32`, under real Wine, does `WSAStartup`/`connect`/`recv`
+      and fetches a page. `make test-winsock`
 - [x] **Sockets a program can call** — `AF_INET`, streams and datagrams
       both, over the same i386 `socketcall` ABI. A Linux binary built
       against nothing that has heard of Novaris opens a TCP connection
@@ -482,13 +485,31 @@ five minutes Wine allows for its own boot event, so a successful run
 contains `err:environ:run_wineboot`. Most of that is having no page cache
 — a mapped DLL is read in full and copied into the heap, per file.
 
-And `nsiproxy` and `NDIS` still fail to start, which is worth stating
-precisely rather than as "no networking". Since Milestone 41 a process
-*can* open a TCP connection and send a UDP datagram — `AF_INET` through
-the same `socketcall` ABI as the Unix sockets wineserver already runs on.
-What those two want is not BSD sockets but NT device objects and an `AFD`
-driver, so this is a step toward Wine networking rather than the arrival
-of it.
+**And a Windows program can use the network.** A mingw-built `.exe`
+linked against `ws2_32`, running under real Wine, does `WSAStartup`,
+`connect`, `send` and `recv` and fetches a page:
+
+```
+novaris> wine winsock.exe 10.0.2.2 8000
+[ok] WSAStartup
+[ok] connect
+[ok] HTTP/1.0 200 OK
+[ok] read 579 bytes to end of stream
+```
+
+That arrived as a *consequence* of Milestone 41 rather than as separate
+work, and this file said the opposite for a while — "from inside a Wine
+process the network is exactly as absent as it was" — because the
+sentence predated the socket layer and nobody had re-run it. Wine's
+`ws2_32` is two halves like every builtin, and its Unix half implements
+`AFD` on top of ordinary BSD sockets: `socket`, `connect`, `send`,
+`recvmsg`. Those are exactly what a ring-3 process gained. `make
+test-winsock`.
+
+`nsiproxy` and `NDIS` do still fail to start, and that is a narrower
+thing than it used to sound: they enumerate interfaces, addresses and
+routes through NT device objects, which is a different job from carrying
+a connection.
 
 ## The disk
 
@@ -784,6 +805,7 @@ make test-desktop-gui    # ... opened by double-clicking, with nothing typed
 make test-inet           # a ring-3 process opens a TCP connection,
                          #   then resolves a name over UDP
 make test-listen         # ... and accepts one opened to the machine
+make test-winsock        # a Windows .exe, under Wine, fetches a page
 sh tools/tests/update_e2e.sh   # installs a new version and reboots into it
 ```
 

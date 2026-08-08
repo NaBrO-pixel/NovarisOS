@@ -62,7 +62,7 @@ ISO = novaris.iso
 
 .PHONY: all clean run run-nographic iso test test-qemu test-posix test-wine \
         test-wine-threads test-qemu-disk test-wine-prefix test-desktop \
-        test-wine-persist test-inet test-listen \
+        test-wine-persist test-inet test-listen test-winsock \
         zip disk
 
 all: $(ISO)
@@ -1069,6 +1069,33 @@ test-listen: $(ISO)
 	    --expect "a program on this machine accepted a connection" \
 	    --reject "KERNEL PANIC" \
 	    --stop-when-matched
+
+# Milestone 41's last question: a *Windows* program on the network.
+#
+# Not a Novaris binary using Novaris sockets, but a mingw-built .exe
+# linked against ws2_32, running under real Wine, doing WSAStartup and
+# connect and recv. Wine's ws2_32 implements AFD on top of BSD sockets,
+# so this passes or fails on whether the socket layer underneath is
+# complete enough for somebody else's implementation to sit on - which
+# is a stronger question than whether it satisfies its own test.
+#
+# The settle is long because Wine's startup dominates it; --stop-when-
+# matched means a passing run ends as soon as the last line appears.
+test-winsock: $(ISO)
+	@python3 tools/check_wine_installed.py $(BUILD_DIR)/initrd_staging
+	python3 tools/qemu_test.py --iso $(ISO) --memory 768 \
+	    --boot-wait 40 --settle 700 --timeout 850 \
+	    --http-dir $(BUILD_DIR)/test/www \
+	    --setup "net up" \
+	    --cmd 'wine winsock.exe 10.0.2.2 $$HTTP' \
+	    --expect "\\[ok\\] WSAStartup" \
+	    --expect "\\[ok\\] connect" \
+	    --expect "\\[ok\\] HTTP/1.0 200 OK" \
+	    --expect "a Windows program reached the network" \
+	    --reject "KERNEL PANIC" \
+	    --stop-when-matched
+
+test-winsock: $(BUILD_DIR)/test/www
 
 # A directory for test-inet's server to serve. One small file is enough:
 # what is being tested is the socket, not the transfer.
