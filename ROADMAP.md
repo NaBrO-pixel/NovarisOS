@@ -5608,12 +5608,91 @@ notice. `chain_nth` now remembers where its last walk ended, which is one
 step per cluster for sequential access and a fallback to the walk for
 anything else.
 
+## Milestone 41 — the network, from inside a process ✅ DONE
+
+Milestone 39 gave the machine TCP and Milestone 40 gave it an updater,
+and both of them ran *in the kernel*. From inside a program - and
+therefore from inside anything running under Wine - there was still no
+network at all. README.md said so in as many words, which is how this
+milestone got picked.
+
+So: **AF_INET/SOCK_STREAM**, through the same `socketcall` ABI that
+Milestone 28 built for AF_UNIX. `socket`, `connect`, `send`, `recv`,
+`shutdown`, `getsockname`, `getpeername`, `close` and `poll`, backed by
+kernel/tcp.c.
+
+`userland/inet_test.c` is the proof and it is written to the same rule as
+everything else in that directory: raw `int $0x80`, Linux syscall
+numbers, `gcc -m32 -static -nostdlib`, linked against nothing that has
+heard of Novaris. It speaks HTTP/1.0 by hand, runs on the Linux build
+host, and prints the same lines on both machines:
+
+```
+connecting to 10.0.2.2:34797
+[ok] socket
+[ok] connect
+[ok] peer port 34797
+[ok] sent 52 bytes
+[ok] HTTP/1.0 200 OK
+[ok] read 579 bytes to end of stream
+[ok] close
+inet_test: a process opened a TCP connection
+```
+
+`make test-inet` is that run, against a server on the build host - which
+QEMU presents to the guest as 10.0.2.2, its own gateway, so the test
+needs nothing from the outside world.
+
+### The bug that only a blocking syscall could have
+
+The first version connected and then hung for ever, with no error and no
+fault. The cause is one hex digit in `kernel/idt.c`:
+
+```c
+idt_set_gate(128, (uint32_t)isr128, 0x08, 0xEE);   /* interrupt gate */
+```
+
+`int 0x80` is an **interrupt** gate, so the CPU clears IF on the way in
+and every syscall body runs with interrupts disabled. For a syscall that
+returns promptly that is invisible, and until now they all did. A syscall
+that *waits* is a different matter, and it fails twice over: `hlt` with
+IF clear is a halt nothing can end, and spinning instead would not help
+either, because `pit_get_ticks()` only advances on a timer interrupt - so
+the deadline meant to end the wait never arrives. Both loops waited for
+ever.
+
+The fix is local rather than global: interrupts go on for the duration of
+a wait and back to how they were after. Changing the gate to a trap gate
+would have fixed it too, and would have quietly changed the conditions
+every other syscall in the kernel has always run under.
+
+### What is deliberately not here
+
+- **No listening sockets.** `bind`, `listen` and `accept` on an AF_INET
+  socket return EOPNOTSUPP. Accepting needs a table of listening ports in
+  tcp.c and a queue under it; refusing plainly beats letting the
+  Unix-domain path read a `sockaddr_in` as a path.
+- **No UDP, no raw sockets, no IPv6.**
+- **No DNS from a process.** The resolver is in the kernel and `connect`
+  takes an address, not a name. A program that wants `getaddrinfo` needs
+  a libc that has one and a socket to ask over, and that is a different
+  piece of work.
+- **A blocking call still holds the whole machine.** There is one event
+  loop and no other thread to turn the crank, so a read that waits is a
+  read the desktop waits behind. Every one of them therefore takes a
+  deadline: ten seconds to connect, thirty of no progress to fail.
+
+And `nsiproxy` and `NDIS` still will not start under Wine. They want NT
+device objects and an `AFD` driver, not BSD sockets - so this is a step
+toward Wine networking rather than the arrival of it.
+
 ## Later / open-ended
 
 - ~~Networking (a NIC driver + a minimal TCP/IP stack)~~ — done in
-  Milestones 38-40. What is still missing above it: TLS, a socket API
-  for ring-3 programs (the stack is reachable from the shell and the
-  updater, not from a process), and listening sockets.
+  Milestones 38-41, up to and including AF_INET sockets a ring-3 process
+  can call. What is still missing above it: TLS, listening sockets
+  (bind/listen/accept return EOPNOTSUPP for AF_INET), UDP and raw
+  sockets, and a resolver a process can reach.
 - SMP (multi-core) support.
 - Porting a real libc (newlib) instead of hand-rolling one.
 - A custom bootloader instead of relying on GRUB, if you want the whole

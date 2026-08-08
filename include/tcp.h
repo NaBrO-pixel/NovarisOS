@@ -56,6 +56,10 @@ int tcp_connect_wait(uint32_t dest_ip, uint16_t dest_port, uint32_t ticks);
 
 tcp_state_t tcp_state(int handle);
 
+/* The ephemeral port this end was given. getsockname() needs it, and it
+ * is chosen down here rather than by the caller. */
+uint16_t tcp_local_port(int handle);
+
 /* Queues data. Returns how much was taken - which is 0 when a segment is
  * already in flight, so the caller polls and tries again. */
 int tcp_send(int handle, const uint8_t* data, uint32_t len);
@@ -64,6 +68,10 @@ int tcp_send_all(int handle, const uint8_t* data, uint32_t len, uint32_t ticks);
 
 /* Copies out what has arrived. Returns bytes copied, 0 if none yet. */
 int tcp_recv(int handle, uint8_t* out, uint32_t max);
+
+/* How many bytes are waiting, without taking any. What poll() needs:
+ * asking by reading would consume the thing being asked about. */
+uint32_t tcp_recv_ready(int handle);
 
 /* Whether the peer has finished sending and everything it sent has been
  * read. */

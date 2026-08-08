@@ -26,6 +26,9 @@
 #include "scheduler.h"
 #include "console.h"
 #include "vfs.h"
+#include "tcp.h"
+#include "net.h"
+#include "pit.h"
 
 /* Raised in Milestone 30 for the same reason the descriptor table was:
  * wineserver plus two clients is already a dozen sockets and pipes, and
@@ -54,6 +57,10 @@ typedef enum {
     SS_BOUND,
     SS_LISTENING,
     SS_CONNECTED,
+    /* AF_INET only: a non-blocking connect whose handshake is still in
+     * flight. AF_UNIX has no such state because connecting there is a
+     * table lookup and a pointer, with nothing to wait for. */
+    SS_CONNECTING,
 } sock_state_t;
 
 /* A descriptor waiting to be picked up by recvmsg. Stored as the payload
@@ -107,6 +114,19 @@ struct socket {
     uint32_t     backlog_count;
 
     char         path[108];      /* the name it is bound to, if any */
+
+    /* AF_INET only. `tcp` is a handle into kernel/tcp.c, or -1.
+     *
+     * An inet socket shares this structure and almost none of its fields:
+     * no peer, no ring buffer, no passed descriptors. The bytes live in
+     * tcp.c's own receive buffer and are copied straight out of it, so
+     * queueing them here as well would be a second copy of the same
+     * stream and a second place for it to be wrong. */
+    int          inet;
+    int          tcp;
+    uint32_t     peer_ip;        /* host order */
+    uint16_t     peer_port;      /* host order */
+    uint16_t     local_port;     /* host order, as tcp.c chose it */
 };
 
 static socket_t sockets[MAX_SOCKETS];
@@ -128,6 +148,10 @@ static socket_t* sock_alloc(void) {
         if (sockets[i].state == SS_FREE) {
             socket_t* s = &sockets[i];
             kmemset(s, 0, sizeof(*s));
+            /* Not zero: zero is a valid tcp.c handle, and a socket that
+             * was never connected would close somebody else's
+             * connection on the way out. */
+            s->tcp = -1;
             s->buf = (uint8_t*)kmalloc(SOCK_BUF_SIZE);
             if (!s->buf) return 0;
             s->state = SS_UNBOUND;
@@ -205,7 +229,12 @@ static uint32_t q_get(socket_t* s, uint8_t* dst, uint32_t n, int peek) {
 
 /* --- transfer ------------------------------------------------------------ */
 
+static int32_t inet_write(socket_t* s, const void* buf, uint32_t len);
+static void inet_settle(socket_t* s);
+static int32_t inet_read(socket_t* s, void* buf, uint32_t len);
+
 int32_t socket_write(socket_t* s, const void* buf, uint32_t len) {
+    if (s && s->inet) return inet_write(s, buf, len);
     if (!s || s->state != SS_CONNECTED) return -ENOTCONN;
     if (s->shut_wr) return -EPIPE;
     if (s->peer_closed || !s->peer) return -EPIPE;
@@ -221,6 +250,7 @@ int32_t socket_write(socket_t* s, const void* buf, uint32_t len) {
 }
 
 int32_t socket_read(socket_t* s, void* buf, uint32_t len, registers_t* regs) {
+    if (s && s->inet) { (void)regs; return inet_read(s, buf, len); }
     if (!s) return -EBADF;
     if (s->shut_rd) return 0;
     if (len == 0) return 0;
@@ -270,6 +300,19 @@ void socket_ref(socket_t* s) {
 
 void socket_close(socket_t* s) {
     if (!s) return;
+    if (s->inet) {
+        if (s->refs > 1) { s->refs--; return; }
+        if (s->tcp >= 0) {
+            /* The FIN goes out here, and tcp.c finishes the close under
+             * later net_poll() calls - which is why this does not wait
+             * for the peer's answer. A process that exits should not be
+             * held up by a machine on the other side of the wire. */
+            tcp_close(s->tcp);
+            s->tcp = -1;
+        }
+        sock_free(s);
+        return;
+    }
     /* Another descriptor still names it - a dup, or the same descriptor
      * in a forked child. Nothing happens to the socket, and in
      * particular the peer is *not* told about an end of stream that has
@@ -297,22 +340,205 @@ static void link_pair(socket_t* a, socket_t* b) {
 /* --- the sub-calls -------------------------------------------------------- */
 
 static int32_t do_socket(int domain, int type, int protocol) {
-    if (domain != AF_UNIX) return -EAFNOSUPPORT;
+    if (domain != AF_UNIX && domain != AF_INET) return -EAFNOSUPPORT;
     int flags = type & (SOCK_CLOEXEC | SOCK_NONBLOCK);
     type &= ~(SOCK_CLOEXEC | SOCK_NONBLOCK);
     /* A type this kernel does not have is EINVAL; a protocol it does not
      * have is EPROTONOSUPPORT. Linux distinguishes the two and so does
      * this - both were checked against the host rather than guessed. */
     if (type != SOCK_STREAM) return -EINVAL;
-    if (protocol != 0) return -EPROTONOSUPPORT;
+
+    /* AF_INET/SOCK_STREAM accepts 0 or IPPROTO_TCP for the same reason
+     * Linux does: 0 means "the default stream protocol for this family",
+     * and for AF_INET that is TCP. Every other number is a protocol this
+     * kernel does not have. */
+    if (domain == AF_INET) {
+        if (protocol != 0 && protocol != IPPROTO_TCP) return -EPROTONOSUPPORT;
+        if (!net_available()) return -ENETDOWN;
+        if (!net_config()->configured) return -ENETDOWN;
+    } else if (protocol != 0) {
+        return -EPROTONOSUPPORT;
+    }
 
     socket_t* s = sock_alloc();
     if (!s) return -ENFILE;
     s->nonblock = (flags & SOCK_NONBLOCK) ? 1 : 0;
+    s->inet = (domain == AF_INET);
 
     int fd = posix_fd_install_socket(s);
     if (fd < 0) { sock_free(s); return fd; }
     return fd;
+}
+
+/* --- AF_INET --------------------------------------------------------------
+ *
+ * Everything below turns the crank on the network stack itself. There is
+ * no other thread to do it: kernel/tcp.c makes progress when net_poll()
+ * is called, and inside a syscall the only code that is going to call it
+ * is this. So a blocking operation here is a loop of net_poll() and
+ * `hlt` - which is precisely the shape http.c already uses, and which
+ * holds the whole machine for its duration.
+ *
+ * That is the honest cost of a kernel with one event loop, and it is why
+ * every one of these takes a deadline rather than waiting for ever. A
+ * connect to an address nobody answers must end. */
+
+static uint32_t deadline_in(uint32_t ticks) { return pit_get_ticks() + ticks; }
+
+/* Interrupts on for the duration of a wait, and back to how they were
+ * afterwards.
+ *
+ * `int 0x80` is installed as an *interrupt* gate (0xEE in idt.c), so the
+ * CPU clears IF on the way in and every syscall body runs with
+ * interrupts disabled. For a syscall that returns promptly that is
+ * invisible. For one that waits it is fatal, and in a way that looks
+ * like a hang rather than a bug: `hlt` with IF clear is a halt nothing
+ * can end, and spinning instead would not help either, because
+ * pit_get_ticks() only advances on a timer interrupt - so the deadline
+ * that was supposed to end the wait never arrives. The first version of
+ * this file waited for ever on connect() for exactly that reason.
+ *
+ * Turning them on here is safe because the handlers that can then fire -
+ * the timer, the keyboard, the mouse, the network card - are the same
+ * ones that fire throughout the desktop's own loop, and the scheduler's
+ * tick does nothing unless it is actively multitasking. */
+static uint32_t irq_enable_save(void) {
+    uint32_t flags;
+    __asm__ __volatile__("pushfl; popl %0; sti" : "=r"(flags) :: "memory");
+    return flags;
+}
+
+static void irq_restore(uint32_t flags) {
+    if (!(flags & 0x200)) __asm__ __volatile__("cli" ::: "memory");
+}
+
+/* One turn of waiting: let the card and the timer be heard from. */
+static void net_wait(void) {
+    net_poll();
+    __asm__ __volatile__("hlt" ::: "memory");
+}
+
+#define INET_CONNECT_TICKS 1000     /* ten seconds */
+#define INET_IO_TICKS      3000     /* thirty of no progress */
+
+static int32_t inet_connect(socket_t* s, const sockaddr_in_t* addr,
+                            uint32_t len) {
+    if (!addr || len < sizeof(sockaddr_in_t)) return -EINVAL;
+    if (addr->sin_family != AF_INET) return -EAFNOSUPPORT;
+    if (s->state == SS_CONNECTED) return -EISCONN;
+
+    uint32_t ip = ntohl(addr->sin_addr);
+    uint16_t port = ntohs(addr->sin_port);
+    if (!ip || !port) return -EINVAL;
+
+    int h = tcp_connect(ip, port);
+    if (h < 0) return -ENOBUFS;
+
+    s->tcp = h;
+    s->peer_ip = ip;
+    s->peer_port = port;
+    s->local_port = tcp_local_port(h);
+
+    /* A non-blocking connect returns immediately and the handshake
+     * finishes under whatever the program polls with next. Linux says
+     * EINPROGRESS for exactly this and programs are written for it. */
+    if (s->nonblock) {
+        s->state = SS_CONNECTING;
+        return -EINPROGRESS;
+    }
+
+    uint32_t flags = irq_enable_save();
+    uint32_t deadline = deadline_in(INET_CONNECT_TICKS);
+    int32_t result = -ETIMEDOUT;
+
+    while (pit_get_ticks() < deadline) {
+        tcp_state_t st = tcp_state(h);
+        if (st == TCP_ESTABLISHED) {
+            s->state = SS_CONNECTED;
+            result = 0;
+            break;
+        }
+        if (st == TCP_CLOSED) {
+            result = -ECONNREFUSED;
+            break;
+        }
+        net_wait();
+    }
+    irq_restore(flags);
+
+    if (result != 0) {
+        tcp_close(h);
+        s->tcp = -1;
+    }
+    return result;
+}
+
+/* Whether a non-blocking connect has finished, called before any I/O so
+ * that a program which polls and then writes finds a connected socket. */
+static void inet_settle(socket_t* s) {
+    if (s->state != SS_CONNECTING || s->tcp < 0) return;
+    net_poll();
+    tcp_state_t st = tcp_state(s->tcp);
+    if (st == TCP_ESTABLISHED) s->state = SS_CONNECTED;
+    else if (st == TCP_CLOSED) { tcp_close(s->tcp); s->tcp = -1; s->state = SS_UNBOUND; }
+}
+
+static int32_t inet_write(socket_t* s, const void* buf, uint32_t len) {
+    inet_settle(s);
+    if (s->state == SS_CONNECTING) return -EAGAIN;
+    if (s->state != SS_CONNECTED || s->tcp < 0) return -ENOTCONN;
+    if (s->shut_wr) return -EPIPE;
+    if (!buf) return -EFAULT;
+    if (!len) return 0;
+
+    if (s->nonblock) {
+        net_poll();
+        int n = tcp_send(s->tcp, (const uint8_t*)buf, len);
+        if (n <= 0) return -EAGAIN;
+        stat_bytes += (uint32_t)n;
+        return n;
+    }
+
+    uint32_t flags = irq_enable_save();
+    int n = tcp_send_all(s->tcp, (const uint8_t*)buf, len, INET_IO_TICKS);
+    irq_restore(flags);
+
+    if (n <= 0) return -EPIPE;
+    stat_bytes += (uint32_t)n;
+    return n;
+}
+
+static int32_t inet_read(socket_t* s, void* buf, uint32_t len) {
+    inet_settle(s);
+    if (s->state == SS_CONNECTING) return -EAGAIN;
+    if (s->state != SS_CONNECTED || s->tcp < 0) return -ENOTCONN;
+    if (s->shut_rd) return 0;
+    if (!buf) return -EFAULT;
+    if (!len) return 0;
+
+    /* An idle deadline, reset by nothing: a read waits for the first
+     * byte and returns as soon as it has any. A stream read is allowed
+     * to return short and every program is written for that. */
+    uint32_t flags = irq_enable_save();
+    uint32_t deadline = deadline_in(INET_IO_TICKS);
+    int32_t result;
+
+    for (;;) {
+        net_poll();
+        int n = tcp_recv(s->tcp, (uint8_t*)buf, len);
+        if (n > 0) { stat_bytes += (uint32_t)n; result = n; break; }
+
+        /* End of stream is 0, and it is not an error - it is the answer.
+         * A peer that closed after sending is the normal end of an
+         * HTTP/1.0 body. */
+        if (tcp_eof(s->tcp) || tcp_state(s->tcp) == TCP_CLOSED) { result = 0; break; }
+        if (s->nonblock) { result = -EAGAIN; break; }
+        if (pit_get_ticks() >= deadline) { result = -ETIMEDOUT; break; }
+        __asm__ __volatile__("hlt" ::: "memory");
+    }
+
+    irq_restore(flags);
+    return result;
 }
 
 static int32_t do_socketpair(int domain, int type, int protocol, int* sv) {
@@ -611,23 +837,40 @@ int32_t socket_syscall(uint32_t call, uint32_t* a, registers_t* regs) {
         case SYS_SOCKETPAIR:
             return do_socketpair((int)a[0], (int)a[1], (int)a[2], (int*)a[3]);
 
-        case SYS_BIND:
-            return do_bind(posix_fd_socket((int)a[0]),
-                           (const sockaddr_un_t*)a[1], a[2]);
+        /* An AF_INET socket here can only dial out. Listening needs a
+         * table of accepting ports in tcp.c and an accept queue under
+         * it; refusing plainly beats letting the Unix-domain path read a
+         * sockaddr_in as a path and bind something absurd. */
+        case SYS_BIND: {
+            socket_t* s = posix_fd_socket((int)a[0]);
+            if (s && s->inet) return -EOPNOTSUPP;
+            return do_bind(s, (const sockaddr_un_t*)a[1], a[2]);
+        }
 
-        case SYS_LISTEN:
-            return do_listen(posix_fd_socket((int)a[0]), (int)a[1]);
+        case SYS_LISTEN: {
+            socket_t* s = posix_fd_socket((int)a[0]);
+            if (s && s->inet) return -EOPNOTSUPP;
+            return do_listen(s, (int)a[1]);
+        }
 
-        case SYS_CONNECT:
-            return do_connect(posix_fd_socket((int)a[0]),
-                              (const sockaddr_un_t*)a[1], a[2]);
+        case SYS_CONNECT: {
+            socket_t* s = posix_fd_socket((int)a[0]);
+            if (!s) return -ENOTSOCK;
+            if (s->inet) return inet_connect(s, (const sockaddr_in_t*)a[1], a[2]);
+            return do_connect(s, (const sockaddr_un_t*)a[1], a[2]);
+        }
 
-        case SYS_ACCEPT:
-            return do_accept(posix_fd_socket((int)a[0]), (sockaddr_un_t*)a[1],
-                             (uint32_t*)a[2], 0, regs);
-        case SYS_ACCEPT4:
-            return do_accept(posix_fd_socket((int)a[0]), (sockaddr_un_t*)a[1],
-                             (uint32_t*)a[2], (int)a[3], regs);
+        case SYS_ACCEPT: {
+            socket_t* s = posix_fd_socket((int)a[0]);
+            if (s && s->inet) return -EOPNOTSUPP;
+            return do_accept(s, (sockaddr_un_t*)a[1], (uint32_t*)a[2], 0, regs);
+        }
+        case SYS_ACCEPT4: {
+            socket_t* s = posix_fd_socket((int)a[0]);
+            if (s && s->inet) return -EOPNOTSUPP;
+            return do_accept(s, (sockaddr_un_t*)a[1], (uint32_t*)a[2],
+                             (int)a[3], regs);
+        }
 
         case SYS_SEND:
             return socket_write(posix_fd_socket((int)a[0]), (const void*)a[1], a[2]);
@@ -637,10 +880,23 @@ int32_t socket_syscall(uint32_t call, uint32_t* a, registers_t* regs) {
 
         case SYS_RECV:
             return socket_read(posix_fd_socket((int)a[0]), (void*)a[1], a[2], regs);
-        case SYS_RECVFROM:
-            if (a[4]) ((sockaddr_un_t*)a[4])->sun_family = AF_UNIX;
-            if (a[5]) *(uint32_t*)a[5] = 2;
-            return socket_read(posix_fd_socket((int)a[0]), (void*)a[1], a[2], regs);
+        case SYS_RECVFROM: {
+            socket_t* s = posix_fd_socket((int)a[0]);
+            if (s && s->inet) {
+                if (a[4]) {
+                    sockaddr_in_t* in = (sockaddr_in_t*)a[4];
+                    kmemset(in, 0, sizeof(*in));
+                    in->sin_family = AF_INET;
+                    in->sin_port = htons(s->peer_port);
+                    in->sin_addr = htonl(s->peer_ip);
+                }
+                if (a[5]) *(uint32_t*)a[5] = sizeof(sockaddr_in_t);
+            } else {
+                if (a[4]) ((sockaddr_un_t*)a[4])->sun_family = AF_UNIX;
+                if (a[5]) *(uint32_t*)a[5] = 2;
+            }
+            return socket_read(s, (void*)a[1], a[2], regs);
+        }
 
         case SYS_SENDMSG:
             return do_sendmsg(posix_fd_socket((int)a[0]), (const k_msghdr_t*)a[1],
@@ -669,6 +925,16 @@ int32_t socket_syscall(uint32_t call, uint32_t* a, registers_t* regs) {
         case SYS_GETSOCKNAME: {
             socket_t* s = posix_fd_socket((int)a[0]);
             if (!s) return -ENOTSOCK;
+            if (s->inet) {
+                sockaddr_in_t* in = (sockaddr_in_t*)a[1];
+                if (!in || !a[2]) return -EFAULT;
+                kmemset(in, 0, sizeof(*in));
+                in->sin_family = AF_INET;
+                in->sin_port = htons(s->local_port);
+                in->sin_addr = htonl(net_config()->ip);
+                *(uint32_t*)a[2] = sizeof(*in);
+                return 0;
+            }
             sockaddr_un_t* addr = (sockaddr_un_t*)a[1];
             if (!addr || !a[2]) return -EFAULT;
             addr->sun_family = AF_UNIX;
@@ -680,6 +946,16 @@ int32_t socket_syscall(uint32_t call, uint32_t* a, registers_t* regs) {
             socket_t* s = posix_fd_socket((int)a[0]);
             if (!s) return -ENOTSOCK;
             if (s->state != SS_CONNECTED) return -ENOTCONN;
+            if (s->inet) {
+                sockaddr_in_t* in = (sockaddr_in_t*)a[1];
+                if (!in || !a[2]) return -EFAULT;
+                kmemset(in, 0, sizeof(*in));
+                in->sin_family = AF_INET;
+                in->sin_port = htons(s->peer_port);
+                in->sin_addr = htonl(s->peer_ip);
+                *(uint32_t*)a[2] = sizeof(*in);
+                return 0;
+            }
             sockaddr_un_t* addr = (sockaddr_un_t*)a[1];
             if (!addr || !a[2]) return -EFAULT;
             addr->sun_family = AF_UNIX;
@@ -755,6 +1031,31 @@ uint32_t socket_poll_mask(socket_t* s) {
     uint32_t mask = 0;
     if (!s) return POLLNVAL;
 
+    /* An inet socket has no peer pointer and no local queue, so every
+     * test below it would read a field that is permanently zero and
+     * conclude the connection had hung up. Answered from tcp.c instead,
+     * which is where the state actually is. */
+    if (s->inet) {
+        if (s->state == SS_CONNECTING) {
+            net_poll();
+            inet_settle(s);
+        }
+        if (s->tcp < 0 || s->state == SS_UNBOUND) return POLLHUP;
+
+        /* Polling is also the only moment a program gives this kernel to
+         * move the connection along - there is no other thread to do it.
+         * A select() loop that never called net_poll() would wait for
+         * data that nothing was collecting. */
+        net_poll();
+
+        if (s->state == SS_CONNECTED) {
+            if (tcp_recv_ready(s->tcp) || tcp_eof(s->tcp)) mask |= POLLIN;
+            if (!s->shut_wr) mask |= POLLOUT;
+        }
+        if (tcp_state(s->tcp) == TCP_CLOSED) mask |= POLLHUP | POLLIN;
+        return mask;
+    }
+
     if (s->state == SS_LISTENING) {
         /* An incoming connection is what "readable" means on a listening
          * socket, which is what makes poll() and accept() compose. */
@@ -777,8 +1078,25 @@ uint32_t socket_poll_mask(socket_t* s) {
 
 /* --- lifecycle ------------------------------------------------------------ */
 
+/* A connection an exiting process left open.
+ *
+ * sock_free() releases the *socket*; the TCP connection under an inet one
+ * is in kernel/tcp.c and outlives it, so without this a program that
+ * exits without closing leaks a connection table slot and leaves the peer
+ * waiting on a FIN that never comes. A program is entitled to exit
+ * without tidying up - that is what a process teardown is for. */
+static void drop_tcp(socket_t* s) {
+    if (s->inet && s->tcp >= 0) {
+        tcp_close(s->tcp);
+        s->tcp = -1;
+    }
+}
+
 void socket_process_begin(void) {
-    for (int i = 0; i < MAX_SOCKETS; i++) sockets[i].state = SS_FREE;
+    for (int i = 0; i < MAX_SOCKETS; i++) {
+        drop_tcp(&sockets[i]);
+        sockets[i].state = SS_FREE;
+    }
     for (int i = 0; i < MAX_BOUND; i++) { bound[i].sock = 0; bound[i].path[0] = '\0'; }
     stat_bytes = 0;
     stat_fds = 0;
@@ -786,7 +1104,9 @@ void socket_process_begin(void) {
 
 void socket_process_end(void) {
     for (int i = 0; i < MAX_SOCKETS; i++) {
-        if (sockets[i].state != SS_FREE) sock_free(&sockets[i]);
+        if (sockets[i].state == SS_FREE) continue;
+        drop_tcp(&sockets[i]);
+        sock_free(&sockets[i]);
     }
     for (int i = 0; i < MAX_BOUND; i++) { bound[i].sock = 0; bound[i].path[0] = '\0'; }
 }

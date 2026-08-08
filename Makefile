@@ -62,7 +62,7 @@ ISO = novaris.iso
 
 .PHONY: all clean run run-nographic iso test test-qemu test-posix test-wine \
         test-wine-threads test-qemu-disk test-wine-prefix test-desktop \
-        test-wine-persist \
+        test-wine-persist test-inet \
         zip disk
 
 all: $(ISO)
@@ -461,6 +461,16 @@ $(BUILD_DIR)/user/socktest.elf: userland/sock_test.c | $(BUILD_DIR)
 	$(CC) -m32 -static -nostdlib -ffreestanding -fno-builtin -O2 -Wall \
 	    -o $@ $<
 
+# Milestone 41: the same socketcall ABI, but AF_INET - a TCP connection
+# opened by a *process* rather than by the shell. Unlike the other
+# programs here it is not run on the host and diffed, because it needs a
+# server to talk to and the two machines do not have the same one; what
+# it is compared against is the transcript `make test-inet` expects.
+$(BUILD_DIR)/user/inettest.elf: userland/inet_test.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(CC) -m32 -static -nostdlib -ffreestanding -fno-builtin -O2 -Wall \
+	    -o $@ $<
+
 # Milestone 29: fork, execve, waitpid, pipes, dup2 and poll. It re-executes
 # itself through /proc/self/exe to test execve, so the binary is both the
 # test and its own exec target.
@@ -577,7 +587,8 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
         $(BUILD_DIR)/user/hello_elf.elf $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf \
         $(BUILD_DIR)/user/pthtest.elf $(BUILD_DIR)/user/crashelf.elf \
         $(BUILD_DIR)/user/fstest.elf $(BUILD_DIR)/user/kmaptest.elf \
-        $(BUILD_DIR)/user/socktest.elf $(BUILD_DIR)/user/forktest.elf \
+        $(BUILD_DIR)/user/socktest.elf $(BUILD_DIR)/user/inettest.elf \
+        $(BUILD_DIR)/user/forktest.elf \
         $(BUILD_DIR)/user/mmaptest.elf $(BUILD_DIR)/user/wmtest.elf \
         $(BUILD_DIR)/user/glibc.elf $(BUILD_DIR)/user/dyn.elf \
         $(BUILD_DIR)/user/uctest.elf \
@@ -598,6 +609,7 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
 	cp $(BUILD_DIR)/user/fstest.elf $(BUILD_DIR)/initrd_staging/fstest.elf
 	cp $(BUILD_DIR)/user/kmaptest.elf $(BUILD_DIR)/initrd_staging/kmaptest.elf
 	cp $(BUILD_DIR)/user/socktest.elf $(BUILD_DIR)/initrd_staging/socktest.elf
+	cp $(BUILD_DIR)/user/inettest.elf $(BUILD_DIR)/initrd_staging/inettest.elf
 	cp $(BUILD_DIR)/user/forktest.elf $(BUILD_DIR)/initrd_staging/forktest.elf
 	cp $(BUILD_DIR)/user/mmaptest.elf $(BUILD_DIR)/initrd_staging/mmaptest.elf
 	cp $(BUILD_DIR)/user/wmtest.elf $(BUILD_DIR)/initrd_staging/wmtest.elf
@@ -998,6 +1010,38 @@ run-disk: $(ISO) disk
 # link and syncs; the second reads them back on a machine that has been
 # switched off and on in between, so nothing can have been served out of a
 # cache that did not survive.
+# Milestone 41. The one test that has to be run rather than reasoned
+# about: a ring-3 process opening a TCP connection.
+#
+# The server is this machine. tools/qemu_test.py serves --http-dir from
+# the build host, which QEMU's user-mode stack presents to the guest as
+# 10.0.2.2 - both its default gateway and us - so the test needs nothing
+# from the outside world and cannot fail because the outside world is
+# down.
+#
+# The same binary runs on the Linux host (build/user/inettest.elf
+# 127.0.0.1 <port> against any local server) and prints the same lines,
+# which is the point: nothing in it knows what a Novaris is.
+test-inet: $(ISO)
+	python3 tools/qemu_test.py --iso $(ISO) --memory 768 \
+	    --boot-wait 40 --settle 60 --timeout 260 \
+	    --http-dir $(BUILD_DIR)/test/www \
+	    --setup "net up" \
+	    --cmd 'run inettest.elf 10.0.2.2 $$HTTP' \
+	    --expect "\\[ok\\] connect" \
+	    --expect "\\[ok\\] HTTP/1.0 200 OK" \
+	    --expect "a process opened a TCP connection" \
+	    --reject "KERNEL PANIC" \
+	    --stop-when-matched
+
+# A directory for test-inet's server to serve. One small file is enough:
+# what is being tested is the socket, not the transfer.
+$(BUILD_DIR)/test/www: | $(BUILD_DIR)
+	mkdir -p $@
+	printf 'Novaris reached this from a process.\n' > $@/index.html
+
+test-inet: $(BUILD_DIR)/test/www
+
 test-qemu-disk: $(ISO)
 	rm -f $(BUILD_DIR)/persist.img
 	python3 tools/mkfat32.py $(BUILD_DIR)/persist.img --size 64M --label PERSIST

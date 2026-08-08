@@ -14,7 +14,7 @@ bootloader hands off to a kernel, and the kernel grows from there. Over time
 you can shape it to *feel* like whichever OS inspires you (windowing system,
 shell conventions, UI style) without copying anyone's code.
 
-## Current status: Milestone 40 complete ✅
+## Current status: Milestone 41 complete ✅
 
 - [x] Multiboot bootloader handoff (via GRUB), 32-bit protected mode
 - [x] Freestanding C kernel — no libc, we own the whole stack
@@ -118,6 +118,10 @@ shell conventions, UI style) without copying anyone's code.
       disk's copy on the next reboot. `tools/tests/update_e2e.sh` proves
       it the only way an updater can be proven: by rebooting into the
       version it installed
+- [x] **Sockets a program can call** — `AF_INET`/`SOCK_STREAM` over the
+      same i386 `socketcall` ABI, so a Linux binary built against nothing
+      that has heard of Novaris opens a TCP connection from ring 3.
+      `make test-inet`
 
 See `ROADMAP.md` for the full history and what's next, in order.
 
@@ -476,12 +480,12 @@ five minutes Wine allows for its own boot event, so a successful run
 contains `err:environ:run_wineboot`. Most of that is having no page cache
 — a mapped DLL is read in full and copied into the heap, per file.
 
-And `nsiproxy` and `NDIS` still fail to start, which since Milestone 39 is
-worth stating precisely rather than as "no networking". The machine has a
-TCP/IP stack and uses it — `net up`, `ping`, `fetch`, `update` — but it
-lives in the kernel and is reached from the shell. There is no socket API
-a ring-3 process can call, so from inside a Wine process the network is
-exactly as absent as it was.
+And `nsiproxy` and `NDIS` still fail to start, which is worth stating
+precisely rather than as "no networking". Since Milestone 41 a process
+*can* open a TCP connection — `AF_INET` through the same `socketcall`
+ABI as the Unix sockets wineserver runs on. What those two want is not
+BSD sockets but NT device objects and an `AFD` driver, so this is a step
+toward Wine networking rather than the arrival of it.
 
 ## The disk
 
@@ -774,6 +778,7 @@ make test-wine-persist   # ... twice, across a reboot, on a prefix that survived
 make test-wine-gui       # ... and asserts the *window* from a screendump
 make test-desktop-gui    # ... opened by double-clicking, with nothing typed
 
+make test-inet           # a ring-3 process opens a TCP connection
 sh tools/tests/update_e2e.sh   # installs a new version and reboots into it
 ```
 

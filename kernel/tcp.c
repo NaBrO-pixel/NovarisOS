@@ -554,6 +554,17 @@ void tcp_tick(void) {
     }
 }
 
+uint32_t tcp_recv_ready(int handle) {
+    tcp_conn_t* c = handle_conn(handle);
+    if (!c) return 0;
+    return (c->recv_head - c->recv_tail) % TCP_RECV_BUFFER;
+}
+
+uint16_t tcp_local_port(int handle) {
+    tcp_conn_t* c = handle_conn(handle);
+    return c ? c->local_port : 0;
+}
+
 uint32_t tcp_bytes_received(void) { return bytes_received; }
 uint32_t tcp_retransmits(void) { return retransmits; }
 uint32_t tcp_tick_calls(void) { return tick_calls; }
