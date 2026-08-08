@@ -65,12 +65,21 @@ typedef struct {
 
     int         peer_finished;
     int         ack_pending;
+    /* Passive opens only: set once tcp_accept() has handed this out, so
+     * the same connection is not accepted twice. */
+    int         accepted;
     uint32_t    last_advertised;   /* the window in the last ACK we sent */
     uint32_t    time_wait_until;
 } tcp_conn_t;
 
 static tcp_conn_t conns[TCP_MAX_CONNECTIONS];
 static uint16_t   next_port = 49152;
+
+/* Ports with something listening on them. A flat array rather than a
+ * structure with a queue, because the queue is the connection table -
+ * see the note in tcp.h. */
+#define TCP_MAX_LISTEN 4
+static uint16_t   listening[TCP_MAX_LISTEN];
 static uint32_t   bytes_received;
 static uint32_t   retransmits;
 
@@ -207,6 +216,37 @@ static tcp_conn_t* find_conn(uint32_t remote_ip, uint16_t remote_port,
     return 0;
 }
 
+static int is_listening(uint16_t port) {
+    for (int i = 0; i < TCP_MAX_LISTEN; i++) {
+        if (listening[i] == port) return 1;
+    }
+    return 0;
+}
+
+/* A SYN arrived for a listening port: take a slot, answer SYN+ACK, and
+ * leave it half-open until the client's ACK completes it. */
+static tcp_conn_t* accept_syn(uint32_t src_ip, uint16_t src_port,
+                              uint16_t dest_port, uint32_t their_seq) {
+    for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+        tcp_conn_t* c = &conns[i];
+        if (c->in_use) continue;
+
+        kmemset(c, 0, sizeof(*c));
+        c->in_use = 1;
+        c->state = TCP_SYN_RECEIVED;
+        c->remote_ip = src_ip;
+        c->remote_port = src_port;
+        c->local_port = dest_port;
+        c->rcv_next = their_seq + 1;          /* the SYN takes one */
+        c->snd_next = 0x4E560000u + pit_get_ticks() * 64;
+        c->snd_unacked = c->snd_next;
+
+        send_tracked(c, TCP_SYN | TCP_ACK, 0, 0);
+        return c;
+    }
+    return 0;
+}
+
 static void tcp_receive(uint32_t src_ip, uint32_t dest_ip,
                         const uint8_t* seg, uint32_t len) {
     (void)dest_ip;
@@ -225,6 +265,17 @@ static void tcp_receive(uint32_t src_ip, uint32_t dest_ip,
 
     tcp_conn_t* c = find_conn(src_ip, src_port, dest_port);
     if (!c) {
+        /* A SYN for a port something is listening on is a connection
+         * being opened *to* this machine, which is the one case where
+         * an unrecognised segment is not an error. */
+        if ((th->flags & (TCP_SYN | TCP_ACK)) == TCP_SYN &&
+            is_listening(dest_port)) {
+            c = accept_syn(src_ip, src_port, dest_port, ntohl(th->seq));
+            if (c) return;      /* SYN+ACK sent; the rest is the tick's */
+            /* No slot free. Reset rather than drop: the client learns
+             * now instead of retrying into a table that is still full. */
+        }
+
         /* Nothing here is listening, so anything unrecognised gets a
          * reset - which is what tells the far end to stop retrying
          * rather than to wait out its own timeout. */
@@ -256,6 +307,17 @@ static void tcp_receive(uint32_t src_ip, uint32_t dest_ip,
     }
 
     switch (c->state) {
+        case TCP_SYN_RECEIVED:
+            /* The third segment of the handshake. Anything else here -
+             * a retransmitted SYN, say - is left for the tick to answer
+             * by resending the SYN+ACK it still has pending. */
+            if (th->flags & TCP_ACK) {
+                c->state = TCP_ESTABLISHED;
+                c->pending_len = 0;
+                c->pending_flags = 0;
+            }
+            return;
+
         case TCP_SYN_SENT:
             if ((th->flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK)) {
                 c->rcv_next = seq + 1;
@@ -554,10 +616,63 @@ void tcp_tick(void) {
     }
 }
 
+int tcp_listen(uint16_t port) {
+    if (!port) return -1;
+    for (int i = 0; i < TCP_MAX_LISTEN; i++) {
+        if (listening[i] == port) return 0;        /* already */
+    }
+    for (int i = 0; i < TCP_MAX_LISTEN; i++) {
+        if (!listening[i]) { listening[i] = port; return 0; }
+    }
+    return -1;
+}
+
+void tcp_unlisten(uint16_t port) {
+    for (int i = 0; i < TCP_MAX_LISTEN; i++) {
+        if (listening[i] == port) listening[i] = 0;
+    }
+}
+
+int tcp_accept(uint16_t port) {
+    for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+        tcp_conn_t* c = &conns[i];
+        if (!c->in_use || c->accepted) continue;
+        if (c->local_port != port) continue;
+        /* ESTABLISHED only: a half-open connection is not a connection
+         * yet, and handing one to accept() would give the caller a
+         * socket whose first read could never succeed. */
+        if (c->state != TCP_ESTABLISHED) continue;
+        c->accepted = 1;
+        return i;
+    }
+    return -1;
+}
+
+int tcp_accept_ready(uint16_t port) {
+    for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+        tcp_conn_t* c = &conns[i];
+        if (c->in_use && !c->accepted && c->local_port == port &&
+            c->state == TCP_ESTABLISHED) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 uint32_t tcp_recv_ready(int handle) {
     tcp_conn_t* c = handle_conn(handle);
     if (!c) return 0;
     return (c->recv_head - c->recv_tail) % TCP_RECV_BUFFER;
+}
+
+uint32_t tcp_peer_ip(int handle) {
+    tcp_conn_t* c = handle_conn(handle);
+    return c ? c->remote_ip : 0;
+}
+
+uint16_t tcp_peer_port(int handle) {
+    tcp_conn_t* c = handle_conn(handle);
+    return c ? c->remote_port : 0;
 }
 
 uint16_t tcp_local_port(int handle) {

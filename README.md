@@ -121,8 +121,9 @@ shell conventions, UI style) without copying anyone's code.
 - [x] **Sockets a program can call** — `AF_INET`, streams and datagrams
       both, over the same i386 `socketcall` ABI. A Linux binary built
       against nothing that has heard of Novaris opens a TCP connection
-      from ring 3, and asks a real nameserver a real question over UDP.
-      `make test-inet`
+      from ring 3, asks a real nameserver a real question over UDP, and
+      — with `bind`/`listen`/`accept` — answers a connection opened *to*
+      the machine. `make test-inet`, `make test-listen`
 
 See `ROADMAP.md` for the full history and what's next, in order.
 
@@ -782,6 +783,7 @@ make test-desktop-gui    # ... opened by double-clicking, with nothing typed
 
 make test-inet           # a ring-3 process opens a TCP connection,
                          #   then resolves a name over UDP
+make test-listen         # ... and accepts one opened to the machine
 sh tools/tests/update_e2e.sh   # installs a new version and reboots into it
 ```
 

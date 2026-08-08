@@ -35,7 +35,9 @@
 
 typedef enum {
     TCP_CLOSED = 0,
+    TCP_LISTEN,
     TCP_SYN_SENT,
+    TCP_SYN_RECEIVED,
     TCP_ESTABLISHED,
     TCP_FIN_WAIT_1,
     TCP_FIN_WAIT_2,
@@ -78,6 +80,33 @@ uint32_t tcp_recv_ready(int handle);
 int tcp_eof(int handle);
 
 void tcp_close(int handle);
+
+/* --- accepting ------------------------------------------------------------
+ *
+ * A passive open. tcp_listen() claims a local port; a SYN for it creates
+ * a connection in TCP_SYN_RECEIVED and answers SYN+ACK, and the third
+ * segment of the handshake moves it to ESTABLISHED. tcp_accept() then
+ * hands out the handle.
+ *
+ * There is no separate backlog: a half-open connection occupies an
+ * ordinary slot in the connection table, so the backlog is however many
+ * of the table's slots are free. That is the honest shape for a table of
+ * four, and a listen() whose backlog argument promises more than the
+ * machine has would be a lie told in a signature. */
+int tcp_listen(uint16_t port);
+void tcp_unlisten(uint16_t port);
+
+/* A connection that finished its handshake on `port`, or -1. */
+int tcp_accept(uint16_t port);
+
+/* Whether tcp_accept would return one, without taking it. */
+int tcp_accept_ready(uint16_t port);
+
+/* Who is at the other end. For a connection that arrived rather than one
+ * that was dialled, the caller did not choose these and has no other way
+ * to learn them. */
+uint32_t tcp_peer_ip(int handle);
+uint16_t tcp_peer_port(int handle);
 
 /* Called by net_poll(): retransmits, and finishes closing. */
 void tcp_tick(void);

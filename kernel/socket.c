@@ -309,7 +309,11 @@ void socket_close(socket_t* s) {
     if (!s) return;
     if (s->inet) {
         if (s->refs > 1) { s->refs--; return; }
-        if (s->bound_port) { net_udp_unbind(s->bound_port); s->bound_port = 0; }
+        if (s->bound_port) {
+            if (s->state == SS_LISTENING) tcp_unlisten(s->bound_port);
+            else net_udp_unbind(s->bound_port);
+            s->bound_port = 0;
+        }
         if (s->tcp >= 0) {
             /* The FIN goes out here, and tcp.c finishes the close under
              * later net_poll() calls - which is why this does not wait
@@ -634,6 +638,79 @@ static int32_t dgram_recvfrom(socket_t* s, void* buf, uint32_t len,
 
     irq_restore(flags);
     return result;
+}
+
+/* --- AF_INET, the passive side -------------------------------------------
+ *
+ * bind() records a port, listen() claims it in tcp.c, and accept() hands
+ * out a connection whose handshake has finished. There is no backlog
+ * argument here because there is no backlog: a half-open connection sits
+ * in tcp.c's ordinary connection table, so the depth is however many of
+ * its slots are free. See the note in tcp.h. */
+
+static int32_t inet_bind(socket_t* s, const sockaddr_in_t* addr, uint32_t len) {
+    if (!addr || len < sizeof(*addr)) return -EINVAL;
+    if (addr->sin_family != AF_INET) return -EAFNOSUPPORT;
+    if (s->state == SS_CONNECTED || s->tcp >= 0) return -EINVAL;
+
+    /* The address is ignored beyond checking the family: this machine
+     * has one interface, so binding to a particular one of its addresses
+     * and binding to all of them are the same thing. */
+    s->local_port = ntohs(addr->sin_port);
+    s->state = SS_BOUND;
+    return 0;
+}
+
+static int32_t inet_listen(socket_t* s) {
+    if (s->state != SS_BOUND || !s->local_port) return -EINVAL;
+    if (tcp_listen(s->local_port) != 0) return -EADDRINUSE;
+    s->bound_port = s->local_port;      /* so close() knows to release it */
+    s->state = SS_LISTENING;
+    return 0;
+}
+
+static int32_t inet_accept(socket_t* s, sockaddr_in_t* addr, uint32_t* addrlen,
+                           int flags) {
+    if (s->state != SS_LISTENING) return -EINVAL;
+
+    uint32_t saved = irq_enable_save();
+    uint32_t deadline = deadline_in(INET_IO_TICKS);
+    int h = -1;
+
+    for (;;) {
+        net_poll();
+        h = tcp_accept(s->local_port);
+        if (h >= 0) break;
+        if (s->nonblock || (flags & SOCK_NONBLOCK)) break;
+        if (pit_get_ticks() >= deadline) break;
+        __asm__ __volatile__("hlt" ::: "memory");
+    }
+    irq_restore(saved);
+
+    if (h < 0) return s->nonblock ? -EAGAIN : -ETIMEDOUT;
+
+    socket_t* c = sock_alloc();
+    if (!c) { tcp_close(h); return -ENFILE; }
+    c->inet = 1;
+    c->type = SOCK_STREAM;
+    c->tcp = h;
+    c->state = SS_CONNECTED;
+    c->local_port = s->local_port;
+    c->peer_ip = tcp_peer_ip(h);
+    c->peer_port = tcp_peer_port(h);
+    c->nonblock = (flags & SOCK_NONBLOCK) ? 1 : 0;
+
+    int fd = posix_fd_install_socket(c);
+    if (fd < 0) { tcp_close(h); c->tcp = -1; sock_free(c); return fd; }
+
+    if (addr && addrlen && *addrlen >= sizeof(*addr)) {
+        kmemset(addr, 0, sizeof(*addr));
+        addr->sin_family = AF_INET;
+        addr->sin_port = htons(c->peer_port);
+        addr->sin_addr = htonl(c->peer_ip);
+        *addrlen = sizeof(*addr);
+    }
+    return fd;
 }
 
 /* Whether a non-blocking connect has finished, called before any I/O so
@@ -1009,13 +1086,14 @@ int32_t socket_syscall(uint32_t call, uint32_t* a, registers_t* regs) {
         case SYS_BIND: {
             socket_t* s = posix_fd_socket((int)a[0]);
             if (s && s->dgram) return dgram_bind(s, (const sockaddr_in_t*)a[1], a[2]);
-            if (s && s->inet) return -EOPNOTSUPP;
+            if (s && s->inet) return inet_bind(s, (const sockaddr_in_t*)a[1], a[2]);
             return do_bind(s, (const sockaddr_un_t*)a[1], a[2]);
         }
 
         case SYS_LISTEN: {
             socket_t* s = posix_fd_socket((int)a[0]);
-            if (s && s->inet) return -EOPNOTSUPP;
+            if (s && s->dgram) return -EOPNOTSUPP;
+            if (s && s->inet) return inet_listen(s);
             return do_listen(s, (int)a[1]);
         }
 
@@ -1028,12 +1106,16 @@ int32_t socket_syscall(uint32_t call, uint32_t* a, registers_t* regs) {
 
         case SYS_ACCEPT: {
             socket_t* s = posix_fd_socket((int)a[0]);
-            if (s && s->inet) return -EOPNOTSUPP;
+            if (s && s->dgram) return -EOPNOTSUPP;
+            if (s && s->inet) return inet_accept(s, (sockaddr_in_t*)a[1],
+                                                 (uint32_t*)a[2], 0);
             return do_accept(s, (sockaddr_un_t*)a[1], (uint32_t*)a[2], 0, regs);
         }
         case SYS_ACCEPT4: {
             socket_t* s = posix_fd_socket((int)a[0]);
-            if (s && s->inet) return -EOPNOTSUPP;
+            if (s && s->dgram) return -EOPNOTSUPP;
+            if (s && s->inet) return inet_accept(s, (sockaddr_in_t*)a[1],
+                                                 (uint32_t*)a[2], (int)a[3]);
             return do_accept(s, (sockaddr_un_t*)a[1], (uint32_t*)a[2],
                              (int)a[3], regs);
         }
@@ -1218,6 +1300,11 @@ uint32_t socket_poll_mask(socket_t* s) {
         return mask;
     }
 
+    if (s->inet && s->state == SS_LISTENING) {
+        net_poll();
+        return tcp_accept_ready(s->local_port) ? POLLIN : 0;
+    }
+
     if (s->inet) {
         if (s->state == SS_CONNECTING) {
             net_poll();
@@ -1275,7 +1362,8 @@ static void drop_tcp(socket_t* s) {
         s->tcp = -1;
     }
     if (s->bound_port) {
-        net_udp_unbind(s->bound_port);
+        if (s->state == SS_LISTENING) tcp_unlisten(s->bound_port);
+        else net_udp_unbind(s->bound_port);
         s->bound_port = 0;
     }
 }

@@ -50,6 +50,9 @@ static long sc3(long n, long a, long b, long c) {
 #define SC_RECV        10
 #define SC_SENDTO      11
 #define SC_RECVFROM    12
+#define SC_BIND         2
+#define SC_LISTEN       4
+#define SC_ACCEPT       5
 
 #define AF_INET       2
 #define SOCK_STREAM   1
@@ -222,7 +225,81 @@ static int dns_query(unsigned server_ip, const char* name) {
     return answers ? 0 : 1;
 }
 
+/* --- the passive side ----------------------------------------------------
+ *
+ * bind, listen, accept, and one exchange over the connection that
+ * arrives. Run as `inet_test.elf listen <port>`, it waits for somebody
+ * to connect and echoes what they send - which is enough to prove that
+ * a connection opened *to* this machine reaches a program on it.
+ *
+ * There is no fork here, so this serves exactly one client and stops. */
+static int serve(unsigned port) {
+    long a[6];
+
+    a[0] = AF_INET; a[1] = SOCK_STREAM; a[2] = 0;
+    long fd = sc2(SYS_socketcall, SC_SOCKET, (long)a);
+    if (fd < 0) { out("[--] socket failed: "); out_int(fd); out("\n"); return 1; }
+
+    struct sockaddr_in sin;
+    for (unsigned i = 0; i < sizeof(sin.sin_zero); i++) sin.sin_zero[i] = 0;
+    sin.sin_family = AF_INET;
+    sin.sin_port = hton16((unsigned short)port);
+    sin.sin_addr = 0;                    /* any address this machine has */
+
+    a[0] = fd; a[1] = (long)&sin; a[2] = sizeof(sin);
+    long r = sc2(SYS_socketcall, SC_BIND, (long)a);
+    if (r < 0) { out("[--] bind failed: "); out_int(r); out("\n"); return 1; }
+    out("[ok] bind\n");
+
+    a[0] = fd; a[1] = 4;
+    r = sc2(SYS_socketcall, SC_LISTEN, (long)a);
+    if (r < 0) { out("[--] listen failed: "); out_int(r); out("\n"); return 1; }
+    out("[ok] listening on ");
+    out_uint(port);
+    out("\n");
+
+    struct sockaddr_in peer;
+    unsigned peerlen = sizeof(peer);
+    a[0] = fd; a[1] = (long)&peer; a[2] = (long)&peerlen;
+    long cfd = sc2(SYS_socketcall, SC_ACCEPT, (long)a);
+    if (cfd < 0) { out("[--] accept failed: "); out_int(cfd); out("\n"); return 1; }
+    out("[ok] accepted a connection from port ");
+    out_uint(hton16(peer.sin_port));
+    out("\n");
+
+    a[0] = cfd; a[1] = (long)buf; a[2] = sizeof(buf) - 1; a[3] = 0;
+    r = sc2(SYS_socketcall, SC_RECV, (long)a);
+    if (r <= 0) { out("[--] recv returned "); out_int(r); out("\n"); return 1; }
+    buf[r] = '\0';
+    out("[ok] received ");
+    out_int(r);
+    out(" bytes\n");
+
+    static const char reply[] = "novaris\n";
+    a[0] = cfd; a[1] = (long)reply; a[2] = sizeof(reply) - 1; a[3] = 0;
+    r = sc2(SYS_socketcall, SC_SEND, (long)a);
+    if (r != (long)(sizeof(reply) - 1)) {
+        out("[--] send returned "); out_int(r); out("\n");
+        return 1;
+    }
+    out("[ok] replied\n");
+
+    sc1(SYS_close, cfd);
+    sc1(SYS_close, fd);
+    out("inet_test: a program on this machine accepted a connection\n");
+    return 0;
+}
+
+static int streq(const char* a, const char* b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
 int main(int argc, char** argv) {
+    if (argc > 2 && streq(argv[1], "listen")) {
+        return serve(parse_uint(argv[2]));
+    }
+
     const char* host = argc > 1 ? argv[1] : "10.0.2.2";
     unsigned port = argc > 2 ? parse_uint(argv[2]) : 80;
 

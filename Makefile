@@ -62,7 +62,7 @@ ISO = novaris.iso
 
 .PHONY: all clean run run-nographic iso test test-qemu test-posix test-wine \
         test-wine-threads test-qemu-disk test-wine-prefix test-desktop \
-        test-wine-persist test-inet \
+        test-wine-persist test-inet test-listen \
         zip disk
 
 all: $(ISO)
@@ -1039,6 +1039,26 @@ test-inet: $(ISO)
 	    --reject "KERNEL PANIC" \
 	    --stop-when-matched
 
+# Milestone 41, the other direction: a *server* on Novaris.
+#
+# QEMU's user-mode stack blocks inbound connections, so the guest's
+# listening port is forwarded to this machine's loopback (--hostfwd) and
+# the client runs out here (--host-connect). That split is not an
+# awkwardness of the harness, it is the test: a connection has to be
+# opened from somewhere that is not the machine being tested, or the
+# three-way handshake never has Novaris on the answering side.
+test-listen: $(ISO)
+	python3 tools/qemu_test.py --iso $(ISO) --memory 768 \
+	    --boot-wait 40 --settle 90 --timeout 220 \
+	    --hostfwd 18080:8080 --host-connect 18080 \
+	    --setup "net up" \
+	    --cmd 'run inettest.elf listen 8080' \
+	    --expect "\\[ok\\] listening on 8080" \
+	    --expect "accepted a connection from port" \
+	    --expect "a program on this machine accepted a connection" \
+	    --reject "KERNEL PANIC" \
+	    --stop-when-matched
+
 # A directory for test-inet's server to serve. One small file is enough:
 # what is being tested is the socket, not the transfer.
 $(BUILD_DIR)/test/www: | $(BUILD_DIR)
@@ -1195,6 +1215,15 @@ test-wine-gui: $(ISO)
 # on the window it opens, and notepad.exe in the alphabetical listing.
 # They are what they are because this is a pointer test: nothing about
 # double-clicking can be tested by typing.
+#
+# The third one is coupled to the *contents* of the initrd root, which is
+# worth knowing before it wastes anybody's afternoon: the listing is plain
+# alphabetical and the rows are ROW_H (28px, kernel/app_files.c) apart, so
+# adding one file that sorts before "notepad.exe" moves the target down by
+# exactly one row and the test double-clicks whatever is now there. That
+# is how Milestone 41 broke it - inettest.elf sorts between hellowin.exe
+# and notepad.exe - and the symptom was a passing boot that ran the wrong
+# program, not an error.
 test-desktop-gui: $(ISO)
 	@python3 tools/check_wine_installed.py $(BUILD_DIR)/initrd_staging
 	python3 tools/qemu_test.py --iso $(ISO) --memory 768 \
@@ -1202,7 +1231,7 @@ test-desktop-gui: $(ISO)
 	    --click-settle 3 \
 	    --click "60,233,double" \
 	    --click "881,66" \
-	    --click "240,646,double" \
+	    --click "240,674,double" \
 	    --screenshot $(BUILD_DIR)/desktop-gui.ppm \
 	    --expect "starting notepad\.exe under Wine" \
 	    --reject "no driver could be loaded" \

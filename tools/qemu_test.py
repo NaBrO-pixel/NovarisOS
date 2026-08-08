@@ -206,7 +206,7 @@ def wait_for(serial_path, seconds, patterns):
 def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
         memory=128, disk=None, setup=(), stop_when=(), clicks=(),
         click_settle=1.5, post=(), screenshot=None, post_clicks=(),
-        http_forward=None, pcap=None):
+        http_forward=None, pcap=None, hostfwd=None, host_connect=None):
     serial_path = keep_serial or tempfile.mktemp(suffix=".log", prefix="novaris-serial-")
     port = 45000 + (os.getpid() % 10000)
 
@@ -238,7 +238,9 @@ def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
         #
         # Binding the server to 0.0.0.0 rather than loopback is what makes
         # 10.0.2.2 answer: slirp connects out from the host's stack.
-        "-netdev", "user,id=n0",
+        "-netdev",
+        ("user,id=n0,hostfwd=tcp:127.0.0.1:%d-:%d" % hostfwd) if hostfwd
+            else "user,id=n0",
         "-device", "rtl8139,netdev=n0",
     ] + ([
         # A pcap of everything on the wire. The one tool that answers
@@ -322,6 +324,26 @@ def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
                 wait_for(serial_path, settle, stop_when)
             else:
                 time.sleep(settle)
+
+        # A client for a server running in the guest. Tried repeatedly
+        # because the guest has to reach accept() first, and how long
+        # that takes is a property of the machine rather than of the
+        # test.
+        if host_connect:
+            deadline = time.time() + 60.0
+            while time.time() < deadline:
+                try:
+                    c = socket.create_connection(("127.0.0.1", host_connect), 2.0)
+                    c.settimeout(5.0)
+                    c.sendall(b"hello from the host\n")
+                    reply = c.recv(200)
+                    c.close()
+                    print("host-connect: guest replied %r" % reply)
+                    break
+                except OSError:
+                    time.sleep(1.0)
+            else:
+                print("host-connect: never got a connection")
 
         # Typed after the waiting is over rather than before it, so that a
         # `sync` at the end of a run does not cost the run's whole settle.
@@ -411,6 +433,19 @@ def main():
                     help="serve --http-dir on this port rather than one "
                          "picked from the pid. For a test whose URLs are "
                          "written down before the run starts.")
+    ap.add_argument("--host-connect", metavar="PORT", type=int,
+                    help="after the last command is typed, connect to this "
+                         "port on this machine's loopback (see --hostfwd), "
+                         "send a line and print the reply. The only way to "
+                         "drive a *listening* socket in the guest: the "
+                         "client has to be out here.")
+    ap.add_argument("--hostfwd", metavar="HOST:GUEST",
+                    help="forward a TCP port on this machine's loopback "
+                         "into the guest, so something here can connect "
+                         "*in*. QEMU's user-mode stack blocks inbound "
+                         "connections otherwise, which is what makes a "
+                         "listening socket in the guest untestable "
+                         "without it.")
     ap.add_argument("--pcap", help="write a packet capture of the guest's "
                                    "network to this file")
     ap.add_argument("--stop-when-matched", action="store_true",
@@ -434,6 +469,12 @@ def main():
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.5)
 
+    # "8080:80" - this machine's loopback port, then the guest's.
+    hostfwd = None
+    if args.hostfwd:
+        host_s, guest_s = args.hostfwd.split(":", 1)
+        hostfwd = (int(host_s), int(guest_s))
+
     commands = list(args.cmd)
     if args.script:
         with open(args.script) as fh:
@@ -450,7 +491,8 @@ def main():
                      args.disk, args.setup,
                      args.expect if args.stop_when_matched else (),
                      args.click, args.click_settle, args.post_cmd,
-                     args.screenshot, args.post_click, http_forward, args.pcap)
+                     args.screenshot, args.post_click, http_forward, args.pcap,
+                     hostfwd, args.host_connect)
     if http_proc:
         http_proc.terminate()
         http_proc.wait()

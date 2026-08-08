@@ -5704,13 +5704,41 @@ an obvious failure:
   never been bound and the answer was delivered to nobody. It looked
   exactly like a nameserver that did not reply.
 
+### And the other direction: a server on Novaris
+
+`bind`, `listen`, `accept`. tcp.c grew the passive half of the state
+machine it had been missing - `TCP_LISTEN` and `TCP_SYN_RECEIVED`, a SYN
+for a listening port answered with SYN+ACK, and the client's ACK
+completing the handshake - so a connection can now be opened *to* this
+machine and reach a program on it.
+
+There is no backlog argument, because there is no backlog: a half-open
+connection occupies an ordinary slot in tcp.c's connection table, so the
+depth is however many of its four slots are free. A `listen(fd, 128)`
+that promised more than the machine has would be a lie told in a
+signature.
+
+Testing it needed the harness to grow two options, and the awkwardness is
+the point rather than an accident of tooling: QEMU's user-mode stack
+blocks inbound connections, so `--hostfwd` forwards the guest's port to
+the build host's loopback and `--host-connect` runs the client out
+there. A connection has to be opened from somewhere that is not the
+machine under test, or the handshake never has Novaris on the answering
+side. `make test-listen`:
+
+```
+novaris> run inettest.elf listen 8080
+[ok] bind
+[ok] listening on 8080
+[ok] accepted a connection from port 51942
+[ok] received 20 bytes
+[ok] replied
+```
+
+and on the host, `guest replied b'novaris\n'`.
+
 ### What is deliberately not here
 
-- **No listening sockets.** `bind`, `listen` and `accept` on an AF_INET
-  *stream* socket return EOPNOTSUPP. Accepting needs a table of listening
-  ports in tcp.c and a queue under it; refusing plainly beats letting the
-  Unix-domain path read a `sockaddr_in` as a path. (`bind` does work on a
-  datagram socket, which needs no such table.)
 - **No raw sockets, no IPv6.**
 - **No `getaddrinfo`.** A process can now ask a nameserver itself, which
   is the hard half, but the parsing and the `/etc/resolv.conf` reading
@@ -5729,8 +5757,7 @@ toward Wine networking rather than the arrival of it.
 - ~~Networking (a NIC driver + a minimal TCP/IP stack)~~ — done in
   Milestones 38-41, up to and including AF_INET sockets a ring-3 process
   can call, streams and datagrams both. What is still missing above it:
-  TLS, listening sockets (bind/listen/accept return EOPNOTSUPP for a
-  stream), raw sockets, IPv6, and a libc with getaddrinfo in it.
+  TLS, raw sockets, IPv6, and a libc with getaddrinfo in it.
 - SMP (multi-core) support.
 - Porting a real libc (newlib) instead of hand-rolling one.
 - A custom bootloader instead of relying on GRUB, if you want the whole
