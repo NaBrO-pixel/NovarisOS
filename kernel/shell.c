@@ -17,6 +17,7 @@
 #include "pe.h"
 #include "win32.h"
 #include "kstring.h"
+#include "desktop.h"
 #include "scheduler.h"
 #include "socket.h"
 #include "task_a.h"
@@ -498,6 +499,29 @@ static void cmd_net(const char* args) {
  */
 #define FETCH_MAX (4u * 1024u * 1024u)
 
+/* Counts up over itself while a fetch runs, and hands the desktop back a
+ * turn of its loop between packets - see the note on http_progress_fn.
+ * Silent until a download is big enough to be worth watching, because a
+ * 55-byte hello.txt that reports its own progress is noise. */
+static void fetch_progress(uint32_t got, uint32_t expected) {
+    if (expected && expected < 64u * 1024u) return;
+
+    char n[12];
+    terminal_writestring("\r  ");
+    ku32_to_dec(got >> 10, n);
+    terminal_writestring(n);
+    terminal_writestring("K");
+    if (expected) {
+        terminal_writestring(" of ");
+        ku32_to_dec(expected >> 10, n);
+        terminal_writestring(n);
+        terminal_writestring("K");
+    }
+    terminal_writestring(" so far      ");
+
+    desktop_pump();
+}
+
 static void cmd_fetch(const char* args) {
     while (*args == ' ') args++;
     if (!*args) {
@@ -530,8 +554,9 @@ static void cmd_fetch(const char* args) {
 
     http_result_t res;
     uint32_t started = pit_get_ticks();
-    int err = http_get(url, body, FETCH_MAX, &res);
+    int err = http_get_progress(url, body, FETCH_MAX, &res, fetch_progress);
     uint32_t elapsed = pit_get_ticks() - started;
+    terminal_writestring("\r");
 
     if (err != HTTP_OK) {
         terminal_writestring_color("fetch failed: ", VGA_COLOR_LIGHT_RED);

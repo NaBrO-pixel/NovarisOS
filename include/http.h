@@ -30,8 +30,28 @@ typedef struct {
     int      truncated;       /* the body did not fit in the buffer given */
 } http_result_t;
 
+/* Called as the body arrives, with how much has been stored and how much
+ * the server said to expect - which is 0 when it did not say, and a
+ * caller that wants to draw a bar has to cope with that.
+ *
+ * It exists because of what a 48MB download looks like without it. The
+ * machine prints one line, then nothing for a minute, then a second line.
+ * There is no way to tell that from a hang, and the first thing anyone
+ * does to a hung machine is turn it off - halfway through an update.
+ *
+ * The other half of the job is that this is the one place a long transfer
+ * yields. Everything in this kernel runs inside the desktop's event loop,
+ * so a download holds that loop for its whole duration: the cursor stops,
+ * windows stop repainting, and the machine is not merely quiet but
+ * visibly dead. A callback that pumps the desktop gives it back. */
+typedef void (*http_progress_fn)(uint32_t got, uint32_t expected);
+
 int http_get(const char* url, uint8_t* body, uint32_t body_max,
              http_result_t* result);
+
+/* As http_get, calling `on_progress` as the body grows. */
+int http_get_progress(const char* url, uint8_t* body, uint32_t body_max,
+                      http_result_t* result, http_progress_fn on_progress);
 
 int http_parse_url(const char* url, char* host, uint32_t host_size,
                    uint16_t* port, char* path, uint32_t path_size);

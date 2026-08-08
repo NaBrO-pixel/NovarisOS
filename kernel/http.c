@@ -102,6 +102,11 @@ static uint32_t split_headers(const uint8_t* buf, uint32_t len,
 
 int http_get(const char* url, uint8_t* body, uint32_t body_max,
              http_result_t* result) {
+    return http_get_progress(url, body, body_max, result, 0);
+}
+
+int http_get_progress(const char* url, uint8_t* body, uint32_t body_max,
+                      http_result_t* result, http_progress_fn on_progress) {
     char host[128], path[256];
     uint16_t port;
 
@@ -200,9 +205,22 @@ int http_get(const char* url, uint8_t* body, uint32_t body_max,
     result->status = status;
     result->content_length = content_length;
 
+    /* Reported on a clock rather than per chunk. tcp_recv() returns
+     * thousands of times a second on a fast link, and a callback that
+     * prints on each one would spend the transfer drawing text. Five
+     * times a second is faster than anyone reads and slower than anything
+     * costs. */
+    const uint32_t report_every = 20;                /* ticks: 5Hz */
+    uint32_t next_report = pit_get_ticks();
+
     /* The rest of the body, until the length is met or the server closes. */
     while (pit_get_ticks() < deadline) {
         if (content_length && result->body_len >= content_length) break;
+
+        if (on_progress && pit_get_ticks() >= next_report) {
+            next_report = pit_get_ticks() + report_every;
+            on_progress(result->body_len, content_length);
+        }
 
         net_poll();
 
@@ -232,6 +250,10 @@ int http_get(const char* url, uint8_t* body, uint32_t body_max,
         if (tcp_eof(conn) || tcp_state(conn) == TCP_CLOSED) break;
         __asm__ __volatile__("hlt");
     }
+
+    /* The last one, unconditionally, so whatever the caller drew ends on
+     * the real figure rather than on whatever the clock last allowed. */
+    if (on_progress) on_progress(result->body_len, content_length);
 
     tcp_close(conn);
     return HTTP_OK;

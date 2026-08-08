@@ -22,6 +22,7 @@
 #include "kstring.h"
 #include "console.h"
 #include "vga_text.h"
+#include "desktop.h"
 
 /* Bumped by hand, one per release. A version this OS can compare against
  * a manifest has to be a number, and a number that means something has to
@@ -176,6 +177,60 @@ static void report(const char* what, uint32_t got, uint32_t want,
     terminal_writestring("\n");
 }
 
+/* The name of whatever is downloading, so the progress callback - which
+ * http.c calls with nothing but two numbers - can say which file it is. */
+static const char* downloading;
+
+/* Drawn over itself with a carriage return, so a download is one line
+ * that counts up rather than a screenful of them.
+ *
+ * And it pumps the desktop, which is the more important half. Everything
+ * here runs inside the desktop's event loop, so a minute-long download
+ * holds that loop for a minute: no cursor, no repaint, nothing. Pumping
+ * from here hands it back between packets. Nesting is safe and is what
+ * the loop was built for - see the note above desktop_pump() - and the
+ * shell refuses to start a second command while this one runs, so a
+ * keystroke that arrives now cannot re-enter the updater. */
+static void download_progress(uint32_t got, uint32_t expected) {
+    char n[12];
+
+    /* Kilobytes, and the percentage worked out from them too.
+     *
+     * Not because kilobytes read better - they do - but because
+     * got * 100 overflows 32 bits at 43MB, and the file this exists for
+     * is 48MB. There is no 64-bit divide to fall back on: this is a
+     * freestanding kernel with no libgcc, and asking for one is a link
+     * error rather than slow code. Dividing the kilobyte counts keeps
+     * every intermediate under 2^32 for volumes up to 4GB. */
+    uint32_t got_kb = got >> 10, want_kb = expected >> 10;
+
+    terminal_writestring("\r  ");
+    terminal_writestring(downloading ? downloading : "download");
+    terminal_writestring(": ");
+    ku32_to_dec(got_kb, n);
+    terminal_writestring(n);
+    terminal_writestring("K");
+
+    if (expected) {
+        terminal_writestring(" of ");
+        ku32_to_dec(want_kb, n);
+        terminal_writestring(n);
+        terminal_writestring("K (");
+        /* A file under a kilobyte has want_kb == 0, and is finished the
+         * moment it has started. */
+        ku32_to_dec(want_kb ? (got_kb * 100u) / want_kb : 100u, n);
+        terminal_writestring(n);
+        terminal_writestring("%)");
+    }
+
+    /* Trailing blanks: the line shrinks as the numbers do not, and
+     * without them the tail of the longest line printed so far stays on
+     * screen for ever. */
+    terminal_writestring("      ");
+
+    desktop_pump();
+}
+
 static uint8_t* download_verified(const char* url, uint32_t size, uint32_t sum,
                                   const char* what) {
     uint8_t* buf = (uint8_t*)kmalloc(size);
@@ -188,7 +243,10 @@ static uint8_t* download_verified(const char* url, uint32_t size, uint32_t sum,
     }
 
     http_result_t res;
-    int err = http_get(url, buf, size, &res);
+    downloading = what;
+    int err = http_get_progress(url, buf, size, &res, download_progress);
+    downloading = 0;
+    terminal_writestring("\r");
     if (err != HTTP_OK || res.status != 200) {
         terminal_writestring_color("update: could not download ",
                                    VGA_COLOR_LIGHT_RED);
