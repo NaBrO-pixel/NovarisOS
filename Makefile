@@ -541,6 +541,15 @@ $(BUILD_DIR)/user/cppinit.exe: userland/pe_test/cpp_init.cpp | $(BUILD_DIR)
 	$(MINGW_CXX) $(MINGW_CFLAGS) -static-libstdc++ -static-libgcc -o $@ $<
 
 # -mwindows makes this a GUI-subsystem binary with a WinMain entry point.
+# Milestone 41's open question, as a program. Whether a *Windows* binary
+# can reach the network now that Novaris has BSD sockets: Wine's ws2_32
+# Unix half implements AFD on top of socket()/connect()/send(), which are
+# exactly the calls that arrived with AF_INET. Nothing about that path is
+# obviously complete, so this runs it.
+$(BUILD_DIR)/user/winsock.exe: userland/pe_test/winsock.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(MINGW_CC) $(MINGW_CFLAGS) -o $@ $< -lws2_32
+
 $(BUILD_DIR)/user/guiapp.exe: userland/pe_test/gui_app.c | $(BUILD_DIR)
 	mkdir -p $(BUILD_DIR)/user
 	$(MINGW_CC) $(MINGW_CFLAGS) -mwindows -o $@ $<
@@ -595,6 +604,7 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
         $(BUILD_DIR)/user/ld-linux.so.2 $(BUILD_DIR)/user/libc.so.6 \
         $(BUILD_DIR)/user/hello_pe.exe \
         $(BUILD_DIR)/user/hellowin.exe $(BUILD_DIR)/user/winapi.exe \
+        $(BUILD_DIR)/user/winsock.exe \
         $(BUILD_DIR)/user/cppinit.exe $(BUILD_DIR)/user/guiapp.exe \
         $(BUILD_DIR)/user/hello64.exe $(BUILD_DIR)/user/lowbase.exe \
         $(BUILD_DIR)/user/crash.exe $(BUILD_DIR)/user/qsorttest.exe \
@@ -622,6 +632,7 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
 	cp $(BUILD_DIR)/user/hello_pe.exe $(BUILD_DIR)/initrd_staging/hellope.exe
 	cp $(BUILD_DIR)/user/hellowin.exe $(BUILD_DIR)/initrd_staging/hellowin.exe
 	cp $(BUILD_DIR)/user/winapi.exe $(BUILD_DIR)/initrd_staging/winapi.exe
+	cp $(BUILD_DIR)/user/winsock.exe $(BUILD_DIR)/initrd_staging/winsock.exe
 	cp $(BUILD_DIR)/user/cppinit.exe $(BUILD_DIR)/initrd_staging/cppinit.exe
 	cp $(BUILD_DIR)/user/guiapp.exe $(BUILD_DIR)/initrd_staging/guiapp.exe
 	cp $(BUILD_DIR)/user/hello64.exe $(BUILD_DIR)/initrd_staging/hello64.exe

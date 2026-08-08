@@ -1067,6 +1067,72 @@ static int32_t do_recvmsg(socket_t* s, k_msghdr_t* m, int flags,
     return total;
 }
 
+/* --- AF_INET scatter/gather ----------------------------------------------
+ *
+ * An inet socket has no ancillary data - there are no descriptors to pass
+ * over TCP - so msg_control is ignored rather than refused, which is what
+ * a caller that always fills in a control buffer expects.
+ *
+ * Both stop at the first short vector. A stream is allowed to transfer
+ * less than asked and every caller is written for it; looping on to the
+ * next buffer after a short read would reorder the stream if the first
+ * one filled later. */
+
+static int32_t inet_sendmsg(socket_t* s, const k_msghdr_t* m, int flags) {
+    (void)flags;
+    if (!s || !m) return -EFAULT;
+
+    const k_iovec_t* iov = (const k_iovec_t*)m->msg_iov;
+    if (!iov && m->msg_iovlen) return -EFAULT;
+
+    /* sendto's destination, when the caller put one in the header. */
+    const sockaddr_in_t* to = 0;
+    if (s->dgram && m->msg_name && m->msg_namelen >= sizeof(sockaddr_in_t)) {
+        to = (const sockaddr_in_t*)m->msg_name;
+    }
+
+    int32_t total = 0;
+    for (uint32_t i = 0; i < m->msg_iovlen; i++) {
+        if (!iov[i].iov_len) continue;
+        int32_t n = s->dgram
+            ? dgram_sendto(s, (const void*)iov[i].iov_base, iov[i].iov_len,
+                           to, to ? sizeof(*to) : 0)
+            : inet_write(s, (const void*)iov[i].iov_base, iov[i].iov_len);
+        if (n < 0) return total ? total : n;
+        total += n;
+        if ((uint32_t)n < iov[i].iov_len) break;
+    }
+    return total;
+}
+
+static int32_t inet_recvmsg(socket_t* s, k_msghdr_t* m, int flags) {
+    (void)flags;
+    if (!s || !m) return -EFAULT;
+
+    k_iovec_t* iov = (k_iovec_t*)m->msg_iov;
+    if (!iov && m->msg_iovlen) return -EFAULT;
+
+    m->msg_controllen = 0;      /* nothing ancillary ever arrives here */
+    m->msg_flags = 0;
+
+    int32_t total = 0;
+    for (uint32_t i = 0; i < m->msg_iovlen; i++) {
+        if (!iov[i].iov_len) continue;
+        int32_t n = s->dgram
+            ? dgram_recvfrom(s, (void*)iov[i].iov_base, iov[i].iov_len,
+                             (sockaddr_in_t*)m->msg_name,
+                             m->msg_name ? &m->msg_namelen : 0)
+            : inet_read(s, (void*)iov[i].iov_base, iov[i].iov_len);
+        if (n < 0) return total ? total : n;
+        total += n;
+        /* A short read means the stream had no more to give right now,
+         * and a datagram is one message however many vectors were
+         * offered. Either way, stop. */
+        if ((uint32_t)n < iov[i].iov_len || s->dgram) break;
+    }
+    return total;
+}
+
 /* --- the demultiplexer ---------------------------------------------------- */
 
 int32_t socket_syscall(uint32_t call, uint32_t* a, registers_t* regs) {
@@ -1156,12 +1222,29 @@ int32_t socket_syscall(uint32_t call, uint32_t* a, registers_t* regs) {
             return socket_read(s, (void*)a[1], a[2], regs);
         }
 
-        case SYS_SENDMSG:
-            return do_sendmsg(posix_fd_socket((int)a[0]), (const k_msghdr_t*)a[1],
-                              (int)a[2]);
-        case SYS_RECVMSG:
-            return do_recvmsg(posix_fd_socket((int)a[0]), (k_msghdr_t*)a[1],
-                              (int)a[2], regs);
+        /* An inet socket goes to the inet scatter/gather, not the
+         * Unix-domain one.
+         *
+         * Sending these to do_sendmsg/do_recvmsg is what made a Windows
+         * program under Wine connect, send its request, and then read
+         * nothing: Wine's AFD write path uses send() and its read path
+         * uses recvmsg(), so output took the inet route and input took
+         * the AF_UNIX one - straight into an empty ring buffer, whose
+         * "nothing here and no peer" answer is indistinguishable from
+         * end of stream. The program saw a connection that closed the
+         * instant it asked for a reply. */
+        case SYS_SENDMSG: {
+            socket_t* s = posix_fd_socket((int)a[0]);
+            if (s && s->inet) return inet_sendmsg(s, (const k_msghdr_t*)a[1],
+                                                  (int)a[2]);
+            return do_sendmsg(s, (const k_msghdr_t*)a[1], (int)a[2]);
+        }
+        case SYS_RECVMSG: {
+            socket_t* s = posix_fd_socket((int)a[0]);
+            if (s && s->inet) return inet_recvmsg(s, (k_msghdr_t*)a[1],
+                                                  (int)a[2]);
+            return do_recvmsg(s, (k_msghdr_t*)a[1], (int)a[2], regs);
+        }
 
         case SYS_SHUTDOWN: {
             socket_t* s = posix_fd_socket((int)a[0]);
