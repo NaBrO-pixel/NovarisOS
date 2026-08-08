@@ -32,6 +32,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 # Character -> QEMU monitor key name(s). Anything needing shift is sent as
@@ -310,9 +311,32 @@ def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
             else:
                 time.sleep(settle)
 
+        # A client for a server running in the guest, on a thread, because
+        # it has to happen *while* the last command is still running.
+        # Doing it after the settle deadlocks by construction: the settle
+        # is waiting for the guest to say it accepted a connection, and
+        # the connection is what this makes. The guest's accept() times
+        # out first and the run fails with everything working.
+        def connect_from_host():
+            deadline = time.time() + 90.0
+            while time.time() < deadline:
+                try:
+                    c = socket.create_connection(("127.0.0.1", host_connect), 2.0)
+                    c.settimeout(10.0)
+                    c.sendall(b"hello from the host\n")
+                    reply = c.recv(200)
+                    c.close()
+                    print("host-connect: guest replied %r" % reply)
+                    return
+                except OSError:
+                    time.sleep(0.5)
+            print("host-connect: never got a connection")
+
         for i, cmd in enumerate(commands):
             mon.type(cmd + "\n", key_delay)
             last = (i == len(commands) - 1)
+            if last and host_connect:
+                threading.Thread(target=connect_from_host, daemon=True).start()
             # Pointer work aimed at the command that is *running*, not at
             # the shell before it. A program that draws a window and reads
             # input can only be sent input while it is up, which is after
@@ -324,26 +348,6 @@ def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
                 wait_for(serial_path, settle, stop_when)
             else:
                 time.sleep(settle)
-
-        # A client for a server running in the guest. Tried repeatedly
-        # because the guest has to reach accept() first, and how long
-        # that takes is a property of the machine rather than of the
-        # test.
-        if host_connect:
-            deadline = time.time() + 60.0
-            while time.time() < deadline:
-                try:
-                    c = socket.create_connection(("127.0.0.1", host_connect), 2.0)
-                    c.settimeout(5.0)
-                    c.sendall(b"hello from the host\n")
-                    reply = c.recv(200)
-                    c.close()
-                    print("host-connect: guest replied %r" % reply)
-                    break
-                except OSError:
-                    time.sleep(1.0)
-            else:
-                print("host-connect: never got a connection")
 
         # Typed after the waiting is over rather than before it, so that a
         # `sync` at the end of a run does not cost the run's whole settle.
