@@ -70,10 +70,16 @@ PORT=${PORT:-38080}
 python3 tools/make_manifest.py "$SERVE" "http://10.0.2.2:$PORT" "$NEXT" \
         "Novaris $NEXT" > "$SERVE/latest.manifest"
 
-# A blank FAT32 disk for the updater to install onto. 64MB is room for a
-# kernel and an initrd twice over.
+# A blank FAT32 disk for the updater to install onto.
+#
+# 512MB rather than the 64MB that would just fit, because the cluster size
+# follows the volume size: FAT32 needs more than 65525 clusters to be
+# FAT32 at all, so a 64MB volume is forced down to 512-byte clusters and a
+# 48MB initrd becomes ninety thousand chain walks. At 512MB the same file
+# is four-kilobyte clusters and an eighth of the work. A machine whose
+# initrd is 48MB does not get installed onto a 64MB disk anyway.
 DISK="$WORK/disk.img"
-python3 tools/mkfat32.py "$DISK" --size 64M --label NOVARIS
+python3 tools/mkfat32.py "$DISK" --size 512M --label NOVARIS
 
 echo "== boot 1: install $NEXT onto the disk"
 python3 tools/qemu_test.py --iso novaris.iso --disk "$DISK" \

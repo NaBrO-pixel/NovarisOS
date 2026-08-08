@@ -170,8 +170,17 @@ static uint32_t fat_get(uint32_t cluster) {
     return rd32(fat_cache + off) & FAT_MASK;
 }
 
+static void chain_memo_forget(void);
+
 static int fat_set(uint32_t cluster, uint32_t value) {
     if (cluster < 2 || cluster >= vol.total_clusters + 2) return -EINVAL;
+
+    /* Freeing a cluster or capping a chain can renumber or invalidate
+     * whatever chain_nth() last remembered - a freed cluster can be handed
+     * to another file, and a shortened chain has no Nth cluster any more.
+     * Linking a cluster onto the end of a chain does neither, which is why
+     * growing a file does not throw the memo away on every cluster. */
+    if (value == 0 || value == FAT_MASK) chain_memo_forget();
     if (fat_cache_load(cluster) != 0) return -EIO;
     uint32_t off = (cluster % (BLOCK_SECTOR_SIZE / 4)) * 4;
     /* The top four bits of a FAT32 entry are reserved and must be left
@@ -243,18 +252,49 @@ static void free_chain(uint32_t cluster) {
     }
 }
 
+/* Where the last chain walk finished. See chain_nth(). */
+static uint32_t memo_first, memo_index, memo_cluster;
+
+static void chain_memo_forget(void) {
+    memo_first = memo_index = memo_cluster = 0;
+}
+
 /* The `index`-th cluster of a chain, or 0 if the chain is shorter than
  * that. Never extends - growing is ensure_chain()'s job, and keeping the
  * two apart is what makes it possible to guarantee that a write which
- * cannot get all its space fails before writing any of it. */
+ * cannot get all its space fails before writing any of it.
+ *
+ * The walk from the head is the obvious implementation, and on its own it
+ * is what made writing a 48MB file impossible rather than merely slow.
+ * Reading or writing a whole file asks for cluster 0, then 1, then 2, and
+ * a fresh walk for each of those is quadratic: ninety thousand clusters
+ * is four billion link steps, for a file that took under a second to
+ * arrive over the network.
+ *
+ * So the last answer is remembered. A request for an index at or after
+ * the one already found continues from there - one step per cluster,
+ * which is what sequential access should cost. Anything else falls back
+ * to the walk, and any change to a chain that could renumber it throws
+ * the memo away, so this is a cache and never a second source of truth. */
 static uint32_t chain_nth(uint32_t first, uint32_t index) {
     if (first < 2) return 0;
+
     uint32_t cur = first;
-    for (uint32_t i = 0; i < index; i++) {
+    uint32_t i = 0;
+    if (memo_cluster >= 2 && memo_first == first && memo_index <= index) {
+        cur = memo_cluster;
+        i = memo_index;
+    }
+
+    for (; i < index; i++) {
         uint32_t next = fat_get(cur);
         if (next < 2 || next >= FAT_BAD) return 0;
         cur = next;
     }
+
+    memo_first = first;
+    memo_index = index;
+    memo_cluster = cur;
     return cur;
 }
 
