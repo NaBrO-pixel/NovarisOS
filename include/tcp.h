@@ -17,8 +17,9 @@
  *     A real stack keeps a congestion window full. For the traffic here -
  *     a few hundred bytes of HTTP request, then megabytes *inbound* - the
  *     slow direction is the one nobody uses.
- *   - **No window scaling, no SACK, no timestamps.** The window is 8KB,
- *     which is the receive ring, and it is advertised honestly.
+ *   - **No window scaling, no SACK, no timestamps.** The window is the
+ *     receive ring - 64KB, which is the largest a header without window
+ *     scaling can advertise - and it is advertised honestly.
  *   - **Retransmit is a timeout and a resend**, with no round-trip
  *     estimation. One second, doubling, five tries.
  *
@@ -29,7 +30,7 @@
  */
 
 #define TCP_MAX_CONNECTIONS 4
-#define TCP_RECV_BUFFER     8192
+#define TCP_RECV_BUFFER     65536
 #define TCP_MSS             1460
 
 typedef enum {
@@ -78,5 +79,11 @@ void tcp_init(void);
 
 uint32_t tcp_bytes_received(void);
 uint32_t tcp_retransmits(void);
+
+/* Diagnostics: how many times the tick ran, how many acknowledgements it
+ * managed to send, and how many it could not. */
+uint32_t tcp_tick_calls(void);
+uint32_t tcp_acks_sent(void);
+uint32_t tcp_acks_failed(void);
 
 #endif /* TCP_H */

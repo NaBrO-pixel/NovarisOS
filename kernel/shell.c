@@ -27,6 +27,7 @@
 #include "netdev.h"
 #include "dhcp.h"
 #include "pci.h"
+#include "rtl8139.h"
 #include "tcp.h"
 #include "dns.h"
 #include "http.h"
@@ -277,6 +278,38 @@ static void print_ip(uint32_t ip) {
     terminal_writestring(buf);
 }
 
+/* The counters that say why a transfer went the speed it did. Printed by
+ * `net`, and again by `fetch` when it finishes - because while a fetch is
+ * running nothing else in this kernel is, so `net` typed during one does
+ * not run until the fetch is over and the interesting moment has passed. */
+static void print_link_counters(void) {
+    terminal_writestring("  card     ");
+    print_uint(rtl8139_irq_count());
+    terminal_writestring(" irqs, ");
+    print_uint(rtl8139_irq_frames());
+    terminal_writestring(" frames from irq, ");
+    print_uint(rtl8139_poll_frames());
+    terminal_writestring(" from poll, ");
+    print_uint(rtl8139_tx_busy());
+    terminal_writestring(" tx-busy\n");
+
+    terminal_writestring("  tcp      ");
+    print_uint(tcp_bytes_received());
+    terminal_writestring(" bytes in, ");
+    print_uint(tcp_retransmits());
+    terminal_writestring(" retransmits\n");
+
+    terminal_writestring("  ticks    ");
+    print_uint(tcp_tick_calls());
+    terminal_writestring(" polls, ");
+    print_uint(tcp_acks_sent());
+    terminal_writestring(" acks sent, ");
+    print_uint(tcp_acks_failed());
+    terminal_writestring(" could not be sent, clock at ");
+    print_uint(pit_get_ticks());
+    terminal_writestring("\n");
+}
+
 static void cmd_net(const char* args) {
     while (*args == ' ') args++;
 
@@ -435,7 +468,9 @@ static void cmd_net(const char* args) {
     print_uint(st->rx_udp);
     terminal_writestring(" udp), ");
     print_uint(dev->rx_errors);
-    terminal_writestring(" errors\n");
+    terminal_writestring(" errors, ");
+    print_uint(dev->rx_dropped);
+    terminal_writestring(" ring overruns\n");
 
     terminal_writestring("  tx       ");
     print_uint(dev->tx_packets);
@@ -446,6 +481,8 @@ static void cmd_net(const char* args) {
     terminal_writestring("  arp      ");
     print_uint(net_arp_entries());
     terminal_writestring(" cached\n");
+
+    print_link_counters();
 }
 
 
@@ -492,12 +529,15 @@ static void cmd_fetch(const char* args) {
     }
 
     http_result_t res;
+    uint32_t started = pit_get_ticks();
     int err = http_get(url, body, FETCH_MAX, &res);
+    uint32_t elapsed = pit_get_ticks() - started;
 
     if (err != HTTP_OK) {
         terminal_writestring_color("fetch failed: ", VGA_COLOR_LIGHT_RED);
         terminal_writestring(http_error_string(err));
         terminal_writestring("\n");
+        print_link_counters();
         kfree(body);
         return;
     }
@@ -513,7 +553,10 @@ static void cmd_fetch(const char* args) {
     }
     terminal_writestring(" from ");
     print_ip(res.server_ip);
-    terminal_writestring("\n");
+    terminal_writestring(" in ");
+    print_uint(elapsed * 10);
+    terminal_writestring("ms\n");
+    print_link_counters();
 
     if (res.truncated) {
         terminal_writestring_color("  (truncated - larger than 4MB)\n",

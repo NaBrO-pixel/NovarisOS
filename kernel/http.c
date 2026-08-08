@@ -160,10 +160,13 @@ int http_get(const char* url, uint8_t* body, uint32_t body_max,
 
     while (pit_get_ticks() < deadline) {
         net_poll();
-        tcp_tick();
 
         uint8_t chunk[512];
         int n = tcp_recv(conn, chunk, sizeof(chunk));
+
+        /* Read first, then acknowledge - see the note in the body loop
+         * below, which is the one that carries the bytes. */
+        tcp_tick();
         if (n > 0) {
             deadline = pit_get_ticks() + idle_ticks;
             uint32_t take = (uint32_t)n;
@@ -202,10 +205,24 @@ int http_get(const char* url, uint8_t* body, uint32_t body_max,
         if (content_length && result->body_len >= content_length) break;
 
         net_poll();
-        tcp_tick();
 
         int n = tcp_recv(conn, body + result->body_len,
                          body_max - result->body_len);
+
+        /* Acknowledged *after* the read, not before it.
+         *
+         * The window in an acknowledgement is however much room is left
+         * in the receive ring at the moment it is built. Acknowledging
+         * before draining therefore reports the ring as the sender's own
+         * data left it - full, or nearly - and the sender stops until
+         * something tells it otherwise. Draining first means the same
+         * acknowledgement carries the window the reader has just opened,
+         * and the sender never pauses at all.
+         *
+         * The cost of the wrong order is one round trip per window rather
+         * than a stall, so it does not look like a bug; it looks like a
+         * link that is half as fast as it should be. */
+        tcp_tick();
         if (n > 0) {
             deadline = pit_get_ticks() + idle_ticks;
             result->body_len += (uint32_t)n;

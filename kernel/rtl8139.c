@@ -67,11 +67,20 @@
  * with an 8KB ring, unlimited DMA burst and the WRAP bit. */
 #define RXCFG_ACCEPT    0x0000000F
 #define RXCFG_WRAP      0x00000080
-#define RXCFG_64K       0x00001800  /* bits 12:11 = 11 -> 64K + 16 */
+/* bits 12:11 = 10 -> 32K + 16.
+ *
+ * Not 64K, which the card also offers and which looks like the obvious
+ * choice. CAPR and CBR - the read and write pointers the driver and the
+ * card use to find each other in the ring - are both sixteen bits, so a
+ * 64K ring makes "how far ahead is the card" ambiguous at exactly the
+ * moment the ring is full or empty. 32K leaves the top bit spare and the
+ * comparison unambiguous. Every driver that has ever worked reliably
+ * uses 8K, 16K or 32K for this reason. */
+#define RXCFG_32K       0x00001000
 #define RXCFG_MXDMA     0x00000700  /* unlimited */
 #define RXCFG_RXFTH     0x0000E000  /* no threshold: whole frames */
 
-#define RX_BUF_LEN      65536
+#define RX_BUF_LEN      32768
 /* The slack the WRAP bit needs, plus the 16 bytes the card's own
  * bookkeeping wants past the end. */
 #define RX_BUF_PAD      (16 + 1536)
@@ -95,6 +104,37 @@ typedef struct {
 
 static rtl8139_t nic;
 static int present;
+
+/* Milestone 39 diagnostics. A download that stalls looks the same from
+ * outside whether the card never raised an interrupt or the driver never
+ * drained the ring; these tell the two apart. */
+static uint32_t stat_irqs, stat_irq_frames, stat_poll_frames, stat_tx_busy;
+static int in_irq;
+
+uint32_t rtl8139_irq_count(void)   { return stat_irqs; }
+uint32_t rtl8139_irq_frames(void)  { return stat_irq_frames; }
+uint32_t rtl8139_poll_frames(void) { return stat_poll_frames; }
+uint32_t rtl8139_tx_busy(void)     { return stat_tx_busy; }
+
+/* Interrupts off and back on again, saving whether they were on to begin
+ * with. Both of the routines below are reached from inside the receive
+ * interrupt as well as from the shell, and both touch state the other
+ * half also touches.
+ *
+ * Saving and restoring rather than cli/sti, because the caller may
+ * already be inside an interrupt handler: an unconditional sti there
+ * re-enables interrupts in the middle of a handler that was entered with
+ * them off, and the next thing that happens is the handler running inside
+ * itself. */
+static inline uint32_t irq_save(void) {
+    uint32_t flags;
+    __asm__ __volatile__("pushfl; popl %0; cli" : "=r"(flags) :: "memory");
+    return flags;
+}
+
+static inline void irq_restore(uint32_t flags) {
+    if (flags & 0x200) __asm__ __volatile__("sti" ::: "memory");
+}
 
 /* --- receive ------------------------------------------------------------ */
 
@@ -125,6 +165,7 @@ static void rx_drain(void) {
             return;
         }
 
+        if (in_irq) stat_irq_frames++; else stat_poll_frames++;
         netdev_receive(&nic.dev, p + 4, (uint32_t)(length - 4));
 
         /* Frames are dword-aligned in the ring, header included. */
@@ -148,8 +189,24 @@ static int rtl_send(netdev_t* dev, const uint8_t* frame, uint32_t len) {
      * not pad for us, and a switch would drop a runt. */
     uint32_t pad = len < 60 ? 60 - len : 0;
 
+    /* Claiming a transmit buffer runs with interrupts off. An ARP or ICMP
+     * reply is sent from inside the receive interrupt, so this routine
+     * can interrupt itself; two callers that both read "slot 0 is free"
+     * both memcpy into slot 0 and the first frame never leaves. */
+    uint32_t flags = irq_save();
+
+    /* Round-robin, but skipping past a buffer the card still owns rather
+     * than giving up on it. The four are interchangeable; insisting on
+     * the next one in order turns one slow transmission into four
+     * buffers' worth of dropped frames. */
     uint32_t slot = nic.tx_next;
-    uint32_t status_reg = nic.io + REG_TXSTATUS0 + slot * 4;
+    uint32_t status_reg = 0;
+    for (uint32_t i = 0; i < TX_BUFFERS; i++) {
+        uint32_t s = (nic.tx_next + i) % TX_BUFFERS;
+        uint32_t reg = nic.io + REG_TXSTATUS0 + s * 4;
+        if (inl(reg) & 0x2000) { slot = s; status_reg = reg; break; }
+    }
+    if (!status_reg) status_reg = nic.io + REG_TXSTATUS0 + slot * 4;
 
     /* Bit 13 (OWN) is set by the card when it has finished with the
      * buffer. If it is not set, all four buffers are busy - and this
@@ -168,7 +225,9 @@ static int rtl_send(netdev_t* dev, const uint8_t* frame, uint32_t len) {
      * retransmitted. TCP is built for a link that drops things, and this
      * is a link that drops things. */
     if (!(inl(status_reg) & 0x2000)) {
+        stat_tx_busy++;
         nic.dev.tx_errors++;
+        irq_restore(flags);
         return -1;
     }
 
@@ -184,6 +243,7 @@ static int rtl_send(netdev_t* dev, const uint8_t* frame, uint32_t len) {
     nic.tx_next = (slot + 1) % TX_BUFFERS;
     nic.dev.tx_packets++;
     nic.dev.tx_bytes += len;
+    irq_restore(flags);
     return 0;
 }
 
@@ -193,6 +253,8 @@ static void rtl_interrupt(registers_t* regs) {
     (void)regs;
     uint16_t status = inw(nic.io + REG_ISR);
     if (!status) return;          /* shared line, not ours */
+    stat_irqs++;
+    in_irq = 1;
 
     /* Acknowledged by writing the bits back, and *before* the work: a
      * frame that arrives while this handler runs must leave the bit set
@@ -212,6 +274,7 @@ static void rtl_interrupt(registers_t* regs) {
         rx_drain();
         outw(nic.io + REG_CAPR, (uint16_t)(nic.rx_offset - 16));
     }
+    in_irq = 0;
 }
 
 /* --- bring-up ----------------------------------------------------------- */
@@ -259,7 +322,7 @@ int rtl8139_init(void) {
     outw(nic.io + REG_IMR,
          ISR_ROK | ISR_RER | ISR_TOK | ISR_TER | ISR_RXOVW | ISR_FOVW);
     outl(nic.io + REG_RXCONFIG,
-         RXCFG_ACCEPT | RXCFG_WRAP | RXCFG_64K | RXCFG_MXDMA | RXCFG_RXFTH);
+         RXCFG_ACCEPT | RXCFG_WRAP | RXCFG_32K | RXCFG_MXDMA | RXCFG_RXFTH);
     outl(nic.io + REG_TXCONFIG, 0x03000700);   /* default IFG, unlimited DMA */
 
     outb(nic.io + REG_CMD, CMD_TX_ENABLE | CMD_RX_ENABLE);
@@ -297,7 +360,24 @@ uint8_t rtl8139_irq(void) {
 
 /* Called from the stack's poll: the card's interrupt is the normal path,
  * but a kernel that spends minutes inside one shell command (a Wine run)
- * can leave the ring filling. Draining on demand costs one port read. */
+ * can leave the ring filling. Draining on demand costs one port read.
+ *
+ * With interrupts held off for the duration, because rx_drain() is the
+ * one routine in this driver reached from both sides. The ring has a
+ * single read pointer; two walkers sharing it do not read the ring twice,
+ * they read it wrong - one advances rx_offset past a header the other is
+ * still standing on, and the loser then reads length and status out of
+ * the middle of a frame's payload. That fails the sanity check, and the
+ * sanity check resets the receiver and throws the whole ring away.
+ *
+ * Which is what a stalled download looks like from the outside: bytes
+ * arrive, the driver discards them along with everything queued behind
+ * them, and nothing moves again until the sender's retransmission timer
+ * fires a second later. */
 void rtl8139_poll(void) {
-    if (present) rx_drain();
+    if (!present) return;
+
+    uint32_t flags = irq_save();
+    rx_drain();
+    irq_restore(flags);
 }

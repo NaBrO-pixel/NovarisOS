@@ -65,6 +65,7 @@ typedef struct {
 
     int         peer_finished;
     int         ack_pending;
+    uint32_t    last_advertised;   /* the window in the last ACK we sent */
     uint32_t    time_wait_until;
 } tcp_conn_t;
 
@@ -72,6 +73,11 @@ static tcp_conn_t conns[TCP_MAX_CONNECTIONS];
 static uint16_t   next_port = 49152;
 static uint32_t   bytes_received;
 static uint32_t   retransmits;
+
+/* Diagnostics. A transfer that stalls has exactly two possible reasons -
+ * the loop that would acknowledge is not running, or it is running and
+ * the acknowledgement is not leaving - and these tell them apart. */
+static uint32_t   tick_calls, ack_ok, ack_failed;
 
 /* --- sequence arithmetic ------------------------------------------------ */
 
@@ -125,7 +131,10 @@ static int send_segment(tcp_conn_t* c, uint8_t flags, uint32_t seq,
     th->ack = htonl(c->rcv_next);
     th->data_offset = (sizeof(tcp_header_t) / 4) << 4;
     th->flags = flags;
-    th->window = htons((uint16_t)recv_free(c));
+    uint32_t window = recv_free(c);
+    if (window > 65535) window = 65535;
+    th->window = htons((uint16_t)window);
+    c->last_advertised = window;
     th->checksum = 0;
     th->urgent = 0;
 
@@ -159,8 +168,12 @@ static int send_tracked(tcp_conn_t* c, uint8_t flags,
     return r;
 }
 
-static void send_ack(tcp_conn_t* c) {
-    send_segment(c, TCP_ACK, c->snd_next, 0, 0);
+/* Returns whether the acknowledgement actually left the machine. The
+ * caller has to know: rtl_send() drops when all four transmit buffers are
+ * busy, and net_send_ip() returns short when the next hop's MAC is still
+ * being resolved. */
+static int send_ack(tcp_conn_t* c) {
+    return send_segment(c, TCP_ACK, c->snd_next, 0, 0) == 0;
 }
 
 static void send_reset(uint32_t dest_ip, uint16_t dest_port,
@@ -407,6 +420,26 @@ int tcp_recv(int handle, uint8_t* out, uint32_t max) {
         out[n++] = c->recv[c->recv_tail];
         c->recv_tail = (c->recv_tail + 1) % TCP_RECV_BUFFER;
     }
+
+    /* Draining the ring opens the window, and the sender has no way to
+     * find that out unless it is told. This is the window update, and
+     * leaving it out is what made a 2MB download take six minutes.
+     *
+     * The failure is worth spelling out because it looks like slowness
+     * rather than a bug. The sender fills the window and stops. The
+     * reader empties the ring - but an ACK was only ever sent in response
+     * to *data*, and no data is arriving, because the sender is waiting
+     * for the window this ACK would have opened. Neither side is broken
+     * and neither side speaks. What breaks the tie is the sender's
+     * persist timer, about a second and a half later, and the whole
+     * transfer proceeds one window per persist timeout: 8KB per 1.5s,
+     * which is the 5KB/s that was measured.
+     *
+     * A window update per MSS freed, rather than per byte, because an ACK
+     * for every byte read would be its own kind of silly. */
+    if (n && recv_free(c) >= c->last_advertised + TCP_MSS) {
+        c->ack_pending = 1;
+    }
     return (int)n;
 }
 
@@ -434,6 +467,7 @@ void tcp_close(int handle) {
 
 void tcp_tick(void) {
     uint32_t now = pit_get_ticks();
+    tick_calls++;
 
     for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
         tcp_conn_t* c = &conns[i];
@@ -460,9 +494,48 @@ void tcp_tick(void) {
          * Out here the transmitter has had time to drain, and one ACK per
          * poll covers however many segments arrived since the last one -
          * which is what a delayed ACK is for anyway. */
+        /* Cleared only if the acknowledgement was really sent.
+         *
+         * Clearing it unconditionally is what held a 2MB download to
+         * 8KB/s. A dropped ACK is not an error - the transmitter was
+         * busy, which is normal and which TCP is built for - but it is
+         * only harmless if it is *sent again*. Forgetting it instead left
+         * the sender waiting on a window nobody had opened, once per
+         * dropped ACK, each one costing a persist timeout. The transfer
+         * then runs at one window per stall rather than at the speed of
+         * the link. */
+        /* Cleared *before* the send, not after.
+         *
+         * This is the bug that held every download to one round-trip per
+         * retransmission timeout, and it is a race with the interrupt
+         * handler rather than anything wrong with TCP. The flag is set by
+         * the receive path, which runs in the interrupt; it is cleared
+         * here, which does not. Clearing it after send_ack() returns
+         * therefore erases a request that arrived *during* the send - the
+         * segments that landed while the acknowledgement for the ones
+         * before them was being built. Nobody asks again, because asking
+         * is what the flag was for. The sender waits for an
+         * acknowledgement that will never come, times out, and
+         * retransmits; that retransmission sets the flag again, and the
+         * whole window is acknowledged at once - which is why the traces
+         * showed an acknowledgement arriving in the same millisecond as
+         * every retransmission, and nothing at all in between.
+         *
+         * Clearing first cannot lose one. A segment that arrives after
+         * the clear sets the flag again and is acknowledged next tick; a
+         * segment that arrives after that, during send_ack() itself, is
+         * covered by the acknowledgement being sent *and* leaves the flag
+         * set, which costs one redundant acknowledgement and no data. */
         if (c->ack_pending) {
             c->ack_pending = 0;
-            send_ack(c);
+            if (send_ack(c)) {
+                ack_ok++;
+            } else {
+                /* Not sent - the transmitter was busy or the next hop is
+                 * still being resolved. Ask again. */
+                c->ack_pending = 1;
+                ack_failed++;
+            }
         }
 
         if (!c->pending_len && !c->pending_flags) continue;
@@ -483,3 +556,6 @@ void tcp_tick(void) {
 
 uint32_t tcp_bytes_received(void) { return bytes_received; }
 uint32_t tcp_retransmits(void) { return retransmits; }
+uint32_t tcp_tick_calls(void) { return tick_calls; }
+uint32_t tcp_acks_sent(void) { return ack_ok; }
+uint32_t tcp_acks_failed(void) { return ack_failed; }

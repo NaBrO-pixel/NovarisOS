@@ -206,7 +206,7 @@ def wait_for(serial_path, seconds, patterns):
 def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
         memory=128, disk=None, setup=(), stop_when=(), clicks=(),
         click_settle=1.5, post=(), screenshot=None, post_clicks=(),
-        http_forward=None):
+        http_forward=None, pcap=None):
     serial_path = keep_serial or tempfile.mktemp(suffix=".log", prefix="novaris-serial-")
     port = 45000 + (os.getpid() % 10000)
 
@@ -240,6 +240,11 @@ def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
         # 10.0.2.2 answer: slirp connects out from the host's stack.
         "-netdev", "user,id=n0",
         "-device", "rtl8139,netdev=n0",
+    ] + ([
+        # A pcap of everything on the wire. The one tool that answers
+        # "who is waiting for whom" without guessing.
+        "-object", "filter-dump,id=dump0,netdev=n0,file=" + pcap,
+    ] if pcap else []) + [
     ]
     if disk:
         # Milestone 32. QEMU's -cdrom is IDE index 2 (secondary master),
@@ -402,6 +407,12 @@ def main():
                          "route to the outside world here, and a test that "
                          "needed one would fail when the outside world did - "
                          "so the server it fetches from is this machine.")
+    ap.add_argument("--http-port", type=int,
+                    help="serve --http-dir on this port rather than one "
+                         "picked from the pid. For a test whose URLs are "
+                         "written down before the run starts.")
+    ap.add_argument("--pcap", help="write a packet capture of the guest's "
+                                   "network to this file")
     ap.add_argument("--stop-when-matched", action="store_true",
                     help="end the last command's settle as soon as every "
                          "--expect pattern has appeared, instead of always "
@@ -412,7 +423,11 @@ def main():
     http_proc = None
     http_forward = None
     if args.http_dir:
-        http_forward = 34000 + (os.getpid() % 20000)
+        # A port derived from the pid, so two runs at once do not collide,
+        # unless the caller needs to know it in advance - which the
+        # updater's test does, because the URLs it is testing live inside
+        # a manifest that has to be written before the run starts.
+        http_forward = args.http_port or 34000 + (os.getpid() % 20000)
         http_proc = subprocess.Popen(
             [sys.executable, "-m", "http.server", str(http_forward),
              "--bind", "0.0.0.0", "--directory", args.http_dir],
@@ -435,7 +450,7 @@ def main():
                      args.disk, args.setup,
                      args.expect if args.stop_when_matched else (),
                      args.click, args.click_settle, args.post_cmd,
-                     args.screenshot, args.post_click, http_forward)
+                     args.screenshot, args.post_click, http_forward, args.pcap)
     if http_proc:
         http_proc.terminate()
         http_proc.wait()
