@@ -382,9 +382,15 @@ HOST_LIB32 ?= /lib32
 # in front of it.
 #
 #   git clone --depth 1 -b stable https://github.com/wine-mirror/wine
-#   cd wine && CC="gcc -m32" ./configure --enable-archs=i386 #       --disable-tests --without-x --without-freetype ...
+#   cd wine && CC="gcc -m32" ./configure --enable-archs=i386 \
+#       --disable-tests --without-x --without-vulkan --without-opengl
 #   make -j4
 #   cd ../NovarisOS && make WINE_BUILD=../wine
+#
+# Not --without-freetype, however headless this looks. Without a font
+# engine win32u reads the caption font's tm.tmHeight as garbage, derives
+# SM_CYCAPTION from it, and every window comes out 952x1 with no error
+# printed anywhere. See the note in README.md.
 #
 # With WINE_BUILD set, the ordinary `make` installs Wine into the OS image
 # it builds - see tools/install_wine.sh and the initrd rule below. Without

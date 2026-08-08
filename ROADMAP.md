@@ -5493,15 +5493,127 @@ a window that works rather than one that merely exists.
   display-mode changes.** All optional entry points, all absent, and
   win32u has sensible behaviour for a driver that does not fill them in.
 - **And `chrome.exe` is still not reachable.** A browser needs a 64-bit
-  Wine build (this one is 32-bit only), networking (there is none), a font
-  rasteriser, a GPU, a sandbox built on NT APIs this kernel does not have,
-  and far more than the 33 of Wine's 601 DLLs that ship here. What works
-  is a Windows program with a window - `notepad.exe`, `winemine.exe` - and
-  that is a different sentence from "Windows programs work".
+  Wine build (this one is 32-bit only), a GPU, a sandbox built on NT APIs
+  this kernel does not have, and far more than the 33 of Wine's 601 DLLs
+  that ship here. Milestones 38-40 gave the machine networking, which
+  removes one item from that list and none of the others. What works is a
+  Windows program with a window - `notepad.exe`, `winemine.exe` - and that
+  is a different sentence from "Windows programs work".
+
+## Milestone 38 — a network card, an address, and a packet that comes back ✅ DONE
+
+`net up`, and the machine has an IP address it was given rather than one
+it was told. `ping 10.0.2.2`, and the reply comes back.
+
+- **PCI** (`kernel/pci.c`): configuration mechanism #1, ports 0xCF8 and
+  0xCFC. A bus scan, a device list, `pci_find`, bus mastering, and the
+  I/O base out of a BAR. `net pci` prints what is on the bus.
+- **RTL8139** (`kernel/rtl8139.c`): chosen because it is the smallest
+  real Ethernet controller — receive is one circular buffer, transmit is
+  four registers and four buffers, and there are no descriptor rings on
+  either side. Every other card worth having is better hardware and more
+  code, and the thing being built is the stack above it.
+- **Ethernet, ARP, IPv4, ICMP, UDP** (`kernel/net.c`), and **DHCP**
+  (`kernel/dhcp.c`): DISCOVER, OFFER, REQUEST, ACK.
+
+DMA is the part that needed something new underneath: the card addresses
+memory itself, so its buffers must be physically contiguous and known by
+physical address (`pmm_alloc_contiguous`, `paging_alloc_dma`).
+
+## Milestone 39 — TCP, DNS and HTTP ✅ DONE
+
+`fetch http://host/path [file]`, and the bytes are on the machine.
+
+- **TCP** (`kernel/tcp.c`): a connection table, a segment builder, a
+  receive path that is one switch on the state, and a tick that
+  retransmits. Sequence numbers are compared through the sign of a
+  *signed* difference, which is correct across the wrap; comparing them
+  with `<` is a bug that appears after four gigabytes and never in a test.
+- **DNS** (`kernel/dns.c`): A records, with a jump-counting walker for
+  compression pointers so a malicious answer cannot loop it.
+- **HTTP** (`kernel/http.c`): HTTP/1.0 with a Host header. The server's
+  close is the framing.
+
+No TLS, and deliberately so: a client that says "https" while validating
+nothing would be worse than not having one.
+
+### The two bugs that were the milestone
+
+Both looked like slowness rather than breakage, which is why they took
+the longest.
+
+**Partial segment acceptance.** Taking *part* of a segment looks like
+progress and is the opposite: `rcv_next` lands in the middle of what the
+sender has moved past, so every following segment is out of order and
+dropped until the retransmission timer fires. A 200KB download stopped
+dead at 53KB with every byte it had correct. Segments are now all-or-
+nothing.
+
+**The acknowledgement nobody sent.** `ack_pending` is set by the receive
+path, which runs in the card's interrupt, and was cleared *after*
+`send_ack()` returned, which does not — so a segment arriving during the
+send set the flag and the store then wiped it. Nobody asked again,
+because asking is what the flag was for. The sender waited on an
+acknowledgement that would never come, and the whole transfer ran at one
+window per retransmission timeout: **8.2 KB/s**. Clearing the flag before
+the send instead cannot lose one.
+
+Counters were what found it — over one transfer the tick ran 416 times
+and failed to send *none*, yet only five acknowledgements left the
+machine for fourteen segments. `net` and `fetch` still print them.
+
+**2,000,000 bytes in 110ms, byte for byte.** Two related fixes went with
+it: `http.c` acknowledged before reading, so every window advertised was
+the one the sender had just filled rather than the one the reader had
+just opened; and `rx_drain()` is reached from both the interrupt and the
+poll, which share the ring's read pointer.
+
+## Milestone 40 — the OS updates itself ✅ DONE
+
+`update apply <manifest-url>`, reboot, and the machine is a new version.
+
+The manifest is plain text — `key = value`, one per line — naming a
+kernel and an initrd with a size and a checksum for each. Both are
+downloaded and both are verified **before either is written**, because
+the failure being designed against is a machine with half an update on
+it: a new kernel with an old initrd does not boot, and a machine that
+does not boot cannot be updated again. The version marker is written
+**last**, so its presence is what says the two images beside it are
+complete.
+
+GRUB reads FAT32 natively, so nothing has to be installed on the disk:
+`search --no-floppy --file --set=root /boot/version` finds the disk's
+copy and boots it, and falls back to the disc's when there is none. The
+disc stays the thing that boots; the disk holds what it boots *into*.
+
+The checksum is FNV-1a 32 — a *hash*, not a signature. It catches a
+truncated or corrupted download and nothing at all about who served it.
+Over plain HTTP this trusts the network, and `include/update.h` says so.
+
+### The test is the milestone
+
+An updater is the one thing that cannot be tested by reading its own
+output, because what it claims to have done and what it did are the same
+sentence. `tools/tests/update_e2e.sh` builds the tree twice, serves the
+newer build with a manifest, installs it from inside the guest, and boots
+again — and the machine comes back up saying `This is Novaris Milestone
+41 (version 41)`.
+
+Writing it was what exposed **a quadratic FAT32**. `fat_write_raw` asked
+`chain_nth` for each cluster and `chain_nth` walked from the head of the
+chain, so a 48MB initrd was ninety thousand clusters squared — four
+billion link steps for a file that arrived in a second. Reading had the
+same line and the same shape; nothing in the tree had been big enough to
+notice. `chain_nth` now remembers where its last walk ended, which is one
+step per cluster for sequential access and a fallback to the walk for
+anything else.
 
 ## Later / open-ended
 
-- Networking (a NIC driver + a minimal TCP/IP stack) — big undertaking.
+- ~~Networking (a NIC driver + a minimal TCP/IP stack)~~ — done in
+  Milestones 38-40. What is still missing above it: TLS, a socket API
+  for ring-3 programs (the stack is reachable from the shell and the
+  updater, not from a process), and listening sockets.
 - SMP (multi-core) support.
 - Porting a real libc (newlib) instead of hand-rolling one.
 - A custom bootloader instead of relying on GRUB, if you want the whole
