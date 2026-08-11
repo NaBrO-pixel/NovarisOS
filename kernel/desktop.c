@@ -1805,27 +1805,6 @@ int desktop_pump(void) {
     }
 
     uint32_t now = pit_get_ticks();
-    /* A heartbeat, so a run that takes five minutes says where the five
-     * minutes went. Three measurements have now come back too small to
-     * explain it - 32MB of mapping copies, no disk at all, under two
-     * thousand socket operations - which means the next thing to look at
-     * is the shape of the timeline rather than another suspect. */
-    {
-        extern uint32_t user_fault_count;
-        static uint32_t last_beat;
-        if (now - last_beat >= 500) {          /* every five seconds */
-            last_beat = now;
-            char num[12];
-            terminal_writestring_color("[hb] ", VGA_COLOR_LIGHT_CYAN);
-            ku32_to_dec(now / 100, num);
-            terminal_writestring(num);
-            terminal_writestring("s  faults ");
-            ku32_to_dec(user_fault_count, num);
-            terminal_writestring(num);
-            terminal_writestring("\n");
-        }
-    }
-
     if (now - last_tick >= 10) {       /* ~10 Hz housekeeping */
         last_tick = now;
         wm_tick();
