@@ -471,6 +471,14 @@ static int ensure_capacity(vfs_node_t* n, uint32_t want) {
  * made on Unix and exactly what wineserver does. Recorded rather than
  * defended against, because defending would mean a page cache and a page
  * cache is a different milestone. */
+/* Set to 1 to have every mapping and its running total printed to the
+ * console as it happens. Off by default: it is a few lines per program
+ * launch in ordinary use and seventy during a Wine startup, which is
+ * noise on a desktop and a hazard to any test matching on the
+ * transcript. The counters below cost an add and stay on, so `df` can
+ * still answer the question at any time. */
+#define TRACE_MAPPINGS 0
+
 /* What mapping files actually costs, so the question can be answered
  * with a number rather than an assumption. README.md has claimed since
  * Milestone 35 that Wine's startup is dominated by "no page cache - a
@@ -555,7 +563,7 @@ int vfs_make_mappable(vfs_node_t* n, uint32_t bytes) {
      * collected nothing at all. A counter that cannot be read is not a
      * measurement. This goes into the serial log, where the run itself
      * already is. */
-    {
+    if (TRACE_MAPPINGS) {
         char num[12];
         terminal_writestring_color("[map] ", VGA_COLOR_LIGHT_CYAN);
         ku32_to_dec(keep >> 10, num);

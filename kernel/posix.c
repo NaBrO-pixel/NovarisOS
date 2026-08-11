@@ -2493,10 +2493,18 @@ static void trace_exit(int32_t r) {
  * whole run, and the count is itself a candidate answer: bytes, disk and
  * wineserver round trips have each come back too small, and "several
  * million syscalls" would look exactly like this. */
+/* Set to 1 to print the syscall rate and the user/kernel time split
+ * every 200,000 calls. Off by default for the same reason as
+ * TRACE_MAPPINGS in kernel/ramfs.c. This is the instrument that found
+ * where Wine's five minutes go - see README.md - so it is kept rather
+ * than deleted. */
+#define TRACE_SYSCALL_RATE 0
+
 static uint32_t stat_syscalls, stat_syscall_report;
 
 void posix_syscall(registers_t* regs) {
-    if (++stat_syscalls - stat_syscall_report >= 200000u) {
+    if (TRACE_SYSCALL_RATE &&
+        ++stat_syscalls - stat_syscall_report >= 200000u) {
         stat_syscall_report = stat_syscalls;
         char num[12];
         terminal_writestring_color("[sys] ", VGA_COLOR_LIGHT_CYAN);
