@@ -148,6 +148,9 @@ static struct {
 
 static uint32_t stat_bytes = 0, stat_fds = 0;
 
+/* See report_ops(): the wineserver round trip, counted and timed. */
+static uint32_t stat_ops, stat_blocks, stat_last_report, stat_start_tick;
+
 /* --- housekeeping -------------------------------------------------------- */
 
 static socket_t* sock_alloc(void) {
@@ -1056,6 +1059,7 @@ static int32_t do_recvmsg(socket_t* s, k_msghdr_t* m, int flags,
             /* Put the caller's header back the way it was: this call is
              * about to happen again from the beginning. */
             m->msg_controllen = room;
+            stat_blocks++;
             posix_request_block((uint32_t)s, regs);
             return 0;
         }
@@ -1135,8 +1139,45 @@ static int32_t inet_recvmsg(socket_t* s, k_msghdr_t* m, int flags) {
 
 /* --- the demultiplexer ---------------------------------------------------- */
 
+/* The wineserver round trip, counted and timed.
+ *
+ * 32MB of mapping copies came to about thirty milliseconds, against a
+ * wineboot that takes five minutes, so the time is not in bytes - it is
+ * in how many times the two sides of Wine have to take turns. Every
+ * Windows handle, every registry key, every process and thread is a
+ * request to wineserver over a Unix socket, and this kernel has one
+ * event loop: the client blocks, the server runs, control comes back,
+ * and none of it overlaps.
+ *
+ * So: operations, blocks, and the clock, reported periodically into the
+ * log the run is already writing - the same trick the mapping counters
+ * needed, and for the same reason. A rate is the useful number here, not
+ * a total: 200 operations in 30 ticks and 200 in 3000 are different
+ * diagnoses. */
+
+static void report_ops(void) {
+    if (!stat_start_tick) stat_start_tick = pit_get_ticks();
+    if (stat_ops - stat_last_report < 2000) return;
+    stat_last_report = stat_ops;
+
+    char num[12];
+    uint32_t elapsed = pit_get_ticks() - stat_start_tick;
+    terminal_writestring_color("[rt] ", VGA_COLOR_LIGHT_CYAN);
+    ku32_to_dec(stat_ops, num);
+    terminal_writestring(num);
+    terminal_writestring(" socket ops, ");
+    ku32_to_dec(stat_blocks, num);
+    terminal_writestring(num);
+    terminal_writestring(" blocked, ");
+    ku32_to_dec(elapsed * 10, num);
+    terminal_writestring(num);
+    terminal_writestring("ms elapsed\n");
+}
+
 int32_t socket_syscall(uint32_t call, uint32_t* a, registers_t* regs) {
     if (!a) return -EFAULT;
+    stat_ops++;
+    report_ops();
 
     switch (call) {
         case SYS_SOCKET:
