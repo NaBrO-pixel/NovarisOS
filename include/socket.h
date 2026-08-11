@@ -19,7 +19,13 @@
  * behind a Windows HANDLE, and a socket layer without it would look
  * complete and be useless for the thing it was built for.
  *
- * There is no networking here and none is implied. AF_INET is refused. */
+ * Milestone 41 added the other family. AF_INET/SOCK_STREAM is an outbound
+ * TCP connection, carried by kernel/tcp.c - which is what makes the
+ * network stack reachable from a *process* rather than only from the
+ * shell's own `fetch` and `update`. The two families share this file
+ * because they share everything a descriptor cares about: read, write,
+ * close, poll and the errno for each. They share nothing below that, and
+ * the `inet` flag is where the two implementations part company. */
 
 /* --- the ABI, as Linux defines it --------------------------------------- */
 #define AF_UNIX      1
@@ -40,6 +46,24 @@
 #define SHUT_RD   0
 #define SHUT_WR   1
 #define SHUT_RDWR 2
+
+#define IPPROTO_TCP  6
+#define IPPROTO_UDP 17
+
+#define SO_ERROR     4
+#define SO_REUSEADDR 2
+
+/* `struct sockaddr_in`, in Linux's exact layout. The two 16-bit fields
+ * are network byte order and the address is too, which is why every one
+ * of them goes through htons/htonl on the way in and out - a socket API
+ * that quietly took host order would work on this machine and on no
+ * other. */
+typedef struct __attribute__((packed)) {
+    uint16_t sin_family;
+    uint16_t sin_port;          /* network order */
+    uint32_t sin_addr;          /* network order */
+    uint8_t  sin_zero[8];
+} sockaddr_in_t;
 
 /* socketcall()'s sub-call numbers. On i386 every socket operation comes
  * through one syscall (102) with the operation in the first argument and

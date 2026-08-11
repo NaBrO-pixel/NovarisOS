@@ -32,6 +32,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 # Character -> QEMU monitor key name(s). Anything needing shift is sent as
@@ -205,7 +206,8 @@ def wait_for(serial_path, seconds, patterns):
 
 def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
         memory=128, disk=None, setup=(), stop_when=(), clicks=(),
-        click_settle=1.5, post=(), screenshot=None, post_clicks=()):
+        click_settle=1.5, post=(), screenshot=None, post_clicks=(),
+        http_forward=None, pcap=None, hostfwd=None, host_connect=None):
     serial_path = keep_serial or tempfile.mktemp(suffix=".log", prefix="novaris-serial-")
     port = 45000 + (os.getpid() % 10000)
 
@@ -220,6 +222,32 @@ def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
         "-serial", "file:" + serial_path,
         "-monitor", "tcp:127.0.0.1:%d,server,nowait" % port,
         "-no-reboot",
+        # Milestone 38. A network card, and QEMU's own user-mode stack
+        # behind it: a DHCP server at 10.0.2.2 that hands out 10.0.2.15, a
+        # DNS forwarder at 10.0.2.3, and the host reachable at 10.0.2.2.
+        # Always present rather than opt-in, because "the OS boots with a
+        # network card in it" is now part of what every test covers.
+        # QEMU's user-mode stack: DHCP hands out 10.0.2.15, the host is
+        # 10.0.2.2, DNS forwards from 10.0.2.3.
+        #
+        # 10.0.2.2 is both the guest's default gateway and this machine,
+        # so a server bound on the host is reachable from the guest with
+        # no forwarding rule at all - which matters, because QEMU's
+        # `guestfwd` proxy serves one connection and then stops, and a
+        # test that fetches twice would fail the second time for reasons
+        # that have nothing to do with the OS.
+        #
+        # Binding the server to 0.0.0.0 rather than loopback is what makes
+        # 10.0.2.2 answer: slirp connects out from the host's stack.
+        "-netdev",
+        ("user,id=n0,hostfwd=tcp:127.0.0.1:%d-:%d" % hostfwd) if hostfwd
+            else "user,id=n0",
+        "-device", "rtl8139,netdev=n0",
+    ] + ([
+        # A pcap of everything on the wire. The one tool that answers
+        # "who is waiting for whom" without guessing.
+        "-object", "filter-dump,id=dump0,netdev=n0,file=" + pcap,
+    ] if pcap else []) + [
     ]
     if disk:
         # Milestone 32. QEMU's -cdrom is IDE index 2 (secondary master),
@@ -283,9 +311,32 @@ def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
             else:
                 time.sleep(settle)
 
+        # A client for a server running in the guest, on a thread, because
+        # it has to happen *while* the last command is still running.
+        # Doing it after the settle deadlocks by construction: the settle
+        # is waiting for the guest to say it accepted a connection, and
+        # the connection is what this makes. The guest's accept() times
+        # out first and the run fails with everything working.
+        def connect_from_host():
+            deadline = time.time() + 90.0
+            while time.time() < deadline:
+                try:
+                    c = socket.create_connection(("127.0.0.1", host_connect), 2.0)
+                    c.settimeout(10.0)
+                    c.sendall(b"hello from the host\n")
+                    reply = c.recv(200)
+                    c.close()
+                    print("host-connect: guest replied %r" % reply)
+                    return
+                except OSError:
+                    time.sleep(0.5)
+            print("host-connect: never got a connection")
+
         for i, cmd in enumerate(commands):
             mon.type(cmd + "\n", key_delay)
             last = (i == len(commands) - 1)
+            if last and host_connect:
+                threading.Thread(target=connect_from_host, daemon=True).start()
             # Pointer work aimed at the command that is *running*, not at
             # the shell before it. A program that draws a window and reads
             # input can only be sent input while it is up, which is after
@@ -374,11 +425,59 @@ def main():
                          "the run. Some things are only true on screen: a "
                          "window drawn by a ring-3 process leaves no trace "
                          "in a serial transcript.")
+    ap.add_argument("--http-dir",
+                    help="serve this directory to the guest. The port is "
+                         "chosen per run and substituted for $HTTP in every "
+                         "--cmd, so a test writes "
+                         "'fetch http://10.0.2.2:$HTTP/x'. The guest has no "
+                         "route to the outside world here, and a test that "
+                         "needed one would fail when the outside world did - "
+                         "so the server it fetches from is this machine.")
+    ap.add_argument("--http-port", type=int,
+                    help="serve --http-dir on this port rather than one "
+                         "picked from the pid. For a test whose URLs are "
+                         "written down before the run starts.")
+    ap.add_argument("--host-connect", metavar="PORT", type=int,
+                    help="after the last command is typed, connect to this "
+                         "port on this machine's loopback (see --hostfwd), "
+                         "send a line and print the reply. The only way to "
+                         "drive a *listening* socket in the guest: the "
+                         "client has to be out here.")
+    ap.add_argument("--hostfwd", metavar="HOST:GUEST",
+                    help="forward a TCP port on this machine's loopback "
+                         "into the guest, so something here can connect "
+                         "*in*. QEMU's user-mode stack blocks inbound "
+                         "connections otherwise, which is what makes a "
+                         "listening socket in the guest untestable "
+                         "without it.")
+    ap.add_argument("--pcap", help="write a packet capture of the guest's "
+                                   "network to this file")
     ap.add_argument("--stop-when-matched", action="store_true",
                     help="end the last command's settle as soon as every "
                          "--expect pattern has appeared, instead of always "
                          "waiting it out")
     args = ap.parse_args()
+
+    # The server the guest fetches from, if the test asked for one.
+    http_proc = None
+    http_forward = None
+    if args.http_dir:
+        # A port derived from the pid, so two runs at once do not collide,
+        # unless the caller needs to know it in advance - which the
+        # updater's test does, because the URLs it is testing live inside
+        # a manifest that has to be written before the run starts.
+        http_forward = args.http_port or 34000 + (os.getpid() % 20000)
+        http_proc = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(http_forward),
+             "--bind", "0.0.0.0", "--directory", args.http_dir],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.5)
+
+    # "8080:80" - this machine's loopback port, then the guest's.
+    hostfwd = None
+    if args.hostfwd:
+        host_s, guest_s = args.hostfwd.split(":", 1)
+        hostfwd = (int(host_s), int(guest_s))
 
     commands = list(args.cmd)
     if args.script:
@@ -386,12 +485,22 @@ def main():
             commands += [ln.strip() for ln in fh
                          if ln.strip() and not ln.startswith("#")]
 
+    if http_forward:
+        commands = [c.replace("$HTTP", str(http_forward)) for c in commands]
+        args.post_cmd = [c.replace("$HTTP", str(http_forward))
+                         for c in args.post_cmd]
+
     transcript = run(args.iso, commands, args.boot_wait, args.key_delay,
                      args.settle, args.timeout, args.serial_log, args.memory,
                      args.disk, args.setup,
                      args.expect if args.stop_when_matched else (),
                      args.click, args.click_settle, args.post_cmd,
-                     args.screenshot, args.post_click)
+                     args.screenshot, args.post_click, http_forward, args.pcap,
+                     hostfwd, args.host_connect)
+    if http_proc:
+        http_proc.terminate()
+        http_proc.wait()
+
     sys.stdout.write(transcript)
 
     failures = []

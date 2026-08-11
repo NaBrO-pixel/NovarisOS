@@ -5374,8 +5374,10 @@ same call X11 and Wayland make, so from `user32` upwards there is no
 difference between a click on a Novaris window and a click on an X11 one -
 no special cases anywhere above the driver.
 
-There is a fifth, `pGetWindowStyleMasks`, and it is *not* implemented -
-for a reason worth knowing, below.
+`pGetWindowStyleMasks` is the fifth, and it is about *not* doing
+something: it tells win32u that `WS_CAPTION`, `WS_DLGFRAME` and
+`WS_THICKFRAME` are drawn by the host. Getting it to work took two goes
+and a font engine - see below.
 
 ### Three things that had to be true first
 
@@ -5415,13 +5417,14 @@ Wine's own, from `nodrv_CreateWindow` and X11's `is_window_managed`: the
 desktop must be its parent, and it must look like something a user would
 drag.
 
-### The thing underneath the two remaining flaws: there is no font
+### The window frame is measured in glyphs
 
-A window here has no text in it, and it wears two title bars - its own,
-drawn by Wine inside the client area, and the one Novaris drew around it.
-Those look like two unrelated cosmetic problems. They are one problem.
+The first Notepad had no text in it, and it wore two title bars - its
+own, drawn by Wine inside the client area, and the one Novaris drew
+around it. Those looked like two unrelated cosmetic problems. They were
+one problem, and it was not a cosmetic one.
 
-This Wine is configured `--without-freetype`, because the host has no
+That Wine was configured `--without-freetype`, because the host had no
 32-bit FreeType to link against. No font engine means no font, and no
 font means `get_text_metr_size()` fills a `TEXTMETRICW` with whatever was
 on the stack. `normalize_nonclientmetrics()` then does:
@@ -5431,9 +5434,9 @@ get_text_metr_size( hdc, &pncm->lfCaptionFont, &tm, NULL );
 pncm->iCaptionHeight = max( pncm->iCaptionHeight, 2 + tm.tmHeight );
 ```
 
-On Novaris `tm.tmHeight` comes out at about six and three quarter
-million, so `SM_CYCAPTION` is six and three quarter million, and so is
-every rectangle computed from it. That is what finding this looked like:
+`tm.tmHeight` came out at about six and three quarter million, so
+`SM_CYCAPTION` was six and three quarter million, and so was every
+rectangle computed from it:
 
 ```
 DBG hwnd 0x10050 style 04cf0000 win (0,0)-(960,570)
@@ -5443,18 +5446,34 @@ DBG hwnd 0x10050 style 04cf0000 win (0,0)-(960,570)
 The window rect is right; the client rect is a strip one pixel tall at
 y=6750323.
 
-Which is why `pGetWindowStyleMasks` is not implemented. It is the correct
-fix for the double title bar - it tells win32u that the host draws the
-caption and the frame - but win32u turns the answer into a rectangle with
+That is why implementing `pGetWindowStyleMasks` - the correct fix for the
+double title bar, since it tells win32u the host draws the caption -
+made Notepad disappear entirely, with a transcript that still passed
+every assertion. win32u turns the mask into a rectangle with
 `NtUserAdjustWindowRect`, and that rectangle is built from
-`SM_CYCAPTION`. Implementing it produced a Notepad window 952 pixels wide
-and 1 pixel tall: invisible, with a transcript full of nothing. The entry
-point is written up in `wine/winenovaris.drv/window.c` where it would go,
-with this explanation, and it waits on fonts.
+`SM_CYCAPTION`. The window came out 952 pixels wide and one tall.
 
-Fonts wait on a Wine built with FreeType, which waits on a build host with
-32-bit FreeType development files. Wine's own `fonts/*.ttf` are only
-484KB - the bytes are not the problem, the rasteriser is.
+So: `apt-get install libfreetype-dev:i386`, reconfigure Wine
+`--with-freetype`, and `tools/install_wine.sh` ships three things it did
+not before -
+
+- Wine's thirteen bundled `.ttf` faces into `/usr/share/wine/fonts`,
+  which is where `get_fonts_data_dir_path()` looks. 484KB.
+- `libfreetype.so.6` and what it needs (`libpng16`, `libz`, `libbz2`,
+  `libbrotlidec`, `libbrotlicommon`) into `/lib32`. Named explicitly,
+  because win32u `dlopen`s FreeType by SONAME - it is in no binary's
+  `NEEDED` list, so the "ask the binaries what they need" loop that
+  ships every other library cannot see it.
+- and `pGetWindowStyleMasks` is now implemented, because the numbers it
+  depends on are real.
+
+Notepad now has a menu bar reading File / Edit / Format / View / Help, a
+white document area with a scroll bar, a status bar saying "Ln 1, Col 1",
+and exactly one title bar. `tools/check_wine_window.py` was rewritten
+around that: it used to look for one flat block of `COLOR_3DFACE`, which
+is what a window with no font engine looks like, and it now wants a white
+`COLOR_WINDOW` document area *with* grey chrome around it - the shape of
+a window that works rather than one that merely exists.
 
 ### What it does not do yet
 
@@ -5470,21 +5489,297 @@ Fonts wait on a Wine built with FreeType, which waits on a build host with
 - **The keyboard is a table, not a layout.** `vkey_for()` maps Novaris's
   character-plus-code to a virtual key well enough to type; a real
   keyboard needs `pKbdLayerDescriptor` and a `KBDTABLES`.
-- **No fonts, so no text and two title bars.** See above - one cause, and
-  it is a Wine build option rather than anything in this repository.
 - **No OpenGL, no Vulkan, no clipboard, no IME, no cursor shapes, no
   display-mode changes.** All optional entry points, all absent, and
   win32u has sensible behaviour for a driver that does not fill them in.
 - **And `chrome.exe` is still not reachable.** A browser needs a 64-bit
-  Wine build (this one is 32-bit only), networking (there is none), a font
-  rasteriser, a GPU, a sandbox built on NT APIs this kernel does not have,
-  and far more than the 33 of Wine's 601 DLLs that ship here. What works
-  is a Windows program with a window - `notepad.exe`, `winemine.exe` - and
-  that is a different sentence from "Windows programs work".
+  Wine build (this one is 32-bit only), a GPU, a sandbox built on NT APIs
+  this kernel does not have, and far more than the 33 of Wine's 601 DLLs
+  that ship here. Milestones 38-40 gave the machine networking, which
+  removes one item from that list and none of the others. What works is a
+  Windows program with a window - `notepad.exe`, `winemine.exe` - and that
+  is a different sentence from "Windows programs work".
+
+## Milestone 38 — a network card, an address, and a packet that comes back ✅ DONE
+
+`net up`, and the machine has an IP address it was given rather than one
+it was told. `ping 10.0.2.2`, and the reply comes back.
+
+- **PCI** (`kernel/pci.c`): configuration mechanism #1, ports 0xCF8 and
+  0xCFC. A bus scan, a device list, `pci_find`, bus mastering, and the
+  I/O base out of a BAR. `net pci` prints what is on the bus.
+- **RTL8139** (`kernel/rtl8139.c`): chosen because it is the smallest
+  real Ethernet controller — receive is one circular buffer, transmit is
+  four registers and four buffers, and there are no descriptor rings on
+  either side. Every other card worth having is better hardware and more
+  code, and the thing being built is the stack above it.
+- **Ethernet, ARP, IPv4, ICMP, UDP** (`kernel/net.c`), and **DHCP**
+  (`kernel/dhcp.c`): DISCOVER, OFFER, REQUEST, ACK.
+
+DMA is the part that needed something new underneath: the card addresses
+memory itself, so its buffers must be physically contiguous and known by
+physical address (`pmm_alloc_contiguous`, `paging_alloc_dma`).
+
+## Milestone 39 — TCP, DNS and HTTP ✅ DONE
+
+`fetch http://host/path [file]`, and the bytes are on the machine.
+
+- **TCP** (`kernel/tcp.c`): a connection table, a segment builder, a
+  receive path that is one switch on the state, and a tick that
+  retransmits. Sequence numbers are compared through the sign of a
+  *signed* difference, which is correct across the wrap; comparing them
+  with `<` is a bug that appears after four gigabytes and never in a test.
+- **DNS** (`kernel/dns.c`): A records, with a jump-counting walker for
+  compression pointers so a malicious answer cannot loop it.
+- **HTTP** (`kernel/http.c`): HTTP/1.0 with a Host header. The server's
+  close is the framing.
+
+No TLS, and deliberately so: a client that says "https" while validating
+nothing would be worse than not having one.
+
+### The two bugs that were the milestone
+
+Both looked like slowness rather than breakage, which is why they took
+the longest.
+
+**Partial segment acceptance.** Taking *part* of a segment looks like
+progress and is the opposite: `rcv_next` lands in the middle of what the
+sender has moved past, so every following segment is out of order and
+dropped until the retransmission timer fires. A 200KB download stopped
+dead at 53KB with every byte it had correct. Segments are now all-or-
+nothing.
+
+**The acknowledgement nobody sent.** `ack_pending` is set by the receive
+path, which runs in the card's interrupt, and was cleared *after*
+`send_ack()` returned, which does not — so a segment arriving during the
+send set the flag and the store then wiped it. Nobody asked again,
+because asking is what the flag was for. The sender waited on an
+acknowledgement that would never come, and the whole transfer ran at one
+window per retransmission timeout: **8.2 KB/s**. Clearing the flag before
+the send instead cannot lose one.
+
+Counters were what found it — over one transfer the tick ran 416 times
+and failed to send *none*, yet only five acknowledgements left the
+machine for fourteen segments. `net` and `fetch` still print them.
+
+**2,000,000 bytes in 110ms, byte for byte.** Two related fixes went with
+it: `http.c` acknowledged before reading, so every window advertised was
+the one the sender had just filled rather than the one the reader had
+just opened; and `rx_drain()` is reached from both the interrupt and the
+poll, which share the ring's read pointer.
+
+## Milestone 40 — the OS updates itself ✅ DONE
+
+`update apply <manifest-url>`, reboot, and the machine is a new version.
+
+The manifest is plain text — `key = value`, one per line — naming a
+kernel and an initrd with a size and a checksum for each. Both are
+downloaded and both are verified **before either is written**, because
+the failure being designed against is a machine with half an update on
+it: a new kernel with an old initrd does not boot, and a machine that
+does not boot cannot be updated again. The version marker is written
+**last**, so its presence is what says the two images beside it are
+complete.
+
+GRUB reads FAT32 natively, so nothing has to be installed on the disk:
+`search --no-floppy --file --set=root /boot/version` finds the disk's
+copy and boots it, and falls back to the disc's when there is none. The
+disc stays the thing that boots; the disk holds what it boots *into*.
+
+The checksum is FNV-1a 32 — a *hash*, not a signature. It catches a
+truncated or corrupted download and nothing at all about who served it.
+Over plain HTTP this trusts the network, and `include/update.h` says so.
+
+### The test is the milestone
+
+An updater is the one thing that cannot be tested by reading its own
+output, because what it claims to have done and what it did are the same
+sentence. `tools/tests/update_e2e.sh` builds the tree twice, serves the
+newer build with a manifest, installs it from inside the guest, and boots
+again — and the machine comes back up saying `This is Novaris Milestone
+41 (version 41)`.
+
+Writing it was what exposed **a quadratic FAT32**. `fat_write_raw` asked
+`chain_nth` for each cluster and `chain_nth` walked from the head of the
+chain, so a 48MB initrd was ninety thousand clusters squared — four
+billion link steps for a file that arrived in a second. Reading had the
+same line and the same shape; nothing in the tree had been big enough to
+notice. `chain_nth` now remembers where its last walk ended, which is one
+step per cluster for sequential access and a fallback to the walk for
+anything else.
+
+## Milestone 41 — the network, from inside a process ✅ DONE
+
+Milestone 39 gave the machine TCP and Milestone 40 gave it an updater,
+and both of them ran *in the kernel*. From inside a program - and
+therefore from inside anything running under Wine - there was still no
+network at all. README.md said so in as many words, which is how this
+milestone got picked.
+
+So: **AF_INET/SOCK_STREAM**, through the same `socketcall` ABI that
+Milestone 28 built for AF_UNIX. `socket`, `connect`, `send`, `recv`,
+`shutdown`, `getsockname`, `getpeername`, `close` and `poll`, backed by
+kernel/tcp.c.
+
+`userland/inet_test.c` is the proof and it is written to the same rule as
+everything else in that directory: raw `int $0x80`, Linux syscall
+numbers, `gcc -m32 -static -nostdlib`, linked against nothing that has
+heard of Novaris. It speaks HTTP/1.0 by hand, runs on the Linux build
+host, and prints the same lines on both machines:
+
+```
+connecting to 10.0.2.2:34797
+[ok] socket
+[ok] connect
+[ok] peer port 34797
+[ok] sent 52 bytes
+[ok] HTTP/1.0 200 OK
+[ok] read 579 bytes to end of stream
+[ok] close
+inet_test: a process opened a TCP connection
+```
+
+`make test-inet` is that run, against a server on the build host - which
+QEMU presents to the guest as 10.0.2.2, its own gateway, so the test
+needs nothing from the outside world.
+
+### The bug that only a blocking syscall could have
+
+The first version connected and then hung for ever, with no error and no
+fault. The cause is one hex digit in `kernel/idt.c`:
+
+```c
+idt_set_gate(128, (uint32_t)isr128, 0x08, 0xEE);   /* interrupt gate */
+```
+
+`int 0x80` is an **interrupt** gate, so the CPU clears IF on the way in
+and every syscall body runs with interrupts disabled. For a syscall that
+returns promptly that is invisible, and until now they all did. A syscall
+that *waits* is a different matter, and it fails twice over: `hlt` with
+IF clear is a halt nothing can end, and spinning instead would not help
+either, because `pit_get_ticks()` only advances on a timer interrupt - so
+the deadline meant to end the wait never arrives. Both loops waited for
+ever.
+
+The fix is local rather than global: interrupts go on for the duration of
+a wait and back to how they were after. Changing the gate to a trap gate
+would have fixed it too, and would have quietly changed the conditions
+every other syscall in the kernel has always run under.
+
+### And datagrams, which is what a resolver needs
+
+`SOCK_DGRAM` too, over net.c's existing UDP ports: `sendto`, `recvfrom`,
+`bind`, and a `connect` that connects to nothing and simply records where
+send and recv should default to. A datagram that does not fit the
+caller's buffer is truncated rather than kept, because that is what makes
+it a datagram and not a stream.
+
+The test is a **DNS query built by hand** - header, encoded name,
+question - sent to QEMU's forwarder at 10.0.2.3 and read back:
+
+```
+[ok] udp socket
+[ok] sent a DNS question for example.com
+[ok] a reply from port 53 with 2 answer(s)
+```
+
+One datagram out and one back is the shape of every resolver ever
+written, which is the point: the kernel has had a resolver since
+Milestone 39, but a *program* could not ask anything until now.
+
+Two bugs, both of which produced a plausible partial success rather than
+an obvious failure:
+
+- **A datagram send is the first packet to an address.** net_send_ip()
+  returns short while ARP resolves, and the caller is expected to poll
+  and retry - which TCP never had to notice, because its first packet is
+  a SYN that gets retransmitted anyway. A resolver's first query is the
+  first thing anyone sends to a nameserver, so it failed with "network
+  down" against a network that was working perfectly.
+
+- **`net_udp_bind` returns 1 for success, not 0.** Reading that backwards
+  meant every real success looked like a failure: the loop kept trying
+  ports until it had filled net.c's whole table, and then treated the one
+  genuine failure as success. The query went out from a port that had
+  never been bound and the answer was delivered to nobody. It looked
+  exactly like a nameserver that did not reply.
+
+### And the other direction: a server on Novaris
+
+`bind`, `listen`, `accept`. tcp.c grew the passive half of the state
+machine it had been missing - `TCP_LISTEN` and `TCP_SYN_RECEIVED`, a SYN
+for a listening port answered with SYN+ACK, and the client's ACK
+completing the handshake - so a connection can now be opened *to* this
+machine and reach a program on it.
+
+There is no backlog argument, because there is no backlog: a half-open
+connection occupies an ordinary slot in tcp.c's connection table, so the
+depth is however many of its four slots are free. A `listen(fd, 128)`
+that promised more than the machine has would be a lie told in a
+signature.
+
+Testing it needed the harness to grow two options, and the awkwardness is
+the point rather than an accident of tooling: QEMU's user-mode stack
+blocks inbound connections, so `--hostfwd` forwards the guest's port to
+the build host's loopback and `--host-connect` runs the client out
+there. A connection has to be opened from somewhere that is not the
+machine under test, or the handshake never has Novaris on the answering
+side. `make test-listen`:
+
+```
+novaris> run inettest.elf listen 8080
+[ok] bind
+[ok] listening on 8080
+[ok] accepted a connection from port 51942
+[ok] received 20 bytes
+[ok] replied
+```
+
+and on the host, `guest replied b'novaris\n'`.
+
+### What is deliberately not here
+
+- **No raw sockets, no IPv6.**
+- **No `getaddrinfo`.** A process can now ask a nameserver itself, which
+  is the hard half, but the parsing and the `/etc/resolv.conf` reading
+  belong in a libc rather than in a kernel.
+- **A blocking call still holds the whole machine.** There is one event
+  loop and no other thread to turn the crank, so a read that waits is a
+  read the desktop waits behind. Every one of them therefore takes a
+  deadline: ten seconds to connect, thirty of no progress to fail.
+
+### The part that was already true and nobody had checked
+
+A Windows program under Wine can use the network, and could as soon as
+this milestone landed. `userland/pe_test/winsock.c` is a mingw-built
+`.exe` linked against `ws2_32` that does `WSAStartup`, `connect`, `send`
+and `recv`; under Wine on Novaris it fetches a page and reads 579 bytes.
+
+Wine's `ws2_32` implements `AFD` on top of ordinary BSD sockets, so the
+Windows side was already written - it only ever needed the Unix
+primitives underneath, which is what this milestone added. The write-up
+above (and README.md) claimed the opposite for a while, on the strength
+of a sentence that predated the socket layer.
+
+One real bug stood between the two, and it was in this file's own work
+rather than in Wine: the `socketcall` dispatcher sent `SENDMSG` and
+`RECVMSG` to the AF_UNIX implementation whatever the socket was. Wine's
+AFD writes with `send()` and reads with `recvmsg()`, so output took the
+inet route and input landed in an empty Unix ring buffer - whose "nothing
+here and no peer" answer is indistinguishable from end of stream. The
+program connected, sent its request, and read `0 bytes to end of stream`,
+which is precisely what a server that says nothing looks like.
+
+`nsiproxy` and `NDIS` do still fail to start, and that is narrower than
+it used to sound: they enumerate interfaces, addresses and routes through
+NT device objects, which is a different job from carrying a connection.
 
 ## Later / open-ended
 
-- Networking (a NIC driver + a minimal TCP/IP stack) — big undertaking.
+- ~~Networking (a NIC driver + a minimal TCP/IP stack)~~ — done in
+  Milestones 38-41, up to and including AF_INET sockets a ring-3 process
+  can call, streams and datagrams both. What is still missing above it:
+  TLS, raw sockets, IPv6, and a libc with getaddrinfo in it.
 - SMP (multi-core) support.
 - Porting a real libc (newlib) instead of hand-rolling one.
 - A custom bootloader instead of relying on GRUB, if you want the whole
@@ -5534,17 +5829,17 @@ much each would widen what runs:
    ```bash
    git clone --depth 1 -b stable https://github.com/wine-mirror/wine
    cd wine && CC="gcc -m32" ./configure --enable-archs=i386 \
-       --disable-tests --without-x --without-freetype --without-vulkan \
+       --disable-tests --without-x --with-freetype --without-vulkan \
        --without-opengl && make -j4
    cd ../NovarisOS && make WINE_BUILD=../wine
    make test-wine test-wine-threads test-wine-gui
    ```
 
-   `--without-freetype` is what the host makes possible rather than what
-   is wanted: with 32-bit FreeType development files, drop it, and
-   Milestone 37's two remaining flaws - no text in a window, and a window
-   with two title bars - both go. See that milestone for why they are the
-   same flaw.
+   `--with-freetype` is not optional if you want windows: without a font
+   engine Wine's caption metrics are uninitialised stack, and the window
+   frame is measured from them. `apt-get install libfreetype-dev:i386`
+   first (`dpkg --add-architecture i386` if it is not enabled). See
+   Milestone 37.
 
    `make` also builds Novaris's Wine display driver and installs it, by
    grafting `wine/winenovaris.drv/` into the Wine tree

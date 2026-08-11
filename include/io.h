@@ -29,6 +29,20 @@ static inline uint16_t inw(uint16_t port) {
     return ret;
 }
 
+/* 32-bit port access. The PCI configuration mechanism is defined in terms
+ * of doubleword reads and writes to 0xCF8/0xCFC - a byte or word at a
+ * time is not the same transaction - and every register on the RTL8139
+ * that matters is 32 bits wide. */
+static inline void outl(uint16_t port, uint32_t val) {
+    __asm__ __volatile__("outl %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline uint32_t inl(uint16_t port) {
+    uint32_t ret;
+    __asm__ __volatile__("inl %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
 static inline void io_wait(void) {
     /* Port 0x80 is used for POST diagnostic codes on real hardware, so
      * writing to it is a well-known "burn a few cycles" trick to give

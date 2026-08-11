@@ -221,6 +221,11 @@
 #define EADDRINUSE 98
 #define ECONNREFUSED 111
 #define EISCONN  106
+#define EINPROGRESS 115  /* a non-blocking connect that has not finished */
+#define ENETDOWN    100
+#define ENOBUFS     105
+#define EDESTADDRREQ 89  /* sendto with nowhere to send it */
+#define EHOSTUNREACH 113
 #define ENOTSOCK 88
 #define ENFILE   23
 #define EMSGSIZE 90

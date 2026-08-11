@@ -32,6 +32,10 @@ OBJS = $(BUILD_DIR)/boot.o $(BUILD_DIR)/kernel.o \
        $(BUILD_DIR)/app_terminal.o $(BUILD_DIR)/app_files.o \
        $(BUILD_DIR)/app_monitor.o $(BUILD_DIR)/app_about.o \
        $(BUILD_DIR)/wmdev.o \
+       $(BUILD_DIR)/pci.o $(BUILD_DIR)/rtl8139.o \
+       $(BUILD_DIR)/net.o $(BUILD_DIR)/dhcp.o \
+       $(BUILD_DIR)/tcp.o $(BUILD_DIR)/dns.o $(BUILD_DIR)/http.o \
+       $(BUILD_DIR)/update.o \
        $(BUILD_DIR)/gdt.o $(BUILD_DIR)/gdt_flush.o \
        $(BUILD_DIR)/idt.o $(BUILD_DIR)/idt_flush.o \
        $(BUILD_DIR)/isr.o $(BUILD_DIR)/pic.o \
@@ -58,7 +62,7 @@ ISO = novaris.iso
 
 .PHONY: all clean run run-nographic iso test test-qemu test-posix test-wine \
         test-wine-threads test-qemu-disk test-wine-prefix test-desktop \
-        test-wine-persist \
+        test-wine-persist test-inet test-listen test-winsock \
         zip disk
 
 all: $(ISO)
@@ -217,6 +221,30 @@ $(BUILD_DIR)/app_files.o: kernel/app_files.c $(HEADERS) | $(BUILD_DIR)
 $(BUILD_DIR)/app_monitor.o: kernel/app_monitor.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/pci.o: kernel/pci.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/rtl8139.o: kernel/rtl8139.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/net.o: kernel/net.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/dhcp.o: kernel/dhcp.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/update.o: kernel/update.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/tcp.o: kernel/tcp.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/dns.o: kernel/dns.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/http.o: kernel/http.c $(HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/wmdev.o: kernel/wmdev.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -354,9 +382,15 @@ HOST_LIB32 ?= /lib32
 # in front of it.
 #
 #   git clone --depth 1 -b stable https://github.com/wine-mirror/wine
-#   cd wine && CC="gcc -m32" ./configure --enable-archs=i386 #       --disable-tests --without-x --without-freetype ...
+#   cd wine && CC="gcc -m32" ./configure --enable-archs=i386 \
+#       --disable-tests --without-x --without-vulkan --without-opengl
 #   make -j4
 #   cd ../NovarisOS && make WINE_BUILD=../wine
+#
+# Not --without-freetype, however headless this looks. Without a font
+# engine win32u reads the caption font's tm.tmHeight as garbage, derives
+# SM_CYCAPTION from it, and every window comes out 952x1 with no error
+# printed anywhere. See the note in README.md.
 #
 # With WINE_BUILD set, the ordinary `make` installs Wine into the OS image
 # it builds - see tools/install_wine.sh and the initrd rule below. Without
@@ -423,6 +457,16 @@ $(BUILD_DIR)/user/kmaptest.elf: userland/kmap_test.c | $(BUILD_DIR)
 	    -o $@ $<
 
 $(BUILD_DIR)/user/socktest.elf: userland/sock_test.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(CC) -m32 -static -nostdlib -ffreestanding -fno-builtin -O2 -Wall \
+	    -o $@ $<
+
+# Milestone 41: the same socketcall ABI, but AF_INET - a TCP connection
+# opened by a *process* rather than by the shell. Unlike the other
+# programs here it is not run on the host and diffed, because it needs a
+# server to talk to and the two machines do not have the same one; what
+# it is compared against is the transcript `make test-inet` expects.
+$(BUILD_DIR)/user/inettest.elf: userland/inet_test.c | $(BUILD_DIR)
 	mkdir -p $(BUILD_DIR)/user
 	$(CC) -m32 -static -nostdlib -ffreestanding -fno-builtin -O2 -Wall \
 	    -o $@ $<
@@ -497,6 +541,15 @@ $(BUILD_DIR)/user/cppinit.exe: userland/pe_test/cpp_init.cpp | $(BUILD_DIR)
 	$(MINGW_CXX) $(MINGW_CFLAGS) -static-libstdc++ -static-libgcc -o $@ $<
 
 # -mwindows makes this a GUI-subsystem binary with a WinMain entry point.
+# Milestone 41's open question, as a program. Whether a *Windows* binary
+# can reach the network now that Novaris has BSD sockets: Wine's ws2_32
+# Unix half implements AFD on top of socket()/connect()/send(), which are
+# exactly the calls that arrived with AF_INET. Nothing about that path is
+# obviously complete, so this runs it.
+$(BUILD_DIR)/user/winsock.exe: userland/pe_test/winsock.c | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/user
+	$(MINGW_CC) $(MINGW_CFLAGS) -o $@ $< -lws2_32
+
 $(BUILD_DIR)/user/guiapp.exe: userland/pe_test/gui_app.c | $(BUILD_DIR)
 	mkdir -p $(BUILD_DIR)/user
 	$(MINGW_CC) $(MINGW_CFLAGS) -mwindows -o $@ $<
@@ -543,13 +596,15 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
         $(BUILD_DIR)/user/hello_elf.elf $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf \
         $(BUILD_DIR)/user/pthtest.elf $(BUILD_DIR)/user/crashelf.elf \
         $(BUILD_DIR)/user/fstest.elf $(BUILD_DIR)/user/kmaptest.elf \
-        $(BUILD_DIR)/user/socktest.elf $(BUILD_DIR)/user/forktest.elf \
+        $(BUILD_DIR)/user/socktest.elf $(BUILD_DIR)/user/inettest.elf \
+        $(BUILD_DIR)/user/forktest.elf \
         $(BUILD_DIR)/user/mmaptest.elf $(BUILD_DIR)/user/wmtest.elf \
         $(BUILD_DIR)/user/glibc.elf $(BUILD_DIR)/user/dyn.elf \
         $(BUILD_DIR)/user/uctest.elf \
         $(BUILD_DIR)/user/ld-linux.so.2 $(BUILD_DIR)/user/libc.so.6 \
         $(BUILD_DIR)/user/hello_pe.exe \
         $(BUILD_DIR)/user/hellowin.exe $(BUILD_DIR)/user/winapi.exe \
+        $(BUILD_DIR)/user/winsock.exe \
         $(BUILD_DIR)/user/cppinit.exe $(BUILD_DIR)/user/guiapp.exe \
         $(BUILD_DIR)/user/hello64.exe $(BUILD_DIR)/user/lowbase.exe \
         $(BUILD_DIR)/user/crash.exe $(BUILD_DIR)/user/qsorttest.exe \
@@ -564,6 +619,7 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
 	cp $(BUILD_DIR)/user/fstest.elf $(BUILD_DIR)/initrd_staging/fstest.elf
 	cp $(BUILD_DIR)/user/kmaptest.elf $(BUILD_DIR)/initrd_staging/kmaptest.elf
 	cp $(BUILD_DIR)/user/socktest.elf $(BUILD_DIR)/initrd_staging/socktest.elf
+	cp $(BUILD_DIR)/user/inettest.elf $(BUILD_DIR)/initrd_staging/inettest.elf
 	cp $(BUILD_DIR)/user/forktest.elf $(BUILD_DIR)/initrd_staging/forktest.elf
 	cp $(BUILD_DIR)/user/mmaptest.elf $(BUILD_DIR)/initrd_staging/mmaptest.elf
 	cp $(BUILD_DIR)/user/wmtest.elf $(BUILD_DIR)/initrd_staging/wmtest.elf
@@ -576,6 +632,7 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
 	cp $(BUILD_DIR)/user/hello_pe.exe $(BUILD_DIR)/initrd_staging/hellope.exe
 	cp $(BUILD_DIR)/user/hellowin.exe $(BUILD_DIR)/initrd_staging/hellowin.exe
 	cp $(BUILD_DIR)/user/winapi.exe $(BUILD_DIR)/initrd_staging/winapi.exe
+	cp $(BUILD_DIR)/user/winsock.exe $(BUILD_DIR)/initrd_staging/winsock.exe
 	cp $(BUILD_DIR)/user/cppinit.exe $(BUILD_DIR)/initrd_staging/cppinit.exe
 	cp $(BUILD_DIR)/user/guiapp.exe $(BUILD_DIR)/initrd_staging/guiapp.exe
 	cp $(BUILD_DIR)/user/hello64.exe $(BUILD_DIR)/initrd_staging/hello64.exe
@@ -964,6 +1021,90 @@ run-disk: $(ISO) disk
 # link and syncs; the second reads them back on a machine that has been
 # switched off and on in between, so nothing can have been served out of a
 # cache that did not survive.
+# Milestone 41. The one test that has to be run rather than reasoned
+# about: a ring-3 process opening a TCP connection, and then asking a
+# real nameserver a real question over UDP. 10.0.2.3 is QEMU's own DNS
+# forwarder, so the second half needs a working resolver on this machine
+# and nothing more.
+#
+# The server is this machine. tools/qemu_test.py serves --http-dir from
+# the build host, which QEMU's user-mode stack presents to the guest as
+# 10.0.2.2 - both its default gateway and us - so the test needs nothing
+# from the outside world and cannot fail because the outside world is
+# down.
+#
+# The same binary runs on the Linux host (build/user/inettest.elf
+# 127.0.0.1 <port> against any local server) and prints the same lines,
+# which is the point: nothing in it knows what a Novaris is.
+test-inet: $(ISO)
+	python3 tools/qemu_test.py --iso $(ISO) --memory 768 \
+	    --boot-wait 40 --settle 60 --timeout 260 \
+	    --http-dir $(BUILD_DIR)/test/www \
+	    --setup "net up" \
+	    --cmd 'run inettest.elf 10.0.2.2 $$HTTP 10.0.2.3 example.com' \
+	    --expect "\\[ok\\] connect" \
+	    --expect "\\[ok\\] HTTP/1.0 200 OK" \
+	    --expect "\\[ok\\] udp socket" \
+	    --expect "answer\\(s\\)" \
+	    --expect "a process opened a TCP connection" \
+	    --reject "KERNEL PANIC" \
+	    --stop-when-matched
+
+# Milestone 41, the other direction: a *server* on Novaris.
+#
+# QEMU's user-mode stack blocks inbound connections, so the guest's
+# listening port is forwarded to this machine's loopback (--hostfwd) and
+# the client runs out here (--host-connect). That split is not an
+# awkwardness of the harness, it is the test: a connection has to be
+# opened from somewhere that is not the machine being tested, or the
+# three-way handshake never has Novaris on the answering side.
+test-listen: $(ISO)
+	python3 tools/qemu_test.py --iso $(ISO) --memory 768 \
+	    --boot-wait 40 --settle 90 --timeout 220 \
+	    --hostfwd 18080:8080 --host-connect 18080 \
+	    --setup "net up" \
+	    --cmd 'run inettest.elf listen 8080' \
+	    --expect "\\[ok\\] listening on 8080" \
+	    --expect "accepted a connection from port" \
+	    --expect "a program on this machine accepted a connection" \
+	    --reject "KERNEL PANIC" \
+	    --stop-when-matched
+
+# Milestone 41's last question: a *Windows* program on the network.
+#
+# Not a Novaris binary using Novaris sockets, but a mingw-built .exe
+# linked against ws2_32, running under real Wine, doing WSAStartup and
+# connect and recv. Wine's ws2_32 implements AFD on top of BSD sockets,
+# so this passes or fails on whether the socket layer underneath is
+# complete enough for somebody else's implementation to sit on - which
+# is a stronger question than whether it satisfies its own test.
+#
+# The settle is long because Wine's startup dominates it; --stop-when-
+# matched means a passing run ends as soon as the last line appears.
+test-winsock: $(ISO)
+	@python3 tools/check_wine_installed.py $(BUILD_DIR)/initrd_staging
+	python3 tools/qemu_test.py --iso $(ISO) --memory 768 \
+	    --boot-wait 40 --settle 700 --timeout 850 \
+	    --http-dir $(BUILD_DIR)/test/www \
+	    --setup "net up" \
+	    --cmd 'wine winsock.exe 10.0.2.2 $$HTTP' \
+	    --expect "\\[ok\\] WSAStartup" \
+	    --expect "\\[ok\\] connect" \
+	    --expect "\\[ok\\] HTTP/1.0 200 OK" \
+	    --expect "a Windows program reached the network" \
+	    --reject "KERNEL PANIC" \
+	    --stop-when-matched
+
+test-winsock: $(BUILD_DIR)/test/www
+
+# A directory for test-inet's server to serve. One small file is enough:
+# what is being tested is the socket, not the transfer.
+$(BUILD_DIR)/test/www: | $(BUILD_DIR)
+	mkdir -p $@
+	printf 'Novaris reached this from a process.\n' > $@/index.html
+
+test-inet: $(BUILD_DIR)/test/www
+
 test-qemu-disk: $(ISO)
 	rm -f $(BUILD_DIR)/persist.img
 	python3 tools/mkfat32.py $(BUILD_DIR)/persist.img --size 64M --label PERSIST
@@ -1112,6 +1253,15 @@ test-wine-gui: $(ISO)
 # on the window it opens, and notepad.exe in the alphabetical listing.
 # They are what they are because this is a pointer test: nothing about
 # double-clicking can be tested by typing.
+#
+# The third one is coupled to the *contents* of the initrd root, which is
+# worth knowing before it wastes anybody's afternoon: the listing is plain
+# alphabetical and the rows are ROW_H (28px, kernel/app_files.c) apart, so
+# adding one file that sorts before "notepad.exe" moves the target down by
+# exactly one row and the test double-clicks whatever is now there. That
+# is how Milestone 41 broke it - inettest.elf sorts between hellowin.exe
+# and notepad.exe - and the symptom was a passing boot that ran the wrong
+# program, not an error.
 test-desktop-gui: $(ISO)
 	@python3 tools/check_wine_installed.py $(BUILD_DIR)/initrd_staging
 	python3 tools/qemu_test.py --iso $(ISO) --memory 768 \
@@ -1119,7 +1269,7 @@ test-desktop-gui: $(ISO)
 	    --click-settle 3 \
 	    --click "60,233,double" \
 	    --click "881,66" \
-	    --click "240,646,double" \
+	    --click "240,674,double" \
 	    --screenshot $(BUILD_DIR)/desktop-gui.ppm \
 	    --expect "starting notepad\.exe under Wine" \
 	    --reject "no driver could be loaded" \

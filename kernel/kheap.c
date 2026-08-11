@@ -45,12 +45,40 @@ void kheap_init(void) {
     heap_head->next = 0;
 }
 
+/* How far kmalloc walks. The list is every block, used and free, from
+ * the start of the heap - so the cost of an allocation is the number of
+ * allocations that came before it, and the cost of N allocations is N
+ * squared. Wine's startup makes about eleven million syscalls and its
+ * syscall rate collapses by twenty-one times partway through, exactly
+ * where wineboot starts filling the prefix; this counts the steps to
+ * confirm that is what the heap is doing rather than assume it. */
+static uint32_t stat_steps, stat_calls, stat_report;
+
+void kheap_walk_stats(uint32_t* steps, uint32_t* calls) {
+    if (steps) *steps = stat_steps;
+    if (calls) *calls = stat_calls;
+}
+
 void* kmalloc(size_t size) {
     if (size == 0) return 0;
     size = (size + 3u) & ~(size_t)3u; /* 4-byte align */
 
+    stat_calls++;
+    if (stat_calls - stat_report >= 20000u) {
+        stat_report = stat_calls;
+        char num[12];
+        terminal_writestring_color("[heap] ", VGA_COLOR_LIGHT_CYAN);
+        ku32_to_dec(stat_calls / 1000u, num);
+        terminal_writestring(num);
+        terminal_writestring("k allocs, avg walk ");
+        ku32_to_dec(stat_calls ? stat_steps / stat_calls : 0, num);
+        terminal_writestring(num);
+        terminal_writestring(" blocks\n");
+    }
+
     block_header_t* block = heap_head;
     while (block) {
+        stat_steps++;
         if (!block->used && block->size >= size) {
             /* Split off the remainder if it's big enough to be useful;
              * otherwise hand over the whole block to avoid slivers. */

@@ -585,7 +585,14 @@ int process_run_pe(const uint8_t* image, uint32_t size, const char* name,
  * be arbitrary .exe files. This kills the program and returns to the
  * shell instead, deferring to the panic path only for faults that really
  * did happen in the kernel. */
+/* Every page fault a user process takes, counted for the heartbeat in
+ * kernel/desktop.c. Wine's startup turned out not to be bytes copied, not
+ * disk, and not wineserver round trips - so what is left is work done per
+ * trap, and faults are the trap this kernel takes most of. */
+uint32_t user_fault_count;
+
 static int handle_user_fault(registers_t* regs) {
+    user_fault_count++;
     if (!user_active) return 0;
     if ((regs->cs & 3) != 3) return 0; /* the kernel itself faulted */
 

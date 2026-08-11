@@ -48,10 +48,12 @@
  */
 
 #include "vfs.h"
+#include "blockdev.h"
 #include "kheap.h"
 #include "kstring.h"
 #include "posix.h"
 #include "console.h"
+#include "vga_text.h"
 #include "rtc.h"
 
 /* Nodes come from the kernel heap in blocks, threaded onto a free list.
@@ -469,6 +471,31 @@ static int ensure_capacity(vfs_node_t* n, uint32_t want) {
  * made on Unix and exactly what wineserver does. Recorded rather than
  * defended against, because defending would mean a page cache and a page
  * cache is a different milestone. */
+/* Set to 1 to have every mapping and its running total printed to the
+ * console as it happens. Off by default: it is a few lines per program
+ * launch in ordinary use and seventy during a Wine startup, which is
+ * noise on a desktop and a hazard to any test matching on the
+ * transcript. The counters below cost an add and stay on, so `df` can
+ * still answer the question at any time. */
+#define TRACE_MAPPINGS 0
+
+/* What mapping files actually costs, so the question can be answered
+ * with a number rather than an assumption. README.md has claimed since
+ * Milestone 35 that Wine's startup is dominated by "no page cache - a
+ * mapped DLL is read in full and copied into the heap, per file". The
+ * copy is real; whether it dominates anything is a different claim, and
+ * these are here to settle it against the block layer's own counters. */
+static uint32_t stat_mappable_calls, stat_mappable_copied;
+static uint32_t stat_materialize_calls, stat_materialize_bytes;
+
+void vfs_map_stats(uint32_t* calls, uint32_t* copied,
+                   uint32_t* mat_calls, uint32_t* mat_bytes) {
+    if (calls) *calls = stat_mappable_calls;
+    if (copied) *copied = stat_mappable_copied;
+    if (mat_calls) *mat_calls = stat_materialize_calls;
+    if (mat_bytes) *mat_bytes = stat_materialize_bytes;
+}
+
 int vfs_make_mappable(vfs_node_t* n, uint32_t bytes) {
     if (!n || (n->flags & VFS_DIRECTORY)) return 0;
     /* A disk file has to be read in before there is anything to align.
@@ -526,6 +553,37 @@ int vfs_make_mappable(vfs_node_t* n, uint32_t bytes) {
     uint8_t* buf = (uint8_t*)(((uint32_t)raw + 4095u) & ~4095u);
 
     uint32_t keep = n->length < cap ? n->length : cap;
+    stat_mappable_calls++;
+    stat_mappable_copied += keep;
+
+    /* Reported here rather than left for a shell command to ask about.
+     * A `wine` run never returns to the prompt - the wineserver it starts
+     * outlives the program - so nothing typed afterwards is ever read,
+     * and four attempts to collect these numbers with a --post-cmd
+     * collected nothing at all. A counter that cannot be read is not a
+     * measurement. This goes into the serial log, where the run itself
+     * already is. */
+    if (TRACE_MAPPINGS) {
+        char num[12];
+        terminal_writestring_color("[map] ", VGA_COLOR_LIGHT_CYAN);
+        ku32_to_dec(keep >> 10, num);
+        terminal_writestring(num);
+        terminal_writestring("K  ");
+        terminal_writestring(n->name);
+        terminal_writestring("  (total ");
+        ku32_to_dec(stat_mappable_copied >> 10, num);
+        terminal_writestring(num);
+        terminal_writestring("K in ");
+        ku32_to_dec(stat_mappable_calls, num);
+        terminal_writestring(num);
+        terminal_writestring(" files, disk ");
+        uint32_t rd = 0, wr = 0;
+        blockdev_stats(&rd, &wr);
+        ku32_to_dec(rd, num);
+        terminal_writestring(num);
+        terminal_writestring(" sectors)\n");
+    }
+
     if (n->data && keep) kmemcpy(buf, n->data, keep);
     kmemset(buf + keep, 0, cap - keep);
 
@@ -545,6 +603,8 @@ int vfs_make_mappable(vfs_node_t* n, uint32_t bytes) {
 int vfs_materialize(vfs_node_t* n) {
     if (!n) return 0;
     if (n->data) return 1;
+    stat_materialize_calls++;
+    stat_materialize_bytes += n->length;
     if (n->ops && n->ops->materialize) return n->ops->materialize(n);
     /* A ramfs file with no storage is an empty one, and an empty file's
      * bytes are trivially all present. */

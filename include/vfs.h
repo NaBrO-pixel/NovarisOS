@@ -269,6 +269,12 @@ void vfs_node_unref(vfs_node_t* node);
  * moves it - see the note in ramfs.c. Returns 0 if memory ran out. */
 int vfs_make_mappable(vfs_node_t* node, uint32_t bytes);
 
+/* How much work mapping files has actually cost: how many files were
+ * copied into mappable storage and how many bytes that moved, and how
+ * many were read off a disk and how many bytes that read. */
+void vfs_map_stats(uint32_t* calls, uint32_t* copied,
+                   uint32_t* mat_calls, uint32_t* mat_bytes);
+
 /* Stamps a node with the current time. Writes and truncates do it
  * themselves; this is for utimensat, and for a caller that has changed a
  * file some other way. */

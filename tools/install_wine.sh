@@ -164,6 +164,37 @@ fi
 # nothing to install and says so.
 cp "${WINE_INF:-$WINE_BUILD/loader/wine.inf}" "$DATADIR/wine.inf"
 rm -f "$DATADIR/wine.inf.tmp"
+
+# --- fonts ---------------------------------------------------------------
+#
+# The thirteen TrueType faces Wine ships with, into the one directory
+# win32u looks in: get_fonts_data_dir_path() is "<data dir>/fonts/", and
+# the data dir is this one. 484KB for all of them.
+#
+# Nothing worked without these and it did not look like a font problem.
+# GDI with no font at all does not fail - normalize_nonclientmetrics()
+# does `iCaptionHeight = max(iCaptionHeight, 2 + tm.tmHeight)` on a
+# TEXTMETRICW nothing filled in, so SM_CYCAPTION came out at about six
+# and three quarter million and every rectangle derived from it was
+# nonsense. See ROADMAP.md, Milestone 37.
+if [ -d "$WINE_BUILD/fonts" ]; then
+    mkdir -p "$DATADIR/fonts"
+    cp "$WINE_BUILD"/fonts/*.ttf "$DATADIR/fonts/" 2>/dev/null || true
+fi
+
+# And the rasteriser, which is not in any binary's NEEDED list because
+# win32u dlopen()s it by SONAME - so the "ask the binaries" loop below
+# cannot find it. Named here, with what it needs, because a library
+# nothing links against is exactly the kind that gets forgotten.
+for lib in libfreetype.so.6 libz.so.1 libbz2.so.1.0 libpng16.so.16 \
+           libbrotlidec.so.1 libbrotlicommon.so.1; do
+    for dir in "$HOST_LIB32" /usr/lib/i386-linux-gnu; do
+        if [ -f "$dir/$lib" ]; then
+            cp "$dir/$lib" "$ROOT/lib32/$lib"
+            break
+        fi
+    done
+done
 # The NLS tables, whole rather than hand-picked: wineserver calls
 # fatal_error() if it cannot load l_intl.nls, and kernelbase's
 # init_locale walks sortdefault.nls without checking that it got it. A

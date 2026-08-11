@@ -298,40 +298,62 @@ void NOVARIS_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     if (width > novaris_screen.w) width = novaris_screen.w;
     if (height > novaris_screen.h) height = novaris_screen.h;
 
-    if (visible && !data->mapped && !data->closing && width > 0 && height > 0)
+    /* And big enough to be worth a frame. Explorer keeps a couple of
+     * captioned windows whose client area is a pixel or two tall - real
+     * windows, but not ones anybody is meant to look at, and a Novaris
+     * frame around one is 32 pixels of title bar over nothing. Sixteen
+     * square is well under any window a program shows on purpose. */
+    if (visible && !data->mapped && !data->closing && width >= 16 && height >= 16)
         window_create(data, width, height);
     else if (!visible && data->mapped) win_data_close(data);
 
     novaris_win_data_release(data);
 }
 
-/* Not implemented, and the reason is worth writing down.
+/**********************************************************************
+ *      GetWindowStyleMasks
  *
- * pGetWindowStyleMasks is how a driver says "the host draws the caption
- * and the frame, do not draw them yourself". Implementing it is the
- * obvious fix for the one cosmetic flaw here: Notepad draws its own blue
- * title bar inside the client area of the one Novaris has already drawn
- * around it.
+ * "Which of these styles do you draw yourself?" Novaris's window manager
+ * draws a title bar with the usual three buttons and a resizable frame
+ * around every window it owns, so win32u must not draw them too - and
+ * without this it did, leaving Notepad with its own blue caption sitting
+ * inside the one Novaris had already drawn for it.
  *
- * It cannot be used yet, and the reason is not in this file. win32u turns
- * the mask into a rectangle with NtUserAdjustWindowRect, whose caption
- * height comes from SM_CYCAPTION, which comes from
- * normalize_nonclientmetrics():
+ * Two things about the implementation, both learnt the hard way.
  *
- *     get_text_metr_size( hdc, &pncm->lfCaptionFont, &tm, NULL );
- *     pncm->iCaptionHeight = max( pncm->iCaptionHeight, 2 + tm.tmHeight );
+ * It answers from the styles it is passed and calls nothing. This runs
+ * inside win32u's window-position calculation - get_visible_rect(), with
+ * the window locked - so a driver that calls back into win32u here
+ * answers at the wrong time. X11's version calls nothing either, and that
+ * is not an accident.
  *
- * This Wine is configured --without-freetype, so there is no font engine,
- * no font, and tm.tmHeight is whatever was on the stack. On Novaris it is
- * about six and three quarter million, and the visible rectangle win32u
- * hands back is a window-wide strip one pixel tall at y=6750323. A window
- * that size is invisible, which is exactly what implementing this
- * produced: no Notepad at all, and a passing transcript.
- *
- * So this waits on fonts, and fonts wait on a Wine built with FreeType.
- * The same missing font engine is why a Windows program's window here has
- * no text in it.
+ * And it depends on there being a font. win32u turns the mask into a
+ * rectangle with NtUserAdjustWindowRect, whose caption height is
+ * SM_CYCAPTION, which normalize_nonclientmetrics() computes as
+ * `max(iCaptionHeight, 2 + tm.tmHeight)` for the caption font. With no
+ * font engine that TEXTMETRICW is uninitialised, tm.tmHeight came out at
+ * about six and three quarter million, and implementing this produced a
+ * Notepad window 952 pixels wide and one pixel tall - invisible, with a
+ * transcript that passed every assertion. That is why tools/install_wine.sh
+ * ships Wine's fonts and FreeType: not for the text, though the text is
+ * the visible half, but because the window frame is measured in glyphs.
  */
+BOOL NOVARIS_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style,
+                                 UINT *style_mask, UINT *ex_style_mask)
+{
+    (void)hwnd;
+    *style_mask = *ex_style_mask = 0;
+
+    if ((style & (WS_CHILD | WS_POPUP)) == WS_CHILD) return TRUE;
+
+    if ((style & WS_CAPTION) == WS_CAPTION || (style & WS_THICKFRAME) ||
+        (ex_style & WS_EX_APPWINDOW))
+    {
+        *style_mask = WS_CAPTION | WS_DLGFRAME | WS_THICKFRAME;
+        *ex_style_mask = WS_EX_DLGMODALFRAME;
+    }
+    return TRUE;
+}
 
 /**********************************************************************
  *      SetWindowText

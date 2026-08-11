@@ -14,7 +14,7 @@ bootloader hands off to a kernel, and the kernel grows from there. Over time
 you can shape it to *feel* like whichever OS inspires you (windowing system,
 shell conventions, UI style) without copying anyone's code.
 
-## Current status: Milestone 35 complete ✅
+## Current status: Milestone 41 complete ✅
 
 - [x] Multiboot bootloader handoff (via GRUB), 32-bit protected mode
 - [x] Freestanding C kernel — no libc, we own the whole stack
@@ -109,6 +109,24 @@ shell conventions, UI style) without copying anyone's code.
       through Novaris's own Wine display driver
       (`wine/winenovaris.drv`, `make test-wine-gui`). Double-click it in
       the File Explorer and it opens, with nothing typed — see below
+- [x] **Networking** — PCI, an RTL8139 driver, Ethernet/ARP/IPv4/ICMP/UDP,
+      DHCP, TCP, DNS and HTTP, all written from scratch. `net up` gets an
+      address, `ping` answers, and `fetch` pulls 2,000,000 bytes in 110ms
+- [x] **An OS that updates itself** — `update apply <manifest-url>`
+      downloads a kernel and an initrd, verifies both before writing
+      either, and writes the version marker last, so GRUB boots the
+      disk's copy on the next reboot. `tools/tests/update_e2e.sh` proves
+      it the only way an updater can be proven: by rebooting into the
+      version it installed
+- [x] **A Windows program on the network** — a mingw-built `.exe` linked
+      against `ws2_32`, under real Wine, does `WSAStartup`/`connect`/`recv`
+      and fetches a page. `make test-winsock`
+- [x] **Sockets a program can call** — `AF_INET`, streams and datagrams
+      both, over the same i386 `socketcall` ABI. A Linux binary built
+      against nothing that has heard of Novaris opens a TCP connection
+      from ring 3, asks a real nameserver a real question over UDP, and
+      — with `bind`/`listen`/`accept` — answers a connection opened *to*
+      the machine. `make test-inet`, `make test-listen`
 
 See `ROADMAP.md` for the full history and what's next, in order.
 
@@ -127,11 +145,12 @@ the framebuffer. Input comes back the other way through
 `NtUserSendHardwareInput`, the same call X11 and Wayland make, so above
 the driver there is no difference between a click here and a click on X.
 
-It has no text in it, and it wears two title bars. Both are the same
-missing piece — this Wine is built `--without-freetype`, so there is no
-font engine — and `ROADMAP.md`'s Milestone 37 traces exactly how one
-missing font turns into a caption six and three quarter million pixels
-tall.
+The menu bar, the scroll bar and the status bar are real: Wine's own
+TrueType faces ship in the image and win32u rasterises them with
+FreeType. That mattered for more than the text — with no font engine
+Wine's caption metrics are uninitialised stack, and a window's *frame* is
+measured from them, so the first version of this had a title bar six and
+three quarter million pixels tall. `ROADMAP.md`'s Milestone 37 traces it.
 
 ## The desktop
 
@@ -451,15 +470,70 @@ One ISO, then. `make` builds the OS; with `WINE_BUILD` pointing at a built
 Wine, `make` installs Wine into it. Without, the same OS builds without
 Wine and the `wine` command says so rather than failing three layers down.
 
-Two things are still true and worth saying plainly. There is **no display
-backend** — `err:winediag:nodrv_CreateWindow` in a transcript is honest,
-and a Windows program can have a console and not a window; wiring
-Milestone 11's compositor up to Wine is the next thing worth building. And
-it is **slow**: wineboot takes longer than the five minutes Wine allows
-for its own boot event, so a successful run contains
-`err:environ:run_wineboot`. Most of that is having no page cache — a
-mapped DLL is read in full and copied into the heap, per file. Networking
-is still absent, which is why `nsiproxy` and `NDIS` fail to start.
+Since Milestone 37 there **is** a display backend, and it is in this
+repository: `wine/winenovaris.drv`, a real Wine display driver in two
+halves that `tools/build_wine_driver.sh` grafts into a Wine tree. It
+answers `pCreateWindowSurface` with a DIB, `pWindowPosChanged` by opening
+`/dev/wm`, and sends input back through `NtUserSendHardwareInput` — the
+same call X11 and Wayland make, so from `user32` upwards there is no
+difference between a click on a Novaris window and a click on an X11 one.
+`err:winediag:nodrv_CreateWindow` in an old transcript was honest; it is
+now a regression, and `make test-wine-gui` rejects it.
+
+What is still true is that it is **slow**: wineboot takes longer than the
+five minutes Wine allows for its own boot event, so a successful run
+contains `err:environ:run_wineboot`.
+
+This file used to blame that on having no page cache — "a mapped DLL is
+read in full and copied into the heap, per file". That was never
+measured, and it is wrong. The measurement, taken by sampling the
+privilege level out of the interrupted `CS` a hundred times a second:
+
+```
+[sys] 8400k syscalls at 54s  (user 40s / kernel 14s)
+[sys] 8600k syscalls at 66s  (user 52s / kernel 14s)
+```
+
+Twelve seconds of wall clock, twelve of them in ring 3 and **none** in
+the kernel. Across a whole startup the kernel accounts for 14 seconds of
+290. The other four minutes are Wine's own code — `rundll32` over
+`wine.inf`, registry construction, setupapi — running on an emulated
+32-bit CPU with no KVM, where QEMU's interpreter costs 10-50x native.
+
+Which means no kernel change moves this number, and four separate
+candidates were eliminated with numbers rather than argument: the page
+cache would have saved ~30ms of copying (32.5MB across 71 files), a block
+cache would have cached a disk that saw **zero** sectors, batching
+wineserver requests would have batched under 2000 socket operations, and
+rewriting the allocator would have fixed fewer than 20,000 kmalloc calls.
+`make run` on a host with `/dev/kvm` is the thing that makes Wine fast
+here; the counters that established this are still in the tree.
+
+**And a Windows program can use the network.** A mingw-built `.exe`
+linked against `ws2_32`, running under real Wine, does `WSAStartup`,
+`connect`, `send` and `recv` and fetches a page:
+
+```
+novaris> wine winsock.exe 10.0.2.2 8000
+[ok] WSAStartup
+[ok] connect
+[ok] HTTP/1.0 200 OK
+[ok] read 579 bytes to end of stream
+```
+
+That arrived as a *consequence* of Milestone 41 rather than as separate
+work, and this file said the opposite for a while — "from inside a Wine
+process the network is exactly as absent as it was" — because the
+sentence predated the socket layer and nobody had re-run it. Wine's
+`ws2_32` is two halves like every builtin, and its Unix half implements
+`AFD` on top of ordinary BSD sockets: `socket`, `connect`, `send`,
+`recvmsg`. Those are exactly what a ring-3 process gained. `make
+test-winsock`.
+
+`nsiproxy` and `NDIS` do still fail to start, and that is a narrower
+thing than it used to sound: they enumerate interfaces, addresses and
+routes through NT device objects, which is a different job from carrying
+a connection.
 
 ## The disk
 
@@ -504,6 +578,94 @@ then its bytes — which is the whole point. The initrd charged forty
 megabytes for every file whether or not anything read it; a Wine prefix
 of a thousand files costs a few hundred kilobytes until it is used.
 
+## Networking, and an OS that updates itself
+
+```
+novaris> net up
+Asking for an address (DHCP)...
+[OK] address 10.0.2.15, gateway 10.0.2.2, dns 10.0.2.3
+
+novaris> ping 10.0.2.2
+reply from 10.0.2.2: seq 1, 0ms
+
+novaris> fetch http://example.com/big.bin /disk/big.bin
+HTTP 200, 2000000 bytes of 2000000 from 10.0.2.2 in 110ms
+Wrote 2000000 bytes to /disk/big.bin
+```
+
+All of it written from scratch: PCI enumeration, an RTL8139 driver,
+Ethernet, ARP, IPv4, ICMP, UDP, DHCP, TCP, DNS and HTTP/1.0. The card was
+chosen for being the *smallest* real Ethernet controller rather than the
+best one — receive is a single circular buffer and transmit is four
+registers — because the interesting part is the stack above it.
+
+No TLS, deliberately. TLS is a certificate store, a chain validator and
+three ciphersuites; shipping a client that says "https" while checking
+nothing would be worse than not having one.
+
+### The bug that was worth the whole milestone
+
+The first working version ran at **8.2 KB/s**, and it looked like
+slowness rather than breakage. A packet capture showed the shape:
+segments arrived in a burst, nothing went back for a second and a half,
+and then — in the same millisecond as the sender's retransmission — an
+acknowledgement covering all of them. Every stall had that shape, and
+each was twice as long as the last, because it was the sender's timer
+that ended it.
+
+```c
+if (c->ack_pending && send_ack(c)) c->ack_pending = 0;   /* wrong */
+```
+
+`ack_pending` is set by the receive path, which runs in the card's
+interrupt. Clearing it *after* `send_ack()` returns erases a request that
+arrived *during* the send — which is exactly what happens while a burst
+is being acknowledged. Nobody asked again, because asking is what the
+flag was for. Clearing it before the send cannot lose one.
+
+Counters are what found it, and `net` still prints them: over one
+transfer the tick ran 416 times, failed to send *none*, and yet only five
+acknowledgements left the machine for fourteen segments. The loop was
+running and the transmitter was fine.
+
+### Updating
+
+```
+novaris> update apply http://example.com/latest.manifest
+Available: Novaris 41 (version 41)
+Installed: Milestone 40 (version 40)
+Downloading...
+  initrd: 47154K of 47154K (100%)
+  kernel: 466660 of 466660 bytes, fnv1a 645a5079 (want 645a5079)
+  initrd: 48286649 of 48286649 bytes, fnv1a f01555ff (want f01555ff)
+Writing to /disk/boot...
+[OK] Update installed to /disk/boot.
+```
+
+Both images are downloaded and both verified **before either is
+written**, because the failure being designed against is a machine with
+half an update on it: a new kernel with an old initrd does not boot, and
+a machine that does not boot cannot be updated again. The version marker
+is written **last**, so its presence is what says the two images beside
+it are complete.
+
+GRUB reads FAT32 natively, so nothing is installed on the disk — the disc
+stays the thing that boots and the disk holds what it boots *into*:
+
+```
+if search --no-floppy --file --set=root /boot/version; then ... fi
+```
+
+The checksum is FNV-1a 32 — a hash, not a signature. It catches a
+truncated or corrupted download and nothing at all about who served it;
+over plain HTTP this trusts the network, and `include/update.h` says so.
+
+An updater is the one thing that cannot be tested by reading its own
+output, because what it claims to have done and what it did are the same
+sentence. `tools/tests/update_e2e.sh` builds the tree twice, serves the
+newer build, installs it from inside the guest, and boots again — and the
+machine comes back up saying `This is Novaris Milestone 41 (version 41)`.
+
 ## Project layout
 
 ```
@@ -541,6 +703,15 @@ novaris/
 │   ├── blockdev.c             # The block-device registry under FAT32
 │   ├── fat32.c                # FAT32: files, directories, long names
 │   ├── ramfs.c                # The in-memory filesystem, and path walking
+│   ├── pci.c                  # PCI bus scan, BARs, bus mastering
+│   ├── rtl8139.c              # The network card
+│   ├── net.c                  # Ethernet, ARP, IPv4, ICMP, UDP
+│   ├── dhcp.c                 # An address, asked for rather than assumed
+│   ├── tcp.c                  # TCP: connections, sequencing, retransmits
+│   ├── dns.c                  # A records, and compression pointers
+│   ├── http.c                 # HTTP/1.0, into memory
+│   ├── update.c               # The updater: manifest, verify, install
+│   ├── wmdev.c                # /dev/wm: a window and its pixels, for a process
 │   ├── process.c / process_asm.s    # Ring 0 <-> ring 3
 │   ├── scheduler.c / scheduler_asm.s # Preemptive multitasking
 │   ├── elf.c                  # ELF32 loader
@@ -597,12 +768,24 @@ To have Wine in it, point `WINE_BUILD` at a built Wine tree and build the
 same target — there is one ISO and Wine is installed into it:
 
 ```bash
+sudo apt-get install libfreetype-dev:i386        # see below - not optional
 git clone --depth 1 -b stable https://github.com/wine-mirror/wine
 cd wine && CC="gcc -m32" ./configure --enable-archs=i386 \
-    --disable-tests --without-x --without-freetype --without-vulkan \
-    --without-opengl && make -j4
+    --disable-tests --without-x --without-vulkan --without-opengl \
+    && make -j4
 cd ../NovarisOS && make WINE_BUILD=../wine
 ```
+
+**FreeType is not optional, however headless this looks.** Configuring
+`--without-freetype` builds a Wine that starts, runs, and draws a window
+that is 952 pixels wide and *one pixel tall*, with no error anywhere.
+win32u derives `SM_CYCAPTION` from the caption font's `tm.tmHeight`, and
+with no font engine that height is garbage — so the window manager is
+asked for a client area of a negative size and does the arithmetic
+faithfully. It cost most of a session to find, twice blamed on the
+display driver, and the symptom names nothing that would lead you here.
+`tools/install_wine.sh` ships the 32-bit FreeType and Wine's own `.ttf`
+files into the image alongside the DLLs.
 
 Without it, `make` builds the same OS without Wine, and the `wine` command
 in the shell says so rather than failing three layers down.
@@ -640,7 +823,22 @@ make test-wine-prefix    # ... on an empty disk, where Wine builds its prefix
 make test-desktop        # ... by double-clicking it, with the mouse, on the desktop
 make test-wine-persist   # ... twice, across a reboot, on a prefix that survived
                          #     (the Wine tests need WINE_BUILD set when the ISO was built)
+make test-wine-gui       # ... and asserts the *window* from a screendump
+make test-desktop-gui    # ... opened by double-clicking, with nothing typed
+
+make test-inet           # a ring-3 process opens a TCP connection,
+                         #   then resolves a name over UDP
+make test-listen         # ... and accepts one opened to the machine
+make test-winsock        # a Windows .exe, under Wine, fetches a page
+sh tools/tests/update_e2e.sh   # installs a new version and reboots into it
 ```
+
+`tools/qemu_test.py` serves `--http-dir` from the build host at 10.0.2.2,
+which is both the guest's gateway and this machine, so a networking test
+fetches from something real without depending on the outside world being
+up. `--pcap` writes a capture of everything on the wire, and it is the
+one tool that answers "who is waiting for whom" without guessing — it is
+what found the acknowledgement bug above.
 
 `userland/mmap_test.c` is worth singling out among the `test-posix`
 programs. It is where the shared-mapping semantics Wine depends on are

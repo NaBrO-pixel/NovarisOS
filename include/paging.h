@@ -81,6 +81,28 @@
 #define INITRD_VIRTUAL_BASE 0xE1000000u
 #define INITRD_VIRTUAL_MAX  (192u * 1024u * 1024u)
 
+/* Where DMA buffers are mapped, just past the initrd's window.
+ *
+ * Milestone 38. A network card writes received frames into memory itself,
+ * so its buffer has to be a physically contiguous run whose physical
+ * address the card is told. Everything else this kernel allocates is
+ * virtual and scattered - kmalloc hands back addresses in the heap whose
+ * physical frames are wherever the PMM had them - which is exactly what a
+ * device cannot use.
+ *
+ * So: pmm_alloc_contiguous() for the physical run, and this window to
+ * look at it from. 1MB, which is thirty times what the one driver here
+ * asks for. */
+#define DMA_VIRTUAL_BASE 0xEE000000u
+#define DMA_VIRTUAL_MAX  (1u * 1024u * 1024u)
+
+/* Reserves a physically contiguous run of `bytes` and maps it into the
+ * DMA window. Writes the physical address through `phys_out` - which is
+ * the whole point, since that is the number the device is given. Returns
+ * the kernel virtual address, or 0. Uncached is not needed here: x86 is
+ * cache-coherent with bus-master DMA. */
+void* paging_alloc_dma(uint32_t bytes, uint32_t* phys_out);
+
 /* Replaces boot.s's coarse 4MB-page bootstrap mapping with a real
  * 4KB-granularity page directory: identity-maps the first 4MB (so the
  * VGA buffer and low-memory structures keep working) and maps the

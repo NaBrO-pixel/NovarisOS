@@ -21,6 +21,9 @@
 #include "serial.h"
 #include "win32.h"
 #include "desktop.h"
+#include "pci.h"
+#include "net.h"
+#include "netdev.h"
 
 /* Defined by linker.ld: mark the physical extent of the kernel's own
  * loaded image so the PMM knows never to hand those frames out. These
@@ -268,6 +271,37 @@ void kernel_main(uint32_t magic, multiboot_info_t* mbi) {
             terminal_writestring_color("[--] ", VGA_COLOR_LIGHT_RED);
             terminal_writestring("No FAT32 volume on any disk - /disk is empty\n");
         }
+    }
+
+    /* The network, if there is one.
+     *
+     * Milestone 38. Everything before this talked to hardware at an
+     * address the original PC fixed forever - the PIC at 0x20, ATA at
+     * 0x1F0. A network card has no such address, so pci_init() goes and
+     * asks the bus, and rtl8139_init() takes whichever card answers.
+     *
+     * A machine with no card is not an error, the same way a machine with
+     * no disk is not: it says so once and the rest of the OS is
+     * unchanged. DHCP is *not* run here - it takes seconds a boot should
+     * not spend, and a kernel that hangs for ten seconds on a network
+     * that is not there would be a worse kernel. `net up` asks. */
+    uint32_t npci = pci_init();
+    if (net_init()) {
+        const netdev_t* nd = netdev_get();
+        terminal_writestring_color("[OK] ", VGA_COLOR_LIGHT_GREEN);
+        terminal_writestring("Network card found on PCI: RTL8139 (");
+        for (int m = 0; m < 6; m++) {
+            static const char* hexd = "0123456789abcdef";
+            char b[3] = { hexd[nd->mac[m] >> 4], hexd[nd->mac[m] & 15], 0 };
+            terminal_writestring(b);
+            if (m < 5) terminal_writestring(":");
+        }
+        terminal_writestring(") - try 'net up'\n");
+    } else if (npci) {
+        terminal_writestring_color("[--] ", VGA_COLOR_LIGHT_RED);
+        terminal_writestring("No supported network card among ");
+        print_uint(npci);
+        terminal_writestring(" PCI devices\n");
     }
 
     /* Live smoke test: allocate, write through the pointer, free, then

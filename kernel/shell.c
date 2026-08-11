@@ -17,12 +17,22 @@
 #include "pe.h"
 #include "win32.h"
 #include "kstring.h"
+#include "desktop.h"
 #include "scheduler.h"
 #include "socket.h"
 #include "task_a.h"
 #include "task_b.h"
 #include "task_c.h"
 #include "thread_demo.h"
+#include "net.h"
+#include "netdev.h"
+#include "dhcp.h"
+#include "pci.h"
+#include "rtl8139.h"
+#include "tcp.h"
+#include "dns.h"
+#include "http.h"
+#include "update.h"
 
 #define CMD_BUFFER_SIZE 128
 
@@ -241,6 +251,466 @@ static int split_args(const char* line, const char** argv_out[]) {
     }
     *argv_out = argv_ptr;
     return argc;
+}
+
+
+/* --- net ----------------------------------------------------------------
+ *
+ * Milestone 38. Four subcommands, and the split between them is the
+ * shape of the stack: `net` reports, `net up` gets an address, `net ping`
+ * proves a packet made a round trip, and `net pci` says what the bus has
+ * on it when none of the rest works.
+ *
+ * `net up` is separate from boot on purpose. DHCP takes seconds - three
+ * attempts with a timeout each - and a kernel that spends them every boot
+ * on a machine with no DHCP server is a kernel that boots slowly for no
+ * reason. */
+/* Two hex digits, no "0x" - a MAC address is six of these and a prefix
+ * on each would be six prefixes nobody wants to read. */
+static void print_hex2(uint8_t v) {
+    static const char* d = "0123456789abcdef";
+    char b[3] = { d[v >> 4], d[v & 15], 0 };
+    terminal_writestring(b);
+}
+
+static void print_ip(uint32_t ip) {
+    char buf[16];
+    net_format_ip(ip, buf);
+    terminal_writestring(buf);
+}
+
+/* The counters that say why a transfer went the speed it did. Printed by
+ * `net`, and again by `fetch` when it finishes - because while a fetch is
+ * running nothing else in this kernel is, so `net` typed during one does
+ * not run until the fetch is over and the interesting moment has passed. */
+static void print_link_counters(void) {
+    terminal_writestring("  card     ");
+    print_uint(rtl8139_irq_count());
+    terminal_writestring(" irqs, ");
+    print_uint(rtl8139_irq_frames());
+    terminal_writestring(" frames from irq, ");
+    print_uint(rtl8139_poll_frames());
+    terminal_writestring(" from poll, ");
+    print_uint(rtl8139_tx_busy());
+    terminal_writestring(" tx-busy\n");
+
+    terminal_writestring("  tcp      ");
+    print_uint(tcp_bytes_received());
+    terminal_writestring(" bytes in, ");
+    print_uint(tcp_retransmits());
+    terminal_writestring(" retransmits\n");
+
+    terminal_writestring("  ticks    ");
+    print_uint(tcp_tick_calls());
+    terminal_writestring(" polls, ");
+    print_uint(tcp_acks_sent());
+    terminal_writestring(" acks sent, ");
+    print_uint(tcp_acks_failed());
+    terminal_writestring(" could not be sent, clock at ");
+    print_uint(pit_get_ticks());
+    terminal_writestring("\n");
+}
+
+static void cmd_net(const char* args) {
+    while (*args == ' ') args++;
+
+    if (streq(args, "pci")) {
+        uint32_t n = pci_device_count();
+        terminal_writestring("PCI devices: ");
+        print_uint(n);
+        terminal_writestring("\n");
+        for (uint32_t i = 0; i < n; i++) {
+            const pci_device_t* d = pci_device_at(i);
+            terminal_writestring("  ");
+            print_uint(d->bus); terminal_writestring(":");
+            print_uint(d->slot); terminal_writestring(".");
+            print_uint(d->func);
+            terminal_writestring("  vendor ");
+            print_hex(d->vendor, 4);
+            terminal_writestring(" device ");
+            print_hex(d->device, 4);
+            terminal_writestring("  class ");
+            print_hex(d->class_code, 2);
+            terminal_writestring("/");
+            print_hex(d->subclass, 2);
+            terminal_writestring(" irq ");
+            print_uint(d->irq);
+            terminal_writestring("\n");
+        }
+        return;
+    }
+
+    if (!net_available()) {
+        terminal_writestring_color("No network card. ", VGA_COLOR_LIGHT_RED);
+        terminal_writestring("'net pci' lists what is on the bus.\n"
+                             "QEMU needs '-device rtl8139' to have one.\n");
+        return;
+    }
+
+    const netdev_t* dev = netdev_get();
+
+    if (streq(args, "up")) {
+        terminal_writestring("Asking for an address (DHCP)...\n");
+        if (dhcp_configure(500)) {          /* five seconds */
+            const net_config_t* c = net_config();
+            terminal_writestring_color("[OK] ", VGA_COLOR_LIGHT_GREEN);
+            terminal_writestring("address ");
+            print_ip(c->ip);
+            terminal_writestring(", gateway ");
+            print_ip(c->gateway);
+            terminal_writestring(", dns ");
+            print_ip(c->dns);
+            terminal_writestring("\n");
+        } else {
+            terminal_writestring_color("[--] ", VGA_COLOR_LIGHT_RED);
+            terminal_writestring("no DHCP answer in five seconds\n");
+        }
+        return;
+    }
+
+    if (starts_with(args, "dns ")) {
+        if (!net_config()->configured) {
+            terminal_writestring("No address yet - run 'net up' first.\n");
+            return;
+        }
+        uint32_t ip = 0;
+        if (dns_resolve(args + 4, &ip, 500)) {
+            terminal_writestring(args + 4);
+            terminal_writestring(" is ");
+            print_ip(ip);
+            terminal_writestring("\n");
+        } else {
+            terminal_writestring_color("could not resolve ", VGA_COLOR_LIGHT_RED);
+            terminal_writestring(args + 4);
+            terminal_writestring("\n");
+        }
+        return;
+    }
+
+    if (starts_with(args, "ping ")) {
+        uint32_t target = 0;
+        if (!net_parse_ip(args + 5, &target)) {
+            terminal_writestring("usage: net ping <a.b.c.d>\n");
+            return;
+        }
+        if (!net_config()->configured) {
+            terminal_writestring("No address yet - run 'net up' first.\n");
+            return;
+        }
+
+        uint32_t before = net_ping_replies();
+        for (uint16_t seq = 1; seq <= 4; seq++) {
+            /* The first send usually returns -2: the next hop's MAC is
+             * not known yet and an ARP request has just gone out. Poll
+             * and retry rather than reporting a failure that is really
+             * one round trip of latency. */
+            for (int attempt = 0; attempt < 200; attempt++) {
+                if (net_ping(target, seq) != -2) break;
+                net_poll();
+                __asm__ __volatile__("hlt");
+            }
+            for (int wait = 0; wait < 100; wait++) {
+                net_poll();
+                if (net_ping_replies() > before) break;
+                __asm__ __volatile__("hlt");
+            }
+            terminal_writestring("  seq ");
+            print_uint(seq);
+            if (net_ping_replies() > before) {
+                terminal_writestring(": reply in ");
+                print_uint(net_ping_last_ticks() * 10);
+                terminal_writestring("ms\n");
+                before = net_ping_replies();
+            } else {
+                terminal_writestring(": no reply\n");
+            }
+        }
+        terminal_writestring("Replies: ");
+        print_uint(net_ping_replies());
+        terminal_writestring("\n");
+        return;
+    }
+
+    /* No argument: report. */
+    const net_config_t* c = net_config();
+    const net_stats_t* st = net_stats();
+
+    terminal_writestring(dev->name);
+    terminal_writestring("  ");
+    for (int m = 0; m < 6; m++) {
+        print_hex2(dev->mac[m]);
+        if (m < 5) terminal_writestring(":");
+    }
+    terminal_writestring("\n");
+
+    terminal_writestring("  address  ");
+    if (c->configured) {
+        print_ip(c->ip);
+        terminal_writestring("  mask ");
+        print_ip(c->netmask);
+        terminal_writestring("\n  gateway  ");
+        print_ip(c->gateway);
+        terminal_writestring("  dns ");
+        print_ip(c->dns);
+        terminal_writestring("\n");
+    } else {
+        terminal_writestring("none - run 'net up'\n");
+    }
+
+    terminal_writestring("  rx       ");
+    print_uint(dev->rx_packets);
+    terminal_writestring(" frames (");
+    print_uint(st->rx_arp);
+    terminal_writestring(" arp, ");
+    print_uint(st->rx_ip);
+    terminal_writestring(" ip, ");
+    print_uint(st->rx_icmp);
+    terminal_writestring(" icmp, ");
+    print_uint(st->rx_udp);
+    terminal_writestring(" udp), ");
+    print_uint(dev->rx_errors);
+    terminal_writestring(" errors, ");
+    print_uint(dev->rx_dropped);
+    terminal_writestring(" ring overruns\n");
+
+    terminal_writestring("  tx       ");
+    print_uint(dev->tx_packets);
+    terminal_writestring(" frames, ");
+    print_uint(dev->tx_errors);
+    terminal_writestring(" errors\n");
+
+    terminal_writestring("  arp      ");
+    print_uint(net_arp_entries());
+    terminal_writestring(" cached\n");
+
+    print_link_counters();
+}
+
+
+/* --- fetch --------------------------------------------------------------
+ *
+ * Milestone 39. `fetch <url> [file]` - the first thing this OS has ever
+ * done that reaches outside the machine.
+ *
+ * With no file, the body is printed. With one, it is written to the VFS,
+ * which is what makes this the bottom half of an updater: everything
+ * `update` needs is a URL, a place to put what comes back, and a way to
+ * tell truncation from completion.
+ */
+#define FETCH_MAX (4u * 1024u * 1024u)
+
+/* Counts up over itself while a fetch runs, and hands the desktop back a
+ * turn of its loop between packets - see the note on http_progress_fn.
+ * Silent until a download is big enough to be worth watching, because a
+ * 55-byte hello.txt that reports its own progress is noise. */
+static void fetch_progress(uint32_t got, uint32_t expected) {
+    if (expected && expected < 64u * 1024u) return;
+
+    char n[12];
+    terminal_writestring("\r  ");
+    ku32_to_dec(got >> 10, n);
+    terminal_writestring(n);
+    terminal_writestring("K");
+    if (expected) {
+        terminal_writestring(" of ");
+        ku32_to_dec(expected >> 10, n);
+        terminal_writestring(n);
+        terminal_writestring("K");
+    }
+    terminal_writestring(" so far      ");
+
+    desktop_pump();
+}
+
+static void cmd_fetch(const char* args) {
+    while (*args == ' ') args++;
+    if (!*args) {
+        terminal_writestring("usage: fetch <url> [file]\n"
+                             "  fetch http://10.0.2.2:8000/hello.txt\n"
+                             "  fetch http://example.com/x.bin /disk/x.bin\n");
+        return;
+    }
+
+    /* Split the URL from an optional destination path. */
+    static char url[256], dest[128];
+    uint32_t n = 0;
+    while (*args && *args != ' ' && n < sizeof(url) - 1) url[n++] = *args++;
+    url[n] = '\0';
+    while (*args == ' ') args++;
+    n = 0;
+    while (*args && n < sizeof(dest) - 1) dest[n++] = *args++;
+    dest[n] = '\0';
+
+    if (!net_config()->configured) {
+        terminal_writestring("No address yet - run 'net up' first.\n");
+        return;
+    }
+
+    uint8_t* body = (uint8_t*)kmalloc(FETCH_MAX);
+    if (!body) {
+        terminal_writestring_color("Out of memory.\n", VGA_COLOR_LIGHT_RED);
+        return;
+    }
+
+    http_result_t res;
+    uint32_t started = pit_get_ticks();
+    int err = http_get_progress(url, body, FETCH_MAX, &res, fetch_progress);
+    uint32_t elapsed = pit_get_ticks() - started;
+    terminal_writestring("\r");
+
+    if (err != HTTP_OK) {
+        terminal_writestring_color("fetch failed: ", VGA_COLOR_LIGHT_RED);
+        terminal_writestring(http_error_string(err));
+        terminal_writestring("\n");
+        print_link_counters();
+        kfree(body);
+        return;
+    }
+
+    terminal_writestring("HTTP ");
+    print_uint((uint32_t)res.status);
+    terminal_writestring(", ");
+    print_uint(res.body_len);
+    terminal_writestring(" bytes");
+    if (res.content_length) {
+        terminal_writestring(" of ");
+        print_uint(res.content_length);
+    }
+    terminal_writestring(" from ");
+    print_ip(res.server_ip);
+    terminal_writestring(" in ");
+    print_uint(elapsed * 10);
+    terminal_writestring("ms\n");
+    print_link_counters();
+
+    if (res.truncated) {
+        terminal_writestring_color("  (truncated - larger than 4MB)\n",
+                                   VGA_COLOR_LIGHT_BROWN);
+    }
+    if (res.content_length && res.body_len < res.content_length) {
+        terminal_writestring_color("  (short - the connection ended early)\n",
+                                   VGA_COLOR_LIGHT_RED);
+    }
+
+    if (dest[0]) {
+        const char* leaf = 0;
+        vfs_node_t* dir = vfs_resolve_parent(dest, &leaf);
+        vfs_node_t* to = dir ? vfs_finddir(dir, leaf) : 0;
+        if (dir && !to) to = vfs_create(dir, leaf, VFS_FILE);
+        if (!to) {
+            terminal_writestring_color("Could not create ", VGA_COLOR_LIGHT_RED);
+            terminal_writestring(dest);
+            terminal_writestring("\n");
+        } else {
+            vfs_truncate(to, 0);
+            int32_t wrote = vfs_write(to, 0, res.body_len, body);
+            if (wrote < 0 || (uint32_t)wrote != res.body_len) {
+                terminal_writestring_color("Short write to ", VGA_COLOR_LIGHT_RED);
+                terminal_writestring(dest);
+                terminal_writestring("\n");
+            } else {
+                terminal_writestring("Wrote ");
+                print_uint(res.body_len);
+                terminal_writestring(" bytes to ");
+                terminal_writestring(dest);
+                terminal_writestring("\n");
+            }
+        }
+    } else {
+        /* Printed, with a bound: a shell that dumps four megabytes into a
+         * terminal is a shell nobody can use afterwards. */
+        uint32_t show = res.body_len < 2048 ? res.body_len : 2048;
+        for (uint32_t i = 0; i < show; i++) {
+            char c = (char)body[i];
+            if (c == '\n' || c == '\t' || (c >= 32 && c < 127)) {
+                terminal_putchar(c);
+            }
+        }
+        if (show < res.body_len) {
+            terminal_writestring("\n... (");
+            print_uint(res.body_len - show);
+            terminal_writestring(" more bytes; give a filename to keep them)\n");
+        } else {
+            terminal_writestring("\n");
+        }
+    }
+
+    kfree(body);
+}
+
+
+/* --- update -------------------------------------------------------------
+ *
+ * Milestone 40. `update <manifest-url>` fetches a manifest, says what it
+ * would do, and - with `apply` - downloads both images, verifies each
+ * against the manifest, and writes them to /disk/boot.
+ *
+ * Checking and applying are separate words on purpose. An updater that
+ * installs whatever it finds the moment it is run is one nobody trusts
+ * enough to run.
+ */
+static void cmd_update(const char* args) {
+    while (*args == ' ') args++;
+
+    int apply = 0;
+    if (starts_with(args, "apply")) {
+        apply = 1;
+        args += 5;
+        while (*args == ' ') args++;
+    }
+
+    if (!*args) {
+        terminal_writestring("This is Novaris ");
+        terminal_writestring(update_current_name());
+        terminal_writestring(" (version ");
+        print_uint(update_current_version());
+        terminal_writestring(")\n\n"
+            "usage: update <manifest-url>        - see what is available\n"
+            "       update apply <manifest-url>  - download and install it\n\n"
+            "The manifest is plain text; see include/update.h. The download\n"
+            "is checked against the sizes and checksums it gives, and\n"
+            "nothing checks the manifest itself - over plain HTTP, this\n"
+            "trusts the network.\n");
+        return;
+    }
+
+    if (!net_config()->configured) {
+        terminal_writestring("No address yet - run 'net up' first.\n");
+        return;
+    }
+
+    static update_manifest_t m;
+    if (!update_check(args, &m)) return;
+
+    terminal_writestring("Available: ");
+    terminal_writestring(m.name[0] ? m.name : "(unnamed)");
+    terminal_writestring(" (version ");
+    print_uint(m.version);
+    terminal_writestring(")\nInstalled: ");
+    terminal_writestring(update_current_name());
+    terminal_writestring(" (version ");
+    print_uint(update_current_version());
+    terminal_writestring(")\n");
+
+    if (m.version <= update_current_version()) {
+        terminal_writestring_color("Already up to date.\n", VGA_COLOR_LIGHT_GREEN);
+        if (!apply) return;
+        terminal_writestring("Installing it anyway, since you asked.\n");
+    }
+
+    if (!apply) {
+        terminal_writestring("Run 'update apply ");
+        terminal_writestring(args);
+        terminal_writestring("' to install it.\n");
+        return;
+    }
+
+    if (update_apply(&m)) {
+        terminal_writestring_color("[OK] ", VGA_COLOR_LIGHT_GREEN);
+        terminal_writestring("Update installed to /disk/boot.\n"
+                             "Run 'sync', then reboot: the bootloader "
+                             "prefers the disk's copy when it is newer.\n");
+    }
 }
 
 static void cmd_run(const char* line) {
@@ -633,6 +1103,9 @@ static void run_command(char* line) {
         terminal_writestring("            real Wine (novaris-wine.iso only)\n");
         terminal_writestring("  strace  - the same, with every syscall logged\n");
         terminal_writestring("  setenv NAME=VALUE, env - the environment programs are given\n");
+        terminal_writestring("  net, net up, net ping <ip>, net dns <name>, net pci\n");
+        terminal_writestring("  fetch <url> [file] - download over HTTP\n");
+        terminal_writestring("  update [apply] <manifest-url> - update the OS\n");
         terminal_writestring("  ps      - the process table (fork gave it more than one row)\n");
         terminal_writestring("  sum <file> - size, checksum and first bytes, for comparing with a host\n");
         terminal_writestring("  vmtest  - prove per-process address spaces work:\n");
@@ -789,6 +1262,12 @@ static void run_command(char* line) {
         print_uint((uint32_t)scheduler_blocked_count());
         terminal_writestring("\n");
         if (line[9]) posix_futex_stats_reset();
+    } else if (starts_with(line, "update")) {
+        cmd_update(line + 6);
+    } else if (starts_with(line, "fetch")) {
+        cmd_fetch(line + 5);
+    } else if (streq(line, "net") || starts_with(line, "net ")) {
+        cmd_net(line + 3);
     } else if (streq(line, "sockinfo")) {
         terminal_writestring("Unix sockets open: ");
         print_uint(socket_open_count());
@@ -925,6 +1404,18 @@ static void run_command(char* line) {
         }
         uint32_t reads = 0, writes = 0;
         blockdev_stats(&reads, &writes);
+        uint32_t mc, mb, tc, tb;
+        vfs_map_stats(&mc, &mb, &tc, &tb);
+        terminal_writestring("  mapped   ");
+        print_uint(mc);
+        terminal_writestring(" files copied into mappable storage, ");
+        print_uint(mb >> 10);
+        terminal_writestring("K moved\n");
+        terminal_writestring("  read in  ");
+        print_uint(tc);
+        terminal_writestring(" files off storage, ");
+        print_uint(tb >> 10);
+        terminal_writestring("K\n");
         terminal_writestring("  sectors read ");
         print_uint(reads);
         terminal_writestring(", written ");

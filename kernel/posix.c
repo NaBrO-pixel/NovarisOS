@@ -2478,7 +2478,50 @@ static void trace_exit(int32_t r) {
     terminal_writestring("\n");
 }
 
+/* The timeline, reported from the one place that still runs during a
+ * Wine startup.
+ *
+ * The heartbeat in desktop_pump() produced exactly one line and then
+ * nothing for five minutes, which is not a broken instrument - it is the
+ * measurement. A shell command runs *inside* the desktop's event loop,
+ * so while `wine` is running that loop is blocked underneath it and
+ * every observer hanging off it stops with it. Same reason a --post-cmd
+ * is never read.
+ *
+ * Syscalls, on the other hand, are what a running program is made of.
+ * Counting them here and printing every so often gives a rate over the
+ * whole run, and the count is itself a candidate answer: bytes, disk and
+ * wineserver round trips have each come back too small, and "several
+ * million syscalls" would look exactly like this. */
+/* Set to 1 to print the syscall rate and the user/kernel time split
+ * every 200,000 calls. Off by default for the same reason as
+ * TRACE_MAPPINGS in kernel/ramfs.c. This is the instrument that found
+ * where Wine's five minutes go - see README.md - so it is kept rather
+ * than deleted. */
+#define TRACE_SYSCALL_RATE 0
+
+static uint32_t stat_syscalls, stat_syscall_report;
+
 void posix_syscall(registers_t* regs) {
+    if (TRACE_SYSCALL_RATE &&
+        ++stat_syscalls - stat_syscall_report >= 200000u) {
+        stat_syscall_report = stat_syscalls;
+        char num[12];
+        terminal_writestring_color("[sys] ", VGA_COLOR_LIGHT_CYAN);
+        ku32_to_dec(stat_syscalls / 1000u, num);
+        terminal_writestring(num);
+        terminal_writestring("k syscalls at ");
+        ku32_to_dec(pit_get_ticks() / 100u, num);
+        terminal_writestring(num);
+        terminal_writestring("s  (user ");
+        extern uint32_t pit_ticks_user, pit_ticks_kernel;
+        ku32_to_dec(pit_ticks_user / 100u, num);
+        terminal_writestring(num);
+        terminal_writestring("s / kernel ");
+        ku32_to_dec(pit_ticks_kernel / 100u, num);
+        terminal_writestring(num);
+        terminal_writestring("s)\n");
+    }
     cur_regs = regs;
     uint32_t n = regs->eax;
     uint32_t a = regs->ebx, b = regs->ecx, c = regs->edx;
