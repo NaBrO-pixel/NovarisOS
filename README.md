@@ -482,8 +482,32 @@ now a regression, and `make test-wine-gui` rejects it.
 
 What is still true is that it is **slow**: wineboot takes longer than the
 five minutes Wine allows for its own boot event, so a successful run
-contains `err:environ:run_wineboot`. Most of that is having no page cache
-— a mapped DLL is read in full and copied into the heap, per file.
+contains `err:environ:run_wineboot`.
+
+This file used to blame that on having no page cache — "a mapped DLL is
+read in full and copied into the heap, per file". That was never
+measured, and it is wrong. The measurement, taken by sampling the
+privilege level out of the interrupted `CS` a hundred times a second:
+
+```
+[sys] 8400k syscalls at 54s  (user 40s / kernel 14s)
+[sys] 8600k syscalls at 66s  (user 52s / kernel 14s)
+```
+
+Twelve seconds of wall clock, twelve of them in ring 3 and **none** in
+the kernel. Across a whole startup the kernel accounts for 14 seconds of
+290. The other four minutes are Wine's own code — `rundll32` over
+`wine.inf`, registry construction, setupapi — running on an emulated
+32-bit CPU with no KVM, where QEMU's interpreter costs 10-50x native.
+
+Which means no kernel change moves this number, and four separate
+candidates were eliminated with numbers rather than argument: the page
+cache would have saved ~30ms of copying (32.5MB across 71 files), a block
+cache would have cached a disk that saw **zero** sectors, batching
+wineserver requests would have batched under 2000 socket operations, and
+rewriting the allocator would have fixed fewer than 20,000 kmalloc calls.
+`make run` on a host with `/dev/kvm` is the thing that makes Wine fast
+here; the counters that established this are still in the tree.
 
 **And a Windows program can use the network.** A mingw-built `.exe`
 linked against `ws2_32`, running under real Wine, does `WSAStartup`,
