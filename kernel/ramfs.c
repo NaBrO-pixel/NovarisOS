@@ -48,10 +48,12 @@
  */
 
 #include "vfs.h"
+#include "blockdev.h"
 #include "kheap.h"
 #include "kstring.h"
 #include "posix.h"
 #include "console.h"
+#include "vga_text.h"
 #include "rtc.h"
 
 /* Nodes come from the kernel heap in blocks, threaded onto a free list.
@@ -545,6 +547,35 @@ int vfs_make_mappable(vfs_node_t* n, uint32_t bytes) {
     uint32_t keep = n->length < cap ? n->length : cap;
     stat_mappable_calls++;
     stat_mappable_copied += keep;
+
+    /* Reported here rather than left for a shell command to ask about.
+     * A `wine` run never returns to the prompt - the wineserver it starts
+     * outlives the program - so nothing typed afterwards is ever read,
+     * and four attempts to collect these numbers with a --post-cmd
+     * collected nothing at all. A counter that cannot be read is not a
+     * measurement. This goes into the serial log, where the run itself
+     * already is. */
+    {
+        char num[12];
+        terminal_writestring_color("[map] ", VGA_COLOR_LIGHT_CYAN);
+        ku32_to_dec(keep >> 10, num);
+        terminal_writestring(num);
+        terminal_writestring("K  ");
+        terminal_writestring(n->name);
+        terminal_writestring("  (total ");
+        ku32_to_dec(stat_mappable_copied >> 10, num);
+        terminal_writestring(num);
+        terminal_writestring("K in ");
+        ku32_to_dec(stat_mappable_calls, num);
+        terminal_writestring(num);
+        terminal_writestring(" files, disk ");
+        uint32_t rd = 0, wr = 0;
+        blockdev_stats(&rd, &wr);
+        ku32_to_dec(rd, num);
+        terminal_writestring(num);
+        terminal_writestring(" sectors)\n");
+    }
+
     if (n->data && keep) kmemcpy(buf, n->data, keep);
     kmemset(buf + keep, 0, cap - keep);
 
