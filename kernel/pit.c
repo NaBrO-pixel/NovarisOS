@@ -12,8 +12,27 @@
 
 static volatile uint32_t ticks = 0;
 
+/* Where the CPU actually is, sampled a hundred times a second.
+ *
+ * A falling syscall *rate* has two readings and the rate cannot tell
+ * them apart: either each call got slower (the kernel degrading) or the
+ * program started doing more of its own work between calls (the kernel
+ * is fine). Asserting the first without checking is how kmalloc came to
+ * be blamed for something it cannot be doing - it is called fewer than
+ * twenty thousand times in a startup that makes eleven million syscalls.
+ *
+ * The interrupted CS says which it is, exactly and with no bookkeeping:
+ * its low two bits are the privilege level of whatever the timer just
+ * interrupted. Ring 3 is the program's own work; ring 0 is this kernel's.
+ * A hundred votes a second over five minutes is thirty thousand samples,
+ * which is far more than enough to say which side of the boundary a
+ * missing four minutes is on. */
+uint32_t pit_ticks_user, pit_ticks_kernel;
+
 static void pit_handler(registers_t* regs) {
     ticks++;
+    if ((regs->cs & 3u) == 3u) pit_ticks_user++;
+    else pit_ticks_kernel++;
     /* Milestone 9: gives the preemptive scheduler its clock. A no-op
      * whenever scheduler_run_until_idle() isn't actively multitasking,
      * so this doesn't change anything about ticks/uptime/sleep for

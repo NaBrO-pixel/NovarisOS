@@ -2505,7 +2505,14 @@ void posix_syscall(registers_t* regs) {
         terminal_writestring("k syscalls at ");
         ku32_to_dec(pit_get_ticks() / 100u, num);
         terminal_writestring(num);
-        terminal_writestring("s\n");
+        terminal_writestring("s  (user ");
+        extern uint32_t pit_ticks_user, pit_ticks_kernel;
+        ku32_to_dec(pit_ticks_user / 100u, num);
+        terminal_writestring(num);
+        terminal_writestring("s / kernel ");
+        ku32_to_dec(pit_ticks_kernel / 100u, num);
+        terminal_writestring(num);
+        terminal_writestring("s)\n");
     }
     cur_regs = regs;
     uint32_t n = regs->eax;
