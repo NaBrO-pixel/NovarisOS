@@ -469,6 +469,23 @@ static int ensure_capacity(vfs_node_t* n, uint32_t want) {
  * made on Unix and exactly what wineserver does. Recorded rather than
  * defended against, because defending would mean a page cache and a page
  * cache is a different milestone. */
+/* What mapping files actually costs, so the question can be answered
+ * with a number rather than an assumption. README.md has claimed since
+ * Milestone 35 that Wine's startup is dominated by "no page cache - a
+ * mapped DLL is read in full and copied into the heap, per file". The
+ * copy is real; whether it dominates anything is a different claim, and
+ * these are here to settle it against the block layer's own counters. */
+static uint32_t stat_mappable_calls, stat_mappable_copied;
+static uint32_t stat_materialize_calls, stat_materialize_bytes;
+
+void vfs_map_stats(uint32_t* calls, uint32_t* copied,
+                   uint32_t* mat_calls, uint32_t* mat_bytes) {
+    if (calls) *calls = stat_mappable_calls;
+    if (copied) *copied = stat_mappable_copied;
+    if (mat_calls) *mat_calls = stat_materialize_calls;
+    if (mat_bytes) *mat_bytes = stat_materialize_bytes;
+}
+
 int vfs_make_mappable(vfs_node_t* n, uint32_t bytes) {
     if (!n || (n->flags & VFS_DIRECTORY)) return 0;
     /* A disk file has to be read in before there is anything to align.
@@ -526,6 +543,8 @@ int vfs_make_mappable(vfs_node_t* n, uint32_t bytes) {
     uint8_t* buf = (uint8_t*)(((uint32_t)raw + 4095u) & ~4095u);
 
     uint32_t keep = n->length < cap ? n->length : cap;
+    stat_mappable_calls++;
+    stat_mappable_copied += keep;
     if (n->data && keep) kmemcpy(buf, n->data, keep);
     kmemset(buf + keep, 0, cap - keep);
 
@@ -545,6 +564,8 @@ int vfs_make_mappable(vfs_node_t* n, uint32_t bytes) {
 int vfs_materialize(vfs_node_t* n) {
     if (!n) return 0;
     if (n->data) return 1;
+    stat_materialize_calls++;
+    stat_materialize_bytes += n->length;
     if (n->ops && n->ops->materialize) return n->ops->materialize(n);
     /* A ramfs file with no storage is an empty one, and an empty file's
      * bytes are trivially all present. */

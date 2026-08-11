@@ -1404,6 +1404,18 @@ static void run_command(char* line) {
         }
         uint32_t reads = 0, writes = 0;
         blockdev_stats(&reads, &writes);
+        uint32_t mc, mb, tc, tb;
+        vfs_map_stats(&mc, &mb, &tc, &tb);
+        terminal_writestring("  mapped   ");
+        print_uint(mc);
+        terminal_writestring(" files copied into mappable storage, ");
+        print_uint(mb >> 10);
+        terminal_writestring("K moved\n");
+        terminal_writestring("  read in  ");
+        print_uint(tc);
+        terminal_writestring(" files off storage, ");
+        print_uint(tb >> 10);
+        terminal_writestring("K\n");
         terminal_writestring("  sectors read ");
         print_uint(reads);
         terminal_writestring(", written ");
