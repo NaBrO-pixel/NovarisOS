@@ -3,6 +3,7 @@
 #include "paging.h"
 #include "pmm.h"
 #include "console.h"
+#include "kstring.h"    /* ku32_to_dec, for the allocation counters below */
 
 /* The heap lives in its own dedicated virtual range, well away from the
  * kernel image and the 0xC0000000-0xC0800000 low-memory alias set up by
