@@ -59,6 +59,9 @@ class Monitor:
     """QEMU monitor over a TCP socket."""
 
     def __init__(self, port, timeout=30.0):
+        # Where the pointer was last put, for mouse_drag_to(). Unknown
+        # until the first mouse_to(), which slams to a known corner.
+        self.mx, self.my = 0, 0
         deadline = time.time() + timeout
         last_err = None
         while time.time() < deadline:
@@ -105,6 +108,29 @@ class Monitor:
             self.send("mouse_move %d %d" % (dx, dy))
             remaining_x -= dx
             remaining_y -= dy
+        self.mx, self.my = x, y
+        time.sleep(0.25)
+
+    def mouse_drag_to(self, x, y):
+        """Moves the pointer from where it is to (x, y) *without* the
+        corner slam, because during a drag the slam is not a way of
+        finding out where the pointer is - it is a drag to the top-left
+        corner. Resizing a window with it collapses the window to its
+        minimum on the way past, and the first version of the resize test
+        did exactly that and reported no resize at all.
+
+        So this tracks the position instead and moves relative to it,
+        which is only correct while nothing else moves the pointer - true
+        for the span of one drag, which is all it is used for."""
+        remaining_x, remaining_y = x - self.mx, y - self.my
+        while remaining_x or remaining_y:
+            dx = max(-120, min(120, remaining_x))
+            dy = max(-120, min(120, remaining_y))
+            self.send("mouse_move %d %d" % (dx, dy))
+            remaining_x -= dx
+            remaining_y -= dy
+            time.sleep(0.03)
+        self.mx, self.my = x, y
         time.sleep(0.25)
 
     def click(self, double=False):
@@ -206,7 +232,7 @@ def wait_for(serial_path, seconds, patterns):
 
 def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
         memory=128, disk=None, setup=(), stop_when=(), clicks=(),
-        click_settle=1.5, post=(), screenshot=None, post_clicks=(),
+        click_settle=1.5, post=(), screenshot=None, post_clicks=(), post_keys=(),
         http_forward=None, pcap=None, hostfwd=None, host_connect=None):
     serial_path = keep_serial or tempfile.mktemp(suffix=".log", prefix="novaris-serial-")
     port = 45000 + (os.getpid() % 10000)
@@ -296,9 +322,24 @@ def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
                 parts = spec.split(",")
                 x, y = int(parts[0]), int(parts[1])
                 what = parts[2].strip() if len(parts) > 2 else ""
-                mon.mouse_to(x, y)
-                if what != "move":
-                    mon.click(what == "double")
+                # A drag is one spec rather than three, because the three
+                # cannot be written separately: every other gesture starts
+                # by slamming the pointer into the top-left corner to find
+                # out where it is, and doing that with the button held is a
+                # drag to the corner. "X,Y,drag,TX,TY" presses at (X,Y),
+                # moves to (TX,TY) without the slam, and releases.
+                if what == "drag":
+                    tx, ty = int(parts[3]), int(parts[4])
+                    mon.mouse_to(x, y)
+                    mon.send("mouse_button 1")
+                    time.sleep(0.2)
+                    mon.mouse_drag_to(tx, ty)
+                    mon.send("mouse_button 0")
+                    time.sleep(0.2)
+                else:
+                    mon.mouse_to(x, y)
+                    if what != "move":
+                        mon.click(what == "double")
                 time.sleep(click_settle)
 
         do_clicks(clicks)
@@ -344,6 +385,16 @@ def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
             # it - here.
             if last:
                 do_clicks(post_clicks)
+                # Key chords aimed at the running program, for the same
+                # reason and at the same moment as the clicks above. A
+                # window shortcut (Win-Up to maximize) is the cheapest way
+                # to make a window change size: unlike a corner drag it
+                # needs no pointer precision at all, and the 5-pixel
+                # resize border is not a target a relative-motion PS/2
+                # mouse can be aimed at reliably.
+                for k in post_keys:
+                    mon.sendkey(k, key_delay)
+                    time.sleep(1.5)
             if last and stop_when:
                 wait_for(serial_path, settle, stop_when)
             else:
@@ -411,10 +462,19 @@ def main():
                          "double-clicking a .exe in the File Explorer is a "
                          "thing no amount of typing can test.")
     ap.add_argument("--post-click", action="append", default=[],
-                    help="X,Y[,double|move] - the same, but done after the "
-                         "last --cmd has been typed, so it reaches the "
-                         "program that command started rather than the "
-                         "shell that started it (repeatable)")
+                    help="X,Y[,double|move] or X,Y,drag,TX,TY - the same, "
+                         "but done after the last --cmd has been typed, so "
+                         "it reaches the program that command started "
+                         "rather than the shell that started it "
+                         "(repeatable). The drag form presses at X,Y, "
+                         "moves to TX,TY and releases, which is how a "
+                         "window gets resized by its corner.")
+    ap.add_argument("--post-key", action="append", default=[],
+                    help="a QEMU sendkey chord (e.g. meta_l-up) sent after "
+                         "the last --cmd, so it reaches the running "
+                         "program. Win-Up maximizes the focused window, "
+                         "which is how a resize is triggered without "
+                         "having to aim at a 5-pixel border (repeatable)")
     ap.add_argument("--click-settle", type=float, default=1.5,
                     help="seconds to wait after each --click")
     ap.add_argument("--post-cmd", action="append", default=[],
@@ -495,7 +555,8 @@ def main():
                      args.disk, args.setup,
                      args.expect if args.stop_when_matched else (),
                      args.click, args.click_settle, args.post_cmd,
-                     args.screenshot, args.post_click, http_forward, args.pcap,
+                     args.screenshot, args.post_click, args.post_key,
+                     http_forward, args.pcap,
                      hostfwd, args.host_connect)
     if http_proc:
         http_proc.terminate()

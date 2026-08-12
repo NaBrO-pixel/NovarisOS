@@ -76,6 +76,7 @@ static long sc6(long n, long a, long b, long c, long d, long e, long f) {
 #define WMIO_POLL    0x5703u
 #define WMIO_GETSIZE 0x5704u
 #define WMIO_TITLE   0x5705u
+#define WMIO_GETINFO 0x5707u
 
 #define WM_EV_NONE   0
 #define WM_EV_MOUSE  1
@@ -86,6 +87,7 @@ static long sc6(long n, long a, long b, long c, long d, long e, long f) {
 struct wm_create { unsigned w, h; char title[64]; };
 struct wm_rect { int x, y, w, h; };
 struct wm_event { unsigned type; int a, b, c, d; };
+struct wm_info { unsigned w, h, stride, cap_h, bytes; };
 
 static unsigned slen(const char* s) { unsigned n = 0; while (s[n]) n++; return n; }
 static void out(const char* s) { sc3(SYS_write, 1, (long)s, slen(s)); }
@@ -118,9 +120,16 @@ static void nap(long ms) {
 
 static unsigned* px;
 
+/* Pixels per row of the buffer, from WMIO_GETINFO. Not W: since Milestone
+ * 42 the kernel allocates a window's buffer at the largest size the window
+ * could be shown at, so that a resize never moves the mapping - which
+ * means a row is `stride` wide and a program that assumes its own width
+ * draws a staircase. */
+static int stride = W;
+
 static void put(int x, int y, unsigned c) {
     if (x < 0 || y < 0 || x >= W || y >= H) return;
-    px[y * W + x] = c;
+    px[y * stride + x] = c;
 }
 static void rect(int x, int y, int w, int h, unsigned c) {
     for (int j = 0; j < h; j++)
@@ -135,7 +144,7 @@ static void draw_background(void) {
         /* 0x00RRGGBB: a little red, rising green, rising blue. */
         unsigned b = (unsigned)(60 + (y * 150) / H);
         unsigned c = (0x20u << 16) | ((unsigned)(40 + (y * 120) / H) << 8) | b;
-        for (int x = 0; x < W; x++) px[y * W + x] = c;
+        for (int x = 0; x < W; x++) px[y * stride + x] = c;
     }
     rect(0, 0, W, 2, 0x00FFFFFFu);
     rect(0, H - 2, W, 2, 0x00FFFFFFu);
@@ -184,7 +193,19 @@ int main_(int argc, char** argv) {
     r = sc3(SYS_ioctl, fd, WMIO_GETSIZE, (long)&size);
     check("it is the size we asked for", r == 0 && size.w == W && size.h == H);
 
-    long a = sc6(SYS_mmap2, 0, W * H * 4, PROT_READ | PROT_WRITE, MAP_SHARED,
+    /* The buffer behind the window, which is wider than the window: the
+     * kernel sizes it for the largest this window could be shown at. Both
+     * numbers below matter - `stride` to draw a straight row, `bytes` to
+     * map a buffer that stays valid when the window is made bigger. */
+    struct wm_info info;
+    r = sc3(SYS_ioctl, fd, WMIO_GETINFO, (long)&info);
+    check("the buffer is at least the window",
+          r == 0 && (int)info.stride >= W && (int)info.cap_h >= H &&
+          info.bytes >= info.stride * info.cap_h * 4u);
+    if (r != 0) { out("  ioctl(WMIO_GETINFO) = "); outn(r); out("\n"); return 1; }
+    stride = (int)info.stride;
+
+    long a = sc6(SYS_mmap2, 0, (long)info.bytes, PROT_READ | PROT_WRITE, MAP_SHARED,
                  fd, 0);
     check("mapped its pixels", (unsigned long)a < 0xfffff000UL);
     if ((unsigned long)a >= 0xfffff000UL) return 1;
@@ -235,7 +256,7 @@ int main_(int argc, char** argv) {
         for (int y = 40; y < 80; y++)
             for (int x = old; x < old + 32 && x < W; x++) {
                 unsigned b = (unsigned)(60 + (y * 150) / H);
-                px[y * W + x] = (0x20u << 16) |
+                px[y * stride + x] = (0x20u << 16) |
                                 ((unsigned)(40 + (y * 120) / H) << 8) | b;
             }
         rect(marker, 40, 32, 40, 0x00FF3030u);

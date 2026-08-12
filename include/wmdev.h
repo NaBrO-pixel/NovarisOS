@@ -25,11 +25,20 @@
  *
  *     fd = open("/dev/wm", O_RDWR);     a window slot of this process's own
  *     ioctl(fd, WMIO_CREATE, &create);  size and title; the window appears
- *     px = mmap(NULL, w*h*4, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
- *     ... draw into px, which is 32-bit 0x00RRGGBB, w pixels per row ...
+ *     ioctl(fd, WMIO_GETINFO, &info);   how big, and the buffer's shape
+ *     px = mmap(NULL, info.bytes, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+ *     ... draw into px, 32-bit 0x00RRGGBB, info.stride pixels per row ...
  *     ioctl(fd, WMIO_DAMAGE, &rect);    "this part changed, show it"
  *     ioctl(fd, WMIO_POLL, &event);     input, or WM_EV_NONE
  *     close(fd);                        the window goes away
+ *
+ * A row is `info.stride` pixels, which is the *buffer's* width and not the
+ * window's. Milestone 42 is the reason, and it is worth the extra field:
+ * the buffer is allocated once, big enough for any size this window can be
+ * given, and a resize changes which part of it is shown rather than where
+ * it lives. So the mapping above survives every resize - no address
+ * changes, nothing is unmapped under a process that is drawing into it,
+ * and that was the whole of what made a resizable window hard.
  *
  * The mmap is the interesting one and it needed no new code: the device's
  * node points `data` at the pixel buffer, so the ordinary MAP_SHARED path
@@ -53,6 +62,12 @@
  * because a program needs it *before* it decides how big to be. Wine's
  * driver reports it as the monitor rectangle. */
 #define WMIO_SCREEN  0x5706u   /* struct wm_rect* */
+/* The size the window is *now*, and the shape of the buffer behind it.
+ * Milestone 42: those are two different things, which is what makes a
+ * window resizable - see the note on the buffer below. A process that
+ * takes WM_EV_RESIZE seriously wants this rather than WMIO_GETSIZE,
+ * which can only answer the first half. */
+#define WMIO_GETINFO 0x5707u   /* struct wm_info* */
 
 #define WM_DEV_TITLE_MAX 64
 
@@ -72,6 +87,24 @@ struct wm_rect {
     int32_t x, y, w, h;
 };
 
+/* What a process needs to draw a frame after a resize.
+ *
+ * `w`/`h` are the client area as it is now; `stride` and `cap_h` describe
+ * the buffer, and they do not change for the life of the window. A row
+ * begins every `stride` pixels, *not* every `w` - the two are equal only
+ * on a window that has never been resized, and a program that assumes so
+ * draws a sheared picture the moment one is.
+ *
+ * `bytes` is the whole mapping, which is what to pass to mmap. It is the
+ * buffer's size rather than the window's, so the mapping made once at
+ * WMIO_CREATE stays valid across every resize - see wmdev.c. */
+struct wm_info {
+    uint32_t w, h;          /* the client area now */
+    uint32_t stride;        /* pixels per row of the buffer, >= w */
+    uint32_t cap_h;         /* rows in the buffer, >= h */
+    uint32_t bytes;         /* stride * cap_h * 4, the mmap length */
+};
+
 /* Input, as a queue the process drains. Coordinates are client-relative,
  * which is what the window's own pixels are indexed by. */
 enum {
@@ -79,8 +112,9 @@ enum {
     WM_EV_MOUSE,        /* a: x, b: y, c: kind (WM_MOUSE_*), d: buttons */
     WM_EV_KEY,          /* a: character or 0, b: keycode, c: modifiers */
     WM_EV_CLOSE,        /* the user closed the window */
-    WM_EV_RESIZE,       /* a: w, b: h - the pixel buffer is unchanged, see
-                         * the note in wmdev.c */
+    WM_EV_RESIZE,       /* a: w, b: h - the new client area. The buffer and
+                         * the mapping are untouched; only the part of them
+                         * that is shown has changed. Milestone 42. */
 };
 
 struct wm_event {

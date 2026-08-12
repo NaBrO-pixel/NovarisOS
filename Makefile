@@ -400,30 +400,18 @@ HOST_LIB32 ?= /lib32
 WINE_BUILD ?=
 WINE_STRIP ?= 1
 
-# Wine's PE builtins, the subset a console program needs. Kept as a list
-# rather than a wildcard so that what ships is a decision rather than
-# whatever happened to be built, and so the initrd stays small enough to
-# read into RAM.
-WINE_PE_DLLS = ntdll apisetschema kernel32 kernelbase win32u user32 gdi32 advapi32 \
-               sechost rpcrt4 msvcrt ucrtbase ws2_32 setupapi version \
-               imm32 combase ole32 oleaut32 shell32 shlwapi shcore winex11 \
-               wow64cpu cryptbase bcrypt userenv coml2 wininet mpr
-WINE_PE_PROGS = wineboot start conhost services explorer rundll32 cmd
-
-# Milestone 31. A Wine builtin is two halves: a PE .dll the Windows
-# program links against, and a Unix .so it reaches through
-# __wine_init_unix_call(). Shipping only the first half is not "that
-# feature is missing" - it is a DLL whose process attach *fails*, and
-# ntdll's loader turns one of those into "Initializing dlls for
-# wineboot.exe failed". Which is exactly what stopped wineboot, and why
-# the prefix had no drive mappings and Wine reported "could not find DOS
-# drive for the current working directory" ever since Milestone 30. It
-# was read as "no networking, so ws2_32 cannot work"; the truth was a
-# file that had been built and not copied.
+# Which of Wine's 601 DLLs ship is decided in tools/install_wine.sh, and
+# only there.
 #
-# ntdll.so and wineserver are handled separately - they are the loader,
-# not builtins.
-WINE_UNIX_DLLS = win32u ws2_32 bcrypt
+# Three variables used to be defined here - WINE_PE_DLLS, WINE_PE_PROGS
+# and WINE_UNIX_DLLS - naming the same things the script names. Nothing
+# ever read them. They were a second copy of a list that had already
+# drifted from the real one (the script had gained comctl32, comdlg32,
+# winspool.drv and five more programs; this copy had not), and the way
+# that drift would have been discovered is somebody adding a DLL here,
+# rebuilding, and finding the initrd unchanged. Milestone 43 deleted
+# them rather than wiring them up: the script is runnable on its own and
+# has to hold the list anyway, so a second copy can only ever be wrong.
 $(BUILD_DIR)/user/ld-linux.so.2: | $(BUILD_DIR)
 	mkdir -p $(BUILD_DIR)/user
 	cp $(HOST_LIB32)/ld-linux.so.2 $@
@@ -870,6 +858,39 @@ test-wm: $(ISO)
 	    --expect "frames drawn: 20" \
 	    --expect "wm test done" \
 	    --expect "Back in the shell" \
+	    --reject "\[FAIL\]" \
+	    --reject "KERNEL PANIC"
+	@echo
+	@echo "--- and Milestone 42: the window resizes ---"
+# Win-Up maximizes the focused window, and maximizing is a resize: the
+# client area goes from 480x320 to the whole work area, and the program
+# prints the WM_EV_RESIZE it gets.
+#
+# It is a keystroke rather than a corner drag because a corner drag could
+# not be aimed. The resize border is RESIZE_BORDER = 5 pixels inside the
+# window (kernel/wm.c), and Novaris's mouse is a *relative* PS/2 device,
+# so the harness positions the pointer by slamming it into a corner and
+# counting deltas out from there - which is accurate enough to hit a
+# window, and not accurate enough to hit five pixels of it. Two attempts
+# at the drag landed in the client area instead and were delivered to the
+# program as ordinary mouse input, which is exactly what "input reached
+# the window" in the first stanza above means.
+#
+# (tools/qemu_test.py grew a real drag primitive on the way - press,
+# move without re-slamming, release. It is still the right way to test a
+# drag; it is not the right way to test a resize.)
+#
+# What this proves that the stride check above cannot: that the buffer
+# outlives the resize. Before Milestone 42 the mapping was exactly the
+# client area, so growing the window past it would have had to move the
+# mapping - which is the thing there was no safe moment to do.
+	python3 tools/qemu_test.py --iso $(ISO) --memory 512 \
+	    --boot-wait 30 --settle 30 --timeout 260 \
+	    --cmd "run wmtest.elf 1200" \
+	    --post-key "meta_l-up" \
+	    --click-settle 3 \
+	    --screenshot $(BUILD_DIR)/wm-resize.ppm \
+	    --expect "resized to" \
 	    --reject "\[FAIL\]" \
 	    --reject "KERNEL PANIC"
 
