@@ -117,7 +117,9 @@ static void win_data_close(struct novaris_win_data *data)
 {
     if (data->pixels)
     {
-        munmap(data->pixels, (size_t)data->width * data->height * 4);
+        /* The mapping's own length, not the window's: since the window
+         * resizes, `width`*`height` is no longer what was mapped. */
+        munmap(data->pixels, data->bytes);
         data->pixels = NULL;
     }
     if (data->fd >= 0)
@@ -127,6 +129,8 @@ static void win_data_close(struct novaris_win_data *data)
     }
     data->mapped = FALSE;
     data->width = data->height = 0;
+    data->stride = 0;
+    data->bytes = 0;
 }
 
 void novaris_win_data_destroy(HWND hwnd)
@@ -204,7 +208,7 @@ static void window_title(HWND hwnd, char *out, unsigned int size)
 static BOOL window_create(struct novaris_win_data *data, int width, int height)
 {
     struct wm_create create;
-    size_t bytes;
+    struct wm_info info;
 
     if (width <= 0 || height <= 0) return FALSE;
 
@@ -227,8 +231,19 @@ static BOOL window_create(struct novaris_win_data *data, int width, int height)
         return FALSE;
     }
 
-    bytes = (size_t)width * height * 4;
-    data->pixels = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, data->fd, 0);
+    /* How big the buffer actually is, which is not how big the window is:
+     * the kernel sizes it for the largest this window could be shown at so
+     * that a resize never moves it. Map all of it, once - every later
+     * resize is then a change of `width`/`height` and nothing else. */
+    if (ioctl(data->fd, WMIO_GETINFO, &info) != 0 || !info.stride || !info.bytes)
+    {
+        ERR("%s did not answer WMIO_GETINFO\n", WMDEV_PATH);
+        close(data->fd);
+        data->fd = -1;
+        return FALSE;
+    }
+
+    data->pixels = mmap(NULL, info.bytes, PROT_READ | PROT_WRITE, MAP_SHARED, data->fd, 0);
     if (data->pixels == MAP_FAILED)
     {
         ERR("cannot map the window's pixels\n");
@@ -240,9 +255,12 @@ static BOOL window_create(struct novaris_win_data *data, int width, int height)
 
     data->width = width;
     data->height = height;
+    data->stride = info.stride;
+    data->bytes = info.bytes;
     data->mapped = TRUE;
 
-    TRACE("hwnd %p -> %dx%d window \"%s\"\n", data->hwnd, width, height, create.title);
+    TRACE("hwnd %p -> %dx%d window \"%s\" (buffer %ux%u)\n", data->hwnd, width, height,
+          create.title, info.stride, info.cap_h);
     return TRUE;
 }
 
@@ -252,16 +270,16 @@ static BOOL window_create(struct novaris_win_data *data, int width, int height)
  * Everything about where a window is arrives here: shown, hidden, moved,
  * resized, minimized. Novaris's window manager places and moves windows
  * itself - a program does not get to say where on the desktop it lands,
- * the same way it does not under a tiling window manager - so of all of
- * that, only two things are acted on: a window becoming visible for the
- * first time, which opens it, and a window becoming hidden, which closes
- * it.
+ * the same way it does not under a tiling window manager - so a move is
+ * ignored and three things are acted on: a window becoming visible for
+ * the first time, which opens it; a window becoming hidden, which closes
+ * it; and a size change, which since Milestone 42 the window follows.
  *
- * A size change is deliberately *not* acted on. /dev/wm cannot resize a
- * mapping under a process that is drawing into it (see kernel/wmdev.c),
- * so the window keeps the size it opened at and win32u's surface is
- * clipped into it. That is a real limitation and it is visible: a program
- * that resizes itself gets a window that does not follow.
+ * A size change used to be deliberately ignored, because /dev/wm could
+ * not resize a mapping under a process drawing into it. It no longer has
+ * to: the kernel allocates the buffer for the largest the window can be
+ * shown at and the client size is a sub-rectangle of it, so following a
+ * resize is two stores here and nothing at all underneath.
  */
 void NOVARIS_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                               const struct window_rects *new_rects,
@@ -306,6 +324,22 @@ void NOVARIS_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     if (visible && !data->mapped && !data->closing && width >= 16 && height >= 16)
         window_create(data, width, height);
     else if (!visible && data->mapped) win_data_close(data);
+    else if (data->mapped && (width != data->width || height != data->height) &&
+             width > 0 && height > 0)
+    {
+        /* A program resized its own window. Since Milestone 42 that costs
+         * nothing on this side: the buffer was allocated for the largest
+         * this window can be, so the mapping and its stride are unchanged
+         * and only the part of it that is shown moves. Clamped to the
+         * buffer, because the kernel will show at most that much.
+         *
+         * win32u recreates the window surface on a size change and will
+         * flush the whole of it, so there is no repaint to ask for here. */
+        if (width > data->stride) width = data->stride;
+        data->width = width;
+        data->height = height;
+        TRACE("hwnd %p resized to %dx%d\n", hwnd, width, height);
+    }
 
     novaris_win_data_release(data);
 }
@@ -442,15 +476,19 @@ static BOOL novaris_surface_flush(struct window_surface *base, const RECT *rect,
         return TRUE;
     }
 
+    /* The destination steps by the *buffer's* stride, which is wider than
+     * the window whenever the window is not at its largest. Stepping by
+     * `data->width` here would shear the picture the first time anything
+     * was resized. */
     src_stride = color_info->bmiHeader.biWidth * 4;
     src = (const char *)color_bits + (size_t)y0 * src_stride + (size_t)x0 * 4;
-    dst = (char *)data->pixels + ((size_t)y0 * data->width + x0) * 4;
+    dst = (char *)data->pixels + ((size_t)y0 * data->stride + x0) * 4;
 
     for (y = 0; y < h; y++)
     {
         memcpy(dst, src, (size_t)w * 4);
         src += src_stride;
-        dst += (size_t)data->width * 4;
+        dst += (size_t)data->stride * 4;
     }
 
     damage.x = x0;
@@ -688,10 +726,28 @@ BOOL NOVARIS_ProcessEvents(DWORD mask)
                 NtUserPostMessage(hwnd, WM_SYSCOMMAND, SC_CLOSE, 0);
                 break;
             case WM_EV_RESIZE:
-                /* The window manager resized the frame. The mapping did
-                 * not follow it (see kernel/wmdev.c), so this is only
-                 * worth telling Wine about once it can. */
-                TRACE("hwnd %p resized to %dx%d, not following\n", hwnd, ev.a, ev.b);
+                /* The user dragged an edge on the Novaris desktop. Hand
+                 * the new size up to win32u, which recreates the window
+                 * surface at it, sends the program WM_SIZE, and comes
+                 * back down through WindowPosChanged - where the only
+                 * thing left to do is note the new width and height,
+                 * because since Milestone 42 the buffer and the mapping
+                 * are already the right ones.
+                 *
+                 * `ev.a`/`ev.b` are the kernel's client area, which is
+                 * the rectangle this driver asked for at WMIO_CREATE and
+                 * so is Wine's *visible* rectangle - the same quantity
+                 * window_create() was given. The frame Novaris draws
+                 * around it is the window manager's own and Wine does not
+                 * count it (see GetWindowStyleMasks).
+                 *
+                 * The re-entry terminates: SetWindowPos reaches
+                 * WindowPosChanged, which changes bookkeeping and sends
+                 * nothing back to /dev/wm. */
+                TRACE("hwnd %p resized to %dx%d by the user\n", hwnd, ev.a, ev.b);
+                if (ev.a > 0 && ev.b > 0)
+                    NtUserSetWindowPos(hwnd, 0, 0, 0, ev.a, ev.b,
+                                       SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
                 break;
             default:
                 break;

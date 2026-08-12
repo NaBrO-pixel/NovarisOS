@@ -26,6 +26,7 @@
 #endif
 
 #include <pthread.h>
+#include <stddef.h>     /* size_t, for the mapping length in win_data */
 #include <stdint.h>
 
 /* ntstatus.h before windef.h, and WIN32_NO_STATUS between them: the two
@@ -59,6 +60,7 @@
 #define WMIO_GETSIZE 0x5704u   /* struct wm_rect*    */
 #define WMIO_TITLE   0x5705u   /* char[64]           */
 #define WMIO_SCREEN  0x5706u   /* struct wm_rect*    */
+#define WMIO_GETINFO 0x5707u   /* struct wm_info*    */
 
 #define WM_DEV_TITLE_MAX 64
 
@@ -71,6 +73,18 @@ struct wm_create
 struct wm_rect
 {
     int x, y, w, h;
+};
+
+/* The client area and the buffer behind it, which are not the same thing:
+ * the kernel allocates for the biggest the window could be shown at, so a
+ * row is `stride` pixels and not `w`. That is what makes the mapping
+ * survive a resize - see the kernel's wmdev.c. */
+struct wm_info
+{
+    unsigned int w, h;          /* the client area now */
+    unsigned int stride;        /* pixels per row of the buffer, >= w */
+    unsigned int cap_h;         /* rows in the buffer, >= h */
+    unsigned int bytes;         /* the mmap length */
 };
 
 /* Mouse event kinds, as the window manager routes them (kernel/wm.h). */
@@ -114,7 +128,9 @@ struct novaris_win_data
     HWND    hwnd;
     int     fd;                 /* /dev/wm, one per window */
     void   *pixels;             /* the mapping; NULL until created */
-    int     width, height;      /* the size the window was created at */
+    int     width, height;      /* the client area now - this follows a resize */
+    int     stride;             /* pixels per row of the mapping; fixed */
+    size_t  bytes;              /* the mapping's length, for munmap */
     struct window_rects rects;  /* what win32u last told us */
     BOOL    mapped;             /* the kernel has a window for this */
     BOOL    closing;            /* the user clicked the X */

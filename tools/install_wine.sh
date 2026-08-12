@@ -49,21 +49,67 @@ HOST_LIB32=${HOST_LIB32:-/lib32}
 # The subset that ships. Kept as a list rather than a wildcard so that
 # what is installed is a decision rather than whatever happened to be
 # built - the initrd is read into RAM whole, and Wine builds 601 DLLs.
+#
+# Grouped, because the groups are how to bisect this. Adding a DLL is not
+# free: a builtin that is absent fails only for the program that imports
+# it, but one that is *present* and cannot initialise takes its whole
+# process down (see the note on the two halves below), and shell32 and
+# explorer will use a DLL if they find one. So if a boot that worked
+# stops working, drop the last group and try again.
+
+# Tier 1: the loader, the C runtimes, and what wineboot needs to build a
+# prefix. Nothing below this line has ever been optional.
 PE_DLLS="ntdll apisetschema kernel32 kernelbase win32u user32 gdi32 advapi32
          sechost rpcrt4 msvcrt ucrtbase ws2_32 setupapi version
-         imm32 combase ole32 oleaut32 shell32 shlwapi shcore winex11
+         imm32 combase ole32 oleaut32 shell32 shlwapi shcore
          wow64cpu cryptbase bcrypt userenv coml2 wininet mpr
          comctl32 comdlg32 winspool.drv"
+# `winex11` was in the line above and is gone: its module is winex11.drv,
+# in dlls/winex11.drv, so the name never resolved to a file - and Novaris
+# configures Wine --without-x and has its own display driver, so even
+# spelled correctly there would be nothing to install and no reason to
+# want it. It had been dead in this list since Milestone 35.
+
+# Tier 2 (Milestone 43): what an ordinary window is actually made of.
+# comctl32 was already here and these are what it reaches for - uxtheme
+# for visual styles, usp10 to shape the text in a control, oleacc because
+# it publishes an accessible object per control. msimg32 is AlphaBlend
+# and GradientFill, which is most of what a toolbar is drawn with;
+# riched20/32 is the edit control anything bigger than Notepad uses.
+PE_DLLS="$PE_DLLS uxtheme usp10 oleacc msimg32 riched20 riched32"
+
+# Tier 3: pictures and the shell's own plumbing. windowscodecs decodes
+# the PNGs and JPEGs an app shows and a shell draws thumbnails from;
+# gdiplus is how a great many Windows programs draw anything at all;
+# propsys is the property system shell32 asks for.
+PE_DLLS="$PE_DLLS windowscodecs gdiplus propsys urlmon"
+
+# Tier 4: the network above a socket. Milestone 41 gave the machine
+# AF_INET and a Wine program reached it through ws2_32; these are the
+# layers programs actually call instead - winhttp and urlmon for
+# fetching, crypt32 because neither does HTTPS without a certificate
+# store, dnsapi for resolution, iphlpapi for "what are my addresses".
+#
+# iphlpapi is the one to watch: it answers through nsiproxy.sys, which
+# ROADMAP.md records as still failing to start. Shipping it is how that
+# gets diagnosed rather than assumed, and a program that only *asks*
+# about interfaces failing is narrower than one that cannot connect.
+PE_DLLS="$PE_DLLS crypt32 winhttp dnsapi iphlpapi netapi32"
+
+# Tier 5: what installers and long-lived programs expect to find.
+# winmm is here for timeGetTime and the multimedia timers rather than for
+# audio, which this machine has no driver for at all.
+PE_DLLS="$PE_DLLS winmm psapi imagehlp cabinet wintrust"
+
 # rundll32 and the setupapi machinery behind it are what wineboot needs to
 # *update* a prefix from wine.inf - which is how a prefix comes to exist
 # at all. Milestone 35 is the first time they have had wine.inf to read.
+#
+# wordpad and winefile are Milestone 43's: real GUI programs, bigger than
+# Notepad, that resize and use the controls the tiers above added - which
+# makes them the first honest test of Milestone 42 as well.
 PE_PROGS="wineboot start conhost services explorer rundll32 cmd winepath
-          reg regsvr32 notepad winemine"
-# A Wine builtin is two halves: a PE .dll the Windows program links
-# against, and a Unix .so it reaches through __wine_init_unix_call().
-# Shipping only the first half is not "that feature is missing" - it is a
-# DLL whose process attach fails.
-UNIX_DLLS="win32u ws2_32 bcrypt"
+          reg regsvr32 notepad winemine wordpad winefile taskmgr winver"
 
 # Novaris's own display driver, built into the same tree by
 # tools/build_wine_driver.sh. Not in the lists above because it is not
@@ -88,8 +134,41 @@ mkdir -p "$UNIXDIR" "$PEDIR" "$BINDIR" "$DATADIR/nls" \
 cp "$WINE_BUILD/dlls/ntdll/ntdll.so"        "$UNIXDIR/ntdll.so"
 cp "$WINE_BUILD/loader/wine"                "$UNIXDIR/wine"
 cp "$WINE_BUILD/loader/wine-preloader"      "$UNIXDIR/wine-preloader"
-for d in $UNIX_DLLS; do
-    cp "$WINE_BUILD/dlls/$d/$d.so" "$UNIXDIR/$d.so" 2>/dev/null || true
+# A Wine builtin is two halves: a PE .dll the Windows program links
+# against, and a Unix .so it reaches through __wine_init_unix_call().
+# Shipping only the first half is not "that feature is missing" - it is a
+# DLL whose process attach *fails*, and ntdll's loader turns one of those
+# into "Initializing dlls for wineboot.exe failed". That is what stopped
+# wineboot for two milestones, and the cause was a file that had been
+# built and not copied.
+#
+# So the second half is no longer a list to keep in step with the first
+# one. Every builtin that ships gets its Unix half if the tree built one,
+# worked out from the tree - which is the same reasoning as the "ask the
+# binaries" loop further down, applied one level up. A list here could
+# only ever be a way to forget something.
+#
+# ntdll.so and wineserver are not in it: they are the loader, not
+# builtins, and are installed above.
+# The name of the Unix half is *not* derivable from the module's name:
+# winspool.drv's is winspool.so, dropping an extension that ws2_32.so
+# keeps. Wine writes it down in the module's Makefile.in as UNIXLIB, so
+# that is what is read here, and the guesses are only a fallback for a
+# tree laid out differently than expected.
+for d in $PE_DLLS; do
+    unixlib=
+    if [ -f "$WINE_BUILD/dlls/$d/Makefile.in" ]; then
+        unixlib=$(sed -n 's/^UNIXLIB[[:space:]]*=[[:space:]]*\([^[:space:]]*\).*/\1/p' \
+                  "$WINE_BUILD/dlls/$d/Makefile.in" | head -1)
+    fi
+    for cand in "$WINE_BUILD/dlls/$d/$unixlib" \
+                "$WINE_BUILD/dlls/$d/$d.so" \
+                "$WINE_BUILD/dlls/$d/${d%.drv}.so"; do
+        case $cand in *"/") continue ;; esac      # empty $unixlib
+        [ -f "$cand" ] || continue
+        cp "$cand" "$UNIXDIR/$(basename "$cand")"
+        break
+    done
 done
 
 # The wrapper a user runs, and the server it starts.
@@ -109,11 +188,40 @@ cp "$WINE_BUILD/tools/wine/wine"   "$BINDIR/wine"
 cp "$WINE_BUILD/server/wineserver" "$BINDIR/wineserver"
 
 # --- Wine's Windows half ------------------------------------------------
+#
+# A name that is not in the tree is *not* an error: which DLLs a Wine
+# build produces depends on how it was configured, and this script is
+# meant to work against a tree built without X, without Vulkan and
+# without OpenGL. But it is not nothing either - it silently ships less
+# than the list says, which is how a DLL comes to be listed for a
+# milestone and never actually installed. So they are collected and
+# reported at the end rather than swallowed by `|| true`.
+MISSING_DLLS=
+MISSING_PROGS=
+
+# A module whose name already carries an extension keeps it: Wine builds
+# dlls/winspool.drv/i386-windows/winspool.drv, with no .dll on the end,
+# and the same for every .drv and .sys. Appending .dll unconditionally -
+# which this loop did until Milestone 43 - looks for a file that cannot
+# exist, so winspool.drv had been in the list since Milestone 37 and had
+# never once been installed. The reporting below is what found it.
 for d in $PE_DLLS; do
-    cp "$WINE_BUILD/dlls/$d/i386-windows/$d.dll" "$PEDIR/$d.dll" 2>/dev/null || true
+    case $d in
+        *.*) src=$WINE_BUILD/dlls/$d/i386-windows/$d;      dst=$PEDIR/$d ;;
+        *)   src=$WINE_BUILD/dlls/$d/i386-windows/$d.dll;  dst=$PEDIR/$d.dll ;;
+    esac
+    if [ -f "$src" ]; then
+        cp "$src" "$dst"
+    else
+        MISSING_DLLS="$MISSING_DLLS $d"
+    fi
 done
 for p in $PE_PROGS; do
-    cp "$WINE_BUILD/programs/$p/i386-windows/$p.exe" "$PEDIR/$p.exe" 2>/dev/null || true
+    if [ -f "$WINE_BUILD/programs/$p/i386-windows/$p.exe" ]; then
+        cp "$WINE_BUILD/programs/$p/i386-windows/$p.exe" "$PEDIR/$p.exe"
+    else
+        MISSING_PROGS="$MISSING_PROGS $p"
+    fi
 done
 
 # --- the display driver -------------------------------------------------
@@ -243,7 +351,11 @@ printf 'passwd: files\ngroup: files\n'   > "$ROOT/etc/nsswitch.conf"
 # it. It is the difference between an initrd that fits in RAM and one
 # that does not.
 if [ "$DO_STRIP" != "0" ]; then
-    i686-w64-mingw32-strip "$PEDIR"/*.dll "$PEDIR"/*.exe 2>/dev/null || true
+    # *.drv as well as *.dll: a .drv is a PE like any other, and both
+    # winspool.drv and winenovaris.drv were being shipped unstripped
+    # because this glob did not mention them.
+    i686-w64-mingw32-strip "$PEDIR"/*.dll "$PEDIR"/*.exe "$PEDIR"/*.drv \
+        2>/dev/null || true
     strip "$UNIXDIR"/*.so "$UNIXDIR/wine" "$BINDIR/wine" \
           "$BINDIR/wineserver" 2>/dev/null || true
 fi
@@ -252,3 +364,36 @@ echo "Installed Wine into $ROOT:"
 echo "  $(ls "$UNIXDIR" | wc -l) files in /usr/lib/wine/i386-unix"
 echo "  $(ls "$PEDIR" | wc -l) files in /usr/lib/wine/i386-windows"
 echo "  $(du -sh "$ROOT/usr" | cut -f1) total under /usr"
+
+# Which builtins came with both halves, which came with one. Printed
+# every build because it is the cheapest possible check on the thing that
+# has gone wrong most often here: the first half shipping without the
+# second. A name in the "PE only" line is not necessarily a bug - most of
+# Wine's DLLs genuinely have no Unix half - but a name that moves *into*
+# that line between two builds is.
+both= ; pe_only=
+for d in $PE_DLLS; do
+    case $d in
+        *.*) [ -f "$PEDIR/$d" ]     || continue ;;
+        *)   [ -f "$PEDIR/$d.dll" ] || continue ;;
+    esac
+    if [ -f "$UNIXDIR/$d.so" ] || [ -f "$UNIXDIR/${d%.drv}.so" ]; then
+        both="$both $d"
+    else
+        pe_only="$pe_only $d"
+    fi
+done
+echo "  both halves:$both"
+echo "  PE only:$pe_only"
+
+# And what the list asked for and the tree did not have. Loud, because
+# the failure it catches is a DLL that was added to a list, never built,
+# and assumed to be working ever since.
+if [ -n "$MISSING_DLLS" ] || [ -n "$MISSING_PROGS" ]; then
+    echo ""
+    echo "  NOT FOUND in $WINE_BUILD - these were asked for and did not ship:"
+    [ -n "$MISSING_DLLS" ]  && echo "    dlls:    $MISSING_DLLS"
+    [ -n "$MISSING_PROGS" ] && echo "    progs:   $MISSING_PROGS"
+    echo "  (a Wine configured --without-x or --without-vulkan will not have"
+    echo "   built all of these; check before treating it as a bug)"
+fi

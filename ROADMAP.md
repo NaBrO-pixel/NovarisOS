@@ -5199,7 +5199,9 @@ and only a failing run spends it.
   have nothing to install and say so (`SetupDefaultQueueCallbackW copy
   error 1812`, `register_fake_dll failed to create IRegistrar`). Widening
   it is a question of how big an initrd may be, which is a question about
-  the page cache above.
+  the page cache above. — *Milestone 43 widened it to 52, and found that
+  the 33 was really 31: `winex11` and `winspool.drv` were names in the
+  list that resolved to no file.*
 - **The prefix is rebuilt at every boot when there is no disk**, because
   `$HOME` is `/root` and `/root` is a ramfs. With a disk it is built once
   and stays, which is what `make test-wine-persist` now proves: two boots
@@ -5477,10 +5479,10 @@ a window that works rather than one that merely exists.
 
 ### What it does not do yet
 
-- **The window does not resize.** `/dev/wm` cannot resize a mapping under
-  a process that is drawing into it, so the window keeps the size it
-  opened at and win32u's surface is clipped into it. The driver is told
-  about the resize (`WM_EV_RESIZE`) and ignores it, on purpose.
+- ~~**The window does not resize.**~~ — addressed in Milestone 42, by
+  making the buffer bigger than the window rather than by resizing it.
+  Written and compiling, **not yet booted**; until `make test-wm` and
+  `make test-wine-gui` have run, treat this item as open.
 - **There is a copy per frame.** `flush` memcpy's the dirty rows from the
   surface's DIB into the `/dev/wm` mapping. It could hand the mapping to
   `window_surface_create()` as the bitmap's bits and have GDI draw
@@ -5494,8 +5496,8 @@ a window that works rather than one that merely exists.
   win32u has sensible behaviour for a driver that does not fill them in.
 - **And `chrome.exe` is still not reachable.** A browser needs a 64-bit
   Wine build (this one is 32-bit only), a GPU, a sandbox built on NT APIs
-  this kernel does not have, and far more than the 33 of Wine's 601 DLLs
-  that ship here. Milestones 38-40 gave the machine networking, which
+  this kernel does not have, and far more than the 52 of Wine's 601 DLLs
+  that ship here (31 when this was written; Milestone 43 raised it). Milestones 38-40 gave the machine networking, which
   removes one item from that list and none of the others. What works is a
   Windows program with a window - `notepad.exe`, `winemine.exe` - and that
   is a different sentence from "Windows programs work".
@@ -5773,6 +5775,298 @@ which is precisely what a server that says nothing looks like.
 `nsiproxy` and `NDIS` do still fail to start, and that is narrower than
 it used to sound: they enumerate interfaces, addresses and routes through
 NT device objects, which is a different job from carrying a connection.
+
+## Milestone 42 — a window that resizes ✅ DONE (kernel half)
+
+> **Status.** `make test-wm` passes, including a new third stanza that
+> maximizes the window and asserts the program is told:
+>
+> ```
+> novaris> run wmtest.elf 1200
+>   [ok]   the buffer is at least the window
+>   resized to 1280x728
+> ```
+>
+> A 480x320 window became 1280x728 — 2.7x wider and 2.3x taller — through
+> a mapping that was never moved, never remapped, and never unmapped.
+> `make test-qemu` and `make test` still pass.
+>
+> The **Wine half is still unverified**: `make test-wine-gui` needs a
+> built Wine tree, which this machine does not have yet.
+
+Every milestone since 36 has carried the same note: the buffer does not
+follow a resize. The reason given was that resizing a mapping means
+unmapping frames out from under a process that is drawing into them,
+which there is no safe moment to do.
+
+That is true, and it is answered by not doing it. **The buffer is not the
+window.** It is allocated once at the largest client area the window could
+ever be given — the desktop work area, since the window manager never
+makes a window bigger than that — and the client size is a *sub-rectangle*
+of it. A row is `stride` pixels, which is the buffer's width; `w` and `h`
+say how much of it is shown.
+
+So a resize reallocates nothing, moves nothing, and unmaps nothing. It is
+two stores and a `WM_EV_RESIZE`, and the mapping the process made at
+startup is exactly as valid afterwards as it was before.
+
+The compositor needed no work at all: `gfx_surface_t` has carried `pitch`
+and `cap_h` since it was written, so `wmdev_paint` says
+`src.pitch = s->alloc_w` and the existing blit clips correctly.
+
+### What it costs, and why that is the trade
+
+Memory. A 1280x800 desktop makes every window a 4MB allocation whatever
+size it is shown at, and `WMDEV_MAX_SLOTS` is 16 — so the worst case is
+64MB of a 192MB heap. That is a real cost, it is bounded, and it buys the
+removal of the one thing that made resizing unsafe. Wine has one to three
+real windows in practice, not sixteen.
+
+### The compatibility break, which is the part to watch
+
+`stride` is not optional and it is not backward compatible. The buffer is
+now wider than the window **even on a window that has never been
+resized**, so any client that indexes `px[y * width + x]` draws a
+staircase from the first frame. There are two clients and both were
+changed:
+
+- `wine/winenovaris.drv/window.c` — `flush()` steps the destination by
+  `data->stride`, and `window_create()` gets it from `WMIO_GETINFO`.
+- `userland/wm_test.c` — a `stride` global replacing `W` in three places.
+
+A third client written against the old protocol would compile and run and
+draw nonsense, which is the failure mode worth knowing about. `WMIO_GETINFO`
+is the only way to learn the stride; `WMIO_GETSIZE` still answers the
+client area and cannot say anything about the buffer.
+
+### And the driver follows a resize now, in both directions
+
+- **The program resizes itself.** `WindowPosChanged` used to ignore a size
+  change on purpose. It now updates `width`/`height` — and that is the
+  whole change, because the buffer and the mapping are already right.
+- **The user drags an edge.** `WM_EV_RESIZE` used to be traced and
+  dropped. It now calls `NtUserSetWindowPos`, which is what makes win32u
+  recreate the surface at the new size and send the program `WM_SIZE`.
+  The re-entry terminates: `SetWindowPos` reaches `WindowPosChanged`,
+  which changes bookkeeping and sends nothing back to `/dev/wm`.
+
+### What the test actually proves
+
+The picture is the assertion, and the stride is what it checks. Before the
+resize `tools/check_wm_window.py` finds *a solid 476x316 block* at
+(363,84); after maximizing it finds a solid 476x316 block at (2,34). The
+program still draws 480-pixel rows, but the buffer under it is now 1280
+wide — so those rows are no longer contiguous, and the only reason the
+block comes out solid rather than as a diagonal staircase is that both
+sides are using `stride`. A stride bug is not a subtle failure here; it
+is a picture that looks like a venetian blind.
+
+`kmalloc` of 4MB at window-create was the other worry and it is answered:
+the window opens, on a 512MB machine, every run.
+
+### What is still not verified
+
+- **The Wine half.** `NtUserSetWindowPos` re-entry from `ProcessEvents`,
+  the driver's stride in `flush()`, and `WindowPosChanged` following a
+  size change have not been compiled, let alone run. That needs a built
+  Wine tree.
+- **A corner drag**, as opposed to Win-Up. Both go through the same
+  `WM_EV_RESIZE` path in `wmdev_paint`, so the kernel side is the same
+  code — but the drag has never been driven, for the reason in the next
+  section.
+- **The newly-exposed region.** Growing a window shows buffer contents
+  the program has not drawn into. The test program does not repaint on
+  resize, so the screenshot shows exactly that: a 480x320 picture in a
+  1280x728 window. Wine's win32u recreates and flushes the whole surface
+  on a size change, so it should not be visible there. "Should" is doing
+  work in that sentence.
+
+### Two things the test harness needed
+
+Neither is Milestone 42, and both were found by trying to test it.
+
+**A drag primitive.** `tools/qemu_test.py` could click and move but not
+press-move-release, so a corner drag was not expressible. It is now:
+`--post-click "X,Y,drag,TX,TY"`. The subtlety is that it cannot be built
+out of separate down/move/up steps, because every other gesture positions
+the pointer by slamming it into the top-left corner and counting deltas
+out from there — Novaris's mouse is a relative PS/2 device and there is no
+other way to know where the pointer is. Doing that with the button held is
+a drag *to the corner*, which collapses the window to its minimum on the
+way past. So the drag form tracks the position and moves relative to it.
+
+**And then the drag was not used.** `RESIZE_BORDER` is 5 pixels
+(`kernel/wm.c:63`), and corner-slam-plus-deltas is accurate enough to hit
+a window and not accurate enough to hit five pixels of one. Two attempts
+landed in the client area and were delivered to the program as ordinary
+mouse input — which is what `input reached the window` in the first
+stanza means, and it was quietly true while the resize assertion failed.
+So the test maximizes with `Win-Up` instead, through a new `--post-key`,
+and needs no pointer precision at all. The drag primitive stays because it
+is the right way to test a *drag*; it is not the right way to test a
+resize.
+
+## Milestone 43 — more of Wine ships ⚠️ PARTLY VERIFIED
+
+> **Status.** Three levels of confidence, kept apart on purpose.
+>
+> The **plumbing** is verified against a mock tree: the drift, the `.drv`
+> naming bug, the automatic Unix half, the reporting.
+>
+> The **list** is verified against a real Wine 11.0 source tree
+> (`db11d0f`, "Release 11.0"): all twenty-one added modules exist, and
+> which of them have Unix halves is now known rather than guessed — see
+> below, because the answer changed the design.
+>
+> What is **still unverified** is a boot. Whether these DLLs load, and
+> what they do to wineboot, needs a *built* Wine, and building one needs
+> `libfreetype-dev:i386`, which was not installed on this machine.
+
+### Three bugs, none of them in the list
+
+The list was the intended work. Getting to it turned up three things that
+had been wrong for several milestones, and all three were invisible for
+the same reason: every copy in this script ended in `2>/dev/null || true`,
+so a file that was asked for and not found produced silence.
+
+**A second copy of the list, in the Makefile.** `WINE_PE_DLLS`,
+`WINE_PE_PROGS` and `WINE_UNIX_DLLS` were defined at `Makefile:407` and
+read by nothing. They had already drifted from the real list in
+`tools/install_wine.sh` — the script had gained comctl32, comdlg32,
+winspool.drv and five programs; the Makefile copy had not. The way that
+drift would have been found is somebody adding a DLL to the Makefile,
+rebuilding, and finding the initrd unchanged. Deleted rather than wired
+up: the script runs standalone and has to hold the list anyway.
+
+**`winspool.drv` had never been installed.** Wine builds a `.drv` module
+under its own name — `dlls/winspool.drv/i386-windows/winspool.drv`, no
+`.dll` on the end — and the loop appended `.dll` unconditionally, so it
+looked for a file that cannot exist. It had been in the list since
+Milestone 37 and had never once shipped.
+
+**`winex11` had never been installed either**, for the same reason
+(`winex11.drv`), and is now removed rather than fixed: Novaris configures
+Wine `--without-x` and has its own display driver, so spelled correctly
+there would still be nothing to install.
+
+So the real count before this milestone was **31** DLLs, not the 33 that
+`README.md` and Milestone 37 both claimed. Two of the 33 were names that
+resolved to nothing.
+
+### The Unix half is discovered now, not listed
+
+`UNIX_DLLS="win32u ws2_32 bcrypt"` is gone. Every builtin that ships gets
+its Unix half if the tree built one, worked out from the tree — the same
+reasoning as the "ask the binaries" loop that already staged the host
+libraries, applied one level up.
+
+This is the failure this repository has hit most often and paid most for:
+Milestone 31 records `ws2_32.so` being built and not copied, read as "no
+networking, so ws2_32 cannot work", costing two milestones. A list that
+has to be kept in step with another list is how that happens.
+
+**And it turned out not to be optional.** Asked of the real Wine 11.0
+tree, exactly eight of the modules that ship have a `UNIXLIB`:
+
+| module | Unix half |
+| --- | --- |
+| ntdll | `ntdll.so` (the loader; installed separately) |
+| win32u, ws2_32, bcrypt | as before |
+| **winspool.drv** | **`winspool.so`** |
+| **crypt32, dnsapi, netapi32** | **new in this milestone** |
+
+Three of the five DLLs added in tier 4 have Unix halves. Under the old
+hardcoded `UNIX_DLLS="win32u ws2_32 bcrypt"` they would have shipped as
+PE only — which is not "that feature is missing", it is a DLL whose
+process attach fails and takes wineboot down with it. Adding them to the
+list without this change would have reproduced Milestone 31 exactly.
+
+**And the Unix half's name cannot be derived from the module's.**
+`winspool.drv`'s is `winspool.so`, dropping an extension that `ws2_32.so`
+keeps. So the name is read out of the module's `Makefile.in`, where Wine
+writes it, rather than guessed — verified against all eight above.
+
+### And the script says what it did
+
+Every run now prints which builtins came with both halves, which came
+with one, and — loudly — which were asked for and not found in the tree.
+A name in the "PE only" line is not necessarily wrong, since most of
+Wine's DLLs genuinely have no Unix half. A name that *moves into* it
+between two builds is. This is what found two of the three bugs above,
+about a minute after it was written.
+
+### The list: 31 DLLs to 52, in five tiers
+
+Tiers because they are how to bisect this. A builtin that is absent fails
+only for the program that imports it; one that is *present* and cannot
+initialise takes its whole process down, and shell32 and explorer will
+use a DLL if they find one. If a boot that worked stops working, drop the
+last tier and try again.
+
+| Tier | Added | Why |
+| --- | --- | --- |
+| 2 | uxtheme, usp10, oleacc, msimg32, riched20, riched32 | what comctl32 reaches for, and the edit control anything bigger than Notepad uses |
+| 3 | windowscodecs, gdiplus, propsys, urlmon | decoding a picture and drawing one |
+| 4 | crypt32, winhttp, dnsapi, iphlpapi, netapi32 | the network above a socket, which Milestone 41 stopped one layer short of |
+| 5 | winmm, psapi, imagehlp, cabinet, wintrust | what installers and long-lived programs expect to find |
+
+`winmm` is there for `timeGetTime` and the multimedia timers, not for
+audio: this machine has no audio driver at all.
+
+`iphlpapi` is the one to watch. It answers through `nsiproxy.sys`, which
+Milestone 41 records as still failing to start, so it may well not work —
+shipping it is how that gets diagnosed rather than assumed, and a program
+that only *asks* about interfaces failing is much narrower than one that
+cannot connect.
+
+Four programs were added too: `wordpad`, `winefile`, `taskmgr`, `winver`.
+wordpad and winefile are the point — real GUI programs, bigger than
+Notepad, that resize and use the controls tier 2 added, which makes them
+the first honest test of Milestone 42 as well.
+
+### What to check when this is built
+
+1. **The install report.** It is printed by every `make` with
+   `WINE_BUILD` set. Anything under "NOT FOUND" is a DLL this milestone
+   claims to ship and does not.
+2. **`make test-wine` and `make test-wine-gui` still pass.** These are
+   regression tests now: twenty-one new DLLs is twenty-one new chances
+   for a process attach to fail, and the console test is the canary.
+3. **Then `wine wordpad.exe`**, which is the first program here that
+   exercises Milestone 42 and tiers 2-3 at once.
+4. **The initrd size.** It is read into RAM whole. 52 DLLs is a lot more
+   than 31 and nobody has measured what that does.
+
+## The state of the tree, as found
+
+Two things that belong to neither milestone, recorded because the next
+session will hit both.
+
+**`8bfc6d6` did not build.** `kernel/kheap.c` calls `ku32_to_dec` for its
+allocation counters and does not include `kstring.h`, where it is
+declared. On a compiler that treats an implicit declaration as an error —
+which any current gcc does — `make` stops at `build/kheap.o`. It is a
+one-line include and it is fixed, but the merge on the default branch was
+in that state, so the counters added in `374896a`/`56a4a6e` were never
+compiled by whoever merged them.
+
+**`make test-posix` fails, and did before any of this.** It stops in
+section 3a of the mmap test with:
+
+```
+FAIL: the binary produced no recognisable output on the host
+```
+
+The failure is on the **host** side of the differential, not on Novaris —
+the Linux run of `userland/mmap_test.c` produces nothing to compare
+against, so the comparison never reaches the guest. Verified against a
+pristine export of `8bfc6d6` with only the `kheap.c` include added: same
+failure, same place. It is environmental or a real host-side bug in that
+program, and either way it is not a regression from Milestones 42 or 43.
+
+`make`, `make test`, `make test-qemu` and `make test-wm` all pass.
+`make test-desktop`, `test-wine`, `test-wine-gui` and `test-winsock`
+require `WINE_BUILD` and are untested here.
 
 ## Later / open-ended
 

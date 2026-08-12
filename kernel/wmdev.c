@@ -11,14 +11,33 @@
  * memory the compositor reads. Everything else here is bookkeeping around
  * that.
  *
- * Two things are deliberately not done yet, and both are the same
- * decision - make the simple thing correct before making it general:
+ * **The window resizes** (Milestone 42), and the way it does is the only
+ * interesting decision in this file. Until now it could not: the buffer
+ * was allocated at the client size, so following a resize meant handing
+ * the process a different mapping - unmapping frames out from under code
+ * that is drawing into them, which there is no safe moment to do.
  *
- *   - **The buffer does not follow a resize.** The window can be resized
- *     and the process is told (WM_EV_RESIZE), but the buffer keeps the
- *     size it was created with; the paint clips or letterboxes. Resizing
- *     the mapping means unmapping frames out from under a process that is
- *     drawing into them, which is a page-cache-shaped problem.
+ * So the buffer is not the window. It is allocated once, at the largest
+ * client area this window could ever be given (the desktop work area,
+ * since the window manager never makes a window bigger than that), and
+ * the client size is a *sub-rectangle* of it: `w`/`h` rows and columns of
+ * a buffer that is `alloc_w` wide. `gfx_surface_t` has carried `pitch`
+ * and `cap_h` since the compositor was written, so the paint below needed
+ * one line to say the allocation is wider than the picture.
+ *
+ * A resize is then bookkeeping. Nothing is reallocated, no address
+ * changes, the mapping the process made at startup stays exactly as valid
+ * as it was, and the process is told the new size (WM_EV_RESIZE) and
+ * draws into a different part of memory it already has.
+ *
+ * The price is memory: a 1280x800 desktop makes every window a 4MB
+ * allocation whatever size it is on screen. That is a real cost and it is
+ * bounded - WMDEV_MAX_SLOTS windows of it - and it buys the removal of
+ * the one thing that made resizing unsafe, which is a trade worth
+ * writing down rather than hiding.
+ *
+ * One thing is still deliberately not done:
+ *
  *   - **One window per open.** A process that wants two opens /dev/wm
  *     twice. Wine's driver wants one window per HWND, so this will have to
  *     change; the interface does not have to.
@@ -44,9 +63,10 @@ typedef struct {
     vfs_node_t*  node;      /* the per-open node; its `data` is `pixels` */
 
     uint8_t*     alloc;     /* the unaligned allocation */
-    uint32_t*    pixels;    /* page-aligned, w*h*4 */
-    int          w, h;
-    int          last_w, last_h;   /* client area at the last WM_EV_RESIZE */
+    uint32_t*    pixels;    /* page-aligned, alloc_w*alloc_h*4 */
+    int          w, h;              /* the client area now: what is shown */
+    int          alloc_w, alloc_h;  /* the buffer: fixed for the window's life */
+    int          last_w, last_h;    /* client area at the last WM_EV_RESIZE */
 
     /* A ring of input events. Dropped rather than blocking when it
      * overflows: a process that is not draining its input is not one the
@@ -85,27 +105,43 @@ static void wmdev_paint(window_t* win) {
     wmdev_slot_t* s = slot_of(win);
     if (!s || !s->pixels) return;
 
-    /* The client area changed size since the last frame - tell the
-     * process. There is no resize hook on app_t to hang this off, and
-     * there does not need to be: a resize is followed by a repaint, so
-     * noticing it here notices every one of them exactly once. The buffer
-     * itself keeps its size; the blit below letterboxes or clips. */
-    if (wm_client_w(win) != s->w || wm_client_h(win) != s->h) {
-        if (s->last_w != wm_client_w(win) || s->last_h != wm_client_h(win)) {
-            s->last_w = wm_client_w(win);
-            s->last_h = wm_client_h(win);
-            queue_push(s, WM_EV_RESIZE, s->last_w, s->last_h, 0, 0);
+    /* The client area changed size since the last frame - adopt it and
+     * tell the process. There is no resize hook on app_t to hang this off,
+     * and there does not need to be: a resize is followed by a repaint, so
+     * noticing it here notices every one of them exactly once.
+     *
+     * Nothing is reallocated. `w`/`h` name a sub-rectangle of a buffer
+     * that was made big enough at WMIO_CREATE, so this is two stores and
+     * an event - and the process's mapping is as valid afterwards as it
+     * was before. The clamp is belt and braces: the window manager does
+     * not exceed the work area the buffer was sized from, and if that ever
+     * stops being true a clipped window beats a buffer overrun. */
+    int cw = wm_client_w(win), ch = wm_client_h(win);
+    if (cw > s->alloc_w) cw = s->alloc_w;
+    if (ch > s->alloc_h) ch = s->alloc_h;
+    if (cw < 1) cw = 1;
+    if (ch < 1) ch = 1;
+
+    if (cw != s->w || ch != s->h) {
+        s->w = cw;
+        s->h = ch;
+        if (s->last_w != cw || s->last_h != ch) {
+            s->last_w = cw;
+            s->last_h = ch;
+            queue_push(s, WM_EV_RESIZE, cw, ch, 0, 0);
         }
     }
 
     /* A surface header around memory this file already owns - no
-     * allocation, and gfx_copy_region does the clipping. */
+     * allocation, and gfx_copy_region does the clipping. `pitch` is the
+     * buffer's width rather than the window's, which is the whole of what
+     * makes the picture come out unsheared after a resize. */
     gfx_surface_t src;
     src.pixels = s->pixels;
     src.w = s->w;
     src.h = s->h;
-    src.pitch = s->w;
-    src.cap_h = s->h;
+    src.pitch = s->alloc_w;
+    src.cap_h = s->alloc_h;
 
     gfx_blit(&src, 0, 0);
 }
@@ -160,6 +196,8 @@ static void slot_release(wmdev_slot_t* s) {
     if (s->alloc) kfree(s->alloc);
     s->alloc = 0;
     s->pixels = 0;
+    s->w = s->h = 0;
+    s->alloc_w = s->alloc_h = 0;
     s->in_use = 0;
     s->head = s->tail = 0;
 }
@@ -196,10 +234,26 @@ static int32_t wmdev_create(wmdev_slot_t* s, const struct wm_create* c) {
         return -EINVAL;
     }
 
+    /* The buffer is sized for the largest this window could ever be shown
+     * at, not for the size asked for - which is what lets a resize be
+     * bookkeeping instead of a new mapping. The work area is that size:
+     * the window manager maximizes to it and never past it. A window that
+     * asks for more than the desktop still gets what it asked for, since
+     * the buffer only has to be big enough, and clamping here would make
+     * WMIO_CREATE lie about the size it accepted. */
+    gfx_rect_t work;
+    wm_work_area(&work);
+    uint32_t aw = (uint32_t)(work.w > 0 ? work.w : (int)w);
+    uint32_t ah = (uint32_t)(work.h > 0 ? work.h : (int)h);
+    if (aw < w) aw = w;
+    if (ah < h) ah = h;
+    if (aw > WM_DEV_MAX_W) aw = WM_DEV_MAX_W;
+    if (ah > WM_DEV_MAX_H) ah = WM_DEV_MAX_H;
+
     /* Page-aligned, because the process is going to map it and a mapping
      * hands over whole frames. Over-allocate and round up, the same blunt
      * way vfs_make_mappable() does it and for the same reason. */
-    uint32_t bytes = (w * h * 4u + 4095u) & ~4095u;
+    uint32_t bytes = (aw * ah * 4u + 4095u) & ~4095u;
     uint8_t* raw = (uint8_t*)kmalloc(bytes + 4096u);
     if (!raw) return -ENOMEM;
     uint32_t* px = (uint32_t*)(((uint32_t)raw + 4095u) & ~4095u);
@@ -223,13 +277,17 @@ static int32_t wmdev_create(wmdev_slot_t* s, const struct wm_create* c) {
     s->pixels = px;
     s->w = s->last_w = (int)w;
     s->h = s->last_h = (int)h;
+    s->alloc_w = (int)aw;
+    s->alloc_h = (int)ah;
     s->win = win;
 
     /* This is what makes mmap work with no new code: the node's bytes
      * *are* the window's pixels, already page-aligned, already mappable.
      * sys_mmap2's MAP_SHARED path hands the frames straight over. */
     s->node->data = (uint8_t*)px;
-    s->node->length = w * h * 4u;
+    /* The whole buffer, not the client area: a process maps this once and
+     * the mapping has to still cover the window after it is made bigger. */
+    s->node->length = aw * ah * 4u;
     s->node->capacity = bytes;
     s->node->mappable = 1;
     s->node->from_initrd = 0;
@@ -309,6 +367,21 @@ static int32_t wmdev_ioctl(vfs_node_t* node, uint32_t req, void* arg) {
             return 0;
         }
 
+        /* The client area and the buffer behind it, which stopped being
+         * the same thing in Milestone 42. A process that draws with
+         * `stride` survives a resize; one that assumes `w` shears. */
+        case WMIO_GETINFO: {
+            struct wm_info* i = (struct wm_info*)arg;
+            if (!i) return -EFAULT;
+            if (!s->pixels) return -EPIPE;   /* no window created yet */
+            i->w      = (uint32_t)s->w;
+            i->h      = (uint32_t)s->h;
+            i->stride = (uint32_t)s->alloc_w;
+            i->cap_h  = (uint32_t)s->alloc_h;
+            i->bytes  = (uint32_t)s->alloc_w * (uint32_t)s->alloc_h * 4u;
+            return 0;
+        }
+
         case WMIO_TITLE: {
             if (!s->win || !arg) return -EPIPE;
             kstrlcpy(s->win->title, (const char*)arg, WM_TITLE_MAX);
@@ -349,6 +422,7 @@ static vfs_node_t* wmdev_open(vfs_node_t* control) {
         slots[i].alloc = 0;
         slots[i].pixels = 0;
         slots[i].w = slots[i].h = 0;
+        slots[i].alloc_w = slots[i].alloc_h = 0;
         slots[i].last_w = slots[i].last_h = 0;
         slots[i].head = slots[i].tail = 0;
         return n;
