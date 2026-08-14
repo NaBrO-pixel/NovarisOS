@@ -1,52 +1,52 @@
 #include "kstring.h"
 
-void kmemcpy(void* dst, const void* src, uint32_t n) {
+void kmemcpy(void* dst, const void* src, size_t n) {
     uint8_t* d = (uint8_t*)dst;
     const uint8_t* s = (const uint8_t*)src;
-    for (uint32_t i = 0; i < n; i++) d[i] = s[i];
+    for (size_t i = 0; i < n; i++) d[i] = s[i];
 }
 
-void kmemmove(void* dst, const void* src, uint32_t n) {
+void kmemmove(void* dst, const void* src, size_t n) {
     uint8_t* d = (uint8_t*)dst;
     const uint8_t* s = (const uint8_t*)src;
     if (d == s || n == 0) return;
     if (d < s) {
-        for (uint32_t i = 0; i < n; i++) d[i] = s[i];
+        for (size_t i = 0; i < n; i++) d[i] = s[i];
     } else {
-        for (uint32_t i = n; i > 0; i--) d[i - 1] = s[i - 1];
+        for (size_t i = n; i > 0; i--) d[i - 1] = s[i - 1];
     }
 }
 
-void kmemset(void* dst, uint8_t value, uint32_t n) {
+void kmemset(void* dst, uint8_t value, size_t n) {
     uint8_t* d = (uint8_t*)dst;
-    for (uint32_t i = 0; i < n; i++) d[i] = value;
+    for (size_t i = 0; i < n; i++) d[i] = value;
 }
 
-int kmemcmp(const void* a, const void* b, uint32_t n) {
+int kmemcmp(const void* a, const void* b, size_t n) {
     const uint8_t* x = (const uint8_t*)a;
     const uint8_t* y = (const uint8_t*)b;
-    for (uint32_t i = 0; i < n; i++) {
+    for (size_t i = 0; i < n; i++) {
         if (x[i] != y[i]) return (int)x[i] - (int)y[i];
     }
     return 0;
 }
 
-void* kmemchr(const void* s, uint8_t c, uint32_t n) {
+void* kmemchr(const void* s, uint8_t c, size_t n) {
     const uint8_t* p = (const uint8_t*)s;
-    for (uint32_t i = 0; i < n; i++) {
+    for (size_t i = 0; i < n; i++) {
         if (p[i] == c) return (void*)(p + i);
     }
     return 0;
 }
 
-uint32_t kstrlen(const char* s) {
-    uint32_t n = 0;
+size_t kstrlen(const char* s) {
+    size_t n = 0;
     while (s[n]) n++;
     return n;
 }
 
-uint32_t kstrnlen(const char* s, uint32_t max) {
-    uint32_t n = 0;
+size_t kstrnlen(const char* s, size_t max) {
+    size_t n = 0;
     while (n < max && s[n]) n++;
     return n;
 }
@@ -56,16 +56,16 @@ int kstrcmp(const char* a, const char* b) {
     return (int)(uint8_t)*a - (int)(uint8_t)*b;
 }
 
-int kstrncmp(const char* a, const char* b, uint32_t n) {
-    for (uint32_t i = 0; i < n; i++) {
+int kstrncmp(const char* a, const char* b, size_t n) {
+    for (size_t i = 0; i < n; i++) {
         if (a[i] != b[i]) return (int)(uint8_t)a[i] - (int)(uint8_t)b[i];
         if (a[i] == '\0') return 0;
     }
     return 0;
 }
 
-int kstrncasecmp(const char* a, const char* b, uint32_t n) {
-    for (uint32_t i = 0; i < n; i++) {
+int kstrncasecmp(const char* a, const char* b, size_t n) {
+    for (size_t i = 0; i < n; i++) {
         char ca = a[i], cb = b[i];
         if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
         if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
@@ -90,9 +90,9 @@ char* kstrcpy(char* dst, const char* src) {
     return dst;
 }
 
-char* kstrlcpy(char* dst, const char* src, uint32_t size) {
+char* kstrlcpy(char* dst, const char* src, size_t size) {
     if (size == 0) return dst;
-    uint32_t i = 0;
+    size_t i = 0;
     for (; i + 1 < size && src[i]; i++) dst[i] = src[i];
     dst[i] = '\0';
     return dst;
