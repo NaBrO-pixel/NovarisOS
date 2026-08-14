@@ -6104,10 +6104,10 @@ on its own:
 1. ~~**Paging and the PMM**~~ - done in Milestone 45. `pmm64.c` and
    `paging64.c`, four levels, and the recursive-mapping trick reworked
    for a PML4.
-2. **The heap, kstring, and the drivers** - mostly portable C, but every
-   `uint32_t` that is really an address has to be found. Port I/O is
-   already known portable; `serial64.c` exists only because the real
-   serial driver pulls in the console and the framebuffer.
+2. **The heap, kstring, and the drivers** - the heap and kstring are done
+   in Milestone 46; **the drivers are not**. Port I/O is already known
+   portable; `serial64.c` exists only because the real serial driver
+   pulls in the console and the framebuffer, and that is still true.
 3. **Processes, the scheduler and ring 3** - `process_asm.s`,
    `scheduler_asm.s`, and a TSS that switches `rsp0` per task.
    `syscall`/`sysret` replaces `int 0x80`, which is why the GDT's user
@@ -6280,6 +6280,89 @@ the work. Item 4 remains the sting. Novaris implements *Linux's i386
 syscall ABI*, which is what lets real glibc and real Wine run unmodified;
 x86-64 Linux has different numbers, a different register convention and
 different structure layouts, and Milestones 19-31 get re-earned there.
+
+## Milestone 46 — 64-bit: a heap that stays fast, and one kstring ✅ DONE
+
+Milestone 44's item 2, minus the drivers. `make -f Makefile.amd64 test`
+checks 79 things now, up from 56.
+
+### The heap is a rewrite, not a port
+
+`kheap.c` keeps one singly-linked list of every block, used and free
+alike, and `kmalloc` walks it from the start. So an allocation costs the
+number of allocations before it, and N allocations cost N squared. That
+is not a theoretical objection - Milestone 43 measured Wine's syscall
+rate collapsing by twenty-one times partway through startup and traced
+it here. Porting that faithfully would have carried the bug to the
+architecture that is supposed to run a browser.
+
+`kheap64.c` keeps two structures instead:
+
+- blocks doubly linked in **address order**, which makes coalescing a
+  freed block with its neighbours O(1) rather than a rescan of the whole
+  heap (`kfree` in the 32-bit version walks the entire block list on
+  every single free);
+- free blocks additionally on a **free list**, which is the only thing
+  `kmalloc64` walks.
+
+The free-list pointers live in the payload of the free block itself, so
+they cost nothing in a block that is in use. That is the only reason the
+minimum allocation is 16 bytes.
+
+**The measurement, printed by the test rather than claimed here:**
+
+```
+NOVARIS64: walk = 1000 steps for 1000 allocations (quadratic would be ~500000)
+NOVARIS64: heap = 0 used / 200704 mapped, 1 free blocks
+```
+
+One step per allocation. And the second line is the coalescing result:
+after a thousand allocations and frees plus a 128KB allocation that grew
+the heap, the whole thing collapses back to **a single free block** with
+nothing in use. No fragmentation left at all.
+
+Coalescing is checked from outside rather than taken on trust - the test
+allocates three adjacent blocks, asserts the exact 96-byte layout that
+makes them adjacent (32-byte header, 64-byte payload), frees them in a
+deliberately awkward order (middle, first, last), and requires the free
+list to return to the length it had before. Falsified, as usual, before
+being believed: with the two merge lines removed from `kfree64`, that
+assertion fails and the free-block count goes from 1 to **1006**.
+
+There is no console in the 64-bit tree, so heap exhaustion returns NULL
+and shows in the counters rather than printing. The 32-bit version prints
+a warning here, and that dependency on `console.c`/the framebuffer is
+one of the things that made it non-portable.
+
+### kstring is now shared, not forked
+
+`kstring.c` compiles for both architectures and is in both builds. The
+only change it needed: size parameters became `size_t` instead of
+`uint32_t`. On i386 those are the same type, so the 32-bit build is
+byte-for-byte unaffected in behaviour; on x86-64 a `uint32_t` length
+would have silently capped every copy in the kernel at 4GB.
+
+`kdiv64`/`kdiv_hi_lo` were the part expected to be i386-only, and are
+not: they wrap a 32-bit `divl`, which is perfectly legal in long mode.
+They are pointless there - x86-64 divides 64-bit values natively, and
+they only exist because a freestanding i386 kernel cannot call libgcc's
+`__udivmoddi4` - but they still have to be *correct* if they are going
+to be compiled, so the test checks one division.
+
+**Verified no regression on the 32-bit side**, since `kstring.c` is used
+tree-wide: a clean `make` produces zero warnings and zero errors under
+`-Wall -Wextra`, `make test` passes (64 filesystem checks, 52 window
+manager checks, 0 failures), and `make test-qemu` passes all 17
+transcript assertions.
+
+### What is left of Milestone 44's list
+
+Items 3, 4 and 5, and they are the large ones: processes/scheduler/ring
+3, the syscall ABI, and PE32+. The heap and kstring were the portable-C
+part of the port; everything remaining is architecture-specific by
+nature. Item 4 is still the sting - Novaris implements Linux's *i386*
+syscall ABI, which is exactly what lets real glibc and real Wine run
+unmodified, and none of that transfers to x86-64.
 
 ## The state of the tree, as found
 

@@ -15,27 +15,31 @@
  * synthesize calls to those four names, and having our own definitions
  * collide with the compiler's assumptions about them is a subtle trap. */
 
-void  kmemcpy(void* dst, const void* src, uint32_t n);
-void  kmemmove(void* dst, const void* src, uint32_t n);
-void  kmemset(void* dst, uint8_t value, uint32_t n);
-int   kmemcmp(const void* a, const void* b, uint32_t n);
-void* kmemchr(const void* s, uint8_t c, uint32_t n);
+/* Sizes are size_t, not uint32_t, so that one implementation serves both
+ * architectures. On i386 the two are the same type, so nothing about the
+ * 32-bit build changes; on x86-64 a uint32_t length would silently cap
+ * every copy in the kernel at 4GB. */
+void  kmemcpy(void* dst, const void* src, size_t n);
+void  kmemmove(void* dst, const void* src, size_t n);
+void  kmemset(void* dst, uint8_t value, size_t n);
+int   kmemcmp(const void* a, const void* b, size_t n);
+void* kmemchr(const void* s, uint8_t c, size_t n);
 
-uint32_t kstrlen(const char* s);
-uint32_t kstrnlen(const char* s, uint32_t max);
+size_t kstrlen(const char* s);
+size_t kstrnlen(const char* s, size_t max);
 int   kstrcmp(const char* a, const char* b);
-int   kstrncmp(const char* a, const char* b, uint32_t n);
+int   kstrncmp(const char* a, const char* b, size_t n);
 /* Case-insensitive, ASCII only. Milestone 39: HTTP header names are
  * case-insensitive by specification, and a server that answers
  * "content-length" in lower case is not a server that is wrong. */
-int   kstrncasecmp(const char* a, const char* b, uint32_t n);
+int   kstrncasecmp(const char* a, const char* b, size_t n);
 /* ASCII case-insensitive - Win32 module and export lookups are
  * case-insensitive, and import tables spell DLL names every which way
  * ("KERNEL32.dll", "kernel32.DLL", ...). */
 int   kstricmp(const char* a, const char* b);
 char* kstrcpy(char* dst, const char* src);
 /* Bounded copy that always NUL-terminates (unlike strncpy). Returns dst. */
-char* kstrlcpy(char* dst, const char* src, uint32_t size);
+char* kstrlcpy(char* dst, const char* src, size_t size);
 char* kstrcat(char* dst, const char* src);
 char* kstrchr(const char* s, char c);
 char* kstrrchr(const char* s, char c);

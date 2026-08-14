@@ -27,6 +27,8 @@
 #include "multiboot.h"
 #include "pmm64.h"
 #include "paging64.h"
+#include "kheap64.h"
+#include "kstring.h"
 
 static int failures = 0;
 
@@ -351,6 +353,152 @@ void kernel_main(uint32_t magic, void* mbi) {
         serial64_puts("NOVARIS64: tables  = ");
         serial64_putdec(paging64_tables_allocated());
         serial64_puts(" allocated\n");
+    }
+
+    /* --- layer 7: the kernel heap ----------------------------------- */
+    serial64_puts("NOVARIS64: -- heap --\n");
+    {
+        const uint64_t PATTERN = 0xA5A5A5A5DEADBEEFULL;
+        uint8_t *a, *b, *p1, *p2, *p3;
+        uint64_t used, total, blocks_before, blocks_after, dbl;
+
+        kheap64_init();
+
+        a = (uint8_t*)kmalloc64(64);
+        check("kmalloc returned memory", a != 0);
+        check("and it is 16-byte aligned", ((uint64_t)a % KHEAP64_ALIGN) == 0);
+
+        *(volatile uint64_t*)a = PATTERN;
+        check("the allocation is writable and reads back",
+              *(volatile uint64_t*)a == PATTERN);
+
+        b = (uint8_t*)kmalloc64(64);
+        check("a second allocation succeeded", b != 0);
+        check("the two do not overlap", b >= a + 64 || a >= b + 64);
+        /* 32 bytes of header + a 64-byte payload: the next block starts
+         * 96 bytes on. Asserting the exact layout is what makes the
+         * coalescing test below mean anything. */
+        check("blocks are laid out end to end", b == a + 96);
+
+        kheap64_stats(&used, &total);
+        check("stats report memory in use", used > 0);
+        check("stats report at least the initial heap mapped",
+              total >= KHEAP64_INITIAL - PAGE64_SIZE);
+
+        kfree64(a);
+        kfree64(b);
+
+        dbl = kheap64_double_frees();
+        kfree64(a);
+        check("a double free was counted, not obeyed",
+              kheap64_double_frees() == dbl + 1);
+
+        /* Coalescing, observed rather than asserted by the allocator
+         * about itself: three adjacent blocks freed have to collapse back
+         * into the block they were carved from, leaving the free list
+         * exactly as long as it was before. An allocator that only marks
+         * blocks unused would leave three more. */
+        blocks_before = kheap64_free_blocks();
+        p1 = (uint8_t*)kmalloc64(64);
+        p2 = (uint8_t*)kmalloc64(64);
+        p3 = (uint8_t*)kmalloc64(64);
+        check("three consecutive blocks are adjacent",
+              p2 == p1 + 96 && p3 == p2 + 96);
+        kfree64(p2);
+        kfree64(p1);
+        kfree64(p3);
+        blocks_after = kheap64_free_blocks();
+        check("freeing them merged them back into one block",
+              blocks_after == blocks_before);
+
+        /* Bigger than the initial heap, so the growth path runs. */
+        {
+            uint8_t* big = (uint8_t*)kmalloc64(128 * 1024);
+            check("an allocation larger than the heap grew it", big != 0);
+            if (big) {
+                big[0] = 1;
+                big[128 * 1024 - 1] = 2;
+                check("the far end of a grown allocation is mapped",
+                      big[0] == 1 && big[128 * 1024 - 1] == 2);
+                kfree64(big);
+            }
+        }
+
+        /* The point of the rewrite. kheap.c walks every block, used or
+         * free, so N allocations cost N^2/2 steps - 500,000 at N=1000.
+         * Walking only the free list makes it linear. The bound below is
+         * deliberately loose; what it rules out is the quadratic term. */
+        {
+            const uint64_t N = 1000;
+            uint64_t steps0, calls0, steps1, calls1;
+            void** ptrs = (void**)kmalloc64(N * sizeof(void*));
+
+            check("room for the pointer array", ptrs != 0);
+            if (ptrs) {
+                kheap64_walk_stats(&steps0, &calls0);
+                for (uint64_t i = 0; i < N; i++) ptrs[i] = kmalloc64(32);
+                kheap64_walk_stats(&steps1, &calls1);
+
+                check("every allocation in the run succeeded",
+                      ptrs[0] != 0 && ptrs[N - 1] != 0);
+                check("the run made N calls", calls1 - calls0 == N);
+                check("the allocator is linear, not quadratic",
+                      steps1 - steps0 < N * 8);
+
+                serial64_puts("NOVARIS64: walk    = ");
+                serial64_putdec(steps1 - steps0);
+                serial64_puts(" steps for ");
+                serial64_putdec(N);
+                serial64_puts(" allocations (quadratic would be ~");
+                serial64_putdec(N * N / 2);
+                serial64_puts(")\n");
+
+                for (uint64_t i = 0; i < N; i++) kfree64(ptrs[i]);
+                kfree64(ptrs);
+            }
+        }
+
+        kheap64_stats(&used, &total);
+        serial64_puts("NOVARIS64: heap    = ");
+        serial64_putdec(used);
+        serial64_puts(" used / ");
+        serial64_putdec(total);
+        serial64_puts(" mapped, ");
+        serial64_putdec(kheap64_free_blocks());
+        serial64_puts(" free blocks\n");
+    }
+
+    /* --- layer 8: kstring, on a 64-bit target ----------------------- */
+    /* kstring.c is now shared with the 32-bit tree rather than forked:
+     * its size parameters became size_t, which is the same type on i386
+     * and the right one here. These check that the shared file behaves on
+     * this target - kstrlen in particular now returns size_t. */
+    serial64_puts("NOVARIS64: -- kstring --\n");
+    {
+        char buf[64];
+        const char* src = "novaris";
+
+        check("kstrlen counts", kstrlen(src) == 7);
+        check("kstrlen returns a 64-bit size_t here",
+              sizeof(kstrlen(src)) == 8);
+
+        kmemset(buf, 0, sizeof(buf));
+        kmemcpy(buf, src, 8);
+        check("kmemcpy copied", kstrcmp(buf, "novaris") == 0);
+        check("kmemcmp agrees", kmemcmp(buf, src, 8) == 0);
+
+        kstrlcpy(buf, "truncate me", 6);
+        check("kstrlcpy bounds and terminates",
+              kstrcmp(buf, "trunc") == 0);
+
+        /* kdiv64 uses a 32-bit DIV, which is legal in long mode. It is
+         * only needed on i386, where a 64-bit divide would call libgcc,
+         * but it has to still be correct if it is going to be compiled. */
+        {
+            uint32_t rem = 0;
+            uint64_t q = kdiv64(1000000007ULL, 1000U, &rem);
+            check("kdiv64 divides", q == 1000000ULL && rem == 7U);
+        }
     }
 
     /* --- verdict ---------------------------------------------------- */
