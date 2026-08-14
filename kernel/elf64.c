@@ -56,10 +56,11 @@ static inline void* window(uint64_t phys) {
 }
 
 int elf64_load(const void* image, uint64_t size, vmspace64_t* space,
-               uint64_t* entry_out) {
+               elf64_info_t* out) {
     const uint8_t* base = (const uint8_t*)image;
     const elf64_ehdr_t* eh = (const elf64_ehdr_t*)image;
     uint64_t saved_cr3;
+    uint64_t phdr_va = 0, brk_start = 0;
     int i, rc = ELF64_OK;
 
     pages_mapped = 0;
@@ -90,6 +91,18 @@ int elf64_load(const void* image, uint64_t size, vmspace64_t* space,
         if (ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
         if (ph->p_offset + ph->p_filesz > size) { rc = ELF64_TRUNCATED; break; }
         if (ph->p_filesz > ph->p_memsz)         { rc = ELF64_TRUNCATED; break; }
+
+        /* The program headers are mapped wherever the segment that
+         * contains them in the file was mapped. Worked out rather than
+         * assumed to be load_base + e_phoff, which is only true because
+         * ld happens to put the first segment at file offset 0. */
+        if (!phdr_va &&
+            eh->e_phoff >= ph->p_offset &&
+            eh->e_phoff < ph->p_offset + ph->p_filesz)
+            phdr_va = ph->p_vaddr + (eh->e_phoff - ph->p_offset);
+
+        if (ph->p_vaddr + ph->p_memsz > brk_start)
+            brk_start = ph->p_vaddr + ph->p_memsz;
 
         start = ph->p_vaddr & ~(PAGE64_SIZE - 1);
         end   = (ph->p_vaddr + ph->p_memsz + PAGE64_SIZE - 1)
@@ -144,6 +157,13 @@ int elf64_load(const void* image, uint64_t size, vmspace64_t* space,
 
     __asm__ __volatile__("mov %0, %%cr3" :: "r"(saved_cr3) : "memory");
 
-    if (rc == ELF64_OK && entry_out) *entry_out = eh->e_entry;
+    if (rc == ELF64_OK && out) {
+        out->entry     = eh->e_entry;
+        out->phdr_va   = phdr_va;
+        out->phent     = eh->e_phentsize;
+        out->phnum     = eh->e_phnum;
+        out->brk_start = (brk_start + PAGE64_SIZE - 1)
+                         & ~(PAGE64_SIZE - 1);
+    }
     return rc;
 }

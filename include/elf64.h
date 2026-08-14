@@ -21,14 +21,26 @@
 #define ELF64_NOMEM       -6
 #define ELF64_MAP_FAILED  -7
 
+/* What the loader learned, and what a Linux process needs told to it on
+ * its initial stack. AT_PHDR in particular is not optional for glibc: it
+ * walks its own program headers at startup to find PT_TLS and PT_GNU_RELRO,
+ * so it has to be told where they were mapped. */
+typedef struct {
+    uint64_t entry;      /* e_entry                                  */
+    uint64_t phdr_va;    /* where the program headers landed, AT_PHDR */
+    uint64_t phent;      /* AT_PHENT                                  */
+    uint64_t phnum;      /* AT_PHNUM                                  */
+    uint64_t brk_start;  /* first page past the last segment          */
+} elf64_info_t;
+
 /* Loads every PT_LOAD segment of `image` into `space`, allocating and
- * mapping frames as it goes, and writes the entry point to entry_out.
+ * mapping frames as it goes.
  *
  * The frames it allocates are owned by the caller from here: vmspace64
  * frees a space's page tables but deliberately not the pages they point
  * at, since it cannot know what they are. */
 int elf64_load(const void* image, uint64_t size, vmspace64_t* space,
-               uint64_t* entry_out);
+               elf64_info_t* out);
 
 /* How many pages the last successful load mapped - reported so a test
  * can check that a segment with a .bss actually got more memory than the

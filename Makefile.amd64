@@ -28,8 +28,14 @@ ISO       = novaris64.iso
 #   onto the same stack without knowing about it, so leaving this on
 #   corrupts a leaf function's locals at the worst possible moment - and
 #   only sometimes, which is the kind of bug that costs a week.
-# SSE is deliberately *not* disabled: boot64.s enables it, and gcc will
-#   emit xmm register moves for ordinary struct assignments on this target.
+# -mno-sse -mno-mmx: the kernel must not touch xmm at all, which is why
+#   Linux builds itself the same way. Linux's syscall ABI preserves every
+#   register except rax, rcx and r11 - xmm included - and glibc's string
+#   and memory routines keep live data there across a syscall. A kernel
+#   compiled with SSE lets gcc emit an xmm move for something as ordinary
+#   as a struct assignment, which would corrupt the caller's registers
+#   occasionally and unreproducibly. boot64.s still enables CR4.OSFXSR,
+#   because ring 3 very much does use SSE.
 # -MMD -MP: emit a .d file per object listing the headers it included, and
 #   give each header a phony rule so deleting one does not break the build.
 #   Without this, editing a header rebuilds nothing - the object files only
@@ -39,6 +45,7 @@ ISO       = novaris64.iso
 #   that the change had never been compiled.
 CFLAGS = -std=gnu99 -ffreestanding -fno-builtin -fno-stack-protector \
          -fno-pic -fno-pie -m64 -mcmodel=kernel -mno-red-zone \
+         -mno-sse -mno-mmx \
          -Wall -Wextra -O2 -Iinclude -MMD -MP
 
 # -w+error=label-orphan turns "label alone on a line" into an error. NASM
@@ -61,7 +68,9 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/vmspace64.o \
        $(BUILD_DIR)/sched64.o \
        $(BUILD_DIR)/elf64.o \
+       $(BUILD_DIR)/uspace64.o \
        $(BUILD_DIR)/hello64_blob.o \
+       $(BUILD_DIR)/glibc64_blob.o \
        $(BUILD_DIR)/kheap64.o \
        $(BUILD_DIR)/kstring.o \
        $(BUILD_DIR)/kmain64.o
@@ -97,6 +106,24 @@ $(BUILD_DIR)/hello64_blob.c: $(BUILD_DIR)/hello64.elf userland/embed64.py
 	python3 userland/embed64.py $< $@ hello64_elf
 
 $(BUILD_DIR)/hello64_blob.o: $(BUILD_DIR)/hello64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# The same idea one step harder: a C program linked against real glibc,
+# built by the host compiler with no Novaris involvement at all. Getting
+# this to run means implementing what glibc's startup demands, which is
+# a great deal more than three syscalls.
+#
+# -static because there is no dynamic loader here yet, and no filesystem
+# for it to read a .so from.
+$(BUILD_DIR)/hello_glibc64.elf: userland/hello_glibc64.c | $(BUILD_DIR)
+	gcc -static -O2 -o $@ $<
+	@file $@ | grep -q "statically linked" \
+	    || (echo "ERROR: $@ is not static"; false)
+
+$(BUILD_DIR)/glibc64_blob.c: $(BUILD_DIR)/hello_glibc64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ glibc64_elf
+
+$(BUILD_DIR)/glibc64_blob.o: $(BUILD_DIR)/glibc64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/%.o: kernel/%.c | $(BUILD_DIR)
@@ -148,6 +175,20 @@ test: iso
 	@[ "`cat $(BUILD_DIR)/hello64.host.status`" = "42" ] \
 	    || (echo "FAIL: the host run did not exit 42 either"; exit 1)
 	@echo "PASS: the same ELF prints the same bytes, and exits 42, on both"
+	@# The same differential for the glibc binary, which is the stronger
+	@# of the two: its output is produced by printf, through stdio,
+	@# after glibc's startup has set up TLS, read the auxv and
+	@# initialised malloc. Every line matching means all of that agreed.
+	@./$(BUILD_DIR)/hello_glibc64.elf > $(BUILD_DIR)/glibc64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/glibc64.host.status
+	@while read -r line; do \
+	    grep -qF "$$line" $(BUILD_DIR)/serial.log \
+	        || { echo "FAIL: guest never printed: $$line"; exit 1; }; \
+	done < $(BUILD_DIR)/glibc64.host.txt
+	@[ "`cat $(BUILD_DIR)/glibc64.host.status`" = "7" ] \
+	    || (echo "FAIL: the host run of the glibc binary did not exit 7"; \
+	        exit 1)
+	@echo "PASS: real glibc prints the same bytes, and exits 7, on both"
 
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR) $(ISO)

@@ -13,6 +13,7 @@
 #include "syscall64.h"
 #include "gdt64.h"
 #include "serial64.h"
+#include "uspace64.h"
 
 #define IA32_EFER   0xC0000080u
 #define IA32_STAR   0xC0000081u
@@ -72,10 +73,48 @@ static uint64_t bytes_written;
 
 uint64_t syscall64_bytes_written(void) { return bytes_written; }
 
-/* Called from syscall64_entry. The arguments have already been shifted
- * from Linux's (rdi, rsi, rdx) into this function's own. */
-uint64_t syscall64_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
-                            uint64_t a3) {
+/* The number of the last call that had no implementation, and how many
+ * there were. Discovering what a real program needs is done by running
+ * it and reading these, since this kernel has no strace. */
+static uint64_t unimpl_count, last_unimpl;
+
+uint64_t syscall64_unimplemented(void) { return last_unimpl; }
+uint64_t syscall64_unimplemented_count(void) { return unimpl_count; }
+
+/* Off by default: it prints on every call, so leaving it on would bury
+ * the program's own output in the transcript the tests match against. */
+static int trace;
+
+void syscall64_set_trace(int on) { trace = on; }
+
+static uint64_t dispatch(syscall64_args_t* args);
+
+uint64_t syscall64_dispatch(syscall64_args_t* args) {
+    uint64_t r;
+
+    if (!trace) return dispatch(args);
+
+    serial64_puts("NOVARIS64: [call] ");
+    serial64_putdec(args->nr);
+    serial64_puts("(");
+    serial64_puthex(args->a1);
+    serial64_puts(", ");
+    serial64_puthex(args->a2);
+    serial64_puts(", ");
+    serial64_puthex(args->a3);
+    serial64_puts(")");
+    r = dispatch(args);
+    serial64_puts(" = ");
+    serial64_puthex(r);
+    serial64_putc('\n');
+    return r;
+}
+
+/* Called from syscall64_entry with a pointer to the pushed arguments. */
+static uint64_t dispatch(syscall64_args_t* args) {
+    uint64_t nr = args->nr;
+    uint64_t a1 = args->a1, a2 = args->a2, a3 = args->a3;
+
     call_count++;
     switch (nr) {
     case SYS64_WRITE: {
@@ -95,6 +134,102 @@ uint64_t syscall64_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
         bytes_written += n;
         return n;
     }
+    /* writev(fd, iov, iovcnt) - glibc's stdio uses this rather than
+     * write() as soon as it has a buffer to flush. */
+    case SYS64_WRITEV: {
+        const struct { const char* base; uint64_t len; }* iov =
+            (const void*)a2;
+        uint64_t total = 0;
+        if (a1 != 1 && a1 != 2) return (uint64_t)-9;   /* -EBADF */
+        for (uint64_t i = 0; i < a3; i++) {
+            for (uint64_t j = 0; j < iov[i].len; j++)
+                serial64_putc(iov[i].base[j]);
+            total += iov[i].len;
+        }
+        bytes_written += total;
+        return total;
+    }
+
+    case SYS64_BRK:
+        return uspace64_brk(a1);
+
+    case SYS64_MMAP:
+        /* Only anonymous mappings. A file mapping would need a
+         * filesystem, which the 64-bit tree does not have. */
+        if (!(args->a4 & 0x20)) return (uint64_t)-19;  /* MAP_ANONYMOUS */
+        return uspace64_mmap(a1, a2, a3, args->a4);
+
+    case SYS64_MUNMAP:
+        return uspace64_munmap(a1, a2);
+
+    case SYS64_MPROTECT:
+        /* Accepted and ignored. Every mapping this kernel makes is
+         * already readable and writable by the process that owns it, so
+         * the only thing an honest implementation would add here is
+         * *removing* permissions - and nothing yet depends on that. */
+        return 0;
+
+    /* arch_prctl(ARCH_SET_FS, addr) is how a thread pointer is set on
+     * x86-64, and glibc does it before it can touch a single piece of
+     * thread-local storage - errno included. Nothing works before this. */
+    case SYS64_ARCH_PRCTL:
+        switch (a1) {
+        case 0x1002:                                   /* ARCH_SET_FS */
+            write_msr(0xC0000100u, a2);
+            return 0;
+        case 0x1001:                                   /* ARCH_SET_GS */
+            write_msr(0xC0000101u, a2);
+            return 0;
+        default:
+            return (uint64_t)-22;                      /* -EINVAL */
+        }
+
+    case SYS64_SET_TID_ADDRESS:
+        return 1;                                      /* the only tid */
+
+    case SYS64_SET_ROBUST_LIST:
+        return 0;
+
+    case SYS64_IOCTL:
+        /* glibc asks whether fd 1 is a terminal to choose line
+         * buffering. -ENOTTY makes it a fully buffered stream, which is
+         * correct here: this is a serial port, not a tty. */
+        return (uint64_t)-25;
+
+    case SYS64_FSTAT: {
+        /* Only the fields glibc's stdio reads: it wants st_mode to
+         * decide the stream type and st_blksize to size the buffer. */
+        uint8_t* st = (uint8_t*)a2;
+        for (int i = 0; i < 144; i++) st[i] = 0;
+        *(uint32_t*)(st + 24) = 0020620u;  /* st_mode: S_IFCHR | 0620 */
+        *(uint64_t*)(st + 56) = 1024;      /* st_blksize                */
+        return 0;
+    }
+
+    case SYS64_GETRANDOM: {
+        /* Not random. It is deterministic and it is documented as such,
+         * because a kernel with no entropy source that pretends
+         * otherwise is worse than one that says so. glibc uses this for
+         * the stack guard, which this makes predictable. */
+        uint8_t* buf = (uint8_t*)a1;
+        static uint64_t seed = 0x2545F4914F6CDD1DULL;
+        for (uint64_t i = 0; i < a2; i++) {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+            buf[i] = (uint8_t)seed;
+        }
+        return a2;
+    }
+
+    case SYS64_RT_SIGACTION:
+    case SYS64_RT_SIGPROCMASK:
+        /* Accepted so that startup proceeds; no signal is ever
+         * delivered, so agreeing to a handler costs nothing and lying
+         * about it costs nothing yet either. */
+        return 0;
+
+    case SYS64_READ:
+        return 0;                                      /* end of file */
+
     case SYS64_ECHO:
         last_arg = a1;
         return a1 + 0x1111;
@@ -103,6 +238,13 @@ uint64_t syscall64_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
         exit_code = a1;
         return a1;
     default:
+        /* Said out loud, because there is no strace here and the only
+         * way to find out what a real program wants is to let it ask. */
+        unimpl_count++;
+        last_unimpl = nr;
+        serial64_puts("NOVARIS64: [enosys] syscall ");
+        serial64_putdec(nr);
+        serial64_putc('\n');
         /* Linux answers an unimplemented call with -ENOSYS, and programs
          * do check for it, so this is -38 rather than -1. */
         return (uint64_t)-38;
