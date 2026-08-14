@@ -14,6 +14,7 @@
 #include "gdt64.h"
 #include "serial64.h"
 #include "uspace64.h"
+#include "win32_64.h"
 
 #define IA32_EFER   0xC0000080u
 #define IA32_STAR   0xC0000081u
@@ -116,6 +117,18 @@ static uint64_t dispatch(syscall64_args_t* args) {
     uint64_t a1 = args->a1, a2 = args->a2, a3 = args->a3;
 
     call_count++;
+
+    /* A Win32 import, arriving through one of pe64.c's thunks. Checked
+     * before the switch because the range is contiguous and has nothing
+     * to do with Linux's numbering. */
+    if (nr >= WIN32_64_BASE && nr <= WIN32_64_EXIT) {
+        if (nr == WIN32_64_EXIT) {
+            exit_code = a1;
+            return a1;
+        }
+        return win32_64_call(nr, a1, a2, a3, args->a4);
+    }
+
     switch (nr) {
     case SYS64_WRITE: {
         /* write(fd, buf, count). `buf` is a ring-3 pointer, and it is

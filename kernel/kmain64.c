@@ -34,6 +34,8 @@
 #include "sched64.h"
 #include "elf64.h"
 #include "uspace64.h"
+#include "pe64.h"
+#include "win32_64.h"
 
 static int failures = 0;
 
@@ -83,6 +85,8 @@ extern const unsigned char hello64_elf[];
 extern const unsigned long hello64_elf_len;
 extern const unsigned char glibc64_elf[];
 extern const unsigned long glibc64_elf_len;
+extern const unsigned char pe64_exe[];
+extern const unsigned long pe64_exe_len;
 
 /* isr64.s - a load that is allowed to fault, and where to resume if it does. */
 extern uint64_t probe_read64(const void* addr);
@@ -1030,6 +1034,89 @@ void kernel_main(uint32_t magic, void* mbi) {
         serial64_putdec(uspace64_pages_allocated());
         serial64_puts(", enosys ");
         serial64_putdec(syscall64_unimplemented_count() - enosys_before);
+        serial64_putc('\n');
+    }
+
+    /* --- layer 16: a 64-bit Windows executable ---------------------- */
+    /* The format chrome.exe is in. Built by mingw, importing from
+     * kernel32, linked at a Windows image base, and never told what it
+     * would run on - the same relationship the glibc binary above has
+     * with Linux. */
+    serial64_puts("NOVARIS64: -- a 64-bit Windows PE --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 8;
+        vmspace64_t kspace, space;
+        pe64_info_t info;
+        uint64_t rsp, i;
+        uint64_t written_before = win32_64_bytes_written();
+        int rc, stack_ok = 1;
+
+        vmspace64_kernel_space(&kspace);
+        check("a space for the PE", vmspace64_create(&space) != 0);
+
+        rc = pe64_load(pe64_exe, pe64_exe_len, &space, &info);
+        check("the PE32+ loaded", rc == PE64_OK);
+        /* mingw links at 0x140000000, the default for a 64-bit image,
+         * and this one carries no relocations - so it has to go exactly
+         * there or its absolute addresses are wrong. */
+        check("at the image base it asked for",
+              info.image_base == 0x140000000ULL);
+        check("its entry point is inside the image",
+              info.entry > info.image_base &&
+              info.entry < info.image_base + info.image_size);
+        check("all three kernel32 imports were bound", info.imports == 3);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+
+        /* Entered as though it had been called: the Windows ABI expects
+         * rsp to be 8 past a 16-byte boundary at a function's first
+         * instruction, because a return address is sitting there. Get
+         * this wrong and the first `movaps` in the program faults on an
+         * alignment it was entitled to assume. */
+        rsp = STACK_TOP - 8;
+        check("the stack pointer is where a call would leave it",
+              (rsp % 16) == 8);
+
+        serial64_puts("NOVARIS64: base    = ");
+        serial64_puthex(info.image_base);
+        serial64_puts("\nNOVARIS64: entry   = ");
+        serial64_puthex(info.entry);
+        serial64_puts("\nNOVARIS64: imports = ");
+        serial64_putdec(info.imports);
+        serial64_puts(", relocs ");
+        serial64_putdec(info.relocs);
+        serial64_puts(", pages ");
+        serial64_putdec(info.pages);
+        serial64_puts("\nNOVARIS64: --- its output follows ---\n");
+
+        pf_diagnose = 1;
+        vmspace64_switch(&space);
+        enter_user_mode64(info.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+        pf_diagnose = 0;
+
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        /* Reaching WriteFile at all means the import thunk shuffled the
+         * Windows argument registers into the kernel's and came back. */
+        check("it wrote through WriteFile",
+              win32_64_bytes_written() > written_before);
+        check("and ExitProcess ended it with its own status, 3",
+              syscall64_exit_code() == 3);
+
+        serial64_puts("NOVARIS64: wrote   = ");
+        serial64_putdec(win32_64_bytes_written() - written_before);
+        serial64_puts(" bytes, exit ");
+        serial64_putdec(syscall64_exit_code());
         serial64_putc('\n');
     }
 

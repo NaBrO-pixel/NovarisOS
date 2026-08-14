@@ -69,6 +69,9 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/sched64.o \
        $(BUILD_DIR)/elf64.o \
        $(BUILD_DIR)/uspace64.o \
+       $(BUILD_DIR)/pe64.o \
+       $(BUILD_DIR)/win32_64.o \
+       $(BUILD_DIR)/pe64_blob.o \
        $(BUILD_DIR)/hello64_blob.o \
        $(BUILD_DIR)/glibc64_blob.o \
        $(BUILD_DIR)/kheap64.o \
@@ -124,6 +127,24 @@ $(BUILD_DIR)/glibc64_blob.c: $(BUILD_DIR)/hello_glibc64.elf userland/embed64.py
 	python3 userland/embed64.py $< $@ glibc64_elf
 
 $(BUILD_DIR)/glibc64_blob.o: $(BUILD_DIR)/glibc64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# A real 64-bit Windows executable - the format chrome.exe is in. Built
+# by mingw, importing from kernel32, linked at a Windows image base, and
+# with no idea Novaris exists.
+#
+# -nostdlib and its own entry point: mingw's CRT startup wants far more
+# of Win32 than exists here, and what is being tested is the loader and
+# the calling convention rather than the CRT.
+$(BUILD_DIR)/hello_pe64.exe: userland/hello_pe64.c | $(BUILD_DIR)
+	x86_64-w64-mingw32-gcc -nostdlib -O2 -Wl,-e,entry -o $@ $< -lkernel32
+	@file $@ | grep -q "PE32+" \
+	    || (echo "ERROR: $@ is not a PE32+ image"; false)
+
+$(BUILD_DIR)/pe64_blob.c: $(BUILD_DIR)/hello_pe64.exe userland/embed64.py
+	python3 userland/embed64.py $< $@ pe64_exe
+
+$(BUILD_DIR)/pe64_blob.o: $(BUILD_DIR)/pe64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/%.o: kernel/%.c | $(BUILD_DIR)
