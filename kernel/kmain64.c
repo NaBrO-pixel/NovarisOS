@@ -30,6 +30,7 @@
 #include "kheap64.h"
 #include "kstring.h"
 #include "syscall64.h"
+#include "vmspace64.h"
 
 static int failures = 0;
 
@@ -625,6 +626,133 @@ void kernel_main(uint32_t magic, void* mbi) {
 
         paging64_unmap(UCODE_VA);
         paging64_unmap(USTACK_VA);
+        pmm64_free_frame(code_frame);
+        pmm64_free_frame(stack_frame);
+    }
+
+    /* --- layer 11: two address spaces ------------------------------- */
+    serial64_puts("NOVARIS64: -- address spaces --\n");
+    {
+        /* PML4 slot 192: the low half, so it belongs to the space rather
+         * than to the kernel, which is the whole point of the test. */
+        const uint64_t VA = 0x0000600000000000ULL;
+        const uint64_t VAL_A = 0xAAAAAAAA11111111ULL;
+        const uint64_t VAL_B = 0xBBBBBBBB22222222ULL;
+        vmspace64_t kspace, warm, a, b;
+        uint64_t fa, fb, free_before, free_after, got;
+
+        vmspace64_kernel_space(&kspace);
+
+        /* One space created and destroyed before the frames are counted.
+         * The first create maps a scratch page, and the kernel-half page
+         * tables that produces are permanent and shared - counting from
+         * before them would look like a leak that is not one. */
+        if (vmspace64_create(&warm)) vmspace64_destroy(&warm);
+        free_before = pmm64_free_frames();
+
+        check("space A was created", vmspace64_create(&a) != 0);
+        check("space B was created", vmspace64_create(&b) != 0);
+        check("they are distinct spaces", a.pml4_phys != b.pml4_phys);
+        check("and neither is the kernel's",
+              a.pml4_phys != kspace.pml4_phys &&
+              b.pml4_phys != kspace.pml4_phys);
+
+        fa = pmm64_alloc_frame();
+        fb = pmm64_alloc_frame();
+        check("a frame for each", fa != 0 && fb != 0 && fa != fb);
+
+        check("one address mapped in A",
+              vmspace64_map(&a, VA, fa, PAGE64_PRESENT | PAGE64_WRITE)
+              == PAGING64_OK);
+        check("the same address mapped in B, to a different frame",
+              vmspace64_map(&b, VA, fb, PAGE64_PRESENT | PAGE64_WRITE)
+              == PAGING64_OK);
+
+        /* The actual question: does one address mean two different things
+         * depending on which space is loaded. */
+        vmspace64_switch(&a);
+        *(volatile uint64_t*)VA = VAL_A;
+        vmspace64_switch(&b);
+        *(volatile uint64_t*)VA = VAL_B;
+        check("B reads back its own value", *(volatile uint64_t*)VA == VAL_B);
+        vmspace64_switch(&a);
+        check("A still reads its own, at the very same address",
+              *(volatile uint64_t*)VA == VAL_A);
+
+        vmspace64_switch(&kspace);
+        check("and the address means nothing in the kernel's space",
+              paging64_translate(VA, &got) == PAGING64_NOT_MAPPED);
+
+        /* The kernel survived three CR3 loads, which it only can because
+         * its half of every space is the same half. */
+        {
+            void* p = kmalloc64(64);
+            check("the kernel still works after switching back", p != 0);
+            kfree64(p);
+        }
+
+        vmspace64_destroy(&a);
+        vmspace64_destroy(&b);
+        pmm64_free_frame(fa);
+        pmm64_free_frame(fb);
+
+        free_after = pmm64_free_frames();
+        check("destroying both spaces gave every frame back",
+              free_after == free_before);
+
+        serial64_puts("NOVARIS64: frames  = ");
+        serial64_putdec(free_before);
+        serial64_puts(" free before, ");
+        serial64_putdec(free_after);
+        serial64_puts(" after\n");
+    }
+
+    /* --- layer 12: a ring-3 program in its own address space -------- */
+    /* Layers 10 and 11 separately: ring 3 works, and spaces isolate.
+     * This is both at once, which is what a process actually is - user
+     * pages that exist only in its own low half, kernel reachable from
+     * inside it because the high half is shared. */
+    serial64_puts("NOVARIS64: -- a program in its own space --\n");
+    {
+        const uint64_t UCODE_VA  = 0x0000700000000000ULL;
+        const uint64_t USTACK_VA = 0x0000700000010000ULL;
+        vmspace64_t kspace, proc;
+        uint64_t code_frame, stack_frame, code_len, got;
+        uint64_t calls_before = syscall64_count();
+
+        vmspace64_kernel_space(&kspace);
+        code_len = (uint64_t)(user_test_code_end - user_test_code);
+
+        check("a space for the program", vmspace64_create(&proc) != 0);
+        code_frame  = pmm64_alloc_frame();
+        stack_frame = pmm64_alloc_frame();
+        check("frames for it", code_frame != 0 && stack_frame != 0);
+
+        kmemcpy((void*)(0xFFFFFFFF80000000ULL + code_frame),
+                user_test_code, code_len);
+
+        check("its code mapped into its own space",
+              vmspace64_map(&proc, UCODE_VA, code_frame,
+                            PAGE64_PRESENT | PAGE64_USER) == PAGING64_OK);
+        check("its stack too",
+              vmspace64_map(&proc, USTACK_VA, stack_frame,
+                            PAGE64_PRESENT | PAGE64_WRITE | PAGE64_USER)
+              == PAGING64_OK);
+
+        /* Nothing of the program is visible from the kernel's space. */
+        check("none of it is mapped in the kernel's space",
+              paging64_translate(UCODE_VA, &got) == PAGING64_NOT_MAPPED);
+
+        vmspace64_switch(&proc);
+        enter_user_mode64(UCODE_VA, USTACK_VA + PAGE64_SIZE);
+        vmspace64_switch(&kspace);
+
+        check("it ran and exited", syscall64_count() == calls_before + 2);
+        check("it ran at ring 3", syscall64_last_arg() == 0x23);
+        check("and the syscall found the kernel from inside its space",
+              syscall64_exit_code() == 0x23 + 0x1111);
+
+        vmspace64_destroy(&proc);
         pmm64_free_frame(code_frame);
         pmm64_free_frame(stack_frame);
     }
