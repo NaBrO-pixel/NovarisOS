@@ -43,6 +43,11 @@ typedef void (*isr64_handler_t)(registers64_t*);
 
 void idt64_install(void);
 
+/* Unmask (masked = 0) or mask (masked = 1) one IRQ line. idt64_install
+ * leaves every line masked, because a line with no handler behind it can
+ * only produce an interrupt nobody is prepared to service. */
+void idt64_irq_set_mask(int irq, int masked);
+
 /* Same contract as the 32-bit register_interrupt_handler: vectors 0-31 are
  * CPU exceptions, 32-47 the remapped IRQs. */
 void register_interrupt_handler64(uint8_t n, isr64_handler_t handler);

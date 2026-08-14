@@ -44,6 +44,8 @@ LDFLAGS = -m elf_x86_64 -T linker64.ld -nostdlib -z max-page-size=0x1000 -z noex
 
 OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/isr64.o \
+       $(BUILD_DIR)/syscall64_asm.o \
+       $(BUILD_DIR)/syscall64.o \
        $(BUILD_DIR)/gdt64.o \
        $(BUILD_DIR)/idt64.o \
        $(BUILD_DIR)/serial64.o \
@@ -64,6 +66,10 @@ $(BUILD_DIR)/boot64.o: boot/boot64.s | $(BUILD_DIR)
 	$(AS) $(ASFLAGS) $< -o $@
 
 $(BUILD_DIR)/isr64.o: kernel/isr64.s | $(BUILD_DIR)
+	$(AS) $(ASFLAGS) $< -o $@
+
+# Named _asm so it does not collide with syscall64.c's object file.
+$(BUILD_DIR)/syscall64_asm.o: kernel/syscall64.s | $(BUILD_DIR)
 	$(AS) $(ASFLAGS) $< -o $@
 
 $(BUILD_DIR)/%.o: kernel/%.c | $(BUILD_DIR)
