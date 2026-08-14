@@ -30,9 +30,16 @@ ISO       = novaris64.iso
 #   only sometimes, which is the kind of bug that costs a week.
 # SSE is deliberately *not* disabled: boot64.s enables it, and gcc will
 #   emit xmm register moves for ordinary struct assignments on this target.
+# -MMD -MP: emit a .d file per object listing the headers it included, and
+#   give each header a phony rule so deleting one does not break the build.
+#   Without this, editing a header rebuilds nothing - the object files only
+#   depend on their .c. That is not a hypothetical: a syscall number was
+#   changed in include/syscall64.h during Milestone 50 to check that the
+#   test would catch it, the test passed, and the reason it passed was
+#   that the change had never been compiled.
 CFLAGS = -std=gnu99 -ffreestanding -fno-builtin -fno-stack-protector \
          -fno-pic -fno-pie -m64 -mcmodel=kernel -mno-red-zone \
-         -Wall -Wextra -O2 -Iinclude
+         -Wall -Wextra -O2 -Iinclude -MMD -MP
 
 # -w+error=label-orphan turns "label alone on a line" into an error. NASM
 # accepts an unrecognised mnemonic as a label definition, so a 64-bit
@@ -53,6 +60,8 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/paging64.o \
        $(BUILD_DIR)/vmspace64.o \
        $(BUILD_DIR)/sched64.o \
+       $(BUILD_DIR)/elf64.o \
+       $(BUILD_DIR)/hello64_blob.o \
        $(BUILD_DIR)/kheap64.o \
        $(BUILD_DIR)/kstring.o \
        $(BUILD_DIR)/kmain64.o
@@ -73,6 +82,22 @@ $(BUILD_DIR)/isr64.o: kernel/isr64.s | $(BUILD_DIR)
 # Named _asm so it does not collide with syscall64.c's object file.
 $(BUILD_DIR)/syscall64_asm.o: kernel/syscall64.s | $(BUILD_DIR)
 	$(AS) $(ASFLAGS) $< -o $@
+
+# A real static x86-64 Linux executable, built by the host toolchain and
+# embedded in the kernel image. There is no filesystem in the 64-bit tree
+# yet, so this is how a program gets in; the ELF itself is ordinary and
+# knows nothing about Novaris.
+$(BUILD_DIR)/hello64.elf: userland/hello64.s | $(BUILD_DIR)
+	$(AS) -f elf64 $< -o $(BUILD_DIR)/hello64.o
+	$(LD) -m elf_x86_64 -o $@ $(BUILD_DIR)/hello64.o
+	@file $@ | grep -q "ELF 64-bit" \
+	    || (echo "ERROR: $@ is not a 64-bit ELF"; false)
+
+$(BUILD_DIR)/hello64_blob.c: $(BUILD_DIR)/hello64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ hello64_elf
+
+$(BUILD_DIR)/hello64_blob.o: $(BUILD_DIR)/hello64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/%.o: kernel/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -110,6 +135,23 @@ test: iso
 	@if grep -q "FAIL" $(BUILD_DIR)/serial.log; then \
 	    echo "FAIL: the machine is not in the state it should be"; exit 1; fi
 	@echo "PASS: 64-bit long mode, higher half, multiboot handoff intact"
+	@# The differential. userland/hello64.s is an ordinary static Linux
+	@# executable, so the host can run the very same file the guest just
+	@# ran. Checking the two agree is a much stronger statement than
+	@# checking the guest printed something: it says this kernel
+	@# implements Linux's ABI, rather than something shaped like it.
+	@./$(BUILD_DIR)/hello64.elf > $(BUILD_DIR)/hello64.host.txt 2>/dev/null; \
+	    echo $$? > $(BUILD_DIR)/hello64.host.status
+	@grep -qFf $(BUILD_DIR)/hello64.host.txt $(BUILD_DIR)/serial.log \
+	    || (echo "FAIL: the guest did not print what the host prints"; \
+	        exit 1)
+	@[ "`cat $(BUILD_DIR)/hello64.host.status`" = "42" ] \
+	    || (echo "FAIL: the host run did not exit 42 either"; exit 1)
+	@echo "PASS: the same ELF prints the same bytes, and exits 42, on both"
 
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR) $(ISO)
+
+# The dependency files -MMD wrote. The dash matters on a clean tree, where
+# none of them exist yet.
+-include $(OBJS:.o=.d)

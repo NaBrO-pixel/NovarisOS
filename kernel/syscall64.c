@@ -12,6 +12,7 @@
 
 #include "syscall64.h"
 #include "gdt64.h"
+#include "serial64.h"
 
 #define IA32_EFER   0xC0000080u
 #define IA32_STAR   0xC0000081u
@@ -67,18 +68,44 @@ void syscall64_init(void) {
     write_msr(IA32_FMASK, (1ULL << 9) | (1ULL << 10) | (1ULL << 8));
 }
 
-/* Called from syscall64_entry with the number and one argument. */
-uint64_t syscall64_dispatch(uint64_t nr, uint64_t arg1) {
+static uint64_t bytes_written;
+
+uint64_t syscall64_bytes_written(void) { return bytes_written; }
+
+/* Called from syscall64_entry. The arguments have already been shifted
+ * from Linux's (rdi, rsi, rdx) into this function's own. */
+uint64_t syscall64_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
+                            uint64_t a3) {
     call_count++;
     switch (nr) {
+    case SYS64_WRITE: {
+        /* write(fd, buf, count). `buf` is a ring-3 pointer, and it is
+         * dereferenced directly because the kernel is running in the
+         * caller's address space - the high half is shared, so a syscall
+         * never had to leave the space it was called from.
+         *
+         * It is also completely unchecked, which is the honest state of
+         * this ABI: a real implementation validates that the range is
+         * mapped and belongs to the caller before touching it, and does
+         * so without racing the caller. Nothing here does that yet. */
+        const char* buf = (const char*)a2;
+        uint64_t n = a3;
+        if (a1 != 1 && a1 != 2) return (uint64_t)-1;   /* stdout/stderr */
+        for (uint64_t i = 0; i < n; i++) serial64_putc(buf[i]);
+        bytes_written += n;
+        return n;
+    }
     case SYS64_ECHO:
-        last_arg = arg1;
-        return arg1 + 0x1111;
+        last_arg = a1;
+        return a1 + 0x1111;
     case SYS64_EXIT:
-        exit_code = arg1;
-        return arg1;
+    case SYS64_EXIT_GROUP:
+        exit_code = a1;
+        return a1;
     default:
-        return (uint64_t)-1;
+        /* Linux answers an unimplemented call with -ENOSYS, and programs
+         * do check for it, so this is -38 rather than -1. */
+        return (uint64_t)-38;
     }
 }
 
