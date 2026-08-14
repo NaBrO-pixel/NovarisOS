@@ -6116,10 +6116,11 @@ on its own:
    already *is* the saved context. What is still missing is a per-task
    kernel stack, which is what a task that blocks inside a syscall
    needs; see Milestone 49.
-4. **The syscall ABI** - *started* in Milestone 50, which gets a real
-   static Linux x86-64 executable running: `write`, `exit`, `exit_group`
-   and the register convention, checked differentially against the host.
-   Three calls out of ~350, and no glibc. Still not a port but a rewrite.
+4. **The syscall ABI** - Milestones 50-51. A real static Linux x86-64
+   executable runs (50), and then **real glibc** runs (51): `printf`
+   through stdio, `malloc`, TLS via `arch_prctl`, the auxiliary vector,
+   all byte-identical to the same binary on the host. Around twenty
+   calls of ~350, and no threads, no signals, no filesystem.
    Novaris implements *Linux's i386 syscall ABI*, which is what lets real
    glibc and real Wine run unmodified. x86-64 Linux has different syscall
    numbers, a different register convention, and different structure
@@ -6710,6 +6711,108 @@ base, `brk` or `mmap`, `set_tid_address`, `rseq`, `readlink` on
 `/proc/self/exe`, `getrandom` for the stack guard, and an `auxv` on the
 initial stack that nothing here constructs yet. That, and not the three
 above, is the shape of the remaining work in item 4.
+
+## Milestone 51 — 64-bit: real glibc runs ✅ DONE
+
+132 assertions and a third PASS line. `userland/hello_glibc64.c` is an
+ordinary C program - `printf`, `malloc`, `strcpy` - compiled by the host
+with `gcc -static -O2` and never told what it would run on:
+
+```
+NOVARIS64: --- its output follows ---
+hello from glibc on Novaris
+malloc ok, 1..10 sums to 55
+NOVARIS64: --- end of its output ---
+NOVARIS64: wrote   = 56 bytes, exit 7, pages 34, enosys 3
+```
+
+Byte-identical to the same file run on Linux, exit status included, and
+`make -f Makefile.amd64 test` now checks that line by line rather than
+taking it on trust.
+
+The difference between this and Milestone 50 is the whole point.
+`hello64.s` issues three syscalls by hand. This one goes through glibc's
+startup first: it sets up thread-local storage, reads its own program
+headers out of the auxiliary vector, initialises malloc, and builds a
+buffered stdio stream. glibc was compiled long before Novaris existed and
+none of those steps are negotiable.
+
+### The bug that mattered
+
+Linux's syscall ABI preserves **every** register except `rax`, `rcx` and
+`r11`. The C dispatcher is under no such obligation - SysV lets it
+destroy `rdi`, `rsi`, `rdx`, `r8`, `r9` and `r10` - so the entry stub has
+to put them back. The first version did not.
+
+What that looks like from the outside is worth recording, because it
+points nowhere near the cause: the *first* syscall returns a correct
+value, and the **second** one arrives with a nonsense number and a kernel
+address for an argument.
+
+```
+[call] 12(0x0, 0xc, 0x1f) = 0x4ac000          <- brk(0), correct
+[call] 2149396368(0x4acd40, 0xffffffff801d2f90, ...)  <- registers gone
+```
+
+The program had been resumed with its registers quietly rearranged and
+ran off into nonsense; the syscall layer was simply the first place that
+became visible.
+
+### Two more, found the same way
+
+**A silent hang with nothing on the serial port.** The first glibc
+attempt produced no output and no fault message at all. The cause was the
+page-fault handler left over from Milestone 45's tests, which resumes
+execution at a *kernel* recovery address - from CPL 3 that faults
+immediately, forever, and never escalates to anything that prints.
+There is now a `pf_diagnose` mode that reports `cr2`, `rip`, the error
+code and `cs` and halts, which is what turned the hang into
+`cr2=0xdb8 rip=0x403fd7 err=6` and then into a one-line disassembly of
+`__libc_setup_tls`.
+
+**The kernel was compiled with SSE.** Linux builds itself `-mno-sse`
+precisely because its syscall ABI preserves xmm registers and glibc's
+string and memory routines keep live data in them across a call. A kernel
+that lets gcc emit an xmm move for an ordinary struct assignment corrupts
+its caller occasionally and unreproducibly. `CFLAGS` now carries
+`-mno-sse -mno-mmx`, and `objdump -d build64/novaris64.bin | grep -c xmm`
+is 0. `boot64.s` still enables CR4.OSFXSR, because ring 3 does use SSE.
+
+### What glibc actually asked for
+
+Discovered by running it, since there is no strace here -
+`syscall64_set_trace(1)` prints every call and its result, and that is
+how the list below was found rather than guessed:
+
+`brk` (four times), `arch_prctl(ARCH_SET_FS)`, `set_tid_address`,
+`set_robust_list`, `getrandom`, `mprotect` (for RELRO), `fstat` on fd 1,
+`ioctl` (the `TCGETS` that asks whether stdout is a terminal),
+`writev`/`write`, `exit_group`.
+
+Three calls answer `-ENOSYS` and glibc carries on regardless: `rseq`
+(334), `prlimit64` (302) and `readlinkat` (267). That is not an
+accident - they are all optional paths with fallbacks, and answering
+-ENOSYS rather than something plausible is what lets glibc take them.
+
+Two of the implementations are deliberately dishonest and say so in the
+source: `getrandom` is a deterministic PRNG, because a kernel with no
+entropy source that pretends otherwise is worse than one that admits it
+(it makes glibc's stack guard predictable), and `mprotect` accepts
+everything and does nothing, since nothing yet depends on *removing*
+permissions.
+
+`write` and `writev` dereference ring-3 pointers **entirely unchecked**.
+A real implementation validates that the range is mapped and belongs to
+the caller, without racing the caller. That is the largest known hole in
+this ABI.
+
+### How far this is from Wine
+
+Still no threads (`clone`), no signal *delivery*, no filesystem, no
+`mmap` of a file, no dynamic loader. Wine needs all of them. But the
+thing Milestone 44 called the sting - that none of the 32-bit tree's ABI
+work transfers - now has its first counter-example: the mechanism is
+real, and a real libc runs on it.
 
 ## The state of the tree, as found
 

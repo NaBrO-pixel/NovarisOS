@@ -76,25 +76,51 @@ syscall64_entry:
 
     push rcx                        ; user rip, destroyed by SYSCALL
     push r11                        ; user rflags, likewise
-    push rax                        ; the number, for the exit check below
 
-    ; Linux passes the number in rax and the arguments in rdi, rsi, rdx,
-    ; r10, r8, r9. The SysV convention this C is compiled for wants them
-    ; in rdi, rsi, rdx, rcx - so everything shifts along by one, and the
-    ; moves have to run in this order for each source to be read before
-    ; it is overwritten. rcx is free to be a destination only because it
-    ; was pushed above; it arrived holding the return rip.
-    mov rcx, rdx                    ; arg3
-    mov rdx, rsi                    ; arg2
-    mov rsi, rdi                    ; arg1
-    mov rdi, rax                    ; number
+    ; Keeps rsp 16-byte aligned at the `call` below, which the SysV ABI
+    ; requires and which anything using xmm registers will enforce the
+    ; hard way. Two pushes above plus seven below is an odd number of
+    ; quadwords, so one of them has to be made up somewhere.
+    sub rsp, 8
+
+    ; A syscall64_args_t, built in reverse so the fields end up in
+    ; declaration order with `nr` at the lowest address. Linux's
+    ; arguments are rdi, rsi, rdx, r10, r8, r9 - note r10 and not rcx,
+    ; because SYSCALL destroys rcx.
+    push r9
+    push r8
+    push r10
+    push rdx
+    push rsi
+    push rdi
+    push rax
+
+    mov rdi, rsp
     call syscall64_dispatch         ; result in rax
 
-    pop rcx                         ; the number again
+    mov rcx, [rsp]                  ; the number, for the exit check
     cmp rcx, SYS64_EXIT
     je .leave_ring3
     cmp rcx, SYS64_EXIT_GROUP
     je .leave_ring3
+
+    ; Linux's syscall ABI preserves *every* register except rax, rcx and
+    ; r11. The C above is under no such obligation - SysV lets it destroy
+    ; rdi, rsi, rdx, r8, r9 and r10 - so they are restored here from the
+    ; same slots they were pushed into.
+    ;
+    ; This is not a detail. Without it the first syscall returns into a
+    ; program whose registers have been quietly rearranged, and what that
+    ; looks like from outside is the *second* syscall arriving with a
+    ; nonsense number and a kernel address for an argument.
+    add rsp, 8                      ; skip the saved rax: the result is in it
+    pop rdi
+    pop rsi
+    pop rdx
+    pop r10
+    pop r8
+    pop r9
+    add rsp, 8                      ; the alignment padding
 
     pop r11
     pop rcx
