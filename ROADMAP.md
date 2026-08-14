@@ -6101,8 +6101,9 @@ Everything else, and it is most of the kernel: roughly 40,000 lines and
 six more assembly files. In dependency order, each of these milestone-sized
 on its own:
 
-1. **Paging and the PMM** - `paging.c` is two-level; long mode is four,
-   and the recursive-mapping trick it uses needs reworking for a PML4.
+1. ~~**Paging and the PMM**~~ - done in Milestone 45. `pmm64.c` and
+   `paging64.c`, four levels, and the recursive-mapping trick reworked
+   for a PML4.
 2. **The heap, kstring, and the drivers** - mostly portable C, but every
    `uint32_t` that is really an address has to be found. Port I/O is
    already known portable; `serial64.c` exists only because the real
@@ -6122,6 +6123,163 @@ on its own:
 Item 4 is the honest sting in this milestone. The 32-bit tree's ability to
 run unmodified Linux binaries came from implementing one specific ABI very
 carefully across a dozen milestones, and none of that work transfers.
+
+## Milestone 45 — 64-bit: frames, four levels, and what Chrome actually needs ✅ DONE
+
+Two things, one on each side of the gap: the next layer of the 64-bit
+kernel, and a measurement of how far the *other* end of the problem
+really is.
+
+### The kernel half
+
+`pmm64.c` and `paging64.c`, both booted and asserted rather than read.
+`make -f Makefile.amd64 test` now checks 56 things about the machine, up
+from 23, and the new 33 are the interesting ones.
+
+(Milestone 44 above says the test asserts 19 things. It prints 23, and
+did before this milestone touched it - counted from the serial log of a
+pristine Milestone 44 build, `599643e` on origin/main. The 19 was
+already wrong, and is left standing there rather than quietly edited,
+since the count in *this* section is the one now checked against the
+log. Worth knowing while comparing hashes: local `main` is `e399a85`
+and origin/main is `599643e`, and `git diff` between them is empty -
+same tree, rewritten history.)
+
+**The frame allocator places its bitmap instead of declaring it.** The
+32-bit `pmm.c` sizes a bitmap for a full 4GB address space at compile
+time - 128KB of `.bss` - and stops worrying. That does not survive the
+port: a 64-bit machine can hold more RAM than that bitmap describes, and
+sizing statically for the architectural maximum means one bit per 4KB
+frame across 2^52 frames, which is half a petabyte of bitmap. So the
+bitmap is sized from the memory map at run time and placed immediately
+above the kernel image, inside the one gigabyte `boot64.s` maps at
+KERNEL_VMA. Init checks that it fits there rather than assuming it, and
+reports itself not ready if it would not.
+
+The arithmetic is checkable from the test's own output, which is why it
+prints: 32736 frames for QEMU's default 128MB, 32455 of them free. The
+281-frame difference is 256 (the first megabyte, never handed out) + 24
+(the 96KB kernel image) + 1 (the bitmap). If any of the three reserve
+passes were wrong that sum stops working.
+
+**Four levels, and the recursive map reworked.** With PML4 slot 510
+pointing at the PML4 itself, a hardware walk spends one of its four steps
+going round the self-reference, so it ends one level early - at a page
+table rather than a data page. Repeat the slot twice and it ends at a
+page directory, three times a PDPT, four times the PML4. That gives every
+table an address without needing a physical-to-virtual mapping to already
+exist, which matters more here than it did at 32 bits: a newly allocated
+page table can sit anywhere the frame allocator chooses, including above
+the gigabyte `boot64.s` mapped, and the recursive address reaches it
+anyway. A new table is installed into its parent *first* and zeroed
+through that address second, because it has no address until the parent
+entry exists.
+
+Slot 510 is free because slot 0 is the boot identity map and 511 is the
+higher half; being >= 256 also makes every derived address canonical
+without further care.
+
+**What the paging test proves, as opposed to observes.** Mapping a page
+and reading back what you wrote to it passes even if the mapping is
+nonsense, so the test also reads the same physical frame through the
+KERNEL_VMA window and checks the bytes are there. Unmapping is checked by
+faulting on the address afterwards - reusing the probe/recover symbol
+pair from Milestone 44 - not by asking the code whether it thinks it
+unmapped something.
+
+The test was also falsified before being believed: with the kernel-image
+reserve pass removed, `no frame overlaps the kernel image` fails, and the
+machine then dies before the end of `kernel_main`, because a kernel that
+hands out its own frames corrupts itself. That is the failure that pass
+exists to prevent, and it is now known to be observable.
+
+**Deliberately not done: splitting huge pages.** The higher half is 2MB
+pages, and mapping a 4KB page into one needs the huge page broken up
+first. `paging64_map` returns `PAGING64_HUGE_IN_WAY` instead, and the
+test asserts it does. Refusing is honest; silently overwriting the entry
+would not be.
+
+**Deliberately not done: a second address space.** Recursive mapping
+edits the *current* one only. Editing another process's tables needs a
+temporary mapping or a second recursive slot, and that belongs to
+whichever milestone first has two address spaces - item 3 below.
+
+### The Chrome half, measured rather than guessed
+
+`tools/pe_imports.py` reads a PE (32- or 64-bit), lists every DLL and
+function it imports - the ordinary import table *and* the delay-load
+table, which is where Chrome keeps user32, gdi32 and the graphics stack -
+and answers, from Wine's own `.spec` files, which of them Wine can
+supply. It was checked against `objdump -p` on chrome.exe and agrees
+exactly on the static imports (231/5/3/2 across the four DLLs objdump
+sees).
+
+Getting a `chrome.exe` to point it at is four layers of nested archive,
+and worth writing down because none of it is guessable:
+
+```bash
+curl -L -o chrome64.exe \
+    https://dl.google.com/chrome/install/standalonesetup64.exe
+7z x chrome64.exe -oA        # -> updater.7z
+7z x A/updater.7z -oB        # -> bin/Offline/{...}/<ver>_chrome_installer.exe
+7z x B/.../<ver>_chrome_installer.exe -oC   # -> chrome.7z
+7z x C/chrome.7z -oD         # -> D/Chrome-bin/chrome.exe
+```
+
+The outer installer is a 32-bit `UpdaterSetup.exe`, which is why `file`
+says i386 on it and means nothing about the browser inside.
+
+Run against the real thing - Chrome 151.0.7922.138:
+
+| binary | DLLs | imported functions | no Wine export anywhere |
+|---|---|---|---|
+| `chrome.exe` | 16 (12 delay) | 360 | 2 |
+| `chrome.dll` | 67 (59 delay) | 1316 | 8 |
+
+**The headline is that Wine's Win32 coverage is not the blocker.** Of
+1316 functions `chrome.dll` imports, Wine has an export for all but 25,
+and 17 of those 25 are `chrome_elf.dll` - Chrome's own DLL, which ships
+inside the install and is not Wine's to provide. The genuine gaps are
+eight, all delay-loaded, all on optional paths:
+`AddConditionalAce` and `DeriveAppContainerSidFromAppContainerName`
+(the sandbox), `GetPointerDevice` (touch), `UiaDisconnectAllProviders`
+(accessibility), three `Ndf*` (network diagnostics), `PowerReadACValue`.
+
+Getting that number right took two corrections, both worth keeping:
+API-set names (`api-ms-win-core-synch-l1-2-0.dll` and friends) resolve
+through kernelbase/ntdll/combase rather than existing as DLLs, and a
+`.spec` line that is commented out (`# @ stub AddConditionalAce`) is not
+an export. Before the first fix the tool claimed 13 gaps in chrome.exe
+where there are 2.
+
+The tool also diffs against `tools/install_wine.sh`, since that file is
+the only place the ship list lives. Chrome needs **28 DLLs that Wine has
+and Novaris does not currently install** - mfplat, secur32, ncrypt,
+esent, hid, dbghelp, d3d9/11/12, dxgi, dwmapi, dcomp and the rest. That
+is a list of names, not a research problem.
+
+### What this changes about the plan
+
+Milestone 37 listed four things between here and a browser: 64-bit, a
+GPU, an NT sandbox, and more of Wine's DLLs. Two of those just got much
+better understood.
+
+- **Chrome is 64-bit only.** The question ROADMAP.md left open - whether
+  a 32-bit chrome.exe still exists to fall back on - is answered: the
+  shipping installer contains a PE32+ x86-64 `chrome.exe` and a 285MB
+  x86-64 `chrome.dll`. There is no 32-bit build. The port is not the
+  preferable path, it is the only one.
+- **The DLL count is the smallest of the four items, not a large one.**
+  It is 28 names in a shell variable, and the API surface behind them is
+  already implemented.
+
+Which leaves the architecture as the gate, exactly as Milestone 44 said,
+and sharpens why: items 2-5 of Milestone 44's own list - the heap and
+drivers, processes and ring 3, the syscall ABI, PE32+ - are still all of
+the work. Item 4 remains the sting. Novaris implements *Linux's i386
+syscall ABI*, which is what lets real glibc and real Wine run unmodified;
+x86-64 Linux has different numbers, a different register convention and
+different structure layouts, and Milestones 19-31 get re-earned there.
 
 ## The state of the tree, as found
 

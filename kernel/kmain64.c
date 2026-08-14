@@ -24,6 +24,9 @@
 #include "serial64.h"
 #include "gdt64.h"
 #include "idt64.h"
+#include "multiboot.h"
+#include "pmm64.h"
+#include "paging64.h"
 
 static int failures = 0;
 
@@ -60,6 +63,8 @@ static uint64_t read_cr2(void) {
 
 extern char _kernel_virtual_start[];
 extern char _kernel_virtual_end[];
+extern char _kernel_physical_start[];
+extern char _kernel_physical_end[];
 
 /* isr64.s - a load that is allowed to fault, and where to resume if it does. */
 extern uint64_t probe_read64(const void* addr);
@@ -189,6 +194,164 @@ void kernel_main(uint32_t magic, void* mbi) {
     serial64_puts("NOVARIS64: cr2     = "); serial64_puthex(pf_cr2);
     serial64_puts("\nNOVARIS64: pf err  = "); serial64_puthex(pf_err);
     serial64_putc('\n');
+
+    /* --- layer 5: physical frames ---------------------------------- */
+    serial64_puts("NOVARIS64: -- physical memory --\n");
+    {
+        uint64_t kphys_start = (uint64_t)_kernel_physical_start;
+        uint64_t kphys_end   = (uint64_t)_kernel_physical_end;
+        uint64_t total, free_before, f1, f2, free_after, dbl;
+
+        pmm64_init((const multiboot_info_t*)mbi, kphys_start, kphys_end);
+
+        check("the frame allocator came up", pmm64_ready());
+        total = pmm64_total_frames();
+        free_before = pmm64_free_frames();
+        check("RAM was found", total > 0);
+        check("some of it is free", free_before > 0);
+        check("not all of it is free", free_before < total);
+
+        f1 = pmm64_alloc_frame();
+        f2 = pmm64_alloc_frame();
+        check("a frame was allocated", f1 != 0);
+        check("a second frame was allocated", f2 != 0);
+        check("the two are different frames", f1 != f2);
+        check("frames are page aligned", (f1 % PMM64_FRAME_SIZE) == 0);
+        /* The first megabyte and the kernel's own image are the two things
+         * that must never be handed out; a bug in the reserve pass shows
+         * up here rather than as corruption three milestones later. */
+        check("no frame comes from the first megabyte", f1 >= 0x100000ULL);
+        check("no frame overlaps the kernel image",
+              f1 < kphys_start || f1 >= kphys_end);
+        check("no frame overlaps the frame bitmap",
+              f1 < pmm64_bitmap_phys() ||
+              f1 >= pmm64_bitmap_phys() + pmm64_bitmap_bytes());
+
+        check("allocating two frames used two frames",
+              pmm64_free_frames() == free_before - 2);
+        pmm64_free_frame(f1);
+        pmm64_free_frame(f2);
+        free_after = pmm64_free_frames();
+        check("freeing them gave both back", free_after == free_before);
+
+        /* Freeing twice is the one error this allocator is asked to
+         * notice rather than obey. */
+        dbl = pmm64_double_frees();
+        pmm64_free_frame(f1);
+        check("a double free was counted, not obeyed",
+              pmm64_double_frees() == dbl + 1);
+        check("and it did not change the free count",
+              pmm64_free_frames() == free_after);
+
+        serial64_puts("NOVARIS64: ram top = ");
+        serial64_puthex(pmm64_highest_addr());
+        serial64_puts("\nNOVARIS64: frames  = ");
+        serial64_putdec(total);
+        serial64_puts(" total, ");
+        serial64_putdec(free_before);
+        serial64_puts(" free\n");
+        serial64_puts("NOVARIS64: bitmap  = ");
+        serial64_puthex(pmm64_bitmap_phys());
+        serial64_puts(" .. +");
+        serial64_putdec(pmm64_bitmap_bytes());
+        serial64_puts(" bytes\n");
+    }
+
+    /* --- layer 6: four-level paging --------------------------------- */
+    serial64_puts("NOVARIS64: -- paging --\n");
+    {
+        /* PML4 slot 384. Not 256: that is the address layer 4 above
+         * relies on being unmapped, and mapping it here would quietly
+         * turn that page-fault test into a test of nothing. */
+        const uint64_t TEST_VA = 0xFFFFC00000000000ULL;
+        const uint64_t MAGIC   = 0x00C0FFEE5EA51DE5ULL;
+        uint64_t frame, got, tables_before;
+        volatile uint64_t* p;
+        int rc;
+
+        paging64_init();
+
+        /* The self-reference, read through itself: if the recursive
+         * address were wrong this load would fault rather than answer. */
+        {
+            uint64_t* pml4 = paging64_pml4();
+            check("the PML4 can be read through its own recursive slot",
+                  (pml4[510] & 1) != 0);
+            check("the higher half is still mapped in it",
+                  (pml4[511] & 1) != 0);
+            check("the recursive slot points at the PML4 itself",
+                  (pml4[510] & 0x000FFFFFFFFFF000ULL) ==
+                  (read_cr3() & 0x000FFFFFFFFFF000ULL));
+        }
+
+        tables_before = paging64_tables_allocated();
+        frame = pmm64_alloc_frame();
+        check("a frame to map was allocated", frame != 0);
+
+        rc = paging64_map(TEST_VA, frame, PAGE64_PRESENT | PAGE64_WRITE);
+        check("a fresh 4KB page mapped", rc == PAGING64_OK);
+        /* An empty PML4 slot needs a PDPT, a PD and a PT built under it. */
+        check("three intermediate tables were built",
+              paging64_tables_allocated() == tables_before + 3);
+
+        p = (volatile uint64_t*)TEST_VA;
+        *p = MAGIC;
+        check("the mapped page is writable and reads back",
+              *p == MAGIC);
+
+        rc = paging64_translate(TEST_VA, &got);
+        check("translate resolved the mapping", rc == PAGING64_OK);
+        check("and resolved it to the frame that was mapped", got == frame);
+
+        /* The strongest form of the same question: the bytes written
+         * through the new virtual address must be visible at that
+         * physical frame's other address. A mapping that merely does not
+         * fault would pass everything above and fail this. */
+        if (frame < 0x40000000ULL) {
+            volatile uint64_t* through_phys =
+                (volatile uint64_t*)(0xFFFFFFFF80000000ULL + frame);
+            check("the write landed in that physical frame",
+                  *through_phys == MAGIC);
+        }
+
+        check("an offset inside the page translates with its offset",
+              paging64_translate(TEST_VA + 0x123, &got) == PAGING64_OK &&
+              got == frame + 0x123);
+
+        /* The kernel's own text is inside a 2MB page boot64.s built.
+         * Refusing to map over it is the honest answer while splitting
+         * huge pages is unimplemented. */
+        check("mapping over a 2MB page is refused, not corrupted",
+              paging64_map(0xFFFFFFFF80000000ULL, frame,
+                           PAGE64_PRESENT | PAGE64_WRITE)
+              == PAGING64_HUGE_IN_WAY);
+
+        check("an unmapped address does not translate",
+              paging64_translate(0xFFFFC00000200000ULL, &got)
+              == PAGING64_NOT_MAPPED);
+
+        /* And unmapping must genuinely remove it - checked by faulting on
+         * it, using the same probe/recover pair as layer 4. */
+        rc = paging64_unmap(TEST_VA);
+        check("the page unmapped", rc == PAGING64_OK);
+        check("it no longer translates",
+              paging64_translate(TEST_VA, &got) == PAGING64_NOT_MAPPED);
+
+        pf_hits = 0;
+        pf_resume_rip = (uint64_t)&probe_read64_recover;
+        probe_read64((const void*)TEST_VA);
+        check("reading it now faults", pf_hits == 1);
+        check("and it faulted at that address", pf_cr2 == TEST_VA);
+
+        check("unmapping it twice is refused",
+              paging64_unmap(TEST_VA) == PAGING64_NOT_MAPPED);
+
+        pmm64_free_frame(frame);
+
+        serial64_puts("NOVARIS64: tables  = ");
+        serial64_putdec(paging64_tables_allocated());
+        serial64_puts(" allocated\n");
+    }
 
     /* --- verdict ---------------------------------------------------- */
     serial64_puts("NOVARIS64: failures = ");

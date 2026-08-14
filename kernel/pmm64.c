@@ -1,0 +1,198 @@
+/* pmm64.c - physical frames, on a machine whose addresses are 64 bits.
+ *
+ * The bitmap is placed rather than declared. boot64.s maps the first
+ * gigabyte of physical memory twice - once identity, once at KERNEL_VMA -
+ * so anything below 1GB physical is reachable at KERNEL_VMA + phys with no
+ * further work. The bitmap goes immediately above the kernel image, which
+ * is loaded at 1MB, so it lands inside that window with room to spare: even
+ * 64GB of RAM needs only a 2MB bitmap.
+ *
+ * That window is the one real constraint here, and init checks it rather
+ * than trusting it. If a machine ever turns up whose bitmap would not fit,
+ * the allocator reports itself not ready instead of writing over whatever
+ * happens to be at the far end of the window. */
+
+#include "pmm64.h"
+
+#define KERNEL_VMA        0xFFFFFFFF80000000ULL
+/* How much physical memory boot64.s maps at KERNEL_VMA. */
+#define BOOT_WINDOW_BYTES 0x40000000ULL          /* 1GB */
+
+static uint8_t* bitmap;                  /* through the KERNEL_VMA window */
+static uint64_t bitmap_phys_addr;
+static uint64_t bitmap_size_bytes;
+static uint64_t frame_count;             /* frames the bitmap describes */
+static uint64_t highest_addr;
+static uint64_t double_frees;
+static uint64_t alloc_hint;              /* where the last scan left off */
+static int      ready;
+
+static inline void bitmap_set(uint64_t bit) {
+    bitmap[bit >> 3] |= (uint8_t)(1u << (bit & 7));
+}
+static inline void bitmap_clear(uint64_t bit) {
+    bitmap[bit >> 3] &= (uint8_t)~(1u << (bit & 7));
+}
+static inline int bitmap_test(uint64_t bit) {
+    return bitmap[bit >> 3] & (uint8_t)(1u << (bit & 7));
+}
+
+static void mark_range(uint64_t start_frame, uint64_t count, int used) {
+    for (uint64_t i = 0; i < count; i++) {
+        uint64_t f = start_frame + i;
+        if (f >= frame_count) break;
+        if (used) bitmap_set(f); else bitmap_clear(f);
+    }
+}
+
+/* Walk the Multiboot memory map, calling back per AVAILABLE entry. Written
+ * once and used twice - to size the bitmap, then to fill it - because the
+ * two passes disagreeing about which entries are usable is exactly the kind
+ * of bug that hands out a frame of firmware. */
+typedef void (*mmap_fn)(uint64_t start, uint64_t end);
+
+static void for_each_available(const multiboot_info_t* mbi, mmap_fn fn) {
+    uint64_t addr, end;
+
+    if (!(mbi->flags & MULTIBOOT_INFO_MMAP)) {
+        /* No map. mem_lower/mem_upper are in KB and describe conventional
+         * and extended memory; it is a worse answer than the map but it is
+         * the same answer the 32-bit kernel falls back on. */
+        fn(0, (uint64_t)mbi->mem_lower * 1024ULL);
+        fn(0x100000ULL, 0x100000ULL + (uint64_t)mbi->mem_upper * 1024ULL);
+        return;
+    }
+
+    addr = mbi->mmap_addr;
+    end  = (uint64_t)mbi->mmap_addr + mbi->mmap_length;
+    while (addr < end) {
+        /* The mbi and its map are below 4GB and the identity mapping from
+         * boot64.s is still live, so a physical address is a valid pointer. */
+        const multiboot_mmap_entry_t* e = (const multiboot_mmap_entry_t*)addr;
+        if (e->type == MULTIBOOT_MEMORY_AVAILABLE && e->len > 0)
+            fn(e->addr, e->addr + e->len);
+        addr += e->size + sizeof(e->size);
+    }
+}
+
+/* Pass 1: how high does RAM go. */
+static void note_highest(uint64_t start, uint64_t end) {
+    (void)start;
+    if (end > highest_addr) highest_addr = end;
+}
+
+/* Pass 2: mark it free. */
+static void free_region(uint64_t start, uint64_t end) {
+    uint64_t sf = start / PMM64_FRAME_SIZE;
+    uint64_t ef = end / PMM64_FRAME_SIZE;      /* a partial tail frame is
+                                                * not a whole frame, so it
+                                                * stays marked used */
+    if (ef > sf) mark_range(sf, ef - sf, 0);
+}
+
+void pmm64_init(const multiboot_info_t* mbi,
+                uint64_t kernel_phys_start, uint64_t kernel_phys_end) {
+    uint64_t place;
+
+    ready = 0;
+    highest_addr = 0;
+    double_frees = 0;
+    alloc_hint = 0;
+
+    for_each_available(mbi, note_highest);
+    if (highest_addr == 0) return;
+
+    frame_count = (highest_addr + PMM64_FRAME_SIZE - 1) / PMM64_FRAME_SIZE;
+    bitmap_size_bytes = (frame_count + 7) / 8;
+
+    /* Immediately above the kernel, page aligned. */
+    place = (kernel_phys_end + PMM64_FRAME_SIZE - 1)
+            & ~(PMM64_FRAME_SIZE - 1);
+
+    if (place + bitmap_size_bytes > BOOT_WINDOW_BYTES) {
+        /* Would fall outside what boot64.s mapped. Refusing is the only
+         * safe answer: the write would land somewhere unmapped, or worse,
+         * somewhere mapped and in use. */
+        bitmap_phys_addr = 0;
+        return;
+    }
+
+    bitmap_phys_addr = place;
+    bitmap = (uint8_t*)(KERNEL_VMA + place);
+
+    /* Everything used, then free only what the bootloader vouched for.
+     * The reverse - assume free, mark the exceptions - hands out MMIO and
+     * firmware whenever the map has a hole nobody described. */
+    for (uint64_t i = 0; i < bitmap_size_bytes; i++) bitmap[i] = 0xFF;
+    for_each_available(mbi, free_region);
+
+    /* The first megabyte is never ours: real-mode IVT, BDA, VGA, and the
+     * BIOS areas live there whatever the map says. */
+    mark_range(0, 0x100000ULL / PMM64_FRAME_SIZE, 1);
+
+    pmm64_reserve_region(kernel_phys_start, kernel_phys_end);
+    pmm64_reserve_region(bitmap_phys_addr,
+                         bitmap_phys_addr + bitmap_size_bytes);
+
+    ready = 1;
+}
+
+void pmm64_reserve_region(uint64_t start_addr, uint64_t end_addr) {
+    uint64_t sf = start_addr / PMM64_FRAME_SIZE;
+    uint64_t ef = (end_addr + PMM64_FRAME_SIZE - 1) / PMM64_FRAME_SIZE;
+    if (ef > sf) mark_range(sf, ef - sf, 1);
+}
+
+uint64_t pmm64_alloc_frame(void) {
+    if (!ready) return 0;
+
+    /* Two sweeps from a rolling hint rather than one from zero. The 32-bit
+     * allocator restarts at frame 0 every time, which is O(frames) per
+     * call and turned into a measurable cost once something allocated in
+     * bulk - see the kmalloc note in Milestone 43. */
+    for (int pass = 0; pass < 2; pass++) {
+        uint64_t start = pass == 0 ? alloc_hint : 0;
+        uint64_t stop  = pass == 0 ? frame_count : alloc_hint;
+        for (uint64_t f = start; f < stop; f++) {
+            if (!bitmap_test(f)) {
+                bitmap_set(f);
+                alloc_hint = f + 1;
+                return f * PMM64_FRAME_SIZE;
+            }
+        }
+    }
+    return 0;
+}
+
+void pmm64_free_frame(uint64_t phys) {
+    uint64_t f = phys / PMM64_FRAME_SIZE;
+    if (!ready || f >= frame_count) return;
+
+    /* Freeing something already free is the bug this allocator cannot
+     * survive quietly: if the frame was handed out in between, two owners
+     * now share it and the damage surfaces somewhere else entirely. Count
+     * it rather than clearing the bit a second time. */
+    if (!bitmap_test(f)) { double_frees++; return; }
+    bitmap_clear(f);
+    if (f < alloc_hint) alloc_hint = f;
+}
+
+uint64_t pmm64_total_frames(void) { return ready ? frame_count : 0; }
+
+uint64_t pmm64_free_frames(void) {
+    uint64_t n = 0;
+    if (!ready) return 0;
+    for (uint64_t f = 0; f < frame_count; f++)
+        if (!bitmap_test(f)) n++;
+    return n;
+}
+
+uint64_t pmm64_used_frames(void) {
+    return pmm64_total_frames() - pmm64_free_frames();
+}
+
+uint64_t pmm64_double_frees(void) { return double_frees; }
+uint64_t pmm64_highest_addr(void) { return highest_addr; }
+uint64_t pmm64_bitmap_phys(void)  { return bitmap_phys_addr; }
+uint64_t pmm64_bitmap_bytes(void) { return bitmap_size_bytes; }
+int      pmm64_ready(void)        { return ready; }

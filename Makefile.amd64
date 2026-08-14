@@ -47,6 +47,8 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/gdt64.o \
        $(BUILD_DIR)/idt64.o \
        $(BUILD_DIR)/serial64.o \
+       $(BUILD_DIR)/pmm64.o \
+       $(BUILD_DIR)/paging64.o \
        $(BUILD_DIR)/kmain64.o
 
 .PHONY: all iso run test clean
