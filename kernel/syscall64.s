@@ -21,7 +21,11 @@ UDATA_SEL equ 0x18
 UCODE_SEL equ 0x20
 RPL3      equ 3
 
-SYS64_EXIT equ 1
+; Linux x86-64 numbers. Both of these leave ring 3 rather than returning
+; to it, so both are checked below.
+SYS64_EXIT       equ 60
+SYS64_EXIT_GROUP equ 231
+SYS64_ECHO       equ 0x1000
 
 section .text
 
@@ -74,14 +78,22 @@ syscall64_entry:
     push r11                        ; user rflags, likewise
     push rax                        ; the number, for the exit check below
 
-    ; syscall64_dispatch(nr /*rdi*/, arg1 /*rsi*/). The incoming values
-    ; are the other way round, so they cross over.
-    mov rsi, rdi
-    mov rdi, rax
+    ; Linux passes the number in rax and the arguments in rdi, rsi, rdx,
+    ; r10, r8, r9. The SysV convention this C is compiled for wants them
+    ; in rdi, rsi, rdx, rcx - so everything shifts along by one, and the
+    ; moves have to run in this order for each source to be read before
+    ; it is overwritten. rcx is free to be a destination only because it
+    ; was pushed above; it arrived holding the return rip.
+    mov rcx, rdx                    ; arg3
+    mov rdx, rsi                    ; arg2
+    mov rsi, rdi                    ; arg1
+    mov rdi, rax                    ; number
     call syscall64_dispatch         ; result in rax
 
     pop rcx                         ; the number again
     cmp rcx, SYS64_EXIT
+    je .leave_ring3
+    cmp rcx, SYS64_EXIT_GROUP
     je .leave_ring3
 
     pop r11
@@ -115,11 +127,11 @@ syscall64_entry:
 global user_test_code
 global user_test_code_end
 user_test_code:
-    mov rax, 2                      ; SYS64_ECHO
+    mov rax, SYS64_ECHO
     mov rdi, cs                     ; 0x23 if this is really ring 3
     syscall                         ; -> rax = rdi + 0x1111
     mov rdi, rax
-    mov rax, 1                      ; SYS64_EXIT, with that value
+    mov rax, SYS64_EXIT             ; with that value
     syscall
 .hang:
     jmp .hang                       ; unreachable: exit does not return
@@ -150,7 +162,7 @@ task_count_code:
 
 task_count_exit:
     mov rdi, [rsi]                  ; hand the final count to the kernel
-    mov rax, 1                      ; SYS64_EXIT
+    mov rax, SYS64_EXIT
     syscall
 .hang:
     jmp .hang

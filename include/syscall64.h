@@ -21,8 +21,22 @@
  * With STAR[47:32] = 0x08 that gives kernel 0x08/0x10, and with
  * STAR[63:48] = 0x10 it gives user 0x23/0x1B. */
 
-#define SYS64_EXIT  1   /* leaves ring 3 rather than returning to it */
-#define SYS64_ECHO  2   /* returns its argument + 0x1111 */
+/* Linux's x86-64 numbers, not Novaris's own and not the i386 ones.
+ *
+ * This is the point where Milestone 44's item 4 starts being paid for.
+ * The 32-bit kernel implements Linux's *i386* ABI - `write` is 4 there
+ * and 1 here, `exit` is 1 there and 60 here, the arguments arrive in
+ * different registers, and the structures they point at are laid out
+ * differently. Every one of those has to be re-earned, and using the
+ * real numbers from the start is how the rest of it gets earned against
+ * something real rather than against a private convention. */
+#define SYS64_WRITE       1
+#define SYS64_EXIT        60
+#define SYS64_EXIT_GROUP  231
+
+/* One Novaris-private number, well above anything Linux uses, kept for
+ * the bring-up test that has no way to print. */
+#define SYS64_ECHO  0x1000   /* returns its argument + 0x1111 */
 
 /* Sets EFER.SCE, STAR, LSTAR and FMASK. Call after gdt64_install(). */
 void syscall64_init(void);
@@ -51,5 +65,6 @@ extern uint8_t task_count_code_end[];
 uint64_t syscall64_count(void);
 uint64_t syscall64_last_arg(void);
 uint64_t syscall64_exit_code(void);
+uint64_t syscall64_bytes_written(void);
 
 #endif

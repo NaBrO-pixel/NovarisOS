@@ -6116,7 +6116,10 @@ on its own:
    already *is* the saved context. What is still missing is a per-task
    kernel stack, which is what a task that blocks inside a syscall
    needs; see Milestone 49.
-4. **The syscall ABI** - and this one is not a port but a rewrite.
+4. **The syscall ABI** - *started* in Milestone 50, which gets a real
+   static Linux x86-64 executable running: `write`, `exit`, `exit_group`
+   and the register convention, checked differentially against the host.
+   Three calls out of ~350, and no glibc. Still not a port but a rewrite.
    Novaris implements *Linux's i386 syscall ABI*, which is what lets real
    glibc and real Wine run unmodified. x86-64 Linux has different syscall
    numbers, a different register convention, and different structure
@@ -6606,6 +6609,107 @@ frame reachable only from its own task's address space, mapped at the
 other at exactly zero. Falsified by making `sched64_tick` never pick a
 different task: the first task then loops forever, the kernel never gets
 control back, and the run dies on the harness timeout.
+
+## Milestone 50 — 64-bit: a real Linux binary runs ✅ DONE
+
+The beginning of Milestone 44's item 4. 123 assertions, and a second
+PASS line, because this milestone's real result is a differential rather
+than an assertion inside the kernel.
+
+### What actually ran
+
+`userland/hello64.s` is an ordinary static x86-64 Linux executable. It is
+assembled and linked by the host toolchain, uses Linux's syscall numbers
+and register convention, and knows nothing whatsoever about Novaris.
+`file` calls it what it is:
+
+```
+ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked
+```
+
+The same file - not a rebuild, the same bytes - now runs in two places
+and does the same thing in both:
+
+```
+$ ./build64/hello64.elf
+hello from a real x86-64 ELF, loaded by Novaris
+$ echo $?
+42
+```
+
+```
+NOVARIS64: --- its output follows ---
+hello from a real x86-64 ELF, loaded by Novaris
+NOVARIS64: --- end of its output ---
+NOVARIS64: wrote   = 48 bytes, exit 42
+```
+
+`make -f Makefile.amd64 test` now runs the host copy itself and requires
+its output to appear in the guest's serial log and its status to be 42.
+That is a much stronger statement than "the guest printed something": it
+says this kernel implements *Linux's ABI*, not something shaped like it.
+Which is the entire reason the 32-bit tree can run real glibc and real
+Wine, and the property the whole port exists to re-earn.
+
+### The pieces
+
+**`elf64.c`**, a separate reader rather than an ifdef through the 32-bit
+`elf.c`. The two formats disagree about field *order* as well as width -
+in ELF64 `p_flags` moves from second-to-last in the program header to
+directly after `p_type`, so reading an ELF64 with ELF32 field offsets
+takes the segment's alignment as its permissions and produces a mapping
+that looks plausible.
+
+It zeroes each page before copying into it, which is what gives a segment
+its `.bss` (`p_memsz` past `p_filesz` is defined to read as zero), and it
+reuses an existing mapping where two segments share the page one ends and
+the next begins, rather than stranding the frame already there.
+
+**Three syscalls, with Linux's numbers**: `write` (1), `exit` (60),
+`exit_group` (231), and unimplemented calls answer `-ENOSYS` (-38)
+because that is what programs check for. The entry stub shifts arguments
+from Linux's `rdi, rsi, rdx` into the SysV registers the C is compiled
+for, which it can only do after `rcx` is saved, since `rcx` arrives
+holding the return address.
+
+`write` dereferences a ring-3 pointer directly, which works because the
+kernel is running in the caller's address space - the high half is
+shared, so a syscall never leaves the space it was called from. **It is
+also completely unchecked**, and that is the honest state of this ABI: a
+real implementation validates the range is mapped and belongs to the
+caller, without racing the caller. Nothing here does that yet.
+
+### Two bugs found by trying to falsify the result
+
+**The build had no header dependencies.** The falsification for this
+milestone was to set `SYS64_WRITE` to 4 - the *i386* number - and check
+the test noticed. It did not: the test passed. The reason was that
+`Makefile.amd64` built objects from `.c` alone, so editing
+`include/syscall64.h` rebuilt nothing at all and the change was never
+compiled. `CFLAGS` now carries `-MMD -MP` and the generated `.d` files
+are included.
+
+With that fixed the falsification does what it should, and it is worth
+recording what it looks like, because it is exactly the failure item 4
+warns about:
+
+```
+NOVARIS64: FAIL  it wrote to stdout
+NOVARIS64: wrote   = 0 bytes, exit 42
+```
+
+A real Linux binary, on a kernel that got one syscall number wrong,
+silently prints nothing and exits successfully. Nothing faults. Nothing
+says why.
+
+### How far this is from glibc
+
+Three calls out of roughly 350, and the program is deliberately built
+`-nostdlib`. glibc's startup alone wants `arch_prctl` to set up the TLS
+base, `brk` or `mmap`, `set_tid_address`, `rseq`, `readlink` on
+`/proc/self/exe`, `getrandom` for the stack guard, and an `auxv` on the
+initial stack that nothing here constructs yet. That, and not the three
+above, is the shape of the remaining work in item 4.
 
 ## The state of the tree, as found
 

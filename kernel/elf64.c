@@ -1,0 +1,149 @@
+/* elf64.c - loading a static x86-64 executable into an address space. */
+
+#include "elf64.h"
+#include "paging64.h"
+#include "pmm64.h"
+#include "kstring.h"
+
+#define KERNEL_VMA   0xFFFFFFFF80000000ULL
+#define PHYS_WINDOW  0x40000000ULL      /* what boot64.s maps at KERNEL_VMA */
+
+#define PT_LOAD 1
+#define PF_X    0x1
+#define PF_W    0x2
+
+#define EM_X86_64 62
+#define ET_EXEC   2
+#define ET_DYN    3
+
+typedef struct {
+    unsigned char e_ident[16];
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint64_t e_entry;
+    uint64_t e_phoff;
+    uint64_t e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+} __attribute__((packed)) elf64_ehdr_t;
+
+/* p_flags sits here, between p_type and p_offset. In ELF32 it is the
+ * second-to-last field. Getting this wrong reads the segment's alignment
+ * as its permissions, which produces a mapping that looks plausible. */
+typedef struct {
+    uint32_t p_type;
+    uint32_t p_flags;
+    uint64_t p_offset;
+    uint64_t p_vaddr;
+    uint64_t p_paddr;
+    uint64_t p_filesz;
+    uint64_t p_memsz;
+    uint64_t p_align;
+} __attribute__((packed)) elf64_phdr_t;
+
+static uint64_t pages_mapped;
+
+uint64_t elf64_pages_mapped(void) { return pages_mapped; }
+
+static inline void* window(uint64_t phys) {
+    return (void*)(KERNEL_VMA + phys);
+}
+
+int elf64_load(const void* image, uint64_t size, vmspace64_t* space,
+               uint64_t* entry_out) {
+    const uint8_t* base = (const uint8_t*)image;
+    const elf64_ehdr_t* eh = (const elf64_ehdr_t*)image;
+    uint64_t saved_cr3;
+    int i, rc = ELF64_OK;
+
+    pages_mapped = 0;
+
+    if (size < sizeof(elf64_ehdr_t)) return ELF64_TRUNCATED;
+    if (eh->e_ident[0] != 0x7F || eh->e_ident[1] != 'E' ||
+        eh->e_ident[2] != 'L'  || eh->e_ident[3] != 'F') return ELF64_NOT_ELF;
+    if (eh->e_ident[4] != 2)  return ELF64_WRONG_CLASS;   /* ELFCLASS64 */
+    if (eh->e_ident[5] != 1)  return ELF64_WRONG_CLASS;   /* little endian */
+    if (eh->e_machine != EM_X86_64) return ELF64_WRONG_MACHINE;
+    if (eh->e_type != ET_EXEC && eh->e_type != ET_DYN) return ELF64_NOT_EXEC;
+    if (eh->e_phoff + (uint64_t)eh->e_phnum * eh->e_phentsize > size)
+        return ELF64_TRUNCATED;
+
+    /* Everything below maps into `space`, so run in it rather than
+     * switching per page. The kernel's own half is identical in every
+     * space, so the code, its stack and the physical window it copies
+     * through are all still where they were. */
+    __asm__ __volatile__("mov %%cr3, %0" : "=r"(saved_cr3));
+    __asm__ __volatile__("mov %0, %%cr3" :: "r"(space->pml4_phys) : "memory");
+
+    for (i = 0; i < eh->e_phnum; i++) {
+        const elf64_phdr_t* ph =
+            (const elf64_phdr_t*)(base + eh->e_phoff +
+                                  (uint64_t)i * eh->e_phentsize);
+        uint64_t start, end, va, flags;
+
+        if (ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
+        if (ph->p_offset + ph->p_filesz > size) { rc = ELF64_TRUNCATED; break; }
+        if (ph->p_filesz > ph->p_memsz)         { rc = ELF64_TRUNCATED; break; }
+
+        start = ph->p_vaddr & ~(PAGE64_SIZE - 1);
+        end   = (ph->p_vaddr + ph->p_memsz + PAGE64_SIZE - 1)
+                & ~(PAGE64_SIZE - 1);
+
+        flags = PAGE64_PRESENT | PAGE64_USER;
+        if (ph->p_flags & PF_W) flags |= PAGE64_WRITE;
+
+        for (va = start; va < end; va += PAGE64_SIZE) {
+            uint64_t frame, copy_from, copy_to;
+            uint8_t* dst;
+
+            /* Two segments commonly share the page where one ends and
+             * the next begins. Re-mapping it would strand the frame that
+             * is already there and lose the bytes already written into
+             * it, so an existing mapping is reused. */
+            if (paging64_translate(va, &frame) == PAGING64_OK) {
+                frame &= ~(PAGE64_SIZE - 1);
+                /* The shared page needs the union of both permissions. */
+                if (flags & PAGE64_WRITE)
+                    paging64_map(va, frame, flags);
+            } else {
+                frame = pmm64_alloc_frame();
+                if (!frame) { rc = ELF64_NOMEM; break; }
+                if (frame >= PHYS_WINDOW) { rc = ELF64_NOMEM; break; }
+                if (paging64_map(va, frame, flags) != PAGING64_OK) {
+                    pmm64_free_frame(frame);
+                    rc = ELF64_MAP_FAILED;
+                    break;
+                }
+                /* Zero first, which is what gives a segment its .bss:
+                 * p_memsz beyond p_filesz is defined to read as zero. */
+                kmemset(window(frame), 0, PAGE64_SIZE);
+                pages_mapped++;
+            }
+
+            dst = (uint8_t*)window(frame);
+
+            /* The part of this page the file actually has bytes for. */
+            copy_from = va > ph->p_vaddr ? va : ph->p_vaddr;
+            copy_to   = va + PAGE64_SIZE;
+            if (copy_to > ph->p_vaddr + ph->p_filesz)
+                copy_to = ph->p_vaddr + ph->p_filesz;
+
+            if (copy_to > copy_from)
+                kmemcpy(dst + (copy_from - va),
+                        base + ph->p_offset + (copy_from - ph->p_vaddr),
+                        copy_to - copy_from);
+        }
+        if (rc != ELF64_OK) break;
+    }
+
+    __asm__ __volatile__("mov %0, %%cr3" :: "r"(saved_cr3) : "memory");
+
+    if (rc == ELF64_OK && entry_out) *entry_out = eh->e_entry;
+    return rc;
+}
