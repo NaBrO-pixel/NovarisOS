@@ -34,10 +34,19 @@ CFLAGS = -std=gnu99 -ffreestanding -fno-builtin -fno-stack-protector \
          -fno-pic -fno-pie -m64 -mcmodel=kernel -mno-red-zone \
          -Wall -Wextra -O2 -Iinclude
 
-ASFLAGS = -f elf64
+# -w+error=label-orphan turns "label alone on a line" into an error. NASM
+# accepts an unrecognised mnemonic as a label definition, so a 64-bit
+# instruction it does not know - `lretq`, say, which is a gas spelling -
+# assembles to nothing at all and execution falls through to the next
+# function. That cost a debugging session here; it is an error now.
+ASFLAGS = -f elf64 -w+error=label-orphan
 LDFLAGS = -m elf_x86_64 -T linker64.ld -nostdlib -z max-page-size=0x1000 -z noexecstack
 
 OBJS = $(BUILD_DIR)/boot64.o \
+       $(BUILD_DIR)/isr64.o \
+       $(BUILD_DIR)/gdt64.o \
+       $(BUILD_DIR)/idt64.o \
+       $(BUILD_DIR)/serial64.o \
        $(BUILD_DIR)/kmain64.o
 
 .PHONY: all iso run test clean
@@ -50,7 +59,10 @@ $(BUILD_DIR):
 $(BUILD_DIR)/boot64.o: boot/boot64.s | $(BUILD_DIR)
 	$(AS) $(ASFLAGS) $< -o $@
 
-$(BUILD_DIR)/kmain64.o: kernel/kmain64.c | $(BUILD_DIR)
+$(BUILD_DIR)/isr64.o: kernel/isr64.s | $(BUILD_DIR)
+	$(AS) $(ASFLAGS) $< -o $@
+
+$(BUILD_DIR)/%.o: kernel/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(KERNEL): $(OBJS) linker64.ld
