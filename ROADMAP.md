@@ -6125,8 +6125,10 @@ on its own:
    glibc and real Wine run unmodified. x86-64 Linux has different syscall
    numbers, a different register convention, and different structure
    layouts. Milestones 19-31 all get re-earned here.
-5. **PE32+ and a 64-bit Wine** - `pe.c` loads PE32; Wine must be
-   reconfigured `--enable-archs=x86_64`, or both for WoW64.
+5. **PE32+ and a 64-bit Wine** - **PE32+ is done** in Milestone 52: a
+   real mingw-built 64-bit Windows executable loads, binds its kernel32
+   imports and runs in ring 3. Wine itself is untouched and still needs
+   reconfiguring `--enable-archs=x86_64`, or both for WoW64.
 
 Item 4 is the honest sting in this milestone. The 32-bit tree's ability to
 run unmodified Linux binaries came from implementing one specific ABI very
@@ -6813,6 +6815,96 @@ Still no threads (`clone`), no signal *delivery*, no filesystem, no
 thing Milestone 44 called the sting - that none of the 32-bit tree's ABI
 work transfers - now has its first counter-example: the mechanism is
 real, and a real libc runs on it.
+
+## Milestone 52 — 64-bit: a Windows executable runs ✅ DONE
+
+141 assertions. `userland/hello_pe64.c` is built by
+`x86_64-w64-mingw32-gcc` into an ordinary PE32+ image - the format
+chrome.exe is in - importing `GetStdHandle`, `WriteFile` and
+`ExitProcess` from kernel32, linked at 0x140000000, with no idea Novaris
+exists:
+
+```
+NOVARIS64: base    = 0x0000000140000000
+NOVARIS64: entry   = 0x0000000140001000
+NOVARIS64: imports = 3, relocs 0, pages 7
+NOVARIS64: --- its output follows ---
+hello from a 64-bit Windows PE on Novaris
+NOVARIS64: --- end of its output ---
+NOVARIS64: wrote   = 42 bytes, exit 3
+```
+
+Milestone 30 ran a Windows program on the 32-bit kernel. This is the
+64-bit equivalent, and it is the first thing in this tree that is the
+same *kind* of object as the target.
+
+### PE32+ is not PE32 with wider fields
+
+`pe64.c` is a separate reader from `pe.c` for reasons that would each
+have produced a plausible-looking wrong answer:
+
+- the optional header's magic changes, and **`BaseOfData` disappears**,
+  which shifts every field after it;
+- `ImageBase` becomes 64-bit;
+- the import thunk arrays go from 4 bytes to 8, and the
+  import-by-ordinal flag moves from bit 31 to **bit 63**.
+
+Base relocations are implemented (`IMAGE_REL_BASED_DIR64`) even though
+this image carries none and loads where it asked. chrome.exe will not:
+a loader that silently skips relocations produces a program that runs
+until its first absolute address.
+
+### The calling convention, and why imports are thunks
+
+Windows x86-64 passes arguments in `rcx, rdx, r8, r9` with 32 bytes of
+shadow space. This kernel is compiled for SysV and its syscalls take
+`rdi, rsi, rdx, r10`. Rather than compile a Win32 layer twice, the
+loader writes a 20-byte thunk per import:
+
+```
+48 89 CF   mov rdi, rcx     Windows arg 1 -> SysV arg 1
+48 89 D6   mov rsi, rdx     arg 2, before rdx is overwritten
+4C 89 C2   mov rdx, r8      arg 3
+4D 89 CA   mov r10, r9      arg 4 - r10, since SYSCALL destroys rcx
+B8 nn..    mov eax, number
+0F 05      syscall
+C3         ret
+```
+
+That also solves a problem that has nothing to do with registers: an
+imported function has to be something a *ring-3* program can call. A
+kernel address in the IAT would fault on first use. A thunk in a user
+page that traps is the right shape.
+
+**The move order is load-bearing**, and it was falsified to prove it:
+putting `rdx <- r8` before `rsi <- rdx` loses the second argument, and
+what that produces is `WriteFile` receiving 42 - the byte count - as its
+buffer pointer, and the *kernel* faulting at address 0x2a while
+dereferencing it.
+
+Which is worth dwelling on, because it demonstrates the hole recorded in
+Milestone 51 from the other side: `cs=0x08` in that fault means a ring-3
+program's bad pointer took down the kernel. Win32 arguments are as
+unchecked here as Linux's are.
+
+### What this does not have
+
+Windows' syscall numbers are not implemented and never will be: Windows
+has no stable syscall interface - a program calls kernel32, kernel32
+calls ntdll, and ntdll's numbers change between builds - so the
+compatibility that matters is at the *API* boundary, which is what the
+thunks bridge.
+
+Four functions of kernel32 are implemented. That is not a plan, and the
+honest way to widen it is Milestone 45's `tools/pe_imports.py`, which
+answers exactly which functions a given `.exe` needs. Run against this
+one it says three, from kernel32, and the loader bound three.
+
+Also absent: importing **by ordinal** (rejected outright, since it needs
+the exporting DLL's export table), TLS callbacks, delay imports, SEH and
+`.pdata` unwinding, and any DLL at all - there is nothing to load a
+`.dll` from, and no export tables to resolve against. chrome.exe needs
+all of those, and 285MB of `chrome.dll` besides.
 
 ## The state of the tree, as found
 

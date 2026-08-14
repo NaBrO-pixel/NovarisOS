@@ -27,6 +27,11 @@ SYS64_EXIT       equ 60
 SYS64_EXIT_GROUP equ 231
 SYS64_ECHO       equ 0x1000
 
+; ExitProcess, reached through a pe64.c import thunk. It has to be
+; recognised here rather than in C for the same reason exit is: it is the
+; call that does not return to the program.
+WIN32_64_EXIT    equ 0x2FFF
+
 section .text
 
 extern syscall64_dispatch
@@ -102,6 +107,8 @@ syscall64_entry:
     cmp rcx, SYS64_EXIT
     je .leave_ring3
     cmp rcx, SYS64_EXIT_GROUP
+    je .leave_ring3
+    cmp rcx, WIN32_64_EXIT
     je .leave_ring3
 
     ; Linux's syscall ABI preserves *every* register except rax, rcx and
