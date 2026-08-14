@@ -6467,6 +6467,84 @@ section so that section does not depend on tick timing.
 - **Processes.** One ring-3 program, entered from `kernel_main` and
   returning to it. No address spaces, no scheduler, no context switch.
 
+## Milestone 48 — 64-bit: address spaces, and a program that lives in one ✅ DONE
+
+The rest of Milestone 44's item 3 except the scheduler. 108 assertions
+now, up from 88.
+
+### One PML4 per process, sharing the kernel
+
+The split is decided by the sign bit: PML4 slots 0-255 are the low half
+and belong to the process, 256-511 are the high half and are the kernel,
+identical in every space. That is what lets a syscall or an interrupt
+find the kernel without touching CR3, and it is why creating a space is
+mostly a copy of 256 entries.
+
+Two details that are easy to get wrong and were not:
+
+- **The self-reference must be the space's own.** `vmspace64_create`
+  copies the kernel's high half, which includes slot 510 - the recursive
+  slot - and then *overwrites* it to point at the new PML4. Leaving the
+  copied value there would give every new space a recursive mapping onto
+  the kernel's tables, so it would appear to work and would silently edit
+  the wrong space.
+- **A new PML4 cannot be reached recursively yet.** Until its
+  self-reference exists there is no recursive address for it, so it is
+  initialised through a scratch mapping and only then used normally.
+
+### Editing a space you are not in
+
+`paging64.c` reaches tables through the recursive slot, which by
+construction describes only the current space. The textbook answer is a
+second recursive slot pointing at the other space's PML4, with every
+derived address shifted a level down.
+
+This does the simpler thing: switch CR3, use the ordinary mapping code,
+switch back. That is safe *because* of the split above - the kernel's
+code, stack, heap and frame bitmap are all high-half and mapped
+identically in both spaces, so the switch changes nothing the mapping
+code is standing on. It costs two CR3 loads per edit, which matters while
+a process is being built and never afterwards.
+
+`vmspace64_destroy` frees the space's page tables but **not** the frames
+they point at: this layer cannot know whether those are program pages, a
+shared buffer, or something mapped from a device, so ownership stays
+with whoever mapped them.
+
+### What the tests establish
+
+The isolation test maps *the same virtual address* in two spaces to two
+different frames, writes a different value through each, and requires
+each space to still read its own. Falsified by pointing both at one
+frame, which makes A read B's value and fails exactly that assertion.
+
+Frame accounting is checked rather than assumed: free frames before and
+after creating two spaces, mapping in both, and destroying both come back
+identical (32386 either side). One space is created and destroyed before
+the count is taken, because the first create ever made allocates the
+kernel-half tables for its scratch mapping and those are permanent and
+shared - counting from before them would look like a leak that is not
+one.
+
+Then both halves at once, which is what a process actually is: a ring-3
+program whose code and stack exist only in its own low half, entered with
+CR3 pointing at its space. It runs, its `syscall` finds the kernel
+through the shared high half, and it exits - while the same addresses
+translate to nothing at all in the kernel's own space.
+
+### Still missing before this is a scheduler
+
+No context switch, no run queue, no saving of a process's registers - the
+program is entered from `kernel_main` and returns to it. The path that
+takes an interrupt *while at CPL 3* and switches to the TSS's `rsp0` is
+set up correctly but still unexercised, and that is the piece a
+preemptive scheduler is built on.
+
+And item 4 is untouched and unchanged: this is the mechanism, not an ABI.
+Novaris's 32-bit kernel implements Linux's *i386* syscall ABI, which is
+exactly what lets real glibc and real Wine run unmodified, and none of it
+transfers to x86-64.
+
 ## The state of the tree, as found
 
 Two things that belong to neither milestone, recorded because the next
