@@ -1,0 +1,91 @@
+# Makefile.amd64 - the 64-bit build, during the port.
+#
+# Deliberately separate from the main Makefile rather than a set of ifeqs
+# inside it. The 32-bit build is the one that currently works end to end,
+# and the port takes a while; breaking `make` on day one to start it would
+# mean no working reference to test against for as long as the port lasts.
+# When the 64-bit tree can do what the 32-bit tree can, this collapses back
+# into Makefile and the ARCH split goes with it.
+#
+#   make -f Makefile.amd64            build the ISO
+#   make -f Makefile.amd64 test       boot it and check the machine state
+#   make -f Makefile.amd64 run        boot it interactively
+
+CC = gcc
+AS = nasm
+LD = ld
+
+BUILD_DIR = build64
+ISO_DIR   = iso64
+KERNEL    = $(BUILD_DIR)/novaris64.bin
+ISO       = novaris64.iso
+
+# -mcmodel=kernel: the kernel is linked in the top 2GB, so a 32-bit
+#   sign-extended displacement reaches every symbol. It pairs with the
+#   KERNEL_VMA in linker64.ld and neither is correct without the other.
+# -mno-red-zone: the 128 bytes below rsp that the System V ABI lets leaf
+#   functions use without adjusting the stack. Hardware interrupts push
+#   onto the same stack without knowing about it, so leaving this on
+#   corrupts a leaf function's locals at the worst possible moment - and
+#   only sometimes, which is the kind of bug that costs a week.
+# SSE is deliberately *not* disabled: boot64.s enables it, and gcc will
+#   emit xmm register moves for ordinary struct assignments on this target.
+CFLAGS = -std=gnu99 -ffreestanding -fno-builtin -fno-stack-protector \
+         -fno-pic -fno-pie -m64 -mcmodel=kernel -mno-red-zone \
+         -Wall -Wextra -O2 -Iinclude
+
+ASFLAGS = -f elf64
+LDFLAGS = -m elf_x86_64 -T linker64.ld -nostdlib -z max-page-size=0x1000 -z noexecstack
+
+OBJS = $(BUILD_DIR)/boot64.o \
+       $(BUILD_DIR)/kmain64.o
+
+.PHONY: all iso run test clean
+
+all: iso
+
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+$(BUILD_DIR)/boot64.o: boot/boot64.s | $(BUILD_DIR)
+	$(AS) $(ASFLAGS) $< -o $@
+
+$(BUILD_DIR)/kmain64.o: kernel/kmain64.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(KERNEL): $(OBJS) linker64.ld
+	$(LD) $(LDFLAGS) -o $@ $(OBJS)
+	@# A 64-bit kernel that GRUB cannot find a Multiboot header in fails
+	@# with "no multiboot header found" and nothing else, so check here
+	@# where the message can say which of the two things went wrong.
+	@grub-file --is-x86-multiboot $@ \
+	    || (echo "ERROR: $@ has no valid Multiboot header"; false)
+	@echo "  built $@"
+
+iso: $(KERNEL)
+	mkdir -p $(ISO_DIR)/boot/grub
+	cp $(KERNEL) $(ISO_DIR)/boot/novaris64.bin
+	cp grub64.cfg $(ISO_DIR)/boot/grub/grub.cfg
+	grub-mkrescue -o $(ISO) $(ISO_DIR) 2>/dev/null
+	@echo "  built $(ISO)"
+
+run: iso
+	qemu-system-x86_64 -cdrom $(ISO) -serial stdio
+
+# The bring-up test. kernel_main halts rather than exiting, so the run is
+# bounded by `timeout` and judged by what reached the serial port.
+test: iso
+	@rm -f $(BUILD_DIR)/serial.log
+	@timeout 30 qemu-system-x86_64 -cdrom $(ISO) -display none \
+	    -serial file:$(BUILD_DIR)/serial.log -no-reboot >/dev/null 2>&1 || true
+	@echo "--- serial ---"
+	@cat $(BUILD_DIR)/serial.log 2>/dev/null || true
+	@echo "--------------"
+	@if ! grep -q "bring-up complete" $(BUILD_DIR)/serial.log 2>/dev/null; then \
+	    echo "FAIL: the kernel did not reach the end of kernel_main"; exit 1; fi
+	@if grep -q "FAIL" $(BUILD_DIR)/serial.log; then \
+	    echo "FAIL: the machine is not in the state it should be"; exit 1; fi
+	@echo "PASS: 64-bit long mode, higher half, multiboot handoff intact"
+
+clean:
+	rm -rf $(BUILD_DIR) $(ISO_DIR) $(ISO)
