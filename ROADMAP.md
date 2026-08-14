@@ -6108,10 +6108,11 @@ on its own:
    in Milestone 46; **the drivers are not**. Port I/O is already known
    portable; `serial64.c` exists only because the real serial driver
    pulls in the console and the framebuffer, and that is still true.
-3. **Processes, the scheduler and ring 3** - `process_asm.s`,
-   `scheduler_asm.s`, and a TSS that switches `rsp0` per task.
-   `syscall`/`sysret` replaces `int 0x80`, which is why the GDT's user
-   selectors are ordered the way they are.
+3. **Processes, the scheduler and ring 3** - the ring-3 and
+   `syscall`/`sysret` *mechanism* is done in Milestone 47, which is also
+   why the GDT's user selectors are ordered the way they are. Still
+   missing: `process_asm.s`, `scheduler_asm.s`, a TSS that switches
+   `rsp0` per task, address spaces, and any context switch at all.
 4. **The syscall ABI** - and this one is not a port but a rewrite.
    Novaris implements *Linux's i386 syscall ABI*, which is what lets real
    glibc and real Wine run unmodified. x86-64 Linux has different syscall
@@ -6363,6 +6364,108 @@ part of the port; everything remaining is architecture-specific by
 nature. Item 4 is still the sting - Novaris implements Linux's *i386*
 syscall ABI, which is exactly what lets real glibc and real Wine run
 unmodified, and none of that transfers to x86-64.
+
+## Milestone 47 — 64-bit: ring 3, SYSCALL, and the IRQ bug it uncovered ✅ DONE
+
+The mechanism half of Milestone 44's item 3. `make -f Makefile.amd64
+test` checks 88 things now, up from 79, and one of them is a bug that had
+been sitting in the tree since Milestone 44.
+
+### The bug: IRQ0 was still arriving as a double fault
+
+`idt64_install` has always installed its IRQ gates at vectors 32-47. But
+nothing ever remapped the 8259 pair, so the hardware was still delivering
+on the defaults the BIOS leaves behind - **IRQ0 at vector 8**, which is
+`#DF`. The gates were written for a remap that had never been performed.
+
+No previous milestone noticed because none of them ever set IF. This one
+does, on the way into ring 3, and the failure is worth recording because
+of how it presented: an intermittent double fault whose register dump was
+shifted by exactly one quadword.
+
+```
+NOVARIS64: *** unhandled exception: double fault (vector 8)
+NOVARIS64:   err=0x0000700000000000 rip=0x0000000000000023 cs=0x0000000000000202
+```
+
+`err` is the user rip, `rip` is the user CS, `cs` is the user RFLAGS. The
+handler for vector 8 pops an error code because a real `#DF` pushes one;
+a hardware interrupt does not, so every field reads one slot low. **A
+shifted exception dump is the signature of an IRQ arriving on an
+exception vector**, and it is worth knowing on sight.
+
+It was intermittent because it only fired if a timer tick happened to
+land inside the few microseconds spent in ring 3 - the same code passed,
+then failed, then passed.
+
+`pic64_remap()` now runs at the end of `idt64_install`, after the table
+is loaded so that an already-asserted line lands on a gate that exists.
+Every line is left **masked**: the 64-bit tree has no drivers, so an
+unmasked line can only produce an interrupt nobody will service.
+`idt64_irq_set_mask()` unmasks one line at a time, and unmasking anything
+on the slave unmasks IRQ2 with it, since that is the line it cascades on.
+
+The test proves the remap rather than assuming it: it programs the PIT to
+1kHz, unmasks IRQ0, sets IF, and requires three ticks to arrive **at
+vector 32**. Before the fix that first tick was a `#DF` and the machine
+halted, so reaching the assertion at all is half the result.
+
+### Ring 3, and a syscall that comes back
+
+`int 0x80` is not how a 64-bit kernel is entered. SYSCALL/SYSRET do no
+descriptor lookup and - the part that has to be handled by hand - **no
+stack switch**: on entry `rsp` is still the ring-3 stack, so the entry
+stub cannot push anything until it has moved off it. SYSCALL also
+destroys `rcx` and `r11`, which is where it puts the return rip and
+rflags, so both are preserved by hand.
+
+The selectors come from MSRs rather than the IDT, computed from one base
+by fixed offsets, which is *why* `gdt64.h` orders the user pair
+data-before-code:
+
+```
+SYSCALL:  CS = STAR[47:32],      SS = STAR[47:32] + 8
+SYSRET :  CS = STAR[63:48] + 16, SS = STAR[63:48] + 8   (both forced RPL 3)
+```
+
+STAR[47:32] = 0x08 gives kernel 0x08/0x10; STAR[63:48] = 0x10 gives user
+0x23/0x1B. Reordering the GDT silently changes which selectors land here,
+which is the kind of coupling worth writing down next to both.
+
+A multiprocessor kernel does the stack switch with `swapgs` and a per-CPU
+block. This one is single-CPU during bring-up and uses RIP-relative
+globals; `swapgs` is what that becomes when there is more than one CPU to
+tell apart.
+
+**How the test avoids proving nothing.** The ring-3 program reads its own
+`CS` and hands it to the kernel. That is the one value ring 0 could not
+have produced - the same code at ring 0 reports 0x08 - and it is checked
+to be 0x23, the user code selector with RPL 3. It then feeds the value
+the kernel returned into its exit call, so the recorded exit code
+(0x1134 = 0x23 + 0x1111) also proves SYSRET went *back* to ring 3 rather
+than the program never resuming.
+
+Falsified before believed, as usual: entering with kernel selectors
+instead of user ones makes it report `user cs = 0x08` and fails both
+assertions.
+
+The boot test was run six times after the fix and passed six times; the
+intermittency is gone, because IRQ0 is masked again before the ring-3
+section so that section does not depend on tick timing.
+
+### What is deliberately not done
+
+- **An interrupt taken while in ring 3** - the path that switches to the
+  TSS's `rsp0`. The `rsp0` is set and correct, but nothing has yet been
+  interrupted while at CPL 3. The scheduler is what needs that path and
+  what should test it.
+- **A syscall ABI.** This is the mechanism only: two made-up call numbers
+  and one argument. Novaris's 32-bit kernel implements Linux's *i386*
+  ABI - the numbers, the register convention, the structure layouts - and
+  that is exactly what lets real glibc and real Wine run unmodified. None
+  of it transfers. That rewrite is still the sting in item 4.
+- **Processes.** One ring-3 program, entered from `kernel_main` and
+  returning to it. No address spaces, no scheduler, no context switch.
 
 ## The state of the tree, as found
 

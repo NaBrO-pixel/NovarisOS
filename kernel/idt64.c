@@ -21,9 +21,25 @@
 #include "serial64.h"
 #include "io.h"
 
-#define PIC1_CMD 0x20
-#define PIC2_CMD 0xA0
-#define PIC_EOI  0x20
+#define PIC1_CMD  0x20
+#define PIC1_DATA 0x21
+#define PIC2_CMD  0xA0
+#define PIC2_DATA 0xA1
+#define PIC_EOI   0x20
+
+/* Where the IRQs are made to land. The gates below are installed at 32-47
+ * on the assumption that this remap has happened - and until Milestone 47
+ * it had not, because nothing in the 64-bit tree had yet enabled
+ * interrupts, so nothing noticed.
+ *
+ * The default the BIOS leaves behind puts IRQ0-7 at vectors 8-15, which
+ * collides with the CPU's own exception vectors: a timer tick arrives as
+ * vector 8, which is #DF. That is not a theoretical clash. It presents as
+ * a double fault whose register dump is shifted by one quadword, because
+ * the handler for vector 8 expects an error code on the stack and a
+ * hardware interrupt does not push one. */
+#define PIC1_VECTOR_BASE 32
+#define PIC2_VECTOR_BASE 40
 
 #define IDT_ENTRIES 256
 
@@ -148,6 +164,52 @@ void irq64_handler(registers64_t* r) {
     }
 }
 
+/* The 8259 pair, moved off the exception vectors and then silenced.
+ *
+ * Everything is masked afterwards on purpose: the 64-bit tree has no
+ * device drivers yet, so an unmasked line can only produce an interrupt
+ * nobody is prepared to service. Callers unmask what they have a handler
+ * for, one line at a time, with idt64_irq_set_mask(). */
+static void pic64_remap(void) {
+    uint8_t mask1 = inb(PIC1_DATA);
+    uint8_t mask2 = inb(PIC2_DATA);
+    (void)mask1; (void)mask2;   /* read for the io delay, then discarded */
+
+    outb(PIC1_CMD, 0x11);       /* ICW1: begin init, expect ICW4 */
+    outb(PIC2_CMD, 0x11);
+    outb(PIC1_DATA, PIC1_VECTOR_BASE);  /* ICW2: vector offsets */
+    outb(PIC2_DATA, PIC2_VECTOR_BASE);
+    outb(PIC1_DATA, 0x04);      /* ICW3: a slave is wired to IRQ2 */
+    outb(PIC2_DATA, 0x02);      /* ICW3: and this is which line that is */
+    outb(PIC1_DATA, 0x01);      /* ICW4: 8086 mode */
+    outb(PIC2_DATA, 0x01);
+
+    outb(PIC1_DATA, 0xFF);      /* every line masked */
+    outb(PIC2_DATA, 0xFF);
+}
+
+void idt64_irq_set_mask(int irq, int masked) {
+    uint16_t port;
+    uint8_t bit, value;
+
+    if (irq < 0 || irq > 15) return;
+    if (irq < 8) {
+        port = PIC1_DATA;
+        bit = (uint8_t)irq;
+    } else {
+        port = PIC2_DATA;
+        bit = (uint8_t)(irq - 8);
+    }
+    value = inb(port);
+    if (masked) value |= (uint8_t)(1u << bit);
+    else        value &= (uint8_t)~(1u << bit);
+    outb(port, value);
+
+    /* Unmasking a line on the slave does nothing unless IRQ2, the line
+     * the slave is cascaded onto, is unmasked too. */
+    if (irq >= 8 && !masked) idt64_irq_set_mask(2, 0);
+}
+
 void idt64_install(void) {
     int i;
 
@@ -210,4 +272,8 @@ void idt64_install(void) {
     idt_ptr.base  = (uint64_t)&idt;
 
     idt64_flush(&idt_ptr);
+
+    /* After the table is loaded, so that if a line is somehow already
+     * asserted the gate it lands on exists. */
+    pic64_remap();
 }

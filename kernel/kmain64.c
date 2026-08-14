@@ -29,8 +29,14 @@
 #include "paging64.h"
 #include "kheap64.h"
 #include "kstring.h"
+#include "syscall64.h"
 
 static int failures = 0;
+
+/* The stack the CPU switches to when an interrupt arrives in ring 3.
+ * Separate from the kernel's own stack because the interrupted kernel
+ * stack is not necessarily where the CPU should land. */
+static uint8_t ring3_int_stack[16384] __attribute__((aligned(16)));
 
 static void check(const char* what, int ok) {
     if (!ok) failures++;
@@ -86,6 +92,13 @@ static void breakpoint_handler(registers64_t* r) {
     bp_rip = r->rip;
     /* #BP is a trap: rip already points past the int3, so returning
      * unchanged resumes at the next instruction. */
+}
+
+static volatile uint64_t timer_ticks;
+
+static void timer_handler(registers64_t* r) {
+    (void)r;
+    timer_ticks++;
 }
 
 static void page_fault_handler(registers64_t* r) {
@@ -499,6 +512,121 @@ void kernel_main(uint32_t magic, void* mbi) {
             uint64_t q = kdiv64(1000000007ULL, 1000U, &rem);
             check("kdiv64 divides", q == 1000000ULL && rem == 7U);
         }
+    }
+
+    /* --- layer 9: an IRQ that lands where the IDT expects ----------- */
+    /* This is the layer that found the bug. The IDT has always installed
+     * its IRQ gates at 32-47, but nothing remapped the 8259s, so the
+     * hardware was still delivering IRQ0 to vector 8 - which is #DF. No
+     * previous milestone noticed because none of them ever set IF. */
+    serial64_puts("NOVARIS64: -- timer --\n");
+    {
+        const uint32_t divisor = 1193182u / 1000u;   /* ~1kHz */
+        uint64_t spins;
+
+        register_interrupt_handler64(32, timer_handler);
+
+        outb(0x43, 0x36);                    /* channel 0, lo/hi, mode 3 */
+        outb(0x40, (uint8_t)(divisor & 0xFF));
+        outb(0x40, (uint8_t)(divisor >> 8));
+
+        idt64_irq_set_mask(0, 0);
+        __asm__ __volatile__("sti");
+
+        /* Bounded, so a machine where this never arrives fails the test
+         * rather than hanging until the harness kills it. */
+        for (spins = 0; spins < 50000000ULL && timer_ticks < 3; spins++)
+            __asm__ __volatile__("pause");
+
+        __asm__ __volatile__("cli");
+
+        check("the timer interrupt arrived at vector 32", timer_ticks >= 3);
+        /* If the remap had not happened, the first tick would have been
+         * taken as #DF and the machine would already have halted, so
+         * reaching this line at all is half the result. */
+        check("the machine survived taking interrupts",
+              spins < 50000000ULL);
+
+        /* Masked again before ring 3 below, so that test is deterministic
+         * rather than depending on whether a tick happens to land inside
+         * its few microseconds. Taking an interrupt *while in ring 3* is
+         * a different path - it switches to the TSS's rsp0 - and it is
+         * not exercised yet; the scheduler in item 3 is what will need
+         * it and what should test it. */
+        idt64_irq_set_mask(0, 1);
+
+        serial64_puts("NOVARIS64: ticks   = ");
+        serial64_putdec(timer_ticks);
+        serial64_putc('\n');
+    }
+
+    /* --- layer 10: ring 3, and a syscall that comes back ------------ */
+    serial64_puts("NOVARIS64: -- ring 3 --\n");
+    {
+        /* PML4 slot 224. Not one of the low addresses: slot 0 is still
+         * the boot identity map, built from 2MB pages, so anything under
+         * a gigabyte would come back HUGE_IN_WAY. */
+        const uint64_t UCODE_VA  = 0x0000700000000000ULL;
+        const uint64_t USTACK_VA = 0x0000700000010000ULL;
+        uint64_t code_frame, stack_frame, code_len;
+        int rc_code, rc_stack;
+
+        code_len = (uint64_t)(user_test_code_end - user_test_code);
+        check("the ring-3 program fits in a page",
+              code_len > 0 && code_len < PAGE64_SIZE);
+
+        /* An interrupt taken in ring 3 switches to the stack in the TSS.
+         * Without this the first one triple-faults, and it would be the
+         * timer rather than anything this test does. */
+        gdt64_set_kernel_stack((uint64_t)&ring3_int_stack[sizeof(ring3_int_stack)]);
+        syscall64_init();
+
+        code_frame  = pmm64_alloc_frame();
+        stack_frame = pmm64_alloc_frame();
+        check("frames for the program and its stack",
+              code_frame != 0 && stack_frame != 0);
+
+        /* Copied through the physical window rather than through the
+         * user mapping, so the code page never has to be writable. */
+        kmemcpy((void*)(0xFFFFFFFF80000000ULL + code_frame),
+                user_test_code, code_len);
+
+        rc_code  = paging64_map(UCODE_VA, code_frame,
+                                PAGE64_PRESENT | PAGE64_USER);
+        rc_stack = paging64_map(USTACK_VA, stack_frame,
+                                PAGE64_PRESENT | PAGE64_WRITE | PAGE64_USER);
+        check("the program mapped as user-readable", rc_code == PAGING64_OK);
+        check("its stack mapped as user-writable", rc_stack == PAGING64_OK);
+
+        /* Everything above this line is setup. This is the line that
+         * either returns or hangs the machine. */
+        enter_user_mode64(UCODE_VA, USTACK_VA + PAGE64_SIZE);
+
+        check("ring 3 was entered and returned", syscall64_count() == 2);
+        /* The program read its own CS and handed it over. 0x23 is the
+         * user code selector with RPL 3, and it is the one value here
+         * that ring 0 could not have produced: the same code running at
+         * ring 0 would have reported 0x08. */
+        check("the program really was at ring 3 (CS = 0x23)",
+              syscall64_last_arg() == 0x23);
+        /* And it resumed after the first syscall with the value the
+         * kernel returned, which is what proves SYSRET went back rather
+         * than the program simply never continuing. */
+        check("SYSRET returned to ring 3 with the result",
+              syscall64_exit_code() == 0x23 + 0x1111);
+
+        serial64_puts("NOVARIS64: user cs = ");
+        serial64_puthex(syscall64_last_arg());
+        serial64_puts("\nNOVARIS64: exit   = ");
+        serial64_puthex(syscall64_exit_code());
+        serial64_puts("\nNOVARIS64: calls  = ");
+        serial64_putdec(syscall64_count());
+        serial64_putc('\n');
+
+        paging64_unmap(UCODE_VA);
+        paging64_unmap(USTACK_VA);
+        pmm64_free_frame(code_frame);
+        pmm64_free_frame(stack_frame);
     }
 
     /* --- verdict ---------------------------------------------------- */
