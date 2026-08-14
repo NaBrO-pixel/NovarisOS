@@ -6037,6 +6037,92 @@ the first honest test of Milestone 42 as well.
 4. **The initrd size.** It is read into RAM whole. 52 DLLs is a lot more
    than 31 and nobody has measured what that does.
 
+## Milestone 44 — 64-bit: long mode, descriptors, interrupts ⚠️ IN PROGRESS
+
+The port to x86-64, started because the target is `chrome.exe` and every
+other blocker in front of it is downstream of this one. Milestone 37's
+list said a browser needs a 64-bit Wine, a GPU, an NT sandbox and far more
+of Wine's DLLs; of those, the architecture is the one everything else has
+to be rebuilt on top of, so it goes first.
+
+**What is done and booted.** Three layers, each verified by running it
+rather than by reading it:
+
+- **Long mode.** `boot/boot64.s` takes GRUB's 32-bit protected-mode
+  handoff, builds a PML4/PDPT/PD with 2MB pages, and performs the switch
+  itself: CR4.PAE, CR3, EFER.LME, CR0.PG, then a far jump through a
+  descriptor with the L bit set. Multiboot 1 is kept - nothing about a
+  64-bit kernel needs Multiboot 2, it only changes who does the switching.
+- **The higher half moved.** 0xFFFFFFFF80000000, not 0xC0000000, because
+  `-mcmodel=kernel` lets gcc assume every symbol is reachable by a
+  sign-extended 32-bit displacement. That is true only in the top 2GB, and
+  linking elsewhere under that model miscompiles silently.
+- **Descriptors.** `gdt64.c` - a GDT whose code/data base and limit the
+  hardware ignores, a 16-byte TSS descriptor, and the IST.
+- **Interrupts.** `idt64.c` and `isr64.s` - 16-byte gates, fifteen
+  registers pushed by hand, `iretq`, and the PIC EOI in the dispatcher.
+
+`make -f Makefile.amd64 test` boots the ISO and asserts 19 things about
+the machine's actual state. It is deliberately not a banner test: a
+bootstrap that silently stayed in compatibility mode prints too. EFER.LMA
+is the bit the CPU sets itself when long mode goes active, and the test
+fails on that rather than on any claim the kernel makes about itself.
+
+### Two bugs that cost the session, both worth reading
+
+**NASM has no `lretq`.** That is a gas spelling, and NASM treats an
+unrecognised mnemonic as a *label definition* - so it assembled to zero
+bytes and `gdt64_flush` fell through into `idt64_flush`. The only
+complaint was a "label alone on a line without a colon" warning, which is
+now `-w+error=label-orphan` in ASFLAGS: any 64-bit mnemonic NASM does not
+know will stop the build rather than delete an instruction.
+
+**A label's address is not a resume point at -O2.** The page-fault test
+first used GCC's labels-as-values (`&&recovered`) and had the handler set
+`rip` to it. The optimiser duplicates and reorders basic blocks, so the
+address resolved to a *copy* of the block, reachable with different
+register state; resuming there re-entered an earlier test and leaked a
+stack frame per iteration until the stack overflowed and the machine
+triple-faulted. Both the faulting instruction and the recovery point are
+real symbols in `isr64.s` now - the same shape as the exception tables a
+Unix kernel keeps for exactly this purpose.
+
+### Why a separate Makefile.amd64
+
+The 32-bit tree is the only thing that currently works end to end, and
+this port is long. Breaking `make` on day one would mean no working
+reference to test against for as long as it lasts. `Makefile.amd64`
+collapses back into `Makefile` when the 64-bit tree can do what the
+32-bit one can.
+
+### What is not done
+
+Everything else, and it is most of the kernel: roughly 40,000 lines and
+six more assembly files. In dependency order, each of these milestone-sized
+on its own:
+
+1. **Paging and the PMM** - `paging.c` is two-level; long mode is four,
+   and the recursive-mapping trick it uses needs reworking for a PML4.
+2. **The heap, kstring, and the drivers** - mostly portable C, but every
+   `uint32_t` that is really an address has to be found. Port I/O is
+   already known portable; `serial64.c` exists only because the real
+   serial driver pulls in the console and the framebuffer.
+3. **Processes, the scheduler and ring 3** - `process_asm.s`,
+   `scheduler_asm.s`, and a TSS that switches `rsp0` per task.
+   `syscall`/`sysret` replaces `int 0x80`, which is why the GDT's user
+   selectors are ordered the way they are.
+4. **The syscall ABI** - and this one is not a port but a rewrite.
+   Novaris implements *Linux's i386 syscall ABI*, which is what lets real
+   glibc and real Wine run unmodified. x86-64 Linux has different syscall
+   numbers, a different register convention, and different structure
+   layouts. Milestones 19-31 all get re-earned here.
+5. **PE32+ and a 64-bit Wine** - `pe.c` loads PE32; Wine must be
+   reconfigured `--enable-archs=x86_64`, or both for WoW64.
+
+Item 4 is the honest sting in this milestone. The 32-bit tree's ability to
+run unmodified Linux binaries came from implementing one specific ABI very
+carefully across a dozen milestones, and none of that work transfers.
+
 ## The state of the tree, as found
 
 Two things that belong to neither milestone, recorded because the next
