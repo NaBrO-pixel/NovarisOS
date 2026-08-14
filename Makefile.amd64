@@ -52,6 +52,7 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/pmm64.o \
        $(BUILD_DIR)/paging64.o \
        $(BUILD_DIR)/vmspace64.o \
+       $(BUILD_DIR)/sched64.o \
        $(BUILD_DIR)/kheap64.o \
        $(BUILD_DIR)/kstring.o \
        $(BUILD_DIR)/kmain64.o

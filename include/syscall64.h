@@ -27,15 +27,25 @@
 /* Sets EFER.SCE, STAR, LSTAR and FMASK. Call after gdt64_install(). */
 void syscall64_init(void);
 
-/* Enters ring 3 at user_rip with user_rsp, and returns here when the
- * program makes a SYS64_EXIT call. Implemented in syscall64.s. */
-extern void enter_user_mode64(uint64_t user_rip, uint64_t user_rsp);
+/* Enters ring 3 at user_rip with user_rsp and `arg` in rdi, and returns
+ * here when the program makes a SYS64_EXIT call - whichever program that
+ * turns out to be, once a scheduler is rotating between several.
+ * Implemented in syscall64.s. */
+extern void enter_user_mode64(uint64_t user_rip, uint64_t user_rsp,
+                              uint64_t arg);
 
 /* The ring-3 test program, as bytes to be copied into a user page. It is
  * position independent - immediates and `syscall`, no absolute
  * addressing - so it runs wherever it is mapped. */
 extern uint8_t user_test_code[];
 extern uint8_t user_test_code_end[];
+
+/* The scheduler's test program: increments the counter whose address it
+ * is given, forever. It is stopped by resuming it at task_count_exit
+ * rather than by anything it does itself. */
+extern uint8_t task_count_code[];
+extern uint8_t task_count_exit[];
+extern uint8_t task_count_code_end[];
 
 /* What the dispatcher saw. */
 uint64_t syscall64_count(void);

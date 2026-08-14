@@ -31,6 +31,7 @@
 #include "kstring.h"
 #include "syscall64.h"
 #include "vmspace64.h"
+#include "sched64.h"
 
 static int failures = 0;
 
@@ -100,6 +101,12 @@ static volatile uint64_t timer_ticks;
 static void timer_handler(registers64_t* r) {
     (void)r;
     timer_ticks++;
+}
+
+/* The same interrupt, once there is something to schedule. */
+static void sched_timer_handler(registers64_t* r) {
+    timer_ticks++;
+    sched64_tick(r);
 }
 
 static void page_fault_handler(registers64_t* r) {
@@ -601,7 +608,7 @@ void kernel_main(uint32_t magic, void* mbi) {
 
         /* Everything above this line is setup. This is the line that
          * either returns or hangs the machine. */
-        enter_user_mode64(UCODE_VA, USTACK_VA + PAGE64_SIZE);
+        enter_user_mode64(UCODE_VA, USTACK_VA + PAGE64_SIZE, 0);
 
         check("ring 3 was entered and returned", syscall64_count() == 2);
         /* The program read its own CS and handed it over. 0x23 is the
@@ -744,7 +751,7 @@ void kernel_main(uint32_t magic, void* mbi) {
               paging64_translate(UCODE_VA, &got) == PAGING64_NOT_MAPPED);
 
         vmspace64_switch(&proc);
-        enter_user_mode64(UCODE_VA, USTACK_VA + PAGE64_SIZE);
+        enter_user_mode64(UCODE_VA, USTACK_VA + PAGE64_SIZE, 0);
         vmspace64_switch(&kspace);
 
         check("it ran and exited", syscall64_count() == calls_before + 2);
@@ -755,6 +762,104 @@ void kernel_main(uint32_t magic, void* mbi) {
         vmspace64_destroy(&proc);
         pmm64_free_frame(code_frame);
         pmm64_free_frame(stack_frame);
+    }
+
+    /* --- layer 13: two tasks, preempted by the timer ---------------- */
+    /* The first thing in this tree to be interrupted while at CPL 3, and
+     * therefore the first use of the TSS's rsp0. Everything below rests
+     * on one property of the interrupt path: by the time a handler runs,
+     * the whole user-visible state of the interrupted task is already a
+     * registers64_t in memory, so switching tasks is copying structs. */
+    serial64_puts("NOVARIS64: -- preemption --\n");
+    {
+        const uint64_t UCODE_VA  = 0x0000700000000000ULL;
+        const uint64_t USTACK_VA = 0x0000700000010000ULL;
+        const uint64_t UDATA_VA  = 0x0000700000020000ULL;
+        vmspace64_t kspace, space[2];
+        uint64_t data_frame[2];
+        uint64_t code_len, exit_off, counters[2];
+        int i, ok = 1;
+
+        vmspace64_kernel_space(&kspace);
+        code_len = (uint64_t)(task_count_code_end - task_count_code);
+        exit_off = (uint64_t)(task_count_exit - task_count_code);
+        check("the counting program fits in a page", code_len < PAGE64_SIZE);
+
+        sched64_init();
+
+        for (i = 0; i < 2; i++) {
+            uint64_t code_frame, stack_frame;
+
+            if (!vmspace64_create(&space[i])) { ok = 0; break; }
+            code_frame    = pmm64_alloc_frame();
+            stack_frame   = pmm64_alloc_frame();
+            data_frame[i] = pmm64_alloc_frame();
+            if (!code_frame || !stack_frame || !data_frame[i]) { ok = 0; break; }
+
+            kmemcpy((void*)(0xFFFFFFFF80000000ULL + code_frame),
+                    task_count_code, code_len);
+            /* The counter starts at zero, and the kernel reads it back
+             * through this same window once the run is over. */
+            *(volatile uint64_t*)(0xFFFFFFFF80000000ULL + data_frame[i]) = 0;
+
+            vmspace64_map(&space[i], UCODE_VA, code_frame,
+                          PAGE64_PRESENT | PAGE64_USER);
+            vmspace64_map(&space[i], USTACK_VA, stack_frame,
+                          PAGE64_PRESENT | PAGE64_WRITE | PAGE64_USER);
+            vmspace64_map(&space[i], UDATA_VA, data_frame[i],
+                          PAGE64_PRESENT | PAGE64_WRITE | PAGE64_USER);
+
+            /* Identical entry point, stack and counter address in both -
+             * the two tasks differ only in which address space they run
+             * in, which is what makes the counters below mean something. */
+            sched64_add(UCODE_VA, USTACK_VA + PAGE64_SIZE, UDATA_VA,
+                        &space[i]);
+        }
+        check("two tasks, each in its own address space", ok);
+
+        if (ok) {
+            sched64_set_current(0);
+            /* Ends the run after a known number of *ticks*. Counting
+             * iterations inside the task instead would make the test
+             * depend on how fast the emulator happens to be. */
+            sched64_stop_after(8, UCODE_VA + exit_off);
+
+            register_interrupt_handler64(32, sched_timer_handler);
+            idt64_irq_set_mask(0, 0);
+
+            vmspace64_switch(&space[0]);
+            enter_user_mode64(UCODE_VA, USTACK_VA + PAGE64_SIZE, UDATA_VA);
+            /* Returned because one of the two made an exit call. The
+             * syscall path cleared IF on the way in and never restored
+             * it, so no tick can land between here and the mask below. */
+            vmspace64_switch(&kspace);
+            idt64_irq_set_mask(0, 1);
+
+            for (i = 0; i < 2; i++)
+                counters[i] = *(volatile uint64_t*)
+                    (0xFFFFFFFF80000000ULL + data_frame[i]);
+
+            check("the timer switched between them",
+                  sched64_switches() >= 8);
+            /* Both counters non-zero is the result. One task running
+             * would leave the other at exactly zero, and each counter
+             * lives in a frame only its own space can reach. */
+            check("the first task ran", counters[0] > 0);
+            check("the second task ran too", counters[1] > 0);
+            check("they counted into different physical frames",
+                  data_frame[0] != data_frame[1]);
+            check("the task that exited reported its own count",
+                  syscall64_exit_code() == counters[0] ||
+                  syscall64_exit_code() == counters[1]);
+
+            serial64_puts("NOVARIS64: switches= ");
+            serial64_putdec(sched64_switches());
+            serial64_puts(", task0 = ");
+            serial64_putdec(counters[0]);
+            serial64_puts(", task1 = ");
+            serial64_putdec(counters[1]);
+            serial64_putc('\n');
+        }
     }
 
     /* --- verdict ---------------------------------------------------- */
