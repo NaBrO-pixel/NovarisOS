@@ -51,6 +51,11 @@ enter_user_mode64:
     push qword 0x202                ; RFLAGS: IF set, bit 1 always set
     push qword UCODE_SEL | RPL3
     push rdi                        ; user rip
+
+    ; The argument the program starts with, in the register the SysV ABI
+    ; would have put a first argument in. Done after the frame is built,
+    ; because rdi was carrying the entry point until now.
+    mov rdi, rdx
     iretq
 
 ; ---------------------------------------------------------------------
@@ -119,6 +124,37 @@ user_test_code:
 .hang:
     jmp .hang                       ; unreachable: exit does not return
 user_test_code_end:
+
+; ---------------------------------------------------------------------
+; The scheduler's test program: increment a counter, forever.
+;
+; It takes the address of its counter in rdi, because a program entered
+; on a synthesised frame has whatever registers the kernel put there and
+; that is the cheapest way to tell two copies of one program apart. It
+; keeps the pointer in rsi so that rdi is free.
+;
+; It never exits on its own. The scheduler stops it by rewriting rip to
+; task_exit_stub on a resume, which works precisely because everything
+; else in the frame - rsi included - is restored untouched. That makes
+; the test end after a fixed number of *ticks* rather than a fixed number
+; of iterations, so it does not depend on how fast the machine runs.
+; ---------------------------------------------------------------------
+global task_count_code
+global task_count_exit
+global task_count_code_end
+task_count_code:
+    mov rsi, rdi                    ; the counter's address
+.loop:
+    inc qword [rsi]
+    jmp .loop
+
+task_count_exit:
+    mov rdi, [rsi]                  ; hand the final count to the kernel
+    mov rax, 1                      ; SYS64_EXIT
+    syscall
+.hang:
+    jmp .hang
+task_count_code_end:
 
 section .bss
 align 16

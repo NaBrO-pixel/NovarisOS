@@ -6108,11 +6108,14 @@ on its own:
    in Milestone 46; **the drivers are not**. Port I/O is already known
    portable; `serial64.c` exists only because the real serial driver
    pulls in the console and the framebuffer, and that is still true.
-3. **Processes, the scheduler and ring 3** - the ring-3 and
-   `syscall`/`sysret` *mechanism* is done in Milestone 47, which is also
-   why the GDT's user selectors are ordered the way they are. Still
-   missing: `process_asm.s`, `scheduler_asm.s`, a TSS that switches
-   `rsp0` per task, address spaces, and any context switch at all.
+3. ~~**Processes, the scheduler and ring 3**~~ - done across Milestones
+   47-49: ring 3 and `syscall`/`sysret` (47, and why the GDT's user
+   selectors are ordered as they are), address spaces (48), and
+   preemptive round-robin scheduling from the timer (49). No
+   `process_asm.s` or `scheduler_asm.s` was needed - the interrupt frame
+   already *is* the saved context. What is still missing is a per-task
+   kernel stack, which is what a task that blocks inside a syscall
+   needs; see Milestone 49.
 4. **The syscall ABI** - and this one is not a port but a rewrite.
    Novaris implements *Linux's i386 syscall ABI*, which is what lets real
    glibc and real Wine run unmodified. x86-64 Linux has different syscall
@@ -6544,6 +6547,65 @@ And item 4 is untouched and unchanged: this is the mechanism, not an ABI.
 Novaris's 32-bit kernel implements Linux's *i386* syscall ABI, which is
 exactly what lets real glibc and real Wine run unmodified, and none of it
 transfers to x86-64.
+
+## Milestone 49 — 64-bit: two tasks, preempted ✅ DONE
+
+The end of Milestone 44's item 3. 115 assertions, up from 108.
+
+### The context switch is a struct copy
+
+There is no `process_asm.s` and no `scheduler_asm.s` in the 64-bit tree,
+and there does not need to be, because of where the state already is.
+When the CPU takes an interrupt at CPL 3 it switches to the stack in the
+TSS and pushes the ring-3 `ss:rsp`, `rflags` and `cs:rip`; `isr64.s` then
+pushes all fifteen general-purpose registers. By the time a handler runs,
+**the entire user-visible state of the interrupted task is already laid
+out in memory as a `registers64_t`**.
+
+So switching tasks is: copy that struct into the outgoing task, copy the
+incoming task's struct over it, load the incoming CR3, return. `iretq`
+reloads from exactly the memory the handler just rewrote - the same
+property Milestone 44 built the interrupt path around, and the reason
+that milestone insisted on proving a handler could move `rip`.
+
+This is also the first thing in the 64-bit tree to be interrupted *while
+at CPL 3*, so it is the first real use of the TSS `rsp0` that Milestone
+47 set up and could not exercise.
+
+### Why it works, and where it stops working
+
+It works because these tasks only ever run in ring 3 and are never
+interrupted inside the kernel, so no task has a kernel stack that needs
+preserving - one `rsp0` serves all of them. **A task that can block
+inside a syscall needs its own kernel stack**, and that is the next thing
+this has to grow. There are no priorities, no accounting and no run
+queue: a fixed array walked in order.
+
+### Ending the run without measuring the machine
+
+The two tasks increment a counter forever and never exit on their own.
+The scheduler stops the run by rewriting `rip` to an exit stub on a
+resume, which works precisely because every other register - including
+the pointer the task keeps its counter address in - is restored
+untouched.
+
+That makes the test end after a fixed number of **ticks** rather than a
+fixed number of iterations, and the difference is the whole point: five
+consecutive runs report `switches = 8` every time while the counters
+range from 326,672 to 726,002 depending on how fast the emulator felt
+like being. An iteration-counted test would have been a coin flip
+between finishing before the first preemption and taking too long.
+
+```
+NOVARIS64: switches= 8, task0 = 591070, task1 = 719048
+```
+
+Both counters non-zero is the result. Each counter lives in a physical
+frame reachable only from its own task's address space, mapped at the
+*same* virtual address in both - so one task running would leave the
+other at exactly zero. Falsified by making `sched64_tick` never pick a
+different task: the first task then loops forever, the kernel never gets
+control back, and the run dies on the harness timeout.
 
 ## The state of the tree, as found
 
