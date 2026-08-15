@@ -32,4 +32,8 @@ uint64_t win32_64_call(uint64_t number, uint64_t a1, uint64_t a2,
 
 uint64_t win32_64_bytes_written(void);
 
+/* How many modules LoadLibraryA mapped (re-requests of an already-loaded
+ * name do not count - they return the existing handle). */
+uint64_t win32_64_loads(void);
+
 #endif

@@ -91,16 +91,25 @@ static int name_matches(const char* a, const char* b) {
 
 /* Resolves an export in an already-loaded module. Must run with that
  * module's address space current, since the tables it walks are the
- * mapped ones rather than the file's. */
-static uint64_t module_export(const char* dll, const char* fn,
-                              uint32_t ordinal, int by_ordinal) {
+ * mapped ones rather than the file's.
+ *
+ * `dll` selects by name; passing 0 with a non-zero `base` selects by
+ * base address instead, which is what GetProcAddress needs - it is
+ * handed an HMODULE, not a name. */
+static uint64_t module_export_ex(const char* dll, uint64_t want_base,
+                                 const char* fn,
+                                 uint32_t ordinal, int by_ordinal) {
     for (uint64_t m = 0; m < module_count; m++) {
         const export_dir_t* ed;
         const uint32_t* funcs;
         uint64_t base = modules[m].base;
         uint32_t idx;
 
-        if (!name_matches(modules[m].name, dll)) continue;
+        if (dll) {
+            if (!name_matches(modules[m].name, dll)) continue;
+        } else {
+            if (base != want_base) continue;
+        }
         if (!modules[m].export_size) return 0;
 
         ed = (const export_dir_t*)(base + modules[m].export_rva);
@@ -133,6 +142,21 @@ static uint64_t module_export(const char* dll, const char* fn,
 
         return base + funcs[idx];
     }
+    return 0;
+}
+
+static uint64_t module_export(const char* dll, const char* fn,
+                              uint32_t ordinal, int by_ordinal) {
+    return module_export_ex(dll, 0, fn, ordinal, by_ordinal);
+}
+
+uint64_t pe64_export_by_base(uint64_t base, const char* function) {
+    return module_export_ex(0, base, function, 0, 0);
+}
+
+uint64_t pe64_module_base(const char* name) {
+    for (uint64_t m = 0; m < module_count; m++)
+        if (name_matches(modules[m].name, name)) return modules[m].base;
     return 0;
 }
 
@@ -428,4 +452,11 @@ int pe64_load(const void* image, uint64_t size, vmspace64_t* space,
 int pe64_load_dll(const void* image, uint64_t size, vmspace64_t* space,
                   const char* name, uint64_t bias, pe64_info_t* out) {
     return load_in_space(image, size, space, bias, name, out);
+}
+
+int pe64_load_dll_here(const void* image, uint64_t size, const char* name,
+                       uint64_t bias, pe64_info_t* out) {
+    /* No CR3 switch: the caller is a syscall from the process this
+     * module belongs to, so its space is already loaded. */
+    return load_common(image, size, bias, name, out);
 }

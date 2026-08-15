@@ -8,6 +8,8 @@
 #include "win32_64.h"
 #include "kstring.h"
 #include "serial64.h"
+#include "initrd64.h"
+#include "pe64.h"
 
 /* Handles are opaque to the program, so these can be anything that is
  * not NULL and not INVALID_HANDLE_VALUE. */
@@ -22,6 +24,9 @@ enum {
     FN_WRITEFILE,
     FN_GETLASTERROR,
     FN_SETLASTERROR,
+    FN_LOADLIBRARYA,
+    FN_GETPROCADDRESS,
+    FN_FREELIBRARY,
     /* ExitProcess is WIN32_64_EXIT rather than the next number here: the
      * syscall stub has to recognise it without calling into C, because
      * it is the one that does not return. */
@@ -35,13 +40,18 @@ static const struct {
     { "WriteFile",     FN_WRITEFILE    },
     { "GetLastError",  FN_GETLASTERROR },
     { "SetLastError",  FN_SETLASTERROR },
+    { "LoadLibraryA",  FN_LOADLIBRARYA },
+    { "GetProcAddress", FN_GETPROCADDRESS },
+    { "FreeLibrary",   FN_FREELIBRARY  },
     { "ExitProcess",   WIN32_64_EXIT   },
 };
 
 static uint64_t bytes_written;
 static uint32_t last_error;
+static uint64_t loads;
 
 uint64_t win32_64_bytes_written(void) { return bytes_written; }
+uint64_t win32_64_loads(void)         { return loads; }
 
 int win32_64_resolve(const char* dll, const char* function) {
     /* Only kernel32 so far. The DLL name is compared case-insensitively
@@ -86,6 +96,64 @@ uint64_t win32_64_call(uint64_t number, uint64_t a1, uint64_t a2,
         if (written) *written = n;
         return 1;
     }
+
+    /* LoadLibraryA(lpLibFileName) -> HMODULE.
+     *
+     * The module's image comes from the initrd, which is the whole point
+     * of this milestone: until now a DLL had to be compiled into the
+     * kernel to be loadable, and a program could not ask for one by name
+     * at run time.
+     *
+     * Everything here happens in the calling process's address space,
+     * because a syscall never leaves it. */
+    case FN_LOADLIBRARYA: {
+        const char* name = (const char*)a1;
+        const void* image;
+        uint64_t len, base;
+        pe64_info_t info;
+
+        if (!name) { last_error = 87; return 0; }   /* ERROR_INVALID_PARAMETER */
+
+        /* Already loaded: return the same handle rather than mapping a
+         * second copy. A DLL's data is per-process, and two copies would
+         * give the program two sets of it. */
+        base = pe64_module_base(name);
+        if (base) return base;
+
+        if (initrd64_open(name, &image, &len) != INITRD64_OK) {
+            last_error = 126;                       /* ERROR_MOD_NOT_FOUND */
+            return 0;
+        }
+
+        /* Bias 0: load where it asked. Nothing here tracks which address
+         * ranges are already occupied, so a collision between two DLLs
+         * that want the same base would go unnoticed - that is what a
+         * real loader's address-space bookkeeping is for, and it is not
+         * here yet. */
+        if (pe64_load_dll_here(image, len, name, 0, &info) != PE64_OK) {
+            last_error = 193;                       /* ERROR_BAD_EXE_FORMAT */
+            return 0;
+        }
+        loads++;
+        return info.image_base;                     /* the HMODULE */
+    }
+
+    /* GetProcAddress(hModule, lpProcName) -> FARPROC. Only by name:
+     * looking up by ordinal is legal on Windows (a name that is really a
+     * small integer) and is not implemented here. */
+    case FN_GETPROCADDRESS: {
+        uint64_t addr;
+        if (!a1 || !a2) { last_error = 87; return 0; }
+        addr = pe64_export_by_base(a1, (const char*)a2);
+        if (!addr) last_error = 127;                /* ERROR_PROC_NOT_FOUND */
+        return addr;
+    }
+
+    /* FreeLibrary(hModule). Accepted and ignored: nothing here reference
+     * counts modules or unmaps them, and a program that frees a library
+     * it is about to stop using loses nothing by the module staying. */
+    case FN_FREELIBRARY:
+        return 1;
 
     case FN_GETLASTERROR:
         return last_error;
