@@ -6906,6 +6906,93 @@ the exporting DLL's export table), TLS callbacks, delay imports, SEH and
 `.dll` from, and no export tables to resolve against. chrome.exe needs
 all of those, and 285MB of `chrome.dll` besides.
 
+## Milestone 53 — 64-bit: a Windows program that ships its own DLL ✅ DONE
+
+151 assertions. `dlluser64.exe` imports two functions from
+`dlllib64.dll` and three from kernel32; the DLL imports from kernel32
+itself. That is chrome.exe's shape - a small executable whose real work
+lives in a library beside it, the way chrome.exe leans on
+`chrome_elf.dll`.
+
+```
+NOVARIS64: dll     = 0x0000000392eb0000, relocs 1
+NOVARIS64: exe     = 0x0000000140000000
+NOVARIS64: --- its output follows ---
+hello from a DLL, called by a 64-bit PE
+hello from a DLL, called by a 64-bit PE
+NOVARIS64: --- end of its output ---
+```
+
+Two things happen here that Milestone 52 could not do. An import
+resolves against a **real export table** rather than a kernel stub - so
+the call is an ordinary ring-3 call into the DLL with no thunk and no
+syscall in the middle - and the DLL is **loaded away from the base it
+was linked at**, with its relocations applied.
+
+### The relocation is load-bearing, not decorative
+
+A DLL built `-nostdlib` from simple code has no `.reloc` section at all:
+everything the compiler emits is RIP-relative, so there is nothing to
+fix up, and a loader that skipped relocation entirely would pass. The
+DLL therefore exports a *data pointer* initialised to an address, which
+is a value that has to exist in memory as a full 64 bits and cannot be
+folded into a `lea`. That is what makes the linker emit a `.reloc`, and
+the Makefile fails the build if it ever stops doing so.
+
+The executable then calls `DllGetMessage`, which returns that pointer,
+and prints through it. Loaded at a forced bias of 0x10000000, the
+correct answer is 0x392eb3000. Falsified by counting relocations without
+applying them: the pointer stays at the address the linker chose,
+0x382eb3000, and the program faults reading it.
+
+### The bug: rdi and rsi
+
+Milestone 52's thunk was wrong, and worked by luck.
+
+**`rdi` and `rsi` are callee-saved in the Windows x64 ABI and volatile
+in SysV.** A Windows program may keep a live value in either across a
+call, and mingw does exactly that - holding the message pointer in `rsi`
+across a `GetStdHandle` call - while the SysV C the syscall lands in is
+entitled to destroy both. The thunk now pushes and pops them.
+
+Milestone 52's executable happened to keep nothing live in those two
+registers, which is the only reason it passed.
+
+What the failure looked like is worth recording, because it is the same
+shape as Milestone 51's register bug seen from the Windows side: the
+call that *breaks* is not the one that clobbered anything. `GetStdHandle`
+returned correctly, and then `WriteFile` was called with 0x28 - the
+string's length - as its buffer pointer, because the pointer that should
+have been in `rsi` was gone.
+
+The other half of the same ABI difference is already covered: Windows
+also treats xmm6-xmm15 as callee-saved, and Milestone 51 made the kernel
+`-mno-sse`, so it cannot touch them at all.
+
+### Forwarders are rejected rather than followed
+
+An export whose RVA lands inside the export directory is not code, it is
+a string like `"OTHERDLL.OtherFunc"`, and resolving it means loading that
+module too. `module_export` detects the case and refuses, rather than
+returning a pointer to a string as though it were a function. Chrome's
+DLLs use forwarders heavily, so this will have to be implemented; failing
+loudly is the honest interim.
+
+### What is still missing
+
+`DllMain` is **not called**. Doing it properly means entering ring 3,
+running it, and coming back, before the executable that needs it starts -
+which is a scheduler question rather than a loader one, and the DLLs here
+have no initialisation to do.
+
+There is still no filesystem, so a module is "loaded" only in the sense
+that the kernel already had its bytes: `pe64_load_dll` is handed an image
+that was linked into the kernel. A real `LoadLibrary` needs somewhere to
+read a `.dll` from, and that is the next thing this needs.
+
+Also still absent: TLS callbacks, delay imports, SEH and `.pdata`
+unwinding, and bound imports.
+
 ## The state of the tree, as found
 
 Two things that belong to neither milestone, recorded because the next

@@ -52,8 +52,94 @@ typedef struct {
     uint32_t SizeOfBlock;
 } __attribute__((packed)) reloc_block_t;
 
-/* One import thunk, 20 bytes:
+typedef struct {
+    uint32_t Characteristics;
+    uint32_t TimeDateStamp;
+    uint16_t MajorVersion;
+    uint16_t MinorVersion;
+    uint32_t Name;
+    uint32_t Base;                  /* the ordinal the table starts at */
+    uint32_t NumberOfFunctions;
+    uint32_t NumberOfNames;
+    uint32_t AddressOfFunctions;
+    uint32_t AddressOfNames;
+    uint32_t AddressOfNameOrdinals;
+} __attribute__((packed)) export_dir_t;
+
+/* Modules loaded into the current process, in load order. A real loader
+ * keeps this per process next to the address space; this is a static for
+ * the same reason uspace64.c's is, and pe64_reset_modules() is what
+ * stands in for the process going away. */
+#define MAX_MODULES 8
+
+static struct {
+    char     name[32];
+    uint64_t base;
+    uint32_t export_rva;
+    uint32_t export_size;
+} modules[MAX_MODULES];
+static uint64_t module_count;
+
+void pe64_reset_modules(void) { module_count = 0; }
+uint64_t pe64_module_count(void) { return module_count; }
+
+/* Windows compares module names case-insensitively, and import tables
+ * spell them every possible way. */
+static int name_matches(const char* a, const char* b) {
+    return kstricmp(a, b) == 0;
+}
+
+/* Resolves an export in an already-loaded module. Must run with that
+ * module's address space current, since the tables it walks are the
+ * mapped ones rather than the file's. */
+static uint64_t module_export(const char* dll, const char* fn,
+                              uint32_t ordinal, int by_ordinal) {
+    for (uint64_t m = 0; m < module_count; m++) {
+        const export_dir_t* ed;
+        const uint32_t* funcs;
+        uint64_t base = modules[m].base;
+        uint32_t idx;
+
+        if (!name_matches(modules[m].name, dll)) continue;
+        if (!modules[m].export_size) return 0;
+
+        ed = (const export_dir_t*)(base + modules[m].export_rva);
+        funcs = (const uint32_t*)(base + ed->AddressOfFunctions);
+
+        if (by_ordinal) {
+            if (ordinal < ed->Base) return 0;
+            idx = ordinal - ed->Base;
+            if (idx >= ed->NumberOfFunctions) return 0;
+        } else {
+            const uint32_t* names = (const uint32_t*)(base + ed->AddressOfNames);
+            const uint16_t* ords =
+                (const uint16_t*)(base + ed->AddressOfNameOrdinals);
+            uint32_t i;
+            for (i = 0; i < ed->NumberOfNames; i++)
+                if (kstrcmp((const char*)(base + names[i]), fn) == 0) break;
+            if (i == ed->NumberOfNames) return 0;
+            idx = ords[i];
+            if (idx >= ed->NumberOfFunctions) return 0;
+        }
+
+        /* An export RVA that lands inside the export directory itself is
+         * not code: it is a forwarder string, "OTHERDLL.OtherFunc", and
+         * following it means loading that module too. Rejected rather
+         * than returning a pointer to a string as if it were a
+         * function - Chrome's DLLs use forwarders heavily. */
+        if (funcs[idx] >= modules[m].export_rva &&
+            funcs[idx] <  modules[m].export_rva + modules[m].export_size)
+            return 0;
+
+        return base + funcs[idx];
+    }
+    return 0;
+}
+
+/* One import thunk, 24 bytes:
  *
+ *   57              push rdi         see below
+ *   56              push rsi
  *   48 89 CF        mov rdi, rcx     Windows arg 1 -> SysV arg 1
  *   48 89 D6        mov rsi, rdx     arg 2 (before rdx is overwritten)
  *   4C 89 C2        mov rdx, r8      arg 3
@@ -61,14 +147,34 @@ typedef struct {
  *                                    SYSCALL destroys rcx
  *   B8 nn nn nn nn  mov eax, number
  *   0F 05           syscall
+ *   5E              pop rsi
+ *   5F              pop rdi
  *   C3              ret
  *
  * The move order is not free: rsi <- rdx has to happen before rdx <- r8,
- * or the second argument is lost. */
-#define THUNK_SIZE 20
+ * or the second argument is lost.
+ *
+ * The pushes are not optional either, and this is the trap in bridging
+ * two ABIs rather than one: **rdi and rsi are callee-saved on Windows
+ * and volatile on SysV**. A Windows program may keep a live value in
+ * either across a call - mingw does exactly that, holding a pointer in
+ * rsi across a GetStdHandle call - while the SysV C this syscall lands
+ * in is entitled to destroy both. Without saving them the program
+ * resumes with a register quietly rewritten, and what that looks like is
+ * the *next* call receiving a plausible-but-wrong argument.
+ *
+ * The other direction of the same problem is already handled: Windows
+ * also treats xmm6-xmm15 as callee-saved, and the kernel is compiled
+ * -mno-sse (Milestone 51) so it cannot touch them at all.
+ *
+ * Pushing shifts rsp, which would matter for a function reading its
+ * fifth and later arguments off the stack. Nothing here has one. */
+#define THUNK_SIZE 24
 
 static void write_thunk(uint8_t* p, uint32_t number) {
     static const uint8_t prologue[] = {
+        0x57,
+        0x56,
         0x48, 0x89, 0xCF,
         0x48, 0x89, 0xD6,
         0x4C, 0x89, 0xC2,
@@ -76,14 +182,16 @@ static void write_thunk(uint8_t* p, uint32_t number) {
     };
     int i;
     for (i = 0; i < (int)sizeof(prologue); i++) p[i] = prologue[i];
-    p[12] = 0xB8;
-    p[13] = (uint8_t)(number      );
-    p[14] = (uint8_t)(number >>  8);
-    p[15] = (uint8_t)(number >> 16);
-    p[16] = (uint8_t)(number >> 24);
-    p[17] = 0x0F;
-    p[18] = 0x05;
-    p[19] = 0xC3;
+    p[14] = 0xB8;
+    p[15] = (uint8_t)(number      );
+    p[16] = (uint8_t)(number >>  8);
+    p[17] = (uint8_t)(number >> 16);
+    p[18] = (uint8_t)(number >> 24);
+    p[19] = 0x0F;
+    p[20] = 0x05;
+    p[21] = 0x5E;
+    p[22] = 0x5F;
+    p[23] = 0xC3;
 }
 
 static int map_pages(uint64_t start, uint64_t end, uint64_t* pages) {
@@ -111,12 +219,15 @@ static int map_pages(uint64_t start, uint64_t end, uint64_t* pages) {
     return 1;
 }
 
-int pe64_load(const void* image, uint64_t size, vmspace64_t* space,
-              pe64_info_t* out) {
+/* Everything except the CR3 switch, so that the executable and the DLLs
+ * beside it share one implementation. Runs with `space` already
+ * current. */
+static int load_common(const void* image, uint64_t size, uint64_t bias,
+                       const char* module_name, pe64_info_t* out) {
     const uint8_t* f = (const uint8_t*)image;
     uint32_t pe_off, n_sections, size_opt, size_headers, size_image;
     uint32_t entry_rva, i;
-    uint64_t want_base, base, delta, saved_cr3, thunk_va, thunk_next;
+    uint64_t want_base, base, delta, thunk_va, thunk_next;
     uint64_t pages = 0, imports = 0, relocs = 0;
     const data_dir_t* dirs;
     const section_hdr_t* sections;
@@ -151,11 +262,8 @@ int pe64_load(const void* image, uint64_t size, vmspace64_t* space,
     if (opt + size_opt + n_sections * sizeof(section_hdr_t) > size)
         return PE64_TRUNCATED;
 
-    base = want_base;              /* no ASLR: loaded where it asked */
-    delta = base - want_base;
-
-    __asm__ __volatile__("mov %%cr3, %0" : "=r"(saved_cr3));
-    __asm__ __volatile__("mov %0, %%cr3" :: "r"(space->pml4_phys) : "memory");
+    base = want_base + bias;
+    delta = bias;
 
     /* The image, plus one page after it for the import thunks. */
     thunk_va = (base + size_image + PAGE64_SIZE - 1) & ~(PAGE64_SIZE - 1);
@@ -209,8 +317,26 @@ int pe64_load(const void* image, uint64_t size, vmspace64_t* space,
         }
     }
 
-    /* Imports. Every name is resolved to a thunk in the page above the
-     * image, and the thunk's address is written into the IAT. */
+    /* Registered before its own imports are resolved, which is harmless
+     * and means the export table is readable the moment anything asks. */
+    if (module_name) {
+        if (module_count >= MAX_MODULES) { rc = PE64_NOMEM; goto done; }
+        kstrlcpy(modules[module_count].name, module_name,
+                 sizeof(modules[module_count].name));
+        modules[module_count].base = base;
+        if (n_dirs > DIR_EXPORT) {
+            modules[module_count].export_rva  = dirs[DIR_EXPORT].VirtualAddress;
+            modules[module_count].export_size = dirs[DIR_EXPORT].Size;
+        } else {
+            modules[module_count].export_rva  = 0;
+            modules[module_count].export_size = 0;
+        }
+        module_count++;
+    }
+
+    /* Imports. A name the kernel provides becomes a thunk in the page
+     * above the image; a name another loaded module exports becomes that
+     * module's actual address. */
     thunk_next = thunk_va;
     if (n_dirs > DIR_IMPORT && dirs[DIR_IMPORT].Size) {
         const import_desc_t* d =
@@ -223,17 +349,34 @@ int pe64_load(const void* image, uint64_t size, vmspace64_t* space,
             uint64_t* iat = (uint64_t*)(base + d->FirstThunk);
 
             for (; *lookup; lookup++, iat++) {
-                const char* name;
+                const char* name = 0;
+                uint32_t ordinal = 0;
+                int by_ordinal = (*lookup & IMAGE_ORDINAL_FLAG64) != 0;
+                uint64_t addr;
                 int number;
 
-                if (*lookup & IMAGE_ORDINAL_FLAG64) {
-                    /* Importing by ordinal needs the exporting DLL's
-                     * export table, which nothing here has. */
-                    rc = PE64_BAD_IMPORT;
-                    goto done;
+                if (by_ordinal) {
+                    ordinal = (uint32_t)(*lookup & 0xFFFF);
+                } else {
+                    /* IMAGE_IMPORT_BY_NAME: a 2-byte hint, then the name. */
+                    name = (const char*)(base + (*lookup & 0x7FFFFFFF) + 2);
                 }
-                /* IMAGE_IMPORT_BY_NAME: a 2-byte hint, then the name. */
-                name = (const char*)(base + (*lookup & 0x7FFFFFFF) + 2);
+
+                /* A real module that has been loaded wins: the import
+                 * resolves to an actual address inside it, and the call
+                 * is an ordinary ring-3 call with no thunk and no
+                 * syscall in the middle. */
+                addr = module_export(dll, name, ordinal, by_ordinal);
+                if (addr) {
+                    *iat = addr;
+                    imports++;
+                    continue;
+                }
+
+                /* Otherwise it has to be something the kernel provides,
+                 * which is only ever by name - an ordinal is meaningless
+                 * without the exporting DLL's table. */
+                if (by_ordinal) { rc = PE64_BAD_IMPORT; goto done; }
 
                 number = win32_64_resolve(dll, name);
                 if (number < 0) { rc = PE64_BAD_IMPORT; goto done; }
@@ -251,8 +394,6 @@ int pe64_load(const void* image, uint64_t size, vmspace64_t* space,
     }
 
 done:
-    __asm__ __volatile__("mov %0, %%cr3" :: "r"(saved_cr3) : "memory");
-
     if (rc == PE64_OK && out) {
         out->image_base = base;
         out->entry      = base + entry_rva;
@@ -262,4 +403,29 @@ done:
         out->pages      = pages;
     }
     return rc;
+}
+
+/* The two public entry points differ only in whether the image's exports
+ * are recorded and whether it is allowed to move. */
+static int load_in_space(const void* image, uint64_t size,
+                         vmspace64_t* space, uint64_t bias,
+                         const char* module_name, pe64_info_t* out) {
+    uint64_t saved_cr3;
+    int rc;
+
+    __asm__ __volatile__("mov %%cr3, %0" : "=r"(saved_cr3));
+    __asm__ __volatile__("mov %0, %%cr3" :: "r"(space->pml4_phys) : "memory");
+    rc = load_common(image, size, bias, module_name, out);
+    __asm__ __volatile__("mov %0, %%cr3" :: "r"(saved_cr3) : "memory");
+    return rc;
+}
+
+int pe64_load(const void* image, uint64_t size, vmspace64_t* space,
+              pe64_info_t* out) {
+    return load_in_space(image, size, space, 0, 0, out);
+}
+
+int pe64_load_dll(const void* image, uint64_t size, vmspace64_t* space,
+                  const char* name, uint64_t bias, pe64_info_t* out) {
+    return load_in_space(image, size, space, bias, name, out);
 }
