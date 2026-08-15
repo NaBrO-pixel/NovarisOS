@@ -167,6 +167,46 @@ syscall64_entry:
     ret
 
 ; ---------------------------------------------------------------------
+; void sched64_resume(registers64_t *regs)  - does not return.
+;
+; Loads a saved thread and goes there. The scheduler's ordinary switch
+; happens inside an interrupt and can just rewrite the frame it was
+; handed; this is for the other case - a thread that has exited and can
+; never be returned to, so its sibling has to be entered directly.
+;
+; The offsets are registers64_t's layout. If that struct changes, this
+; breaks silently and catastrophically, which is why idt64.h says the two
+; have to stay in step.
+; ---------------------------------------------------------------------
+global sched64_resume
+sched64_resume:
+    ; The frame iretq consumes, off the incoming struct: ss, rsp,
+    ; rflags, cs, rip. Built on the current stack, which iretq abandons
+    ; the moment it loads the thread's own rsp.
+    push qword [rdi + 168]          ; ss
+    push qword [rdi + 160]          ; rsp
+    push qword [rdi + 152]          ; rflags
+    push qword [rdi + 144]          ; cs
+    push qword [rdi + 136]          ; rip
+
+    mov rax, [rdi + 0]
+    mov rbx, [rdi + 8]
+    mov rcx, [rdi + 16]
+    mov rdx, [rdi + 24]
+    mov rsi, [rdi + 32]
+    mov rbp, [rdi + 48]
+    mov r8,  [rdi + 56]
+    mov r9,  [rdi + 64]
+    mov r10, [rdi + 72]
+    mov r11, [rdi + 80]
+    mov r12, [rdi + 88]
+    mov r13, [rdi + 96]
+    mov r14, [rdi + 104]
+    mov r15, [rdi + 112]
+    mov rdi, [rdi + 40]             ; last, it was the pointer until now
+    iretq
+
+; ---------------------------------------------------------------------
 ; The ring-3 program. Position independent by construction, so it runs at
 ; whatever address it is copied to.
 ;
@@ -214,7 +254,10 @@ task_count_code:
 
 task_count_exit:
     mov rdi, [rsi]                  ; hand the final count to the kernel
-    mov rax, SYS64_EXIT
+    ; exit_group, not exit: this ends the whole run, and since Milestone
+    ; 56 those are different things - exit(60) would hand the CPU to the
+    ; other counting task and the kernel would never get it back.
+    mov rax, SYS64_EXIT_GROUP
     syscall
 .hang:
     jmp .hang

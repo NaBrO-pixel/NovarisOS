@@ -80,6 +80,11 @@ uint64_t syscall64_bytes_written(void) { return bytes_written; }
  * it and reading these, since this kernel has no strace. */
 static uint64_t unimpl_count, last_unimpl;
 
+/* How many threads ended through exit(2) without ending the process. */
+static uint64_t thread_exits;
+
+uint64_t syscall64_thread_exits(void) { return thread_exits; }
+
 uint64_t syscall64_unimplemented(void) { return last_unimpl; }
 uint64_t syscall64_unimplemented_count(void) { return unimpl_count; }
 
@@ -307,7 +312,33 @@ static uint64_t dispatch(syscall64_args_t* args) {
     case SYS64_ECHO:
         last_arg = a1;
         return a1 + 0x1111;
-    case SYS64_EXIT:
+    /* exit(2) ends the calling THREAD. exit_group(2) ends the process.
+     *
+     * Treating them as the same thing is a real divergence and it was
+     * observable: userland/thread64.s, run on Linux with exit(60), hung
+     * - the parent thread ended and the parked child kept the process
+     * alive. Novaris passed that same program, because it had only one
+     * behaviour for both. */
+    case SYS64_EXIT: {
+        registers64_t next;
+        vmspace64_t next_space;
+        uint64_t next_fs;
+
+        thread_exits++;
+        if (sched64_exit_current(&next, &next_space, &next_fs)) {
+            /* A sibling is still runnable, so this thread simply stops
+             * existing and that one continues. There is no returning to
+             * the caller: the thread it would return to is gone. */
+            vmspace64_switch(&next_space);
+            write_msr(0xC0000100u, next_fs);        /* its own TLS */
+            sched64_resume(&next);                  /* never returns */
+        }
+        /* The last thread. Falling through leaves ring 3 the way
+         * exit_group does, which is correct - the process is over. */
+        exit_code = a1;
+        return a1;
+    }
+
     case SYS64_EXIT_GROUP:
         exit_code = a1;
         return a1;

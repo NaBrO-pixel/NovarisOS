@@ -896,6 +896,12 @@ void kernel_main(uint32_t magic, void* mbi) {
                   syscall64_exit_code() == counters[0] ||
                   syscall64_exit_code() == counters[1]);
 
+            /* Leave no live tasks behind. Since Milestone 56 exit(2)
+             * hands the CPU to a surviving sibling rather than ending
+             * the run, so a stale task here would capture the *next*
+             * layer's exit and never give control back. */
+            sched64_init();
+
             serial64_puts("NOVARIS64: switches= ");
             serial64_putdec(sched64_switches());
             serial64_puts(", task0 = ");
@@ -1304,6 +1310,9 @@ void kernel_main(uint32_t magic, void* mbi) {
         elf64_info_t info;
         uint64_t i;
         uint64_t written_before = syscall64_bytes_written();
+        /* Earlier layers call exit(2) too, so this counts the delta
+         * rather than the total. */
+        uint64_t exits_before = syscall64_thread_exits();
         int rc, stack_ok = 1, main_tid;
         registers64_t placeholder;
 
@@ -1357,6 +1366,12 @@ void kernel_main(uint32_t magic, void* mbi) {
          * clone failed; a hang would mean the child never got the CPU. */
         check("the parent saw the child's write and exited cleanly",
               syscall64_exit_code() == 23);
+        /* The child called exit(2), which ends a thread. If that were
+         * still a synonym for exit_group(2) the run would have ended
+         * with the child's status and the parent would never have
+         * printed - which is exactly how Linux caught this. */
+        check("the child ended as a thread, not as the process",
+              syscall64_thread_exits() == exits_before + 1);
 
         serial64_puts("NOVARIS64: switches= ");
         serial64_putdec(sched64_switches());

@@ -49,6 +49,21 @@ int  sched64_add_frame(const registers64_t* regs, const vmspace64_t* space,
  * what a thread inherits from the thread that cloned it. */
 const vmspace64_t* sched64_current_space(void);
 
+/* Ends the calling thread and picks a successor.
+ *
+ * Returns 0 if there was none - the caller was the last thread, and the
+ * process is over. Otherwise the successor's state is written out and
+ * the caller is expected to hand it to sched64_resume(), because a
+ * thread that has exited cannot be returned to.
+ */
+int sched64_exit_current(registers64_t* out_regs, vmspace64_t* out_space,
+                         uint64_t* out_fs_base);
+
+/* Enters a saved thread directly. Never returns. Implemented in
+ * syscall64.s, and it depends on registers64_t's exact layout. */
+extern void sched64_resume(const registers64_t* regs)
+    __attribute__((noreturn));
+
 /* Called from the timer handler with the interrupted frame. */
 void sched64_tick(registers64_t* frame);
 

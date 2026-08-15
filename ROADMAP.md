@@ -7120,10 +7120,7 @@ its own TLS in BoringSSL - and none of them are what stands in the way.
 
 ### Still missing, in the order Wine will hit them
 
-1. **Thread exit.** A thread that returns has nowhere to go; the test
-   program parks in a loop instead. Related, and worse: `exit` and
-   `exit_group` are the same thing here, which the section above shows
-   is already observable.
+1. ~~**Thread exit**~~ - done in Milestone 56.
 2. **futex**, which is how every real thread library waits. The spin in
    this test is what a program does when it has no futex.
 3. **Per-task kernel stacks.** One syscall stack is shared by all
@@ -7132,6 +7129,49 @@ its own TLS in BoringSSL - and none of them are what stands in the way.
    stops being safe the moment any syscall blocks, which is the moment
    futex arrives.
 4. Signals, a writable filesystem, file-backed `mmap`.
+
+## Milestone 56 — 64-bit: exit(2) ends a thread, not the process ✅ DONE
+
+168 assertions. Milestone 55 recorded the divergence its own differential
+had exposed; this closes it.
+
+`exit` (60) now ends the calling thread. If a sibling is still runnable
+the thread simply stops existing and that sibling continues; only the
+last thread out ends the process. `exit_group` (231) always ends the
+process. `userland/thread64.s`'s child now calls `exit`, and the parent
+still prints afterwards - on Novaris and on Linux alike.
+
+**A thread that has exited cannot be returned to**, which is what makes
+this more than a bookkeeping change. The scheduler's ordinary switch
+happens inside an interrupt and rewrites the frame it was handed; there
+is no such frame here, so `sched64_resume` in `syscall64.s` builds an
+`iretq` frame from a saved `registers64_t` and enters the sibling
+directly. That assembly reaches into the struct by hand-written byte
+offsets, so `sched64.c` now carries `_Static_assert`s on all nine of
+them - if the struct changes shape, the build stops instead of the
+kernel jumping somewhere arbitrary.
+
+### It broke Milestone 49, which was correct of it
+
+The preemption test hung. Its counting tasks ended the run with `exit`,
+which had always torn everything down; now it hands the CPU to the other
+counting task and the kernel never gets it back. The test meant
+`exit_group`, and says so now.
+
+The same change had a second consequence worth recording: the scheduler's
+task table outlives a test layer, so a stale live task would capture the
+*next* layer's `exit` and never return. Milestone 49's layer clears the
+table when it finishes. In a real kernel the process teardown does this;
+here the layers share one scheduler, and that is the seam.
+
+### And the assertion caught its own author
+
+`syscall64_thread_exits() == 1` failed on the first run - earlier layers
+call `exit` too, so the counter does not start at zero. It measures the
+delta now. Worth noting only because it is the third time in this port
+that a test's first failure was the test being wrong rather than the
+kernel, and each time the alternative was a green run that proved
+nothing.
 
 ## Where chrome.exe actually is from here
 
