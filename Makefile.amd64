@@ -72,6 +72,8 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/pe64.o \
        $(BUILD_DIR)/win32_64.o \
        $(BUILD_DIR)/pe64_blob.o \
+       $(BUILD_DIR)/dlllib64_blob.o \
+       $(BUILD_DIR)/dlluser64_blob.o \
        $(BUILD_DIR)/hello64_blob.o \
        $(BUILD_DIR)/glibc64_blob.o \
        $(BUILD_DIR)/kheap64.o \
@@ -145,6 +147,35 @@ $(BUILD_DIR)/pe64_blob.c: $(BUILD_DIR)/hello_pe64.exe userland/embed64.py
 	python3 userland/embed64.py $< $@ pe64_exe
 
 $(BUILD_DIR)/pe64_blob.o: $(BUILD_DIR)/pe64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# A DLL and an executable that imports from it - the shape chrome.exe
+# has, where the small .exe's real work lives in a library beside it.
+#
+# The exported data pointer in dlllib64.c is deliberate: it is what makes
+# the linker emit a .reloc section, without which the loader's relocation
+# path could not be tested at all.
+$(BUILD_DIR)/dlllib64.dll: userland/dlllib64.c | $(BUILD_DIR)
+	x86_64-w64-mingw32-gcc -shared -nostdlib -O2 -Wl,-e,DllEntry \
+	    -Wl,--out-implib,$(BUILD_DIR)/dlllib64.lib -o $@ $< -lkernel32
+	@objdump -p $@ | grep -q "Base Relocation Directory" \
+	    || (echo "ERROR: $@ has no .reloc; the relocation test is void"; \
+	        false)
+
+$(BUILD_DIR)/dlluser64.exe: userland/dlluser64.c $(BUILD_DIR)/dlllib64.dll
+	x86_64-w64-mingw32-gcc -nostdlib -O2 -Wl,-e,entry -o $@ $< \
+	    $(BUILD_DIR)/dlllib64.lib -lkernel32
+
+$(BUILD_DIR)/dlllib64_blob.c: $(BUILD_DIR)/dlllib64.dll userland/embed64.py
+	python3 userland/embed64.py $< $@ dlllib64_dll
+
+$(BUILD_DIR)/dlluser64_blob.c: $(BUILD_DIR)/dlluser64.exe userland/embed64.py
+	python3 userland/embed64.py $< $@ dlluser64_exe
+
+$(BUILD_DIR)/dlllib64_blob.o: $(BUILD_DIR)/dlllib64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/dlluser64_blob.o: $(BUILD_DIR)/dlluser64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/%.o: kernel/%.c | $(BUILD_DIR)

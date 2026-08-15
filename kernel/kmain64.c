@@ -87,6 +87,10 @@ extern const unsigned char glibc64_elf[];
 extern const unsigned long glibc64_elf_len;
 extern const unsigned char pe64_exe[];
 extern const unsigned long pe64_exe_len;
+extern const unsigned char dlllib64_dll[];
+extern const unsigned long dlllib64_dll_len;
+extern const unsigned char dlluser64_exe[];
+extern const unsigned long dlluser64_exe_len;
 
 /* isr64.s - a load that is allowed to fault, and where to resume if it does. */
 extern uint64_t probe_read64(const void* addr);
@@ -1116,6 +1120,84 @@ void kernel_main(uint32_t magic, void* mbi) {
         serial64_puts("NOVARIS64: wrote   = ");
         serial64_putdec(win32_64_bytes_written() - written_before);
         serial64_puts(" bytes, exit ");
+        serial64_putdec(syscall64_exit_code());
+        serial64_putc('\n');
+    }
+
+    /* --- layer 17: a PE that ships its own DLL ---------------------- */
+    /* chrome.exe's shape: a small executable whose real work is in a
+     * library beside it. Two things get proved here that layer 16 could
+     * not - resolving an import against a real export table, and moving
+     * an image away from the base it was linked at. */
+    serial64_puts("NOVARIS64: -- a PE with its own DLL --\n");
+    {
+        /* Forced, not incidental. Loading the DLL where it asked would
+         * leave the relocation code untested, and the first image that
+         * genuinely needs it will be chrome.exe. */
+        const uint64_t DLL_BIAS    = 0x10000000ULL;
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 8;
+        vmspace64_t kspace, space;
+        pe64_info_t dll, exe;
+        uint64_t rsp, i;
+        uint64_t written_before = win32_64_bytes_written();
+        int rc_dll, rc_exe, stack_ok = 1;
+
+        vmspace64_kernel_space(&kspace);
+        pe64_reset_modules();
+        check("a space for the pair", vmspace64_create(&space) != 0);
+
+        rc_dll = pe64_load_dll(dlllib64_dll, dlllib64_dll_len, &space,
+                               "dlllib64.dll", DLL_BIAS, &dll);
+        check("the DLL loaded", rc_dll == PE64_OK);
+        check("it was moved off its preferred base", dll.relocs > 0);
+        check("and it is registered as a module", pe64_module_count() == 1);
+        /* The DLL imports from kernel32 itself, so it needed thunks of
+         * its own before anything could call into it. */
+        check("its own kernel32 imports were bound", dll.imports >= 2);
+
+        rc_exe = pe64_load(dlluser64_exe, dlluser64_exe_len, &space, &exe);
+        check("the executable loaded", rc_exe == PE64_OK);
+        /* Two from the DLL, three from kernel32. The DLL's two resolve
+         * to addresses inside it; kernel32's three become thunks. */
+        check("all five of its imports were bound", exe.imports == 5);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        rsp = STACK_TOP - 8;
+
+        serial64_puts("NOVARIS64: dll     = ");
+        serial64_puthex(dll.image_base);
+        serial64_puts(", relocs ");
+        serial64_putdec(dll.relocs);
+        serial64_puts("\nNOVARIS64: exe     = ");
+        serial64_puthex(exe.image_base);
+        serial64_puts("\nNOVARIS64: --- its output follows ---\n");
+
+        pf_diagnose = 1;
+        vmspace64_switch(&space);
+        enter_user_mode64(exe.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+        pf_diagnose = 0;
+
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("the DLL's code ran",
+              win32_64_bytes_written() > written_before);
+        /* The executable exits 5 only if the DLL returned exactly 1234.
+         * 99 would mean the call arrived but the convention is wrong,
+         * which is a different bug from the call not arriving at all. */
+        check("and returned the right value across the call",
+              syscall64_exit_code() == 5);
+
+        serial64_puts("NOVARIS64: exit    = ");
         serial64_putdec(syscall64_exit_code());
         serial64_putc('\n');
     }

@@ -43,4 +43,24 @@ typedef struct {
 int pe64_load(const void* image, uint64_t size, vmspace64_t* space,
               pe64_info_t* out);
 
+/* Loads a DLL into the same space and records its exports, so that a
+ * later pe64_load can resolve imports against it by name or by ordinal.
+ *
+ * `bias` is added to the image's preferred base. Passing a non-zero one
+ * is how the relocation path gets exercised deliberately rather than
+ * waiting for a collision to do it by accident.
+ *
+ * Its DllMain is *not* called. Nothing here can: doing it properly means
+ * entering ring 3, running it, and coming back, before the executable
+ * that needs it has started - which is a scheduler question rather than
+ * a loader one. The DLLs used so far have no initialisation to do. */
+int pe64_load_dll(const void* image, uint64_t size, vmspace64_t* space,
+                  const char* name, uint64_t bias, pe64_info_t* out);
+
+/* Forgets every registered module. Call before building a process, or
+ * one process's DLLs resolve another's imports. */
+void pe64_reset_modules(void);
+
+uint64_t pe64_module_count(void);
+
 #endif
