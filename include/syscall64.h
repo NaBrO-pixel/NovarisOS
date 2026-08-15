@@ -43,6 +43,8 @@
 #define SYS64_WRITEV          20
 #define SYS64_UNAME           63
 #define SYS64_READLINK        89
+#define SYS64_CLONE           56
+#define SYS64_GETTID          186
 #define SYS64_ARCH_PRCTL      158
 #define SYS64_FUTEX           202
 #define SYS64_SET_TID_ADDRESS 218
@@ -52,6 +54,11 @@
 #define SYS64_GETRANDOM       318
 #define SYS64_RSEQ            334
 #define SYS64_EXIT            60
+
+/* clone() flag bits, Linux's values. Only these are acted on. */
+#define CLONE_VM      0x00000100
+#define CLONE_THREAD  0x00010000
+#define CLONE_SETTLS  0x00080000
 
 /* One Novaris-private number, well above anything Linux uses, kept for
  * the bring-up test that has no way to print. */
@@ -64,9 +71,17 @@
  * *number* has to go somewhere as well, so a register-for-register
  * mapping runs out. A struct on the syscall stack costs one `mov` and
  * makes the whole set addressable. */
+/* Exactly the frame syscall64_entry builds, 128 bytes of it, in address
+ * order. The callee-saved half and the two saved-return fields are there
+ * for `clone`, which has to hand a new thread a complete register set
+ * and cannot invent one from registers it cannot see. */
 typedef struct syscall64_args {
-    uint64_t nr;
-    uint64_t a1, a2, a3, a4, a5, a6;
+    uint64_t nr;                          /* rax                       */
+    uint64_t a1, a2, a3, a4, a5, a6;      /* rdi, rsi, rdx, r10, r8, r9 */
+    uint64_t rbx, rbp, r12, r13, r14, r15;
+    uint64_t _pad;                        /* keeps the call 16-aligned */
+    uint64_t ret_rflags;                  /* r11, as SYSCALL left it   */
+    uint64_t ret_rip;                     /* rcx, likewise             */
 } syscall64_args_t;
 
 /* Sets EFER.SCE, STAR, LSTAR and FMASK. Call after gdt64_install(). */

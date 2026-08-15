@@ -7055,6 +7055,84 @@ not. There is also no `DllMain` call, no reference counting (`FreeLibrary`
 accepts and ignores), no search path (the name is matched exactly against
 the archive), and no `LoadLibraryW`.
 
+## Milestone 55 — 64-bit: threads, and Wine configures ✅ DONE
+
+167 assertions and a fourth differential. Two results: `clone(2)` works,
+and Wine reconfigured for x86-64 **configures cleanly**, which is the
+first evidence that the endgame is reachable at all.
+
+### clone(2)
+
+`userland/thread64.s` mmaps a stack, calls `clone`, and the two threads
+share memory: the child writes a value, the parent spins until it sees
+it. That spin is the test - nothing yields, so the parent only ever
+unblocks if the timer preempts it and the scheduler runs the child. A
+kernel that created the thread but never ran it would hang, and the
+harness timeout would catch that rather than the run passing quietly.
+
+This is what makes it different from Milestone 49's two tasks: those had
+an address space each and could not have shared a variable if they
+wanted to. These have one between them.
+
+Three pieces had to change:
+
+- **The syscall stub now saves the callee-saved registers**, which SysV
+  entitles the C dispatcher to ignore. `clone` has to hand a new thread
+  a complete register set and cannot invent one from registers it cannot
+  see. With them, `syscall64_args_t` describes the entire 128-byte frame,
+  the saved `rflags` and return `rip` included - which is where the
+  child's starting point comes from.
+- **The scheduler swaps the thread pointer.** `fs_base` lives in an MSR,
+  not in the interrupt frame, so nothing else would have saved it; each
+  thread has its own, and `CLONE_SETTLS` is how it gets one.
+- **The child is its parent with three differences**, exactly as Linux
+  specifies: a different stack, its own thread pointer, and `rax = 0` so
+  the two can tell each other apart on return.
+
+A `clone` without `CLONE_VM` is a fork, which would have to copy the
+address space. Nothing here does that, so it is refused with -ENOSYS
+rather than silently producing a thread where a process was asked for.
+
+### What the differential caught this time
+
+Run on Linux, the first version of the program **hung**. `exit` (60)
+ends the calling *thread*; with the child parked in a loop, the process
+stayed alive. The program meant `exit_group` (231).
+
+Novaris does not yet tell those two apart - both leave ring 3 and end the
+run - so **the guest alone could not have caught this**, and would have
+gone on passing. That divergence is now the top of the list below.
+
+### Wine, configured for x86-64
+
+```
+$ ../wine/configure --enable-archs=x86_64 --disable-tests --without-x \
+      --with-freetype --without-vulkan --without-opengl
+configure: Finished.  Do 'make' to compile Wine.
+$ grep PE_ARCHS config.log
+PE_ARCHS=' x86_64'
+```
+
+Built out-of-tree in `wine64-build/`, so the working i386 tree beside it
+is untouched. Warnings only: no sound system, no gnutls (so no
+schannel), no gettext. None of those block a browser - Chrome carries
+its own TLS in BoringSSL - and none of them are what stands in the way.
+
+### Still missing, in the order Wine will hit them
+
+1. **Thread exit.** A thread that returns has nowhere to go; the test
+   program parks in a loop instead. Related, and worse: `exit` and
+   `exit_group` are the same thing here, which the section above shows
+   is already observable.
+2. **futex**, which is how every real thread library waits. The spin in
+   this test is what a program does when it has no futex.
+3. **Per-task kernel stacks.** One syscall stack is shared by all
+   threads. That is safe *today* only because `FMASK` clears IF on entry
+   and nothing re-enables it, so a syscall cannot be preempted - and it
+   stops being safe the moment any syscall blocks, which is the moment
+   futex arrives.
+4. Signals, a writable filesystem, file-backed `mmap`.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
@@ -7069,14 +7147,16 @@ all but eight of them.
 **So the target is Wine, not Chrome**, and what Wine needs from a kernel
 is the Linux side of this tree rather than the Windows side:
 
-1. **Threads** (`clone`), which Wine uses heavily and nothing here has.
+1. ~~**Threads** (`clone`)~~ - done in Milestone 55, minus thread exit
+   and futex.
 2. **Signals**, delivered - Wine's exception dispatch is built on them.
 3. **A real filesystem**: Wine reads a prefix of thousands of files and
    writes to it. This milestone's initrd is read-only and lives entirely
    in RAM.
 4. **File-backed `mmap`**, which is how Wine maps a PE at all.
-5. **Wine itself reconfigured** `--enable-archs=x86_64`, which has never
-   been attempted here.
+5. ~~**Wine itself reconfigured** `--enable-archs=x86_64`~~ - it
+   configures cleanly (Milestone 55). Compiling it is a separate
+   question, and running it a much larger one.
 
 Items 1-4 are all Milestone 44's item 4 - the syscall ABI - and the
 32-bit tree took Milestones 19-31 to get there. That is the honest

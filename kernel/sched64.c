@@ -10,8 +10,22 @@
 typedef struct {
     registers64_t regs;
     vmspace64_t   space;
+    uint64_t      fs_base;   /* the thread pointer, per thread          */
     int           used;
 } task64_t;
+
+#define IA32_FS_BASE 0xC0000100u
+
+static inline uint64_t read_fs_base(void) {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdmsr" : "=a"(lo), "=d"(hi) : "c"(IA32_FS_BASE));
+    return ((uint64_t)hi << 32) | lo;
+}
+static inline void write_fs_base(uint64_t v) {
+    __asm__ __volatile__("wrmsr"
+                         :: "c"(IA32_FS_BASE),
+                            "a"((uint32_t)v), "d"((uint32_t)(v >> 32)));
+}
 
 static task64_t tasks[SCHED64_MAX_TASKS];
 static int      task_total;
@@ -50,13 +64,40 @@ int sched64_add(uint64_t rip, uint64_t rsp, uint64_t arg,
     tasks[i].regs.rflags = RFLAGS_IF;
     tasks[i].regs.rdi    = arg;
 
-    tasks[i].space = *space;
-    tasks[i].used  = 1;
+    tasks[i].space   = *space;
+    tasks[i].fs_base = 0;    /* a task that has never run has no TLS yet */
+    tasks[i].used    = 1;
     task_total++;
     return i;
 }
 
-void sched64_set_current(int index) { current = index; }
+int sched64_add_frame(const registers64_t* regs, const vmspace64_t* space,
+                      uint64_t fs_base) {
+    int i;
+
+    for (i = 0; i < SCHED64_MAX_TASKS; i++) if (!tasks[i].used) break;
+    if (i == SCHED64_MAX_TASKS) return -1;
+
+    tasks[i].regs    = *regs;
+    tasks[i].space   = *space;
+    tasks[i].fs_base = fs_base;
+    tasks[i].used    = 1;
+    task_total++;
+    return i;
+}
+
+const vmspace64_t* sched64_current_space(void) {
+    if (current < 0 || !tasks[current].used) return 0;
+    return &tasks[current].space;
+}
+
+void sched64_set_current(int index) {
+    current = index;
+    /* The first task is entered directly rather than switched to, so the
+     * scheduler never got to record what it was running with. */
+    if (index >= 0 && index < SCHED64_MAX_TASKS)
+        tasks[index].fs_base = read_fs_base();
+}
 int  sched64_current(void)          { return current; }
 uint64_t sched64_switches(void)     { return switch_count; }
 
@@ -81,8 +122,11 @@ void sched64_tick(registers64_t* frame) {
     next = next_task(current);
     if (next == current) return;
 
-    /* Everything the outgoing task is, as the CPU and the stub left it. */
-    tasks[current].regs = *frame;
+    /* Everything the outgoing task is, as the CPU and the stub left it -
+     * plus the thread pointer, which lives in an MSR rather than in the
+     * frame, so nothing else would have saved it. */
+    tasks[current].regs    = *frame;
+    tasks[current].fs_base = read_fs_base();
 
     current = next;
 
@@ -90,6 +134,7 @@ void sched64_tick(registers64_t* frame) {
      * from exactly this memory when the stub returns. */
     *frame = tasks[current].regs;
     vmspace64_switch(&tasks[current].space);
+    write_fs_base(tasks[current].fs_base);
     switch_count++;
 
     /* Ending the run by redirecting a resume rather than by counting

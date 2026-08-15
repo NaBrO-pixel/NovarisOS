@@ -94,6 +94,8 @@ extern const unsigned char dlluser64_exe[];
 extern const unsigned long dlluser64_exe_len;
 extern const unsigned char loader64_exe[];
 extern const unsigned long loader64_exe_len;
+extern const unsigned char thread64_elf[];
+extern const unsigned long thread64_elf_len;
 
 /* isr64.s - a load that is allowed to fault, and where to resume if it does. */
 extern uint64_t probe_read64(const void* addr);
@@ -1286,6 +1288,80 @@ void kernel_main(uint32_t magic, void* mbi) {
         serial64_putdec(syscall64_exit_code());
         serial64_puts(", modules loaded ");
         serial64_putdec(win32_64_loads() - loads_before);
+        serial64_putc('\n');
+    }
+
+    /* --- layer 19: a thread, made with clone(2) --------------------- */
+    /* The first thing Wine needs that this tree did not have. Two
+     * threads in ONE address space, which is what makes it different
+     * from Milestone 49's two tasks: those had a space each and could
+     * not have shared a variable if they wanted to. */
+    serial64_puts("NOVARIS64: -- threads --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 16;
+        vmspace64_t kspace, space;
+        elf64_info_t info;
+        uint64_t i;
+        uint64_t written_before = syscall64_bytes_written();
+        int rc, stack_ok = 1, main_tid;
+        registers64_t placeholder;
+
+        vmspace64_kernel_space(&kspace);
+        check("a space for it", vmspace64_create(&space) != 0);
+
+        rc = elf64_load(thread64_elf, thread64_elf_len, &space, &info);
+        check("the threaded program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&space, info.brk_start);
+
+        /* The main thread has to be a scheduler task before it clones,
+         * or there is nothing for the child to be a sibling of. Its
+         * frame is a placeholder: the first timer tick overwrites it
+         * with the real one before any switch happens. */
+        sched64_init();
+        for (i = 0; i < sizeof(placeholder) / 8; i++)
+            ((uint64_t*)&placeholder)[i] = 0;
+        main_tid = sched64_add_frame(&placeholder, &space, 0);
+        check("the main thread is a scheduler task", main_tid == 0);
+        sched64_set_current(main_tid);
+
+        register_interrupt_handler64(32, sched_timer_handler);
+        idt64_irq_set_mask(0, 0);
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        vmspace64_switch(&space);
+        /* The parent spins on a variable only the child writes, so this
+         * returns only if the scheduler really ran both. */
+        enter_user_mode64(info.entry, STACK_TOP, 0);
+        vmspace64_switch(&kspace);
+        pf_diagnose = 0;
+        idt64_irq_set_mask(0, 1);
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("clone created a second thread",
+              sched64_current() >= 0 && sched64_switches() > 0);
+        check("both threads ran, sharing one address space",
+              syscall64_bytes_written() > written_before);
+        /* 23 is the parent's own status. 81 or 82 would mean mmap or
+         * clone failed; a hang would mean the child never got the CPU. */
+        check("the parent saw the child's write and exited cleanly",
+              syscall64_exit_code() == 23);
+
+        serial64_puts("NOVARIS64: switches= ");
+        serial64_putdec(sched64_switches());
+        serial64_puts(", exit ");
+        serial64_putdec(syscall64_exit_code());
         serial64_putc('\n');
     }
 

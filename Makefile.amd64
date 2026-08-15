@@ -75,6 +75,7 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/dlllib64_blob.o \
        $(BUILD_DIR)/dlluser64_blob.o \
        $(BUILD_DIR)/loader64_blob.o \
+       $(BUILD_DIR)/thread64_blob.o \
        $(BUILD_DIR)/initrd64.o \
        $(BUILD_DIR)/hello64_blob.o \
        $(BUILD_DIR)/glibc64_blob.o \
@@ -108,6 +109,18 @@ $(BUILD_DIR)/hello64.elf: userland/hello64.s | $(BUILD_DIR)
 	$(LD) -m elf_x86_64 -o $@ $(BUILD_DIR)/hello64.o
 	@file $@ | grep -q "ELF 64-bit" \
 	    || (echo "ERROR: $@ is not a 64-bit ELF"; false)
+
+# A thread, made with raw clone(2). Static and libc-free for the same
+# reason hello64.s is: what is being tested is the syscall, not the CRT.
+$(BUILD_DIR)/thread64.elf: userland/thread64.s | $(BUILD_DIR)
+	$(AS) -f elf64 $< -o $(BUILD_DIR)/thread64.o
+	$(LD) -m elf_x86_64 -o $@ $(BUILD_DIR)/thread64.o
+
+$(BUILD_DIR)/thread64_blob.c: $(BUILD_DIR)/thread64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ thread64_elf
+
+$(BUILD_DIR)/thread64_blob.o: $(BUILD_DIR)/thread64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/hello64_blob.c: $(BUILD_DIR)/hello64.elf userland/embed64.py
 	python3 userland/embed64.py $< $@ hello64_elf
@@ -270,6 +283,20 @@ test: iso
 	    || (echo "FAIL: the host run of the glibc binary did not exit 7"; \
 	        exit 1)
 	@echo "PASS: real glibc prints the same bytes, and exits 7, on both"
+	@# And the threaded one. This differential earned its place: run on
+	@# Linux it exposed that the program was calling exit(60), which ends
+	@# only the calling thread, where it meant exit_group(231). Novaris
+	@# does not yet tell those apart, so the guest alone could not have
+	@# caught it.
+	@timeout 20 ./$(BUILD_DIR)/thread64.elf > $(BUILD_DIR)/thread64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/thread64.host.status
+	@grep -qFf $(BUILD_DIR)/thread64.host.txt $(BUILD_DIR)/serial.log \
+	    || (echo "FAIL: the guest did not print what the host prints"; \
+	        exit 1)
+	@[ "`cat $(BUILD_DIR)/thread64.host.status`" = "23" ] \
+	    || (echo "FAIL: the host run of the threaded binary did not exit 23"; \
+	        exit 1)
+	@echo "PASS: clone(2) behaves the same, and exits 23, on both"
 
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR) $(ISO)

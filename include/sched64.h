@@ -36,6 +36,19 @@ void sched64_init(void);
 int  sched64_add(uint64_t rip, uint64_t rsp, uint64_t arg,
                  const vmspace64_t* space);
 
+/* Adds a task from a register set that already exists - what `clone`
+ * needs, since a new thread starts as a copy of its parent rather than
+ * at a fresh entry point. `fs_base` is the thread pointer: each thread
+ * has its own, so the scheduler swaps it on every switch.
+ *
+ * Returns the task index (its tid), or -1 if the table is full. */
+int  sched64_add_frame(const registers64_t* regs, const vmspace64_t* space,
+                       uint64_t fs_base);
+
+/* The address space and thread pointer of whatever is running, which is
+ * what a thread inherits from the thread that cloned it. */
+const vmspace64_t* sched64_current_space(void);
+
 /* Called from the timer handler with the interrupted frame. */
 void sched64_tick(registers64_t* frame);
 
