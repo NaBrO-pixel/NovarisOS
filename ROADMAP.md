@@ -7121,13 +7121,9 @@ its own TLS in BoringSSL - and none of them are what stands in the way.
 ### Still missing, in the order Wine will hit them
 
 1. ~~**Thread exit**~~ - done in Milestone 56.
-2. **futex**, which is how every real thread library waits. The spin in
-   this test is what a program does when it has no futex.
-3. **Per-task kernel stacks.** One syscall stack is shared by all
-   threads. That is safe *today* only because `FMASK` clears IF on entry
-   and nothing re-enables it, so a syscall cannot be preempted - and it
-   stops being safe the moment any syscall blocks, which is the moment
-   futex arrives.
+2. ~~**futex**~~ - done in Milestone 57.
+3. **Per-task kernel stacks** - still absent, and Milestone 57 explains
+   why futex did not need them.
 4. Signals, a writable filesystem, file-backed `mmap`.
 
 ## Milestone 56 — 64-bit: exit(2) ends a thread, not the process ✅ DONE
@@ -7172,6 +7168,80 @@ delta now. Worth noting only because it is the third time in this port
 that a test's first failure was the test being wrong rather than the
 kernel, and each time the alternative was a green run that proved
 nothing.
+
+## Milestone 57 — 64-bit: futex, and a full x86-64 Wine ✅ DONE
+
+175 assertions and a fifth differential. Two results again: threads can
+now **sleep**, and a complete 64-bit Wine exists.
+
+### Blocking without a per-task kernel stack
+
+Milestone 55 said futex would force per-task kernel stacks, because one
+shared syscall stack is safe only while no syscall blocks. It did not,
+and the reason is worth writing down.
+
+A thread that blocks in `FUTEX_WAIT` does not leave a half-finished
+kernel call behind. Its entire continuation is a `registers64_t` built
+from the syscall frame - the same construction `clone` uses - so the
+kernel call *ends*, the shared stack is free, and the scheduler enters
+another thread through `sched64_resume`. Waking the thread is setting
+`rax = 0` in that saved frame and marking it runnable; the next switch
+returns to ring 3 exactly where it left.
+
+That works because these syscalls have no kernel-side work left to do
+after they block. A syscall that must block, wake, *and then continue in
+the kernel* - a real `read` on a device, say - has nowhere to keep its
+locals, and that is the one that will finally require per-task stacks.
+
+`FUTEX_PRIVATE_FLAG` is masked off rather than acted on: it lets Linux
+skip a global hash lookup, which is an optimisation rather than a
+semantic, and with no shared memory here private and shared behave
+identically.
+
+### The test had to be made honest twice
+
+**First**, the program's output proves nothing on its own. A kernel that
+implemented `FUTEX_WAIT` as `return 0` still prints the right line - the
+parent just falls back into its recheck loop and spins. So the test
+asserts on kernel counters: a thread *really blocked*, and a wakeup
+*really woke one*. Falsified exactly that way, and the counter assertion
+is what fails while the output stays correct.
+
+**Second**, and more interesting: the first version was **flaky, about
+one run in three**. Nothing in the protocol forces the parent to reach
+`FUTEX_WAIT` before the child sets the flag - and when the child wins,
+the parent takes the fast path, never blocks, and the counters are
+legitimately zero. The kernel was fine; the assertion was asserting
+something the program did not guarantee.
+
+The fix uses the kernel as the oracle. `FUTEX_WAKE` returns how many
+threads it woke, so the child spins on it until it returns non-zero -
+which makes "the parent is asleep" an **observed fact** rather than a
+hope - and only then hands over. Five consecutive runs now report
+`waits = 1, wakes = 1`.
+
+A flaky test that passes two runs in three is worse than a failing one,
+because the third run gets blamed on the machine.
+
+### A full x86-64 Wine
+
+```
+Wine build complete.
+$ ls dlls/*/x86_64-windows/*.dll | wc -l
+602
+$ file dlls/ntdll/x86_64-windows/ntdll.dll
+PE32+ executable for WINE (DLL), x86-64, 19 sections
+```
+
+602 PE32+ x86-64 DLLs and the `wine` loader, built out-of-tree in
+`wine64-build/` so the working i386 tree is untouched. **That is the
+same format `pe64.c` already reads.**
+
+It is not running on Novaris and nothing here has tried. Wine's loader is
+an ELF binary that wants a filesystem, a prefix it can write, file-backed
+`mmap` and signal delivery - none of which exist yet. But the artifact
+Chrome ultimately needs now exists on this machine, in the right
+architecture, and the gap to it is a list rather than a question.
 
 ## Where chrome.exe actually is from here
 

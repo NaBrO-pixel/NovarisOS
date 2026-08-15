@@ -11,6 +11,8 @@ typedef struct {
     registers64_t regs;
     vmspace64_t   space;
     uint64_t      fs_base;   /* the thread pointer, per thread          */
+    uint64_t      wait_addr; /* the futex it is blocked on, 0 if awake  */
+    int           blocked;
     int           used;
 } task64_t;
 
@@ -64,9 +66,11 @@ int sched64_add(uint64_t rip, uint64_t rsp, uint64_t arg,
     tasks[i].regs.rflags = RFLAGS_IF;
     tasks[i].regs.rdi    = arg;
 
-    tasks[i].space   = *space;
-    tasks[i].fs_base = 0;    /* a task that has never run has no TLS yet */
-    tasks[i].used    = 1;
+    tasks[i].space     = *space;
+    tasks[i].fs_base   = 0;  /* a task that has never run has no TLS yet */
+    tasks[i].blocked   = 0;
+    tasks[i].wait_addr = 0;
+    tasks[i].used      = 1;
     task_total++;
     return i;
 }
@@ -78,10 +82,12 @@ int sched64_add_frame(const registers64_t* regs, const vmspace64_t* space,
     for (i = 0; i < SCHED64_MAX_TASKS; i++) if (!tasks[i].used) break;
     if (i == SCHED64_MAX_TASKS) return -1;
 
-    tasks[i].regs    = *regs;
-    tasks[i].space   = *space;
-    tasks[i].fs_base = fs_base;
-    tasks[i].used    = 1;
+    tasks[i].regs      = *regs;
+    tasks[i].space     = *space;
+    tasks[i].fs_base   = fs_base;
+    tasks[i].blocked   = 0;
+    tasks[i].wait_addr = 0;
+    tasks[i].used      = 1;
     task_total++;
     return i;
 }
@@ -144,12 +150,60 @@ int sched64_exit_current(registers64_t* out_regs, vmspace64_t* out_space,
     return 1;
 }
 
+/* A blocked task is not a candidate: it is waiting on a futex and has
+ * nothing to run until somebody wakes it. */
 static int next_task(int from) {
     for (int n = 1; n <= SCHED64_MAX_TASKS; n++) {
         int i = (from + n) % SCHED64_MAX_TASKS;
-        if (tasks[i].used) return i;
+        if (tasks[i].used && !tasks[i].blocked) return i;
     }
     return from;
+}
+
+int sched64_block_current(const registers64_t* regs, uint64_t addr,
+                          registers64_t* out_regs, vmspace64_t* out_space,
+                          uint64_t* out_fs_base) {
+    int next;
+
+    if (current < 0 || !tasks[current].used) return 0;
+
+    /* The frame the caller built is this thread's entire continuation:
+     * when something wakes it, execution resumes from exactly here. */
+    tasks[current].regs      = *regs;
+    tasks[current].blocked   = 1;
+    tasks[current].wait_addr = addr;
+
+    next = next_task(current);
+    if (next == current || tasks[next].blocked) {
+        /* Nothing else can run. Really this is a deadlock, and Linux
+         * would simply block forever; unblocking the caller and letting
+         * it see -EDEADLK is more useful than a machine that stops. */
+        tasks[current].blocked   = 0;
+        tasks[current].wait_addr = 0;
+        return 0;
+    }
+
+    current = next;
+    if (out_regs)    *out_regs    = tasks[next].regs;
+    if (out_space)   *out_space   = tasks[next].space;
+    if (out_fs_base) *out_fs_base = tasks[next].fs_base;
+    return 1;
+}
+
+int sched64_wake(uint64_t addr, int max) {
+    int woken = 0;
+
+    for (int i = 0; i < SCHED64_MAX_TASKS && woken < max; i++) {
+        if (!tasks[i].used || !tasks[i].blocked) continue;
+        if (tasks[i].wait_addr != addr) continue;
+        tasks[i].blocked   = 0;
+        tasks[i].wait_addr = 0;
+        /* futex(2) returns 0 to a waiter that was woken. The value goes
+         * into the saved frame, because that frame IS the thread. */
+        tasks[i].regs.rax = 0;
+        woken++;
+    }
+    return woken;
 }
 
 void sched64_tick(registers64_t* frame) {

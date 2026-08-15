@@ -83,7 +83,52 @@ static uint64_t unimpl_count, last_unimpl;
 /* How many threads ended through exit(2) without ending the process. */
 static uint64_t thread_exits;
 
+/* syscall64.s records the caller's ring-3 stack here on every entry, and
+ * it is the only place that value exists - the frame the stub builds
+ * describes the registers but not the stack they came off. */
+extern uint64_t saved_user_rsp;
+
+/* The calling thread's complete user state, as a frame it could be
+ * resumed from, with `rax` set to what the syscall will return.
+ *
+ * This is what makes a blocking syscall possible without a per-task
+ * kernel stack: a thread that blocks does not leave a half-finished
+ * kernel call behind, it leaves *this*, and waking it is resuming it. */
+static void frame_from_args(const syscall64_args_t* args, uint64_t rax,
+                            registers64_t* out) {
+    out->rax = rax;
+    out->rbx = args->rbx;
+    out->rcx = 0;              /* SYSCALL destroyed it on the way in */
+    out->rdx = args->a3;
+    out->rsi = args->a2;
+    out->rdi = args->a1;
+    out->rbp = args->rbp;
+    out->r8  = args->a5;
+    out->r9  = args->a6;
+    out->r10 = args->a4;
+    out->r11 = 0;
+    out->r12 = args->r12;
+    out->r13 = args->r13;
+    out->r14 = args->r14;
+    out->r15 = args->r15;
+    out->int_no   = 0;
+    out->err_code = 0;
+    out->rip    = args->ret_rip;
+    out->cs     = 0x23;
+    out->rflags = args->ret_rflags | 0x200;
+    out->rsp    = saved_user_rsp;
+    out->ss     = 0x1B;
+}
+
 uint64_t syscall64_thread_exits(void) { return thread_exits; }
+
+/* Threads that actually slept, and wakeups that actually woke one.
+ * Counted because "the futex worked" and "the futex was never contended"
+ * look identical from outside, and only the first is worth claiming. */
+static uint64_t futex_waits, futex_wakes;
+
+uint64_t syscall64_futex_waits(void) { return futex_waits; }
+uint64_t syscall64_futex_wakes(void) { return futex_wakes; }
 
 uint64_t syscall64_unimplemented(void) { return last_unimpl; }
 uint64_t syscall64_unimplemented_count(void) { return unimpl_count; }
@@ -297,6 +342,54 @@ static uint64_t dispatch(syscall64_args_t* args) {
             buf[i] = (uint8_t)seed;
         }
         return a2;
+    }
+
+    /* futex(uaddr, op, val, timeout, uaddr2, val3)
+     *
+     * Two operations, which is what a thread library actually needs:
+     * WAIT blocks until somebody WAKEs the same address.
+     *
+     * FUTEX_PRIVATE_FLAG is masked off rather than acted on. It tells
+     * Linux the futex is not shared between processes, which lets it
+     * skip looking the page up in a global hash - an optimisation, not a
+     * semantic. With one address space per process and no shared memory
+     * here, private and shared behave identically. */
+    case SYS64_FUTEX: {
+        uint32_t op = (uint32_t)a2 & ~(uint32_t)FUTEX_PRIVATE_FLAG;
+
+        if (op == FUTEX_WAIT) {
+            registers64_t self, next;
+            vmspace64_t next_space;
+            uint64_t next_fs;
+
+            /* The comparison is the whole point of the interface, and
+             * it is why futex has no race: between the caller deciding
+             * to sleep and this check, the waker may already have run
+             * and changed the value. If it has, do not sleep. */
+            if (*(volatile uint32_t*)a1 != (uint32_t)a3)
+                return (uint64_t)-11;              /* -EAGAIN */
+
+            futex_waits++;
+            frame_from_args(args, 0, &self);
+            if (!sched64_block_current(&self, a1, &next, &next_space,
+                                       &next_fs))
+                return (uint64_t)-35;              /* -EDEADLK */
+
+            vmspace64_switch(&next_space);
+            write_msr(0xC0000100u, next_fs);
+            sched64_resume(&next);                 /* never returns */
+        }
+
+        if (op == FUTEX_WAKE) {
+            int n = sched64_wake(a1, (int)(uint32_t)a3);
+            futex_wakes += (uint64_t)n;
+            return (uint64_t)n;
+        }
+
+        /* FUTEX_REQUEUE, FUTEX_WAIT_BITSET, priority inheritance and
+         * the rest are not implemented; -ENOSYS is what lets a library
+         * fall back rather than assume they worked. */
+        return (uint64_t)-38;
     }
 
     case SYS64_RT_SIGACTION:

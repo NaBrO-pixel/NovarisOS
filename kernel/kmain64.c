@@ -96,6 +96,8 @@ extern const unsigned char loader64_exe[];
 extern const unsigned long loader64_exe_len;
 extern const unsigned char thread64_elf[];
 extern const unsigned long thread64_elf_len;
+extern const unsigned char futex64_elf[];
+extern const unsigned long futex64_elf_len;
 
 /* isr64.s - a load that is allowed to fault, and where to resume if it does. */
 extern uint64_t probe_read64(const void* addr);
@@ -1375,6 +1377,81 @@ void kernel_main(uint32_t magic, void* mbi) {
 
         serial64_puts("NOVARIS64: switches= ");
         serial64_putdec(sched64_switches());
+        serial64_puts(", exit ");
+        serial64_putdec(syscall64_exit_code());
+        serial64_putc('\n');
+    }
+
+    /* --- layer 20: a futex ------------------------------------------ */
+    /* thread64.s spun. This one sleeps, which is the difference that
+     * matters: a kernel implementing FUTEX_WAIT as "return 0" would
+     * still pass that test - the parent would loop again - and cannot
+     * pass this one, because there is no loop to fall back into. */
+    serial64_puts("NOVARIS64: -- futex --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 16;
+        vmspace64_t kspace, space;
+        elf64_info_t info;
+        uint64_t i;
+        uint64_t written_before = syscall64_bytes_written();
+        uint64_t waits_before   = syscall64_futex_waits();
+        uint64_t wakes_before   = syscall64_futex_wakes();
+        int rc, stack_ok = 1, main_tid;
+        registers64_t placeholder;
+
+        vmspace64_kernel_space(&kspace);
+        check("a space for it", vmspace64_create(&space) != 0);
+
+        rc = elf64_load(futex64_elf, futex64_elf_len, &space, &info);
+        check("the futex program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&space, info.brk_start);
+
+        sched64_init();
+        for (i = 0; i < sizeof(placeholder) / 8; i++)
+            ((uint64_t*)&placeholder)[i] = 0;
+        main_tid = sched64_add_frame(&placeholder, &space, 0);
+        sched64_set_current(main_tid);
+
+        register_interrupt_handler64(32, sched_timer_handler);
+        idt64_irq_set_mask(0, 0);
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        vmspace64_switch(&space);
+        enter_user_mode64(info.entry, STACK_TOP, 0);
+        vmspace64_switch(&kspace);
+        pf_diagnose = 0;
+        idt64_irq_set_mask(0, 1);
+        sched64_init();
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("the handoff happened",
+              syscall64_bytes_written() > written_before);
+        check("and the program exited with its own status, 31",
+              syscall64_exit_code() == 31);
+        /* Without these two the run proves nothing: a parent that never
+         * contended would take the fast path, never sleep, and pass
+         * every assertion above. */
+        check("a thread really blocked in futex(2)",
+              syscall64_futex_waits() > waits_before);
+        check("and a wakeup really woke one",
+              syscall64_futex_wakes() > wakes_before);
+
+        serial64_puts("NOVARIS64: waits   = ");
+        serial64_putdec(syscall64_futex_waits() - waits_before);
+        serial64_puts(", wakes ");
+        serial64_putdec(syscall64_futex_wakes() - wakes_before);
         serial64_puts(", exit ");
         serial64_putdec(syscall64_exit_code());
         serial64_putc('\n');

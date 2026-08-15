@@ -265,6 +265,10 @@ task_count_code_end:
 
 section .bss
 align 16
+; Global because a blocking syscall has to record where its caller's
+; stack was: a thread that blocks is resumed later from a frame the
+; kernel builds, and this is the only place its user rsp exists.
+global saved_user_rsp
 saved_user_rsp:     resq 1
 kernel_return_rsp:  resq 1
 

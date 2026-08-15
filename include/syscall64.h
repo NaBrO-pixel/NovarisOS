@@ -55,6 +55,14 @@
 #define SYS64_RSEQ            334
 #define SYS64_EXIT            60
 
+/* futex(2) operations, Linux's values. FUTEX_PRIVATE_FLAG is masked off
+ * rather than acted on: it lets Linux skip a global hash lookup, which
+ * is an optimisation rather than a semantic, and with no shared memory
+ * here private and shared behave identically. */
+#define FUTEX_WAIT          0
+#define FUTEX_WAKE          1
+#define FUTEX_PRIVATE_FLAG  128
+
 /* clone() flag bits, Linux's values. Only these are acted on. */
 #define CLONE_VM      0x00000100
 #define CLONE_THREAD  0x00010000
@@ -127,5 +135,11 @@ void syscall64_set_trace(int on);
 /* Threads that ended through exit(2) while siblings were still running -
  * the case that does NOT end the process. */
 uint64_t syscall64_thread_exits(void);
+
+/* Threads that actually blocked in futex(2), and wakeups that actually
+ * woke one. A run where nothing ever contended would show zero here and
+ * still pass everything else. */
+uint64_t syscall64_futex_waits(void);
+uint64_t syscall64_futex_wakes(void);
 
 #endif

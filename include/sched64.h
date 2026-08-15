@@ -59,6 +59,22 @@ const vmspace64_t* sched64_current_space(void);
 int sched64_exit_current(registers64_t* out_regs, vmspace64_t* out_space,
                          uint64_t* out_fs_base);
 
+/* Blocks the calling thread on `addr` - a futex wait.
+ *
+ * `regs` is the frame the thread resumes from when something wakes it,
+ * so it IS the thread from here on. Returns 0 if nothing else can run,
+ * in which case the caller is left runnable and should report a
+ * deadlock rather than stopping the machine.
+ */
+int sched64_block_current(const registers64_t* regs, uint64_t addr,
+                          registers64_t* out_regs, vmspace64_t* out_space,
+                          uint64_t* out_fs_base);
+
+/* Wakes at most `max` threads blocked on `addr`; returns how many.
+ * A woken thread's saved rax becomes 0, which is what futex(2) returns
+ * to a waiter that was woken rather than timed out. */
+int sched64_wake(uint64_t addr, int max);
+
 /* Enters a saved thread directly. Never returns. Implemented in
  * syscall64.s, and it depends on registers64_t's exact layout. */
 extern void sched64_resume(const registers64_t* regs)

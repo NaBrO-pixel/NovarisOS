@@ -76,6 +76,7 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/dlluser64_blob.o \
        $(BUILD_DIR)/loader64_blob.o \
        $(BUILD_DIR)/thread64_blob.o \
+       $(BUILD_DIR)/futex64_blob.o \
        $(BUILD_DIR)/initrd64.o \
        $(BUILD_DIR)/hello64_blob.o \
        $(BUILD_DIR)/glibc64_blob.o \
@@ -120,6 +121,17 @@ $(BUILD_DIR)/thread64_blob.c: $(BUILD_DIR)/thread64.elf userland/embed64.py
 	python3 userland/embed64.py $< $@ thread64_elf
 
 $(BUILD_DIR)/thread64_blob.o: $(BUILD_DIR)/thread64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Two threads handing off through a futex, with no spin to fall back on.
+$(BUILD_DIR)/futex64.elf: userland/futex64.s | $(BUILD_DIR)
+	$(AS) -f elf64 $< -o $(BUILD_DIR)/futex64.o
+	$(LD) -m elf_x86_64 -o $@ $(BUILD_DIR)/futex64.o
+
+$(BUILD_DIR)/futex64_blob.c: $(BUILD_DIR)/futex64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ futex64_elf
+
+$(BUILD_DIR)/futex64_blob.o: $(BUILD_DIR)/futex64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/hello64_blob.c: $(BUILD_DIR)/hello64.elf userland/embed64.py
@@ -297,6 +309,18 @@ test: iso
 	    || (echo "FAIL: the host run of the threaded binary did not exit 23"; \
 	        exit 1)
 	@echo "PASS: clone(2) behaves the same, and exits 23, on both"
+	@# And the futex one, which is the strongest of the four: it blocks
+	@# and is woken rather than spinning, so a kernel that faked
+	@# FUTEX_WAIT could not produce this on either side.
+	@timeout 20 ./$(BUILD_DIR)/futex64.elf > $(BUILD_DIR)/futex64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/futex64.host.status
+	@grep -qFf $(BUILD_DIR)/futex64.host.txt $(BUILD_DIR)/serial.log \
+	    || (echo "FAIL: the guest did not print what the host prints"; \
+	        exit 1)
+	@[ "`cat $(BUILD_DIR)/futex64.host.status`" = "31" ] \
+	    || (echo "FAIL: the host run of the futex binary did not exit 31"; \
+	        exit 1)
+	@echo "PASS: futex(2) blocks and wakes the same, and exits 31, on both"
 
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR) $(ISO)
