@@ -74,6 +74,8 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/pe64_blob.o \
        $(BUILD_DIR)/dlllib64_blob.o \
        $(BUILD_DIR)/dlluser64_blob.o \
+       $(BUILD_DIR)/loader64_blob.o \
+       $(BUILD_DIR)/initrd64.o \
        $(BUILD_DIR)/hello64_blob.o \
        $(BUILD_DIR)/glibc64_blob.o \
        $(BUILD_DIR)/kheap64.o \
@@ -178,6 +180,17 @@ $(BUILD_DIR)/dlllib64_blob.o: $(BUILD_DIR)/dlllib64_blob.c
 $(BUILD_DIR)/dlluser64_blob.o: $(BUILD_DIR)/dlluser64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# Imports only kernel32: it finds its DLL by name at run time rather
+# than through an import table, which is what LoadLibrary is for.
+$(BUILD_DIR)/loader64.exe: userland/loader64.c | $(BUILD_DIR)
+	x86_64-w64-mingw32-gcc -nostdlib -O2 -Wl,-e,entry -o $@ $< -lkernel32
+
+$(BUILD_DIR)/loader64_blob.c: $(BUILD_DIR)/loader64.exe userland/embed64.py
+	python3 userland/embed64.py $< $@ loader64_exe
+
+$(BUILD_DIR)/loader64_blob.o: $(BUILD_DIR)/loader64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/%.o: kernel/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -190,9 +203,25 @@ $(KERNEL): $(OBJS) linker64.ld
 	    || (echo "ERROR: $@ has no valid Multiboot header"; false)
 	@echo "  built $@"
 
-iso: $(KERNEL)
+# The initrd, built with the same mkinitrd.py the 32-bit tree uses.
+#
+# It ships dlllib64.dll so that a program can load a library from a FILE
+# rather than from bytes compiled into the kernel - which is the whole
+# point of Milestone 54, and the thing every DLL beyond the test set will
+# need.
+INITRD_STAGE = $(BUILD_DIR)/initrd64
+INITRD       = $(BUILD_DIR)/initrd64.img
+
+$(INITRD): $(BUILD_DIR)/dlllib64.dll userland/mkinitrd.py
+	rm -rf $(INITRD_STAGE)
+	mkdir -p $(INITRD_STAGE)
+	cp $(BUILD_DIR)/dlllib64.dll $(INITRD_STAGE)/dlllib64.dll
+	python3 userland/mkinitrd.py $(INITRD_STAGE) $@
+
+iso: $(KERNEL) $(INITRD)
 	mkdir -p $(ISO_DIR)/boot/grub
 	cp $(KERNEL) $(ISO_DIR)/boot/novaris64.bin
+	cp $(INITRD) $(ISO_DIR)/boot/initrd64.img
 	cp grub64.cfg $(ISO_DIR)/boot/grub/grub.cfg
 	grub-mkrescue -o $(ISO) $(ISO_DIR) 2>/dev/null
 	@echo "  built $(ISO)"

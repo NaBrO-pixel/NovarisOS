@@ -63,4 +63,20 @@ void pe64_reset_modules(void);
 
 uint64_t pe64_module_count(void);
 
+/* Is this name already loaded? Returns its base, or 0. LoadLibrary must
+ * return the same handle for a second request rather than mapping a
+ * second copy - a DLL's state is per-process, not per-call. */
+uint64_t pe64_module_base(const char* name);
+
+/* GetProcAddress: resolve an export in an already-loaded module, found
+ * by the base address that stood in for its HMODULE. Runs in the
+ * module's own address space. */
+uint64_t pe64_export_by_base(uint64_t base, const char* function);
+
+/* Loads a DLL into the address space that is ALREADY current, which is
+ * what a LoadLibrary call from inside a running process needs - it is
+ * already standing in the space the module belongs to. */
+int pe64_load_dll_here(const void* image, uint64_t size, const char* name,
+                       uint64_t bias, pe64_info_t* out);
+
 #endif

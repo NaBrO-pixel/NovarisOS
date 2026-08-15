@@ -36,6 +36,7 @@
 #include "uspace64.h"
 #include "pe64.h"
 #include "win32_64.h"
+#include "initrd64.h"
 
 static int failures = 0;
 
@@ -91,6 +92,8 @@ extern const unsigned char dlllib64_dll[];
 extern const unsigned long dlllib64_dll_len;
 extern const unsigned char dlluser64_exe[];
 extern const unsigned long dlluser64_exe_len;
+extern const unsigned char loader64_exe[];
+extern const unsigned long loader64_exe_len;
 
 /* isr64.s - a load that is allowed to fault, and where to resume if it does. */
 extern uint64_t probe_read64(const void* addr);
@@ -260,6 +263,11 @@ void kernel_main(uint32_t magic, void* mbi) {
         uint64_t total, free_before, f1, f2, free_after, dbl;
 
         pmm64_init((const multiboot_info_t*)mbi, kphys_start, kphys_end);
+
+        /* Immediately after, and before anything allocates: the initrd
+         * sits in RAM the allocator was just told is free, and it
+         * reserves its own pages as part of coming up. */
+        initrd64_init((const multiboot_info_t*)mbi);
 
         check("the frame allocator came up", pmm64_ready());
         total = pmm64_total_frames();
@@ -1199,6 +1207,85 @@ void kernel_main(uint32_t magic, void* mbi) {
 
         serial64_puts("NOVARIS64: exit    = ");
         serial64_putdec(syscall64_exit_code());
+        serial64_putc('\n');
+    }
+
+    /* --- layer 18: a DLL loaded from a file, by name, at run time ---- */
+    /* Everything before this had its libraries resolved before it
+     * started, from bytes compiled into the kernel. This program names a
+     * file, gets back a module, and finds a function in it - which is
+     * what LoadLibrary is, and the shape chrome.exe depends on:
+     * chrome_elf.dll *loads* chrome.dll rather than importing it. */
+    serial64_puts("NOVARIS64: -- LoadLibrary from a file --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 8;
+        vmspace64_t kspace, space;
+        pe64_info_t exe;
+        uint64_t rsp, i;
+        uint64_t loads_before = win32_64_loads();
+        int rc, stack_ok = 1;
+
+        check("the initrd was found and parsed",
+              initrd64_file_count() > 0);
+        {
+            const void* probe;
+            uint64_t plen = 0;
+            check("and dlllib64.dll is in it",
+                  initrd64_open("dlllib64.dll", &probe, &plen)
+                  == INITRD64_OK && plen > 0);
+        }
+
+        vmspace64_kernel_space(&kspace);
+        pe64_reset_modules();
+        check("a space for the program", vmspace64_create(&space) != 0);
+
+        rc = pe64_load(loader64_exe, loader64_exe_len, &space, &exe);
+        check("the program loaded", rc == PE64_OK);
+        /* Its import table names kernel32 only - GetStdHandle, WriteFile,
+         * LoadLibraryA, GetProcAddress, ExitProcess. The DLL it uses is
+         * not in there at all. */
+        check("it imports no DLL of its own", pe64_module_count() == 0);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        rsp = STACK_TOP - 8;
+
+        serial64_puts("NOVARIS64: initrd  = ");
+        serial64_putdec(initrd64_file_count());
+        serial64_puts(" file(s), ");
+        serial64_putdec(initrd64_size());
+        serial64_puts(" bytes\nNOVARIS64: --- its output follows ---\n");
+
+        pf_diagnose = 1;
+        vmspace64_switch(&space);
+        enter_user_mode64(exe.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+        pf_diagnose = 0;
+
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        /* The exit codes are the program's own diagnosis: 11 is success,
+         * and each failure path has its own number so a break says which
+         * step broke rather than only that something did. */
+        check("LoadLibraryA, GetProcAddress and the call all worked",
+              syscall64_exit_code() == 11);
+        check("exactly one module was mapped",
+              win32_64_loads() == loads_before + 1);
+        check("and it is registered under the name it was asked for",
+              pe64_module_base("dlllib64.dll") != 0);
+
+        serial64_puts("NOVARIS64: exit    = ");
+        serial64_putdec(syscall64_exit_code());
+        serial64_puts(", modules loaded ");
+        serial64_putdec(win32_64_loads() - loads_before);
         serial64_putc('\n');
     }
 

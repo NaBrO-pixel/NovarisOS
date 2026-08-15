@@ -21,3 +21,9 @@ novaris-wine.iso
 # else's Wine prefix.
 *.img
 __pycache__/
+
+# Claude Code's local settings. Machine-specific, and it holds the
+# permission allow-list - which is exactly the sort of file that ends up
+# with a credential in it, so it must never be committable.
+.claude/settings.local.json
+.claude/worktrees/

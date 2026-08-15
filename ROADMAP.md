@@ -6993,6 +6993,97 @@ read a `.dll` from, and that is the next thing this needs.
 Also still absent: TLS callbacks, delay imports, SEH and `.pdata`
 unwinding, and bound imports.
 
+## Milestone 54 — 64-bit: a filesystem, and LoadLibrary ✅ DONE
+
+160 assertions. Until now every binary the 64-bit tree ran was compiled
+into the kernel: the ELF, the glibc program, the PE, its DLL. That is
+the constraint this removes.
+
+`initrd64.c` reads the archive GRUB loads as a Multiboot module, using
+the format `userland/mkinitrd.py` already writes - so the same tooling
+serves both trees. It is deliberately the smallest thing that deserves
+the name "filesystem": no disk driver, no FAT32, no writing. The 32-bit
+`ramfs.c` is 877 lines because it is writable and backed by a real disk;
+none of that is needed to answer the question this unblocks.
+
+`LoadLibraryA`, `GetProcAddress` and `FreeLibrary` sit on top of it.
+`userland/loader64.c` imports **only** kernel32 - its import table does
+not mention the DLL at all - and finds the library by string at run time:
+
+```
+NOVARIS64: initrd  = 1 file(s), 8319 bytes
+NOVARIS64: --- its output follows ---
+LoadLibraryA returned a module
+hello from a DLL, called by a 64-bit PE
+NOVARIS64: --- end of its output ---
+NOVARIS64: exit    = 11, modules loaded 1
+```
+
+That is chrome.exe's shape rather than an analogy for it: `chrome.exe`
+imports `chrome_elf.dll`, and `chrome_elf` *loads* `chrome.dll` at run
+time rather than importing it.
+
+The program diagnoses itself - each failure path exits with its own
+number, so a break says which step broke - and it checks three things
+beyond the happy path: that a second `LoadLibraryA` of the same name
+returns the **same handle** (a DLL's data is per-process; two copies
+would give it two sets), that `GetProcAddress` finds a function the
+import table never named, and that a missing DLL fails without taking
+the process down.
+
+Falsified by building the initrd with no files in it: the archive drops
+to 8 bytes, `initrd64_file_count()` is 0, and the program prints
+`LoadLibraryA failed`. The DLL genuinely comes from the file.
+
+### The bug this would have caused
+
+GRUB puts the module in ordinary RAM, which `pmm64_init` has just been
+told is free. Without reserving it the archive is handed out as a page
+like any other and quietly overwritten by whatever allocates next -
+surfacing much later as a corrupt archive, nowhere near the cause.
+`initrd64_init` reserves its own pages and runs immediately after
+`pmm64_init`, before anything allocates.
+
+### What is deliberately missing
+
+`LoadLibraryA` does no address-space bookkeeping: it loads each module
+at its preferred base and nothing notices if two DLLs want the same one.
+Chrome ships dozens of DLLs and some of them will collide, so a real
+loader has to track occupied ranges and relocate on conflict - the
+relocation machinery is there since Milestone 53, the arbitration is
+not. There is also no `DllMain` call, no reference counting (`FreeLibrary`
+accepts and ignores), no search path (the name is matched exactly against
+the archive), and no `LoadLibraryW`.
+
+## Where chrome.exe actually is from here
+
+Worth stating plainly, because the milestones are accumulating and the
+target is not obviously closer.
+
+**The Win32 API surface is not the path.** `win32_64.c` implements seven
+functions. Milestone 45 measured `chrome.dll` as importing **1316**
+across 67 DLLs. Hand-writing that is not a plan, and it never was - the
+plan is Wine, which Milestone 45 also measured as already implementing
+all but eight of them.
+
+**So the target is Wine, not Chrome**, and what Wine needs from a kernel
+is the Linux side of this tree rather than the Windows side:
+
+1. **Threads** (`clone`), which Wine uses heavily and nothing here has.
+2. **Signals**, delivered - Wine's exception dispatch is built on them.
+3. **A real filesystem**: Wine reads a prefix of thousands of files and
+   writes to it. This milestone's initrd is read-only and lives entirely
+   in RAM.
+4. **File-backed `mmap`**, which is how Wine maps a PE at all.
+5. **Wine itself reconfigured** `--enable-archs=x86_64`, which has never
+   been attempted here.
+
+Items 1-4 are all Milestone 44's item 4 - the syscall ABI - and the
+32-bit tree took Milestones 19-31 to get there. That is the honest
+distance: the Windows-side loader work (52, 53, 54) is real and was
+necessary, but the remaining bulk is Linux-side, and it is measured in
+milestones rather than in sessions.
+
 ## The state of the tree, as found
 
 Two things that belong to neither milestone, recorded because the next
