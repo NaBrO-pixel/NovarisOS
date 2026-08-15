@@ -37,6 +37,7 @@
 #include "pe64.h"
 #include "win32_64.h"
 #include "initrd64.h"
+#include "signal64.h"
 
 static int failures = 0;
 
@@ -98,6 +99,8 @@ extern const unsigned char thread64_elf[];
 extern const unsigned long thread64_elf_len;
 extern const unsigned char futex64_elf[];
 extern const unsigned long futex64_elf_len;
+extern const unsigned char signal64_elf[];
+extern const unsigned long signal64_elf_len;
 
 /* isr64.s - a load that is allowed to fault, and where to resume if it does. */
 extern uint64_t probe_read64(const void* addr);
@@ -143,6 +146,12 @@ static void page_fault_handler(registers64_t* r) {
     pf_hits++;
     pf_cr2 = read_cr2();
     pf_err = r->err_code;
+
+    /* A ring-3 fault with a handler installed is the program's business,
+     * not a kernel failure - it is how Wine turns a bad access into a
+     * Windows exception. Tried before the diagnostic below, so that a
+     * fault with no handler still reports rather than vanishing. */
+    if (signal64_deliver(SIG64_SEGV, r, pf_cr2)) return;
 
     if (pf_diagnose) {
         serial64_puts("\nNOVARIS64: *** page fault in the program\n");
@@ -1453,6 +1462,67 @@ void kernel_main(uint32_t magic, void* mbi) {
         serial64_puts(", wakes ");
         serial64_putdec(syscall64_futex_wakes() - wakes_before);
         serial64_puts(", exit ");
+        serial64_putdec(syscall64_exit_code());
+        serial64_putc('\n');
+    }
+
+    /* --- layer 21: a signal handler that resumes elsewhere ---------- */
+    /* Wine's exception dispatch in miniature: take SIGSEGV, read the
+     * saved registers out of the ucontext, write RIP back, carry on.
+     * Every layer before this treated a ring-3 fault as the end of the
+     * program. */
+    serial64_puts("NOVARIS64: -- signals --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 16;
+        vmspace64_t kspace, space;
+        elf64_info_t info;
+        uint64_t i;
+        uint64_t written_before = syscall64_bytes_written();
+        int rc, stack_ok = 1;
+
+        vmspace64_kernel_space(&kspace);
+        signal64_reset();
+        check("a space for it", vmspace64_create(&space) != 0);
+
+        rc = elf64_load(signal64_elf, signal64_elf_len, &space, &info);
+        check("the signal program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&space, info.brk_start);
+
+        /* pf_diagnose stays OFF: this program is *supposed* to fault,
+         * and the diagnostic path halts the machine. */
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        vmspace64_switch(&space);
+        enter_user_mode64(info.entry, STACK_TOP, 0);
+        vmspace64_switch(&kspace);
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("the fault reached a ring-3 handler",
+              signal64_delivered() == 1);
+        check("and the handler returned through rt_sigreturn",
+              signal64_returns() == 1);
+        check("the program resumed and printed",
+              syscall64_bytes_written() > written_before);
+        /* 41 is only reachable through the resume path: the faulting
+         * instruction is followed by nothing else that leads there. */
+        check("it exited with the status that means it recovered",
+              syscall64_exit_code() == 41);
+
+        serial64_puts("NOVARIS64: signals = ");
+        serial64_putdec(signal64_delivered());
+        serial64_puts(" delivered, ");
+        serial64_putdec(signal64_returns());
+        serial64_puts(" returned, exit ");
         serial64_putdec(syscall64_exit_code());
         serial64_putc('\n');
     }

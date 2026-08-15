@@ -16,6 +16,7 @@
 #include "uspace64.h"
 #include "win32_64.h"
 #include "sched64.h"
+#include "signal64.h"
 
 #define IA32_EFER   0xC0000080u
 #define IA32_STAR   0xC0000081u
@@ -393,10 +394,28 @@ static uint64_t dispatch(syscall64_args_t* args) {
     }
 
     case SYS64_RT_SIGACTION:
+        /* Real since Milestone 58: a handler installed here is a handler
+         * a fault will actually reach. */
+        return (uint64_t)(int64_t)signal64_sigaction(
+                   (int)a1, (const ksigaction64_t*)a2,
+                   (ksigaction64_t*)a3);
+
+    case SYS64_RT_SIGRETURN: {
+        registers64_t resumed;
+        /* The frame sits on the thread's own stack, which is where the
+         * handler is returning from. Resuming it is the same trick as
+         * futex: this syscall does not return, the thread does. */
+        signal64_sigreturn(saved_user_rsp, &resumed);
+        /* The scheduler's saved copy for this task is stale now, and
+         * harmlessly so: the next timer tick overwrites it from the
+         * live frame before anything switches away. */
+        sched64_resume(&resumed);                 /* never returns */
+    }
+
     case SYS64_RT_SIGPROCMASK:
-        /* Accepted so that startup proceeds; no signal is ever
-         * delivered, so agreeing to a handler costs nothing and lying
-         * about it costs nothing yet either. */
+        /* Still accepted and ignored. Masking matters for asynchronous
+         * signals; a fault is delivered to the thread that caused it
+         * whether or not it wanted to hear about it. */
         return 0;
 
     case SYS64_READ:

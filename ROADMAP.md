@@ -7124,7 +7124,9 @@ its own TLS in BoringSSL - and none of them are what stands in the way.
 2. ~~**futex**~~ - done in Milestone 57.
 3. **Per-task kernel stacks** - still absent, and Milestone 57 explains
    why futex did not need them.
-4. Signals, a writable filesystem, file-backed `mmap`.
+4. ~~Signals~~ - fault signals done in Milestone 58; asynchronous ones
+   (`kill`, masking, queueing) are not. A writable filesystem and
+   file-backed `mmap` remain.
 
 ## Milestone 56 — 64-bit: exit(2) ends a thread, not the process ✅ DONE
 
@@ -7242,6 +7244,77 @@ an ELF binary that wants a filesystem, a prefix it can write, file-backed
 `mmap` and signal delivery - none of which exist yet. But the artifact
 Chrome ultimately needs now exists on this machine, in the right
 architecture, and the gap to it is a list rather than a question.
+
+## Milestone 58 — 64-bit: a fault becomes a signal ✅ DONE
+
+182 assertions and a sixth differential. A ring-3 fault is no longer the
+end of a program: it is delivered to a handler, which can look at the
+saved registers and decide where to resume.
+
+This is Wine's exception dispatch in miniature, and not by analogy. Wine
+installs a SIGSEGV handler; when a Windows program faults it reads the
+register set out of the `ucontext`, builds an `EXCEPTION_RECORD`, and
+very often **writes RIP back** so execution continues somewhere else. A
+handler that cannot do that is no use to it, which is why the test does
+exactly that and nothing less.
+
+```
+NOVARIS64: --- its output follows ---
+caught SIGSEGV, rewrote RIP, and carried on
+NOVARIS64: --- end of its output ---
+NOVARIS64: signals = 1 delivered, 1 returned, exit 41
+```
+
+### The layout is copied, not invented
+
+`ucontext`, `sigcontext_64` and `rt_sigframe` are Linux's exactly, field
+order included. That is what makes the sixth differential possible:
+`userland/signal64.s` reads the saved RIP at `uc + 40 + 128` because
+that is where Linux puts it, and the same binary catches its fault and
+recovers on both systems. A frame that were merely Novaris-shaped would
+be self-consistent and untestable.
+
+The offsets are `_Static_assert`ed. **Falsified by inserting one padding
+field into `ucontext`**, which does not produce a subtly wrong handler -
+it stops the build:
+
+```
+error: static assertion failed: "uc_mcontext must be at offset 40 in ucontext"
+```
+
+That is a better guarantee than a runtime check, because it cannot be
+forgotten and cannot pass by luck.
+
+### Details that are load-bearing
+
+- **The red zone.** The frame goes 128 bytes below `rsp`, because the
+  ABI lets a leaf function use that space without adjusting the stack
+  pointer. Writing the frame at `rsp` would corrupt the locals of the
+  function that faulted.
+- **`SA_RESTORER` is mandatory** on x86-64 and rejected without, the way
+  Linux does. The kernel supplies no return trampoline, so a handler
+  installed without one returns into whatever `pretcode` happened to be.
+- **`rt_sigreturn` does not return.** It rebuilds a register set from
+  the frame and resumes the thread through `sched64_resume` - the same
+  mechanism as futex and thread exit. Three different syscalls now end
+  by becoming a thread rather than by returning to one.
+- **The selectors and IF are the kernel's, not the frame's.** A process
+  that could write its own `cs` through a signal frame, or clear IF,
+  would be writing itself into ring 0. Only the flag bits a program may
+  legitimately change are taken from the saved context.
+
+### What is not here
+
+Asynchronous signals: no `kill`, no `tgkill`, no queueing, no masking
+(`rt_sigprocmask` is still accepted and ignored), no `SA_ONSTACK`. All
+of that matters for a signal *sent* to a thread; a fault is delivered to
+the thread that caused it, at the instant it causes it, and that is the
+half Wine's exception path needs.
+
+The frame is also written to the faulting thread's stack **unchecked**.
+A thread that faulted *because* its stack pointer was bad will fault
+again inside the kernel while the frame is being written. Linux handles
+that with an alternate signal stack; this does not.
 
 ## Where chrome.exe actually is from here
 

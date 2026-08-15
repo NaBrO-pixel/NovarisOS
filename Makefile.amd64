@@ -77,6 +77,8 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/loader64_blob.o \
        $(BUILD_DIR)/thread64_blob.o \
        $(BUILD_DIR)/futex64_blob.o \
+       $(BUILD_DIR)/signal64_blob.o \
+       $(BUILD_DIR)/signal64.o \
        $(BUILD_DIR)/initrd64.o \
        $(BUILD_DIR)/hello64_blob.o \
        $(BUILD_DIR)/glibc64_blob.o \
@@ -121,6 +123,18 @@ $(BUILD_DIR)/thread64_blob.c: $(BUILD_DIR)/thread64.elf userland/embed64.py
 	python3 userland/embed64.py $< $@ thread64_elf
 
 $(BUILD_DIR)/thread64_blob.o: $(BUILD_DIR)/thread64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Catches SIGSEGV and rewrites RIP - Wine's exception dispatch in
+# miniature, and the reason the frame layout has to be Linux's exactly.
+$(BUILD_DIR)/signal64.elf: userland/signal64.s | $(BUILD_DIR)
+	$(AS) -f elf64 $< -o $(BUILD_DIR)/signal64_user.o
+	$(LD) -m elf_x86_64 -o $@ $(BUILD_DIR)/signal64_user.o
+
+$(BUILD_DIR)/signal64_blob.c: $(BUILD_DIR)/signal64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ signal64_elf
+
+$(BUILD_DIR)/signal64_blob.o: $(BUILD_DIR)/signal64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Two threads handing off through a futex, with no spin to fall back on.
@@ -321,6 +335,19 @@ test: iso
 	    || (echo "FAIL: the host run of the futex binary did not exit 31"; \
 	        exit 1)
 	@echo "PASS: futex(2) blocks and wakes the same, and exits 31, on both"
+	@# The signal one. This is the differential that matters most, because
+	@# the frame layout is not something a guest-only test can check: a
+	@# handler that reads uc_mcontext by Linux's offsets only works if the
+	@# kernel wrote them there, and only Linux can confirm the offsets.
+	@timeout 20 ./$(BUILD_DIR)/signal64.elf > $(BUILD_DIR)/signal64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/signal64.host.status
+	@grep -qFf $(BUILD_DIR)/signal64.host.txt $(BUILD_DIR)/serial.log \
+	    || (echo "FAIL: the guest did not print what the host prints"; \
+	        exit 1)
+	@[ "`cat $(BUILD_DIR)/signal64.host.status`" = "41" ] \
+	    || (echo "FAIL: the host run of the signal binary did not exit 41"; \
+	        exit 1)
+	@echo "PASS: SIGSEGV is caught and resumed the same, and exits 41, on both"
 
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR) $(ISO)

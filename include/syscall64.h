@@ -39,6 +39,7 @@
 #define SYS64_BRK             12
 #define SYS64_RT_SIGACTION    13
 #define SYS64_RT_SIGPROCMASK  14
+#define SYS64_RT_SIGRETURN    15
 #define SYS64_IOCTL           16
 #define SYS64_WRITEV          20
 #define SYS64_UNAME           63
