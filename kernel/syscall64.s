@@ -92,6 +92,19 @@ syscall64_entry:
     ; declaration order with `nr` at the lowest address. Linux's
     ; arguments are rdi, rsi, rdx, r10, r8, r9 - note r10 and not rcx,
     ; because SYSCALL destroys rcx.
+    ;
+    ; The callee-saved registers are pushed too, even though the C below
+    ; is obliged to preserve them, because `clone` has to build a
+    ; complete register set for a new thread and cannot do that from
+    ; registers it cannot see. With them the struct describes the entire
+    ; frame - including the padding, the saved rflags and the return rip
+    ; above it - which is why syscall64_args_t is exactly 128 bytes.
+    push r15
+    push r14
+    push r13
+    push r12
+    push rbp
+    push rbx
     push r9
     push r8
     push r10
@@ -127,6 +140,12 @@ syscall64_entry:
     pop r10
     pop r8
     pop r9
+    pop rbx
+    pop rbp
+    pop r12
+    pop r13
+    pop r14
+    pop r15
     add rsp, 8                      ; the alignment padding
 
     pop r11

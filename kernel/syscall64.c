@@ -15,6 +15,7 @@
 #include "serial64.h"
 #include "uspace64.h"
 #include "win32_64.h"
+#include "sched64.h"
 
 #define IA32_EFER   0xC0000080u
 #define IA32_STAR   0xC0000081u
@@ -197,8 +198,68 @@ static uint64_t dispatch(syscall64_args_t* args) {
             return (uint64_t)-22;                      /* -EINVAL */
         }
 
+    /* clone(flags, child_stack, parent_tid, child_tid, tls)
+     *
+     * Threads only - the CLONE_VM|CLONE_THREAD case. A fork, which is
+     * the same syscall without CLONE_VM, would have to copy the address
+     * space; nothing here does that, so it is refused rather than
+     * silently producing a second thread where a child process was
+     * asked for.
+     *
+     * The child is its parent with three differences, which is exactly
+     * what Linux specifies: a different stack, a thread pointer of its
+     * own, and rax = 0 so the two can tell each other apart on return.
+     * Everything else is inherited, which is why the entry stub saves
+     * the callee-saved registers it is otherwise entitled to ignore. */
+    case SYS64_CLONE: {
+        registers64_t child;
+        const vmspace64_t* space;
+        int tid;
+
+        if (!(a1 & CLONE_VM))    return (uint64_t)-38;  /* -ENOSYS: fork */
+        if (!a2)                 return (uint64_t)-22;  /* -EINVAL       */
+
+        space = sched64_current_space();
+        if (!space) return (uint64_t)-38;
+
+        child.rax = 0;            /* how the child knows it is the child */
+        child.rbx = args->rbx;
+        child.rcx = 0;            /* SYSCALL destroyed it in the parent too */
+        child.rdx = a3;
+        child.rsi = a2;
+        child.rdi = a1;
+        child.rbp = args->rbp;
+        child.r8  = args->a5;
+        child.r9  = args->a6;
+        child.r10 = args->a4;
+        child.r11 = 0;
+        child.r12 = args->r12;
+        child.r13 = args->r13;
+        child.r14 = args->r14;
+        child.r15 = args->r15;
+
+        child.int_no   = 0;
+        child.err_code = 0;
+        child.rip      = args->ret_rip;      /* just after its `syscall` */
+        child.cs       = 0x23;
+        child.rflags   = args->ret_rflags | 0x200;   /* IF, or it never
+                                                      * yields the CPU  */
+        child.rsp      = a2;
+        child.ss       = 0x1B;
+
+        tid = sched64_add_frame(&child, space,
+                                (a1 & CLONE_SETTLS) ? args->a5 : 0);
+        if (tid < 0) return (uint64_t)-11;              /* -EAGAIN */
+
+        /* The parent gets the child's tid; the child gets 0 above. */
+        return (uint64_t)tid + 1;
+    }
+
+    case SYS64_GETTID:
+        return (uint64_t)sched64_current() + 1;
+
     case SYS64_SET_TID_ADDRESS:
-        return 1;                                      /* the only tid */
+        return (uint64_t)sched64_current() + 1;
 
     case SYS64_SET_ROBUST_LIST:
         return 0;
