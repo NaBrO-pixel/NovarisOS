@@ -106,6 +106,44 @@ void sched64_stop_after(uint64_t switches, uint64_t exit_rip) {
     stop_rip   = exit_rip;
 }
 
+/* syscall64.s reaches into registers64_t by hand-written byte offsets,
+ * because it runs before there is a stack frame to speak of. If the
+ * struct ever changes shape, that assembly reads the wrong fields and
+ * jumps somewhere arbitrary - so the offsets are asserted here, where
+ * the compiler can see both. */
+_Static_assert(__builtin_offsetof(registers64_t, rax)    == 0,   "rax");
+_Static_assert(__builtin_offsetof(registers64_t, rdi)    == 40,  "rdi");
+_Static_assert(__builtin_offsetof(registers64_t, rbp)    == 48,  "rbp");
+_Static_assert(__builtin_offsetof(registers64_t, r15)    == 112, "r15");
+_Static_assert(__builtin_offsetof(registers64_t, rip)    == 136, "rip");
+_Static_assert(__builtin_offsetof(registers64_t, cs)     == 144, "cs");
+_Static_assert(__builtin_offsetof(registers64_t, rflags) == 152, "rflags");
+_Static_assert(__builtin_offsetof(registers64_t, rsp)    == 160, "rsp");
+_Static_assert(__builtin_offsetof(registers64_t, ss)     == 168, "ss");
+
+int sched64_exit_current(registers64_t* out_regs, vmspace64_t* out_space,
+                         uint64_t* out_fs_base) {
+    int next;
+
+    if (current < 0 || !tasks[current].used) return 0;
+
+    tasks[current].used = 0;
+    if (task_total > 0) task_total--;
+
+    /* next_task walks from the one that just died, which is still the
+     * right starting point - it is marked unused, so the walk cannot
+     * land back on it. */
+    for (next = 0; next < SCHED64_MAX_TASKS; next++)
+        if (tasks[next].used) break;
+    if (next == SCHED64_MAX_TASKS) { current = -1; return 0; }
+
+    current = next;
+    if (out_regs)     *out_regs     = tasks[next].regs;
+    if (out_space)    *out_space    = tasks[next].space;
+    if (out_fs_base)  *out_fs_base  = tasks[next].fs_base;
+    return 1;
+}
+
 static int next_task(int from) {
     for (int n = 1; n <= SCHED64_MAX_TASKS; n++) {
         int i = (from + n) % SCHED64_MAX_TASKS;

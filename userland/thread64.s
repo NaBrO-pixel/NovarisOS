@@ -18,6 +18,7 @@ bits 64
 SYS_write equ 1
 SYS_mmap  equ 9
 SYS_clone equ 56
+SYS_exit  equ 60                    ; ends this THREAD only
 
 ; exit_group, not exit. exit(60) ends the calling THREAD; with the child
 ; parked in a loop the process would stay alive and the run would hang -
@@ -92,8 +93,14 @@ _start:
     ; share one address space.
 .child:
     mov dword [rel shared], MAGIC
+    ; exit, not exit_group: this ends the CHILD and leaves the parent
+    ; running. If the two were the same thing the parent would never get
+    ; to print, and on Linux the process would die with status 0.
+    mov rax, SYS_exit
+    xor rdi, rdi
+    syscall
 .park:
-    jmp .park                       ; thread exit is not implemented
+    jmp .park                       ; unreachable
 
 .fail_mmap:
     mov rax, SYS_exit_group

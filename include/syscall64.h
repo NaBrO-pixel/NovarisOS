@@ -124,4 +124,8 @@ uint64_t syscall64_unimplemented_count(void);
  * tests match against. */
 void syscall64_set_trace(int on);
 
+/* Threads that ended through exit(2) while siblings were still running -
+ * the case that does NOT end the process. */
+uint64_t syscall64_thread_exits(void);
+
 #endif
