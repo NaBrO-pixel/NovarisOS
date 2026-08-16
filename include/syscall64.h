@@ -37,6 +37,11 @@
 #define SYS64_LSEEK           8
 #define SYS64_MKDIR           83
 #define SYS64_UNLINK          87
+#define SYS64_STAT            4
+#define SYS64_PREAD64         17
+#define SYS64_PWRITE64        18
+#define SYS64_ACCESS          21
+#define SYS64_NEWFSTATAT      262
 #define SYS64_OPENAT          257
 
 /* open(2) flags, Linux's values for x86-64. */
@@ -163,6 +168,10 @@ void syscall64_set_trace(int on);
 /* Closes every open descriptor. A real kernel does this as part of
  * process teardown; here the layers share one table. */
 void syscall64_reset_files(void);
+
+/* Set by the kernel when it ends a program itself, so the recorded
+ * status is the kernel's rather than a leftover. */
+void syscall64_set_exit_code(uint64_t code);
 
 /* Threads that ended through exit(2) while siblings were still running -
  * the case that does NOT end the process. */

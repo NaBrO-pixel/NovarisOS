@@ -48,7 +48,17 @@ static int map_anon(uint64_t start, uint64_t end, uint64_t flags) {
     for (uint64_t va = start; va < end; va += PAGE64_SIZE) {
         uint64_t frame, existing;
 
-        if (paging64_translate(va, &existing) == PAGING64_OK) continue;
+        if (paging64_translate(va, &existing) == PAGING64_OK) {
+            /* Already mapped - keep the page, but adopt the NEW
+             * permissions. A loader reserves a library's whole range
+             * read-only and then maps each segment over it with
+             * MAP_FIXED and the permissions that segment needs; leaving
+             * the reservation's flags in place makes the data segment
+             * read-only, and what that looks like is ld.so faulting on
+             * its own relocations. */
+            paging64_map(va, existing & ~(PAGE64_SIZE - 1), flags);
+            continue;
+        }
 
         frame = pmm64_alloc_frame();
         if (!frame) return 0;
@@ -82,23 +92,35 @@ uint64_t uspace64_brk(uint64_t addr) {
     return brk_current;
 }
 
+#define MAP_FIXED 0x10
+
 uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                        uint64_t flags) {
     uint64_t start, end, pflags;
-    (void)flags;
 
     if (length == 0) return (uint64_t)-22;         /* -EINVAL */
     length = (length + PAGE64_SIZE - 1) & ~(PAGE64_SIZE - 1);
 
-    /* A hint is honoured only when it is free; anything else comes out
-     * of the bump region. MAP_FIXED is not implemented, and a caller
-     * that needed it would be silently given the wrong address - which
-     * is worth knowing about before something relies on it. */
-    start = addr ? (addr & ~(PAGE64_SIZE - 1)) : mmap_next;
-    if (addr) {
-        uint64_t probe;
-        if (paging64_translate(start, &probe) == PAGING64_OK)
-            start = mmap_next;
+    /* MAP_FIXED means exactly here, and it is not optional: a dynamic
+     * loader reserves one range for a library and then maps each
+     * segment into its place with MAP_FIXED. Give it a different
+     * address and the segments land wherever, while the relocations
+     * still point at where they were asked to go.
+     *
+     * Pages already mapped in the range are kept rather than replaced -
+     * the caller is overwriting a reservation it made itself, and the
+     * contents are about to be written anyway. */
+    if (flags & MAP_FIXED) {
+        start = addr & ~(PAGE64_SIZE - 1);
+    } else {
+        /* A hint is honoured only when it is free; anything else comes
+         * out of the bump region. */
+        start = addr ? (addr & ~(PAGE64_SIZE - 1)) : mmap_next;
+        if (addr) {
+            uint64_t probe;
+            if (paging64_translate(start, &probe) == PAGING64_OK)
+                start = mmap_next;
+        }
     }
     end = start + length;
 
@@ -107,7 +129,9 @@ uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 
     if (!map_anon(start, end, pflags)) return (uint64_t)-12;  /* -ENOMEM */
 
-    if (start == mmap_next) mmap_next = end;
+    /* A fixed mapping does not move the bump pointer: it was placed by
+     * the caller, in a range the caller is keeping track of. */
+    if (!(flags & MAP_FIXED) && start == mmap_next) mmap_next = end;
     return start;
 }
 
@@ -143,7 +167,8 @@ uint64_t uspace64_munmap(uint64_t addr, uint64_t length) {
 
 uint64_t uspace64_build_stack(vmspace64_t* space, uint64_t stack_top,
                               uint64_t stack_pages, const char* argv0,
-                              const elf64_info_t* elf) {
+                              const elf64_info_t* elf,
+                              uint64_t interp_base) {
     uint64_t saved_cr3, p, argv0_va, random_va, rsp;
     uint64_t* v;
     uint64_t n;
@@ -189,7 +214,10 @@ uint64_t uspace64_build_stack(vmspace64_t* space, uint64_t stack_top,
     *v++ = AT_PHENT;  *v++ = elf->phent;
     *v++ = AT_PHNUM;  *v++ = elf->phnum;
     *v++ = AT_PAGESZ; *v++ = PAGE64_SIZE;
-    *v++ = AT_BASE;   *v++ = 0;      /* no interpreter: this is static */
+    /* Where the dynamic loader was mapped. ld.so reads this to find
+     * itself, because it has to relocate its own image before it can
+     * relocate anything else. Zero for a static binary. */
+    *v++ = AT_BASE;   *v++ = interp_base;
     *v++ = AT_FLAGS;  *v++ = 0;
     *v++ = AT_ENTRY;  *v++ = elf->entry;
     *v++ = AT_UID;    *v++ = 0;

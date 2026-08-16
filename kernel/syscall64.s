@@ -167,6 +167,31 @@ syscall64_entry:
     ret
 
 ; ---------------------------------------------------------------------
+; void enter_user_mode64_abort(void) - does not return.
+;
+; Ends the ring-3 program from inside an interrupt handler, the way a
+; real kernel kills a process that faulted with no handler installed.
+; Returns to whoever called enter_user_mode64, exactly as the exit
+; syscall path does - the difference being that this is reached from a
+; fault rather than from a syscall, so there is no frame to unwind and
+; the kernel stack is simply restored.
+;
+; Without it an unhandled fault halts the machine, which is fine for a
+; bring-up test asserting nothing faults and useless for one whose whole
+; purpose is to find out how far a program gets.
+; ---------------------------------------------------------------------
+global enter_user_mode64_abort
+enter_user_mode64_abort:
+    mov rsp, [rel kernel_return_rsp]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+; ---------------------------------------------------------------------
 ; void sched64_resume(registers64_t *regs)  - does not return.
 ;
 ; Loads a saved thread and goes there. The scheduler's ordinary switch

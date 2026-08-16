@@ -127,6 +127,45 @@ static uint64_t do_open(const char* path, uint64_t flags) {
     return (uint64_t)fd;
 }
 
+/* st_dev and st_ino, and they are not decoration.
+ *
+ * ld.so identifies an already-loaded object by the (device, inode) pair
+ * it gets back from fstat, so that opening the same library twice by two
+ * different paths does not map it twice. Reporting 0/0 for every file
+ * makes every file look like the same file: ld.so opens libc, compares
+ * it against the main executable it already has, decides they are the
+ * same object, and closes it without mapping. What that looks like from
+ * outside is "undefined symbol: __libc_start_main" - a symbol error, a
+ * long way from the stat that caused it.
+ *
+ * The node index is a perfectly good inode number: it is unique per file
+ * and stable for as long as the file exists. */
+static void fill_ids(uint8_t* st, int node) {
+    *(uint64_t*)(st + 0) = 1;                          /* st_dev */
+    *(uint64_t*)(st + 8) = (uint64_t)node + 1;         /* st_ino */
+    *(uint64_t*)(st + 16) = 1;                         /* st_nlink */
+}
+
+/* struct stat, x86-64. Only the fields anything here reads are filled;
+ * the offsets are the kernel's and must not be tidied.
+ *   0 st_dev  8 st_ino  16 st_nlink  24 st_mode  48 st_size  56 st_blksize */
+static uint64_t do_stat(const char* path, void* out) {
+    int node = ramfs64_lookup(path);
+    uint8_t* st = (uint8_t*)out;
+
+    if (node < 0) return (uint64_t)-2;                 /* -ENOENT */
+    for (int i = 0; i < 144; i++) st[i] = 0;
+    fill_ids(st, node);
+
+    /* S_IFDIR or S_IFREG. ld.so checks this to decide whether a path it
+     * is about to search is a directory at all. */
+    *(uint32_t*)(st + 24) = ramfs64_is_dir(node)
+                            ? 0040755u : 0100644u;
+    *(uint64_t*)(st + 48) = ramfs64_size(node);
+    *(uint64_t*)(st + 56) = 4096;
+    return 0;
+}
+
 /* The calling thread's complete user state, as a frame it could be
  * resumed from, with `rax` set to what the syscall will return.
  *
@@ -160,6 +199,11 @@ static void frame_from_args(const syscall64_args_t* args, uint64_t rax,
 }
 
 uint64_t syscall64_thread_exits(void) { return thread_exits; }
+
+/* Used when the kernel ends a program itself - a fault with no handler -
+ * so that the status a test reads is the one the kernel decided on
+ * rather than whatever the last program to exit left behind. */
+void syscall64_set_exit_code(uint64_t code) { exit_code = code; }
 
 /* Threads that actually slept, and wakeups that actually woke one.
  * Counted because "the futex worked" and "the futex was never contended"
@@ -196,6 +240,22 @@ uint64_t syscall64_dispatch(syscall64_args_t* args) {
 
     serial64_puts("NOVARIS64: [call] ");
     serial64_putdec(args->nr);
+
+    /* Path-taking calls print their path. Without this a trace of a
+     * dynamic loader is a wall of pointers, and the whole question -
+     * which file could it not find - is the one thing it does not
+     * answer. The argument holding the path differs per call. */
+    if (args->nr == SYS64_OPEN || args->nr == SYS64_ACCESS ||
+        args->nr == SYS64_STAT || args->nr == SYS64_UNLINK) {
+        serial64_puts(" \"");
+        serial64_puts((const char*)args->a1);
+        serial64_puts("\"");
+    } else if (args->nr == SYS64_OPENAT || args->nr == SYS64_NEWFSTATAT) {
+        serial64_puts(" \"");
+        serial64_puts((const char*)args->a2);
+        serial64_puts("\"");
+    }
+
     serial64_puts("(");
     serial64_puthex(args->a1);
     serial64_puts(", ");
@@ -436,12 +496,29 @@ static uint64_t dispatch(syscall64_args_t* args) {
         return (uint64_t)-25;
 
     case SYS64_FSTAT: {
-        /* Only the fields glibc's stdio reads: it wants st_mode to
-         * decide the stream type and st_blksize to size the buffer. */
         uint8_t* st = (uint8_t*)a2;
         for (int i = 0; i < 144; i++) st[i] = 0;
-        *(uint32_t*)(st + 24) = 0020620u;  /* st_mode: S_IFCHR | 0620 */
-        *(uint64_t*)(st + 56) = 1024;      /* st_blksize                */
+
+        /* A real file has to report itself as one. Until Milestone 61
+         * this answered "character device, size 0" for every descriptor,
+         * which is fine for stdout and fatal for a library: ld.so fstats
+         * the file it has just opened, sees something unmappable with no
+         * length, and gives up without ever mapping libc - which
+         * presents much later as an undefined symbol. */
+        if (a1 >= 3) {
+            if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+            fill_ids(st, fds[a1].node);
+            *(uint32_t*)(st + 24) = ramfs64_is_dir(fds[a1].node)
+                                    ? 0040755u : 0100644u;
+            *(uint64_t*)(st + 48) = ramfs64_size(fds[a1].node);
+            *(uint64_t*)(st + 56) = 4096;
+            return 0;
+        }
+
+        /* stdin/stdout/stderr: a character device, which is what makes
+         * glibc's stdio choose the buffering it does. */
+        *(uint32_t*)(st + 24) = 0020620u;  /* S_IFCHR | 0620 */
+        *(uint64_t*)(st + 56) = 1024;
         return 0;
     }
 
@@ -562,6 +639,37 @@ static uint64_t dispatch(syscall64_args_t* args) {
         }
         fds[a1].pos = base + a2;
         return fds[a1].pos;
+    }
+
+    /* access(path, mode). ld.so calls this before anything else, on
+     * /etc/ld.so.preload, and treats -ENOSYS as fatal enough to stop
+     * looking - so answering it is the difference between a loader that
+     * searches for a library and one that gives up. */
+    case SYS64_ACCESS:
+        return ramfs64_lookup((const char*)a1) >= 0
+               ? 0 : (uint64_t)-2;                     /* -ENOENT */
+
+    case SYS64_STAT:
+        return do_stat((const char*)a1, (void*)a2);
+
+    case SYS64_NEWFSTATAT:
+        if ((int64_t)(int32_t)a1 != -100) return (uint64_t)-9;
+        return do_stat((const char*)a2, (void*)a3);
+
+    /* pread64/pwrite64(fd, buf, count, offset). A positioned read that
+     * does not move the file offset - which is how ld.so reads a
+     * library's program headers while keeping its place, and the first
+     * thing it wanted once it could open the library at all. */
+    case SYS64_PREAD64: {
+        if (a1 < 3 || a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        return (uint64_t)ramfs64_read(fds[a1].node, args->a4,
+                                      (void*)a2, a3);
+    }
+
+    case SYS64_PWRITE64: {
+        if (a1 < 3 || a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        return (uint64_t)ramfs64_write(fds[a1].node, args->a4,
+                                       (const void*)a2, a3);
     }
 
     case SYS64_MKDIR:

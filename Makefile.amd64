@@ -277,11 +277,33 @@ $(KERNEL): $(OBJS) linker64.ld
 INITRD_STAGE = $(BUILD_DIR)/initrd64
 INITRD       = $(BUILD_DIR)/initrd64.img
 
-$(INITRD): $(BUILD_DIR)/dlllib64.dll userland/mkinitrd.py
+# The host's dynamic loader and C library, so that a dynamically linked
+# program has something to link against. Resolved rather than hardcoded:
+# ld-linux-x86-64.so.2 is a symlink and the real file moves between
+# distributions.
+LD_SO  := $(shell readlink -f /lib64/ld-linux-x86-64.so.2)
+LIBC   := $(shell readlink -f /lib/x86_64-linux-gnu/libc.so.6)
+
+$(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
+           userland/mkinitrd.py
 	rm -rf $(INITRD_STAGE)
 	mkdir -p $(INITRD_STAGE)
 	cp $(BUILD_DIR)/dlllib64.dll $(INITRD_STAGE)/dlllib64.dll
+	cp $(BUILD_DIR)/dynhello64.elf $(INITRD_STAGE)/dynhello64
+	@# At the paths ld.so actually searches, which were read off its own
+	@# trace rather than guessed: it tries /lib/x86_64-linux-gnu first.
+	@# The filesystem matches whole paths, so a file at /libc.so.6 is
+	@# invisible to a loader looking in /lib.
+	mkdir -p $(INITRD_STAGE)/lib/x86_64-linux-gnu $(INITRD_STAGE)/lib64
+	cp $(LD_SO) $(INITRD_STAGE)/lib64/ld-linux-x86-64.so.2
+	cp $(LIBC)  $(INITRD_STAGE)/lib/x86_64-linux-gnu/libc.so.6
 	python3 userland/mkinitrd.py $(INITRD_STAGE) $@
+
+# A dynamically linked program - the smallest thing that makes ld.so run.
+$(BUILD_DIR)/dynhello64.elf: userland/dynhello64.c | $(BUILD_DIR)
+	gcc -O2 -o $@ $<
+	@file $@ | grep -q "dynamically linked" \
+	    || (echo "ERROR: $@ is not dynamically linked"; false)
 
 iso: $(KERNEL) $(INITRD)
 	mkdir -p $(ISO_DIR)/boot/grub

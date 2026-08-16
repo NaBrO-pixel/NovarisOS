@@ -146,6 +146,10 @@ static void sched_timer_handler(registers64_t* r) {
  * immediately, forever - a silent hang with nothing on the serial port,
  * which is exactly how the first attempt at running glibc presented. */
 static volatile int pf_diagnose;
+static volatile uint64_t pf_killed;
+
+/* syscall64.s */
+extern void enter_user_mode64_abort(void) __attribute__((noreturn));
 
 static void page_fault_handler(registers64_t* r) {
     pf_hits++;
@@ -165,7 +169,20 @@ static void page_fault_handler(registers64_t* r) {
         serial64_puts("\nNOVARIS64:   err="); serial64_puthex(pf_err);
         serial64_puts(" cs=");               serial64_puthex(r->cs);
         serial64_puts(" rsp=");              serial64_puthex(r->rsp);
-        serial64_puts("\nNOVARIS64: *** halted\n");
+        serial64_putc('\n');
+
+        /* A ring-3 fault with nobody to catch it kills the program, the
+         * way a real kernel does - 128 + SIGSEGV, which is the status a
+         * shell reports. Halting instead would be right for a test
+         * asserting nothing faults, and useless for one whose purpose
+         * is to find out how far a program gets. */
+        if ((r->cs & 3) == 3) {
+            pf_killed++;
+            syscall64_set_exit_code(139);
+            enter_user_mode64_abort();          /* never returns */
+        }
+
+        serial64_puts("NOVARIS64: *** halted (the fault was in the kernel)\n");
         for (;;) __asm__ __volatile__("cli; hlt");
     }
     /* #PF is a fault: rip points *at* the instruction that faulted, so
@@ -1031,7 +1048,7 @@ void kernel_main(uint32_t magic, void* mbi) {
 
         uspace64_reset(&space, info.brk_start);
         rsp = uspace64_build_stack(&space, STACK_TOP, STACK_PAGES,
-                                   "/hello_glibc64", &info);
+                                   "/hello_glibc64", &info, 0);
         check("argc/argv/envp/auxv built on it", rsp != 0);
         check("and the stack pointer is 16-byte aligned", (rsp % 16) == 0);
 
@@ -1655,6 +1672,135 @@ void kernel_main(uint32_t magic, void* mbi) {
         serial64_puts(" file-backed, exit ");
         serial64_putdec(syscall64_exit_code());
         serial64_putc('\n');
+    }
+
+    /* --- layer 24: the dynamic loader ------------------------------- */
+    /* Wine's loader is a dynamically linked PIE needing
+     * /lib64/ld-linux-x86-64.so.2 and libc.so.6, so nothing about Wine
+     * can be attempted until ld.so itself runs. This is that experiment
+     * at its smallest: load a dynamic program, hand control to its
+     * interpreter, and see how far it gets. Tracing is ON - what this
+     * layer is for is finding out what ld.so asks for. */
+    serial64_puts("NOVARIS64: -- the dynamic loader --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        /* 512KB. ld.so uses far more stack than a hand-written program:
+         * it relocates, resolves symbols, and runs initialisers, all
+         * recursively. The kernel does not grow a stack on fault the way
+         * Linux does, so what it gets at the start is all it gets. */
+        const uint64_t STACK_PAGES = 128;
+        const uint64_t EXE_BIAS    = 0x0000555555554000ULL;
+        const uint64_t INTERP_BASE = 0x00007FFFF7000000ULL;
+        vmspace64_t kspace, space;
+        elf64_info_t exe, interp;
+        const void* image;
+        uint64_t len, rsp, i;
+        char interp_path[128];
+        int rc, stack_ok = 1, have_interp;
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        syscall64_reset_files();
+        /* Layer 21 installed a SIGSEGV handler and the table outlives
+         * its program, so without this a fault here is delivered to a
+         * handler belonging to a binary that is no longer loaded - and
+         * the frame is written onto this program's stack. Process
+         * teardown does this in a real kernel. */
+        signal64_reset();
+        vmspace64_kernel_space(&kspace);
+        check("a space for it", vmspace64_create(&space) != 0);
+
+        check("the dynamic program is in the filesystem",
+              initrd64_open("dynhello64", &image, &len) == INITRD64_OK);
+
+        have_interp = elf64_interp(image, len, interp_path,
+                                   sizeof(interp_path));
+        check("it names a dynamic loader", have_interp == 1);
+        serial64_puts("NOVARIS64: interp  = ");
+        serial64_puts(have_interp ? interp_path : "(none)");
+        serial64_putc('\n');
+
+        /* An ET_DYN executable asks to be placed at 0; the loader
+         * chooses. The two biases here are the addresses Linux itself
+         * tends to use, which keeps the layout familiar when comparing
+         * a trace against a host one. */
+        rc = elf64_load_at(image, len, &space, EXE_BIAS, &exe);
+        check("the program loaded", rc == ELF64_OK);
+        check("and it is position independent", exe.is_dyn == 1);
+
+        {
+            const void* ld_image;
+            uint64_t ld_len;
+            /* The path in PT_INTERP is absolute and the filesystem is
+             * flat, so the loader is looked up by its base name. */
+            int found = initrd64_open("lib64/ld-linux-x86-64.so.2",
+                                      &ld_image, &ld_len) == INITRD64_OK;
+            check("the dynamic loader is in the filesystem", found);
+            if (found) {
+                rc = elf64_load_at(ld_image, ld_len, &space, INTERP_BASE,
+                                   &interp);
+                check("the dynamic loader loaded", rc == ELF64_OK);
+            }
+        }
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&space, exe.brk_start);
+
+        /* AT_BASE tells ld.so where it was mapped - it has to relocate
+         * its own image before it can relocate anything else - and
+         * AT_ENTRY where the program it is loading starts. */
+        rsp = uspace64_build_stack(&space, STACK_TOP, STACK_PAGES,
+                                   "/dynhello64", &exe, INTERP_BASE);
+        check("a stack with AT_BASE on it", rsp != 0);
+
+        {
+            int libc_node = ramfs64_lookup("/lib/x86_64-linux-gnu/libc.so.6");
+            serial64_puts("NOVARIS64: libc    = node ");
+            serial64_putdec((uint64_t)(libc_node < 0 ? 0 : libc_node));
+            serial64_puts(", ");
+            serial64_putdec(ramfs64_size(libc_node));
+            serial64_puts(" bytes\n");
+        }
+
+        serial64_puts("NOVARIS64: exe     = ");
+        serial64_puthex(exe.entry);
+        serial64_puts(", ld.so entry ");
+        serial64_puthex(interp.entry);
+        serial64_puts("\nNOVARIS64: --- what it asks for ---\n");
+
+        /* Control goes to the INTERPRETER, not the program: ld.so runs
+         * first and calls the program's entry when it is ready. */
+        pf_diagnose = 1;
+        syscall64_set_trace(1);
+        vmspace64_switch(&space);
+        enter_user_mode64(interp.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+        syscall64_set_trace(0);
+        pf_diagnose = 0;
+
+        serial64_puts("NOVARIS64: --- end ---\n");
+        serial64_puts("NOVARIS64: exit    = ");
+        serial64_putdec(syscall64_exit_code());
+        serial64_puts(", enosys seen ");
+        serial64_putdec(syscall64_unimplemented_count());
+        serial64_putc('\n');
+
+        /* Deliberately not asserted on. This layer's job is to find out
+         * what the dynamic loader needs, not to claim it works: ld.so
+         * currently maps libc and dies inside glibc's own start-up, and
+         * a check here would either be a lie or a permanent red mark.
+         * What IS asserted is that the kernel survived it - a program
+         * that faults must not take the machine with it. */
+        check("the kernel survived the program it could not finish",
+              syscall64_exit_code() == 139 || syscall64_exit_code() == 67);
     }
 
     /* --- verdict ---------------------------------------------------- */

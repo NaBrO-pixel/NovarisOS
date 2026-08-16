@@ -7451,6 +7451,83 @@ loader at this kernel and read the first thing it complains about - the
 Everything after that is driven by what it asks for, rather than by a
 list written in advance.
 
+## Milestone 61 — 64-bit: the dynamic loader, and what it asked for ✅ DONE
+
+206 assertions. Wine's loader is a dynamically linked PIE needing
+`/lib64/ld-linux-x86-64.so.2` and `libc.so.6`, so **nothing about Wine
+can be attempted until ld.so itself runs**. This milestone ran it and
+followed what it asked for, which is a different way of working from
+every milestone before it: the list was written by the program, not in
+advance.
+
+`PT_INTERP` support, `elf64_load_at` with a load bias so an ET_DYN image
+can be placed, `AT_BASE` on the initial stack, and the host's real
+`ld-linux-x86-64.so.2` and `libc.so.6` in the initrd at the paths ld.so
+actually searches.
+
+### What it asked for, in the order it asked
+
+Each of these was found by running it and reading the trace, then fixed,
+then run again. Five kernel defects, and only the first was a missing
+feature:
+
+1. **`access(2)`** - ld.so probes `/etc/ld.so.preload` before anything
+   else. Missing.
+2. **`newfstatat(2)`** and **`pread64(2)`** - missing. `pread64` is how
+   it reads a library's program headers without losing its place.
+3. **`fstat` lied.** Since Milestone 51 it answered "character device,
+   size 0" for *every* descriptor. Right for stdout, fatal for a
+   library: ld.so fstats what it just opened, sees something unmappable
+   with no length, and gives up.
+4. **`st_dev`/`st_ino` were always 0.** ld.so identifies an
+   already-loaded object by that pair, so every file looked like the
+   same file - it opened libc, compared it against the main executable,
+   concluded they were the same object, and closed it without mapping.
+   What that looks like from outside is `undefined symbol:
+   __libc_start_main`, a very long way from the stat that caused it.
+5. **`MAP_FIXED` was ignored, and worse, ignored twice.** A loader
+   reserves a library's whole range read-only, then maps each segment
+   into place with `MAP_FIXED`. The address was being reallocated
+   instead of honoured; and once that was fixed, the pages already
+   present from the reservation kept the reservation's *read-only*
+   flags, so libc's data segment was read-only and ld.so faulted
+   relocating its own library.
+
+The trace prints paths for path-taking calls now. Without that, a
+dynamic loader's trace is a wall of pointers and the one question worth
+asking - which file could it not find - is the one thing it does not
+answer.
+
+### Where it stops
+
+ld.so now finds libc, maps all four of its segments at the right
+addresses, applies RELRO with `mprotect`, sets up TLS, and begins
+executing **inside glibc**. It dies there, in glibc's own `atexit`
+machinery, on `mov 0x8(%rsi),%rax` with `rsi = 0x20` - a list pointer
+that should be a pointer and is not.
+
+That is not asserted as working, and there is no green check pretending
+it is. What *is* asserted is that the kernel survives it: an unhandled
+ring-3 fault now **kills the program** with status 139 (128 + SIGSEGV),
+the way a real kernel does, instead of halting the machine.
+`enter_user_mode64_abort` does that, and it is useful well beyond this
+layer - a bring-up test that asserts nothing faults wants a halt, and
+one whose purpose is finding out how far a program gets does not.
+
+Remaining `-ENOSYS` in that run: 5, all tolerated - `rseq`, `prlimit64`,
+and `readlinkat`.
+
+### The pattern worth keeping
+
+Four of the five defects were **lies rather than gaps**: a stub that
+returned a plausible answer instead of the true one. A missing syscall
+announces itself with `-ENOSYS` and gets fixed in minutes; a stub that
+answers wrongly is found three layers downstream, wearing a symptom that
+points somewhere else entirely. The `fstat` and `st_ino` bugs had both
+been sitting in the tree since Milestone 51 and passed every test up to
+this one, because nothing before ld.so ever asked them a question whose
+answer mattered.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the

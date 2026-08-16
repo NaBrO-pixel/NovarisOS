@@ -55,8 +55,37 @@ static inline void* window(uint64_t phys) {
     return (void*)(KERNEL_VMA + phys);
 }
 
+#define PT_INTERP 3
+
+int elf64_interp(const void* image, uint64_t size, char* buf, uint64_t n) {
+    const uint8_t* f = (const uint8_t*)image;
+    const elf64_ehdr_t* eh = (const elf64_ehdr_t*)image;
+    int i;
+
+    if (size < sizeof(elf64_ehdr_t)) return 0;
+    if (eh->e_ident[0] != 0x7F || eh->e_ident[1] != 'E') return 0;
+
+    for (i = 0; i < eh->e_phnum; i++) {
+        const elf64_phdr_t* ph =
+            (const elf64_phdr_t*)(f + eh->e_phoff +
+                                  (uint64_t)i * eh->e_phentsize);
+        if (ph->p_type != PT_INTERP) continue;
+        if (ph->p_offset + ph->p_filesz > size) return 0;
+        if (ph->p_filesz == 0 || ph->p_filesz > n) return 0;
+        kmemcpy(buf, f + ph->p_offset, ph->p_filesz);
+        buf[ph->p_filesz - 1] = 0;      /* it is NUL-terminated already */
+        return 1;
+    }
+    return 0;
+}
+
 int elf64_load(const void* image, uint64_t size, vmspace64_t* space,
                elf64_info_t* out) {
+    return elf64_load_at(image, size, space, 0, out);
+}
+
+int elf64_load_at(const void* image, uint64_t size, vmspace64_t* space,
+                  uint64_t bias, elf64_info_t* out) {
     const uint8_t* base = (const uint8_t*)image;
     const elf64_ehdr_t* eh = (const elf64_ehdr_t*)image;
     uint64_t saved_cr3;
@@ -86,9 +115,13 @@ int elf64_load(const void* image, uint64_t size, vmspace64_t* space,
         const elf64_phdr_t* ph =
             (const elf64_phdr_t*)(base + eh->e_phoff +
                                   (uint64_t)i * eh->e_phentsize);
-        uint64_t start, end, va, flags;
+        uint64_t start, end, va, flags, vaddr;
 
         if (ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
+        /* Everything below works in loaded addresses, not file ones.
+         * An ET_DYN image asks to be placed at 0 and expects the loader
+         * to choose, so the bias is what makes it real. */
+        vaddr = ph->p_vaddr + bias;
         if (ph->p_offset + ph->p_filesz > size) { rc = ELF64_TRUNCATED; break; }
         if (ph->p_filesz > ph->p_memsz)         { rc = ELF64_TRUNCATED; break; }
 
@@ -99,13 +132,13 @@ int elf64_load(const void* image, uint64_t size, vmspace64_t* space,
         if (!phdr_va &&
             eh->e_phoff >= ph->p_offset &&
             eh->e_phoff < ph->p_offset + ph->p_filesz)
-            phdr_va = ph->p_vaddr + (eh->e_phoff - ph->p_offset);
+            phdr_va = vaddr + (eh->e_phoff - ph->p_offset);
 
-        if (ph->p_vaddr + ph->p_memsz > brk_start)
-            brk_start = ph->p_vaddr + ph->p_memsz;
+        if (vaddr + ph->p_memsz > brk_start)
+            brk_start = vaddr + ph->p_memsz;
 
-        start = ph->p_vaddr & ~(PAGE64_SIZE - 1);
-        end   = (ph->p_vaddr + ph->p_memsz + PAGE64_SIZE - 1)
+        start = vaddr & ~(PAGE64_SIZE - 1);
+        end   = (vaddr + ph->p_memsz + PAGE64_SIZE - 1)
                 & ~(PAGE64_SIZE - 1);
 
         flags = PAGE64_PRESENT | PAGE64_USER;
@@ -142,14 +175,14 @@ int elf64_load(const void* image, uint64_t size, vmspace64_t* space,
             dst = (uint8_t*)window(frame);
 
             /* The part of this page the file actually has bytes for. */
-            copy_from = va > ph->p_vaddr ? va : ph->p_vaddr;
+            copy_from = va > vaddr ? va : vaddr;
             copy_to   = va + PAGE64_SIZE;
-            if (copy_to > ph->p_vaddr + ph->p_filesz)
-                copy_to = ph->p_vaddr + ph->p_filesz;
+            if (copy_to > vaddr + ph->p_filesz)
+                copy_to = vaddr + ph->p_filesz;
 
             if (copy_to > copy_from)
                 kmemcpy(dst + (copy_from - va),
-                        base + ph->p_offset + (copy_from - ph->p_vaddr),
+                        base + ph->p_offset + (copy_from - vaddr),
                         copy_to - copy_from);
         }
         if (rc != ELF64_OK) break;
@@ -158,12 +191,20 @@ int elf64_load(const void* image, uint64_t size, vmspace64_t* space,
     __asm__ __volatile__("mov %0, %%cr3" :: "r"(saved_cr3) : "memory");
 
     if (rc == ELF64_OK && out) {
-        out->entry     = eh->e_entry;
+        /* Big enough for a real interpreter path - too small a buffer
+         * would make elf64_interp fail and report a dynamic image as
+         * static. */
+        char probe[128];
+        out->entry     = eh->e_entry + bias;
         out->phdr_va   = phdr_va;
         out->phent     = eh->e_phentsize;
         out->phnum     = eh->e_phnum;
         out->brk_start = (brk_start + PAGE64_SIZE - 1)
                          & ~(PAGE64_SIZE - 1);
+        out->base       = bias;
+        out->is_dyn     = (eh->e_type == ET_DYN);
+        out->has_interp = elf64_interp(image, size, probe, sizeof(probe))
+                          ? 1 : 0;
     }
     return rc;
 }
