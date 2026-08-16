@@ -176,6 +176,8 @@ uint64_t syscall64_file_maps(void) { return file_maps; }
 uint64_t syscall64_futex_waits(void) { return futex_waits; }
 uint64_t syscall64_futex_wakes(void) { return futex_wakes; }
 
+uint64_t syscall64_thread_exits(void) { return thread_exits; }
+
 uint64_t syscall64_unimplemented(void) { return last_unimpl; }
 uint64_t syscall64_unimplemented_count(void) { return unimpl_count; }
 
@@ -252,6 +254,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
         }
 
         if (a1 != 1 && a1 != 2) return (uint64_t)-9;   /* -EBADF */
+        if (a1 != 1 && a1 != 2) return (uint64_t)-1;   /* stdout/stderr */
         for (uint64_t i = 0; i < n; i++) serial64_putc(buf[i]);
         bytes_written += n;
         return n;
@@ -329,6 +332,11 @@ static uint64_t dispatch(syscall64_args_t* args) {
         file_maps++;
         return mapped;
     }
+    case SYS64_MMAP:
+        /* Only anonymous mappings. A file mapping would need a
+         * filesystem, which the 64-bit tree does not have. */
+        if (!(args->a4 & 0x20)) return (uint64_t)-19;  /* MAP_ANONYMOUS */
+        return uspace64_mmap(a1, a2, a3, args->a4);
 
     case SYS64_MUNMAP:
         return uspace64_munmap(a1, a2);
@@ -571,6 +579,15 @@ static uint64_t dispatch(syscall64_args_t* args) {
         if (n > 0) fds[a1].pos += (uint64_t)n;
         return (uint64_t)n;
     }
+    case SYS64_RT_SIGACTION:
+    case SYS64_RT_SIGPROCMASK:
+        /* Accepted so that startup proceeds; no signal is ever
+         * delivered, so agreeing to a handler costs nothing and lying
+         * about it costs nothing yet either. */
+        return 0;
+
+    case SYS64_READ:
+        return 0;                                      /* end of file */
 
     case SYS64_ECHO:
         last_arg = a1;

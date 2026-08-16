@@ -7127,6 +7127,14 @@ its own TLS in BoringSSL - and none of them are what stands in the way.
 4. ~~Signals~~ (fault signals, Milestone 58 - asynchronous ones are
    not), ~~a writable filesystem~~ (59), ~~file-backed `mmap`~~ (60).
    **All four structural prerequisites are now present.**
+2. **futex**, which is how every real thread library waits. The spin in
+   this test is what a program does when it has no futex.
+3. **Per-task kernel stacks.** One syscall stack is shared by all
+   threads. That is safe *today* only because `FMASK` clears IF on entry
+   and nothing re-enables it, so a syscall cannot be preempted - and it
+   stops being safe the moment any syscall blocks, which is the moment
+   futex arrives.
+4. Signals, a writable filesystem, file-backed `mmap`.
 
 ## Milestone 56 — 64-bit: exit(2) ends a thread, not the process ✅ DONE
 
