@@ -71,9 +71,6 @@ int sched64_add(uint64_t rip, uint64_t rsp, uint64_t arg,
     tasks[i].blocked   = 0;
     tasks[i].wait_addr = 0;
     tasks[i].used      = 1;
-    tasks[i].space   = *space;
-    tasks[i].fs_base = 0;    /* a task that has never run has no TLS yet */
-    tasks[i].used    = 1;
     task_total++;
     return i;
 }
@@ -91,10 +88,6 @@ int sched64_add_frame(const registers64_t* regs, const vmspace64_t* space,
     tasks[i].blocked   = 0;
     tasks[i].wait_addr = 0;
     tasks[i].used      = 1;
-    tasks[i].regs    = *regs;
-    tasks[i].space   = *space;
-    tasks[i].fs_base = fs_base;
-    tasks[i].used    = 1;
     task_total++;
     return i;
 }
@@ -163,10 +156,6 @@ static int next_task(int from) {
     for (int n = 1; n <= SCHED64_MAX_TASKS; n++) {
         int i = (from + n) % SCHED64_MAX_TASKS;
         if (tasks[i].used && !tasks[i].blocked) return i;
-static int next_task(int from) {
-    for (int n = 1; n <= SCHED64_MAX_TASKS; n++) {
-        int i = (from + n) % SCHED64_MAX_TASKS;
-        if (tasks[i].used) return i;
     }
     return from;
 }
