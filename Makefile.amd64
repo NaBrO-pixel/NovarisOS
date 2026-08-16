@@ -283,6 +283,17 @@ INITRD       = $(BUILD_DIR)/initrd64.img
 # distributions.
 LD_SO  := $(shell readlink -f /lib64/ld-linux-x86-64.so.2)
 LIBC   := $(shell readlink -f /lib/x86_64-linux-gnu/libc.so.6)
+LIBGCC := $(shell readlink -f /lib/x86_64-linux-gnu/libgcc_s.so.1 2>/dev/null)
+
+# An x86-64 Wine built out-of-tree beside the repository, if there is
+# one. Two candidates because a git worktree sits four levels below the
+# checkout it belongs to, and the build has to work from either.
+# Override with `make -f Makefile.amd64 WINE64_LOADER=/path/to/wine`.
+WINE64_LOADER ?= $(firstword $(wildcard \
+    ../wine64-build/loader/wine ../../../../wine64-build/loader/wine))
+WINE64_NTDLL  ?= $(firstword $(wildcard \
+    ../wine64-build/dlls/ntdll/ntdll.so \
+    ../../../../wine64-build/dlls/ntdll/ntdll.so))
 
 $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
            userland/mkinitrd.py
@@ -297,6 +308,30 @@ $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
 	mkdir -p $(INITRD_STAGE)/lib/x86_64-linux-gnu $(INITRD_STAGE)/lib64
 	cp $(LD_SO) $(INITRD_STAGE)/lib64/ld-linux-x86-64.so.2
 	cp $(LIBC)  $(INITRD_STAGE)/lib/x86_64-linux-gnu/libc.so.6
+	@# ntdll.so needs libgcc_s for its unwinder. Copied unconditionally
+	@# rather than only alongside Wine: it is small, and a missing
+	@# dependency is a much more confusing failure than a spare file.
+	@if [ -f "$(LIBGCC)" ]; then \
+	    cp "$(LIBGCC)" $(INITRD_STAGE)/lib/x86_64-linux-gnu/libgcc_s.so.1; \
+	 fi
+	@# Wine's own loader, if a 64-bit Wine has been built beside the
+	@# tree. Optional: the build must not depend on somebody having
+	@# spent an hour compiling Wine, so this is copied when present and
+	@# skipped when not, and the layer that runs it says which.
+	@# ntdll.so goes beside it, because that is where Wine looks: it
+	@# reads /proc/self/exe, takes the directory, and appends the
+	@# library name. With the loader at /wine that is /ntdll.so.
+	@if [ -x "$(WINE64_LOADER)" ]; then \
+	    cp "$(WINE64_LOADER)" $(INITRD_STAGE)/wine; \
+	    if [ -f "$(WINE64_NTDLL)" ]; then \
+	        cp "$(WINE64_NTDLL)" $(INITRD_STAGE)/ntdll.so; \
+	        echo "  initrd: including Wine's loader and ntdll.so"; \
+	    else \
+	        echo "  initrd: Wine loader without ntdll.so"; \
+	    fi; \
+	 else \
+	    echo "  initrd: no Wine loader at $(WINE64_LOADER), skipping"; \
+	 fi
 	python3 userland/mkinitrd.py $(INITRD_STAGE) $@
 
 # A dynamically linked program - the smallest thing that makes ld.so run.

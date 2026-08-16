@@ -186,12 +186,15 @@ uint64_t uspace64_munmap(uint64_t addr, uint64_t length) {
 }
 
 uint64_t uspace64_build_stack(vmspace64_t* space, uint64_t stack_top,
-                              uint64_t stack_pages, const char* argv0,
+                              uint64_t stack_pages, const char* const* argv,
                               const elf64_info_t* elf,
-                              uint64_t interp_base) {
-    uint64_t saved_cr3, p, argv0_va, random_va, rsp;
+                              uint64_t interp_base,
+                              const char* const* envp) {
+    uint64_t saved_cr3, p, random_va, rsp;
+    uint64_t argv_va[8], env_va[16];
     uint64_t* v;
     uint64_t n;
+    int nenv = 0, nargv = 0;
     (void)stack_pages;
 
     __asm__ __volatile__("mov %%cr3, %0" : "=r"(saved_cr3));
@@ -207,10 +210,29 @@ uint64_t uspace64_build_stack(vmspace64_t* space, uint64_t stack_top,
     for (int i = 0; i < 16; i++)
         ((uint8_t*)p)[i] = (uint8_t)(0x5A + i * 7);
 
-    n = kstrlen(argv0) + 1;
-    p -= n;
-    argv0_va = p;
-    kmemcpy((void*)p, argv0, n);
+    for (nargv = 0; argv && argv[nargv]; nargv++) { }
+    if (nargv > (int)(sizeof(argv_va) / sizeof(argv_va[0])))
+        nargv = (int)(sizeof(argv_va) / sizeof(argv_va[0]));
+    for (int a = nargv - 1; a >= 0; a--) {
+        uint64_t l = kstrlen(argv[a]) + 1;
+        p -= l;
+        argv_va[a] = p;
+        kmemcpy((void*)p, argv[a], l);
+    }
+
+    /* The environment, laid down the same way. A program with an empty
+     * environment is not a normal program: glibc looks up the user to
+     * find HOME, and Wine derives its prefix from it, so "no variables
+     * at all" turns into a NULL dereference deep inside a library. */
+    for (nenv = 0; envp && envp[nenv]; nenv++) { }
+    if (nenv > (int)(sizeof(env_va) / sizeof(env_va[0])))
+        nenv = (int)(sizeof(env_va) / sizeof(env_va[0]));
+    for (int e = nenv - 1; e >= 0; e--) {
+        uint64_t l = kstrlen(envp[e]) + 1;
+        p -= l;
+        env_va[e] = p;
+        kmemcpy((void*)p, envp[e], l);
+    }
 
     p &= ~15ULL;
 
@@ -219,16 +241,17 @@ uint64_t uspace64_build_stack(vmspace64_t* space, uint64_t stack_top,
      * which is what the ABI specifies at process entry - glibc's
      * _start does an `and rsp, -16` of its own, but only after reading
      * argc off the stack it was given. */
-    n = 4 + 2 * 16;
+    n = 3 + (uint64_t)nargv + (uint64_t)nenv + 2 * 16;
     p -= n * 8;
     p &= ~15ULL;
     rsp = p;
 
     v = (uint64_t*)p;
-    *v++ = 1;                    /* argc */
-    *v++ = argv0_va;             /* argv[0] */
+    *v++ = (uint64_t)nargv;      /* argc */
+    for (int a = 0; a < nargv; a++) *v++ = argv_va[a];
     *v++ = 0;                    /* argv terminator */
-    *v++ = 0;                    /* envp terminator (no environment) */
+    for (int e = 0; e < nenv; e++) *v++ = env_va[e];
+    *v++ = 0;                    /* envp terminator */
 
     *v++ = AT_PHDR;   *v++ = elf->phdr_va;
     *v++ = AT_PHENT;  *v++ = elf->phent;

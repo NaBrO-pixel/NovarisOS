@@ -19,6 +19,7 @@
 #include "signal64.h"
 #include "ramfs64.h"
 #include "paging64.h"
+#include "kstring.h"
 
 #define IA32_EFER   0xC0000080u
 #define IA32_STAR   0xC0000081u
@@ -104,6 +105,14 @@ static struct {
 
 void syscall64_reset_files(void) {
     for (int i = 0; i < FD_MAX; i++) fds[i].used = 0;
+}
+
+/* What /proc/self/exe resolves to. Set when a program is loaded, since
+ * there is no /proc to derive it from. */
+static char exe_path[RAMFS64_PATH_MAX];
+
+void syscall64_set_exe_path(const char* path) {
+    kstrlcpy(exe_path, path, sizeof(exe_path));
 }
 
 static uint64_t do_open(const char* path, uint64_t flags) {
@@ -650,6 +659,31 @@ static uint64_t dispatch(syscall64_args_t* args) {
      * /etc/ld.so.preload, and treats -ENOSYS as fatal enough to stop
      * looking - so answering it is the difference between a loader that
      * searches for a library and one that gives up. */
+    /* readlink(path, buf, bufsiz).
+     *
+     * Only /proc/self/exe, and that one earns its place: it is how a
+     * program finds out where it was installed. Wine uses it to locate
+     * its own lib directory, and without it Wine computes the path to
+     * ntdll.so as (null) and stops - which is exactly how this came to
+     * be implemented. There is no /proc here, so the answer is
+     * remembered when the program is loaded.
+     *
+     * readlink does not NUL-terminate, and a caller that assumed it did
+     * would read past what it was given. */
+    case SYS64_READLINK: {
+        char* buf = (char*)a2;
+        uint64_t n;
+
+        if (kstrcmp((const char*)a1, "/proc/self/exe") != 0)
+            return (uint64_t)-22;                      /* -EINVAL */
+        if (!exe_path[0]) return (uint64_t)-2;         /* -ENOENT */
+
+        n = kstrlen(exe_path);
+        if (n > a3) n = a3;
+        kmemcpy(buf, exe_path, n);
+        return n;
+    }
+
     case SYS64_ACCESS:
         return ramfs64_lookup((const char*)a1) >= 0
                ? 0 : (uint64_t)-2;                     /* -ENOENT */

@@ -169,6 +169,10 @@ void syscall64_set_trace(int on);
  * process teardown; here the layers share one table. */
 void syscall64_reset_files(void);
 
+/* What readlink("/proc/self/exe") answers. There is no /proc here, so
+ * the loader records it. */
+void syscall64_set_exe_path(const char* path);
+
 /* Set by the kernel when it ends a program itself, so the recorded
  * status is the kernel's rather than a leftover. */
 void syscall64_set_exit_code(uint64_t code);

@@ -41,9 +41,10 @@ void uspace64_protect(uint64_t addr, uint64_t length, uint64_t prot);
 /* `interp_base` is where the dynamic loader was mapped, and becomes
  * AT_BASE. Zero for a static binary. */
 uint64_t uspace64_build_stack(vmspace64_t* space, uint64_t stack_top,
-                              uint64_t stack_pages, const char* argv0,
+                              uint64_t stack_pages, const char* const* argv,
                               const elf64_info_t* elf,
-                              uint64_t interp_base);
+                              uint64_t interp_base,
+                              const char* const* envp);
 
 uint64_t uspace64_pages_allocated(void);
 

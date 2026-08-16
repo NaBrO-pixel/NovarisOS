@@ -34,6 +34,26 @@ void ramfs64_init(void) {
      * on every other one, which is the kind of difference that makes a
      * differential test useless. */
     ramfs64_create("/tmp", 1);
+    ramfs64_create("/root", 1);
+    ramfs64_create("/etc", 1);
+
+    /* glibc looks the user up to answer getpwuid, and Wine asks it where
+     * HOME is. With no passwd database the lookup returns NULL, which
+     * nothing checks, and the failure surfaces as a NULL dereference
+     * inside a library rather than as a missing file. */
+    {
+        static const char passwd[] =
+            "root:x:0:0:root:/root:/bin/sh\n";
+        static const char nsswitch[] =
+            "passwd: files\ngroup: files\nshadow: files\nhosts: files\n";
+        int n;
+
+        n = ramfs64_create("/etc/passwd", 0);
+        if (n >= 0) ramfs64_write(n, 0, passwd, sizeof(passwd) - 1);
+
+        n = ramfs64_create("/etc/nsswitch.conf", 0);
+        if (n >= 0) ramfs64_write(n, 0, nsswitch, sizeof(nsswitch) - 1);
+    }
 }
 
 int ramfs64_lookup(const char* path) {

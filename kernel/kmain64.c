@@ -1034,6 +1034,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         uint64_t written_before = syscall64_bytes_written();
         uint64_t enosys_before  = syscall64_unimplemented_count();
         int rc, stack_ok = 1;
+        static const char* const glibc_argv[] = { "/hello_glibc64", 0 };
 
         vmspace64_kernel_space(&kspace);
         check("a space for glibc", vmspace64_create(&space) != 0);
@@ -1056,7 +1057,7 @@ void kernel_main(uint32_t magic, void* mbi) {
 
         uspace64_reset(&space, info.brk_start);
         rsp = uspace64_build_stack(&space, STACK_TOP, STACK_PAGES,
-                                   "/hello_glibc64", &info, 0);
+                                   glibc_argv, &info, 0, 0);
         check("argc/argv/envp/auxv built on it", rsp != 0);
         check("and the stack pointer is 16-byte aligned", (rsp % 16) == 0);
 
@@ -1706,6 +1707,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         uint64_t written_before = syscall64_bytes_written();
         char interp_path[128];
         int rc, stack_ok = 1, have_interp;
+        static const char* const dyn_argv[] = { "/dynhello64", 0 };
 
         ramfs64_init();
         ramfs64_seed_from_initrd();
@@ -1767,7 +1769,7 @@ void kernel_main(uint32_t magic, void* mbi) {
          * its own image before it can relocate anything else - and
          * AT_ENTRY where the program it is loading starts. */
         rsp = uspace64_build_stack(&space, STACK_TOP, STACK_PAGES,
-                                   "/dynhello64", &exe, INTERP_BASE);
+                                   dyn_argv, &exe, INTERP_BASE, 0);
         check("a stack with AT_BASE on it", rsp != 0);
 
         {
@@ -1812,6 +1814,122 @@ void kernel_main(uint32_t magic, void* mbi) {
               syscall64_exit_code() == 67);
         check("the program printed through the libc it linked against",
               syscall64_bytes_written() > written_before);
+    }
+
+    /* --- layer 25: Wine's own loader -------------------------------- */
+    /* The point of the whole 64-bit port, pointed at the kernel to see
+     * what it says. Wine's loader is a dynamically linked PIE, which
+     * Milestone 62 made runnable; whether it gets anywhere is a
+     * different question, and this layer exists to read the answer
+     * rather than to assert one. Tracing is ON. */
+    serial64_puts("NOVARIS64: -- Wine's loader --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 128;
+        const uint64_t EXE_BIAS    = 0x0000555555554000ULL;
+        const uint64_t INTERP_BASE = 0x00007FFFF7000000ULL;
+        vmspace64_t kspace, space;
+        elf64_info_t exe, interp;
+        const void* image;
+        const void* ld_image;
+        uint64_t len, ld_len, rsp, i;
+        uint64_t enosys_before = syscall64_unimplemented_count();
+        int rc, stack_ok = 1, have_wine;
+
+        /* Wine derives its prefix from HOME, and glibc derives HOME from
+         * the passwd database when the variable is absent - which is a
+         * long way to travel for a value that can simply be handed
+         * over. WINEDLLPATH is where it looks for the rest of its
+         * libraries once ntdll is up. */
+        /* Ask it for its version. With no arguments it prints usage,
+         * which proves it started; --version makes it go further and
+         * answer from ntdll. */
+        static const char* const wine_argv[] = { "/wine", "--version", 0 };
+
+        static const char* const wine_env[] = {
+            "HOME=/root",
+            "USER=root",
+            "WINEPREFIX=/root/.wine",
+            "WINEDLLPATH=/",
+            "WINEDEBUG=+loaddll",
+            0
+        };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        syscall64_reset_files();
+        signal64_reset();
+        sched64_init();
+        vmspace64_kernel_space(&kspace);
+
+        have_wine = initrd64_open("wine", &image, &len) == INITRD64_OK;
+        if (!have_wine) {
+            /* Not a failure: the build does not require anyone to have
+             * spent an hour compiling Wine first. */
+            serial64_puts("NOVARIS64: no Wine loader in the initrd - "
+                          "build one with configure --enable-archs=x86_64\n");
+        } else if (vmspace64_create(&space) &&
+                   initrd64_open("lib64/ld-linux-x86-64.so.2",
+                                 &ld_image, &ld_len) == INITRD64_OK) {
+
+            serial64_puts("NOVARIS64: wine    = ");
+            serial64_putdec(len);
+            serial64_puts(" bytes\n");
+
+            /* Wine reads /proc/self/exe to work out where it is
+             * installed, and derives the path to ntdll.so from it. */
+            syscall64_set_exe_path("/wine");
+
+            rc = elf64_load_at(image, len, &space, EXE_BIAS, &exe);
+            if (rc == ELF64_OK)
+                rc = elf64_load_at(ld_image, ld_len, &space, INTERP_BASE,
+                                   &interp);
+
+            for (i = 0; i < STACK_PAGES; i++) {
+                uint64_t f = pmm64_alloc_frame();
+                if (!f || vmspace64_map(&space,
+                                        STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                        PAGE64_PRESENT | PAGE64_WRITE |
+                                        PAGE64_USER) != PAGING64_OK)
+                    stack_ok = 0;
+            }
+            uspace64_reset(&space, exe.brk_start);
+            rsp = uspace64_build_stack(&space, STACK_TOP, STACK_PAGES,
+                                       wine_argv, &exe, INTERP_BASE,
+                                       wine_env);
+
+            if (rc == ELF64_OK && stack_ok && rsp) {
+                serial64_puts("NOVARIS64: --- what Wine asks for ---\n");
+                pf_diagnose = 1;
+                syscall64_set_trace(1);
+                vmspace64_switch(&space);
+                enter_user_mode64(interp.entry, rsp, 0);
+                vmspace64_switch(&kspace);
+                syscall64_set_trace(0);
+                pf_diagnose = 0;
+                serial64_puts("NOVARIS64: --- end ---\n");
+            } else {
+                serial64_puts("NOVARIS64: could not lay it out\n");
+            }
+        }
+
+        serial64_puts("NOVARIS64: wine exit= ");
+        serial64_putdec(syscall64_exit_code());
+        serial64_puts(", enosys ");
+        serial64_putdec(syscall64_unimplemented_count() - enosys_before);
+        serial64_puts(", last ");
+        serial64_putdec(syscall64_unimplemented());
+        serial64_putc('\n');
+
+        /* Asserted only when a Wine was actually built to run: the
+         * repository must not require an hour of compiling Wine before
+         * `make test` passes. When it is there, `wine --version` exits
+         * 0 and nothing else in this kernel produces that. */
+        if (have_wine)
+            check("Wine's loader ran and answered --version",
+                  syscall64_exit_code() == 0);
+        else
+            check("no Wine to run, which is not a failure", 1);
     }
 
     /* --- verdict ---------------------------------------------------- */

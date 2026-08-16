@@ -7586,6 +7586,70 @@ Wine's loader is a dynamically linked PIE needing exactly this. Running
 it is now a question of whether the syscalls it makes are implemented,
 rather than of whether it can start at all.
 
+## Milestone 63 — Wine runs ✅ DONE
+
+```
+NOVARIS64: --- what Wine asks for ---
+...
+NOVARIS64: [call] 1(0x1, 0x55555555abd0, 0xa)wine-11.0
+NOVARIS64: [call] 231(0x0, ...) = 0x0
+```
+
+Wine's loader started, loaded `ntdll.so`, initialised, parsed its
+arguments, answered `--version` and exited 0. On a kernel written from
+nothing.
+
+208 assertions. The layer asserts this **only when a 64-bit Wine has
+been built beside the tree** - `make test` must not require an hour of
+compiling Wine first - and says so when there is none.
+
+### What it took, in the order Wine asked
+
+The whole milestone was reading a trace and answering it. Nothing here
+was predicted in advance:
+
+1. **`readlink("/proc/self/exe")`** - missing, and Wine derives the path
+   to `ntdll.so` from it. Without it Wine computed that path as `(null)`
+   and stopped. There is no `/proc` here, so the loader records the
+   answer instead.
+2. **`ntdll.so` at `/ntdll.so`** - Wine takes the directory of
+   `/proc/self/exe` and appends the library name. The loader is at
+   `/wine`, so that is where it looked.
+3. **`libgcc_s.so.1`** - `ntdll.so` needs it for its unwinder.
+4. **An environment.** Programs here had *no environment variables at
+   all*. glibc looks the user up to answer `getpwuid`, Wine asks it
+   where `HOME` is, and the absence turned into a NULL dereference deep
+   inside a library. `HOME`, `USER`, `WINEPREFIX` and `WINEDLLPATH` are
+   handed over now, and `uspace64_build_stack` lays out a real `envp`.
+5. **`/etc/passwd` and `/etc/nsswitch.conf`** - created by `ramfs64_init`,
+   because a passwd lookup that returns NULL is checked by nobody.
+6. **`argv`.** The stack builder took a single `argv0`; `wine --version`
+   needs two arguments, so it takes an array.
+
+### What this does and does not mean
+
+It means the Linux ABI this kernel implements is good enough to start
+Wine and get it through `ntdll.so`'s initialisation - the syscalls, the
+dynamic loader, the auxiliary vector, TLS, signals, the filesystem and
+`mmap` all held up under a program that was not written with them in
+mind and cannot be adjusted to suit them.
+
+It does not mean Wine can run a Windows program. `--version` is answered
+before Wine needs any of the things it is actually missing here:
+
+- **No second process.** Wine's architecture is client-server, and
+  `wineserver` is a separate process. There is no `fork` and no
+  `execve`.
+- **No prefix.** Creating one means thousands of files in a deep
+  directory tree, and this filesystem is a flat path table with no
+  `readdir` and no `..`.
+- **Only `ntdll.so` is present.** The other 601 DLLs are not in the
+  initrd, and would not fit: the initrd is RAM-backed and user pages
+  must come from the first gigabyte.
+
+Those are the next three walls, in that order, and the first is the one
+everything else waits on.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
