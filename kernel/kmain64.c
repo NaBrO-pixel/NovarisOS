@@ -38,6 +38,7 @@
 #include "win32_64.h"
 #include "initrd64.h"
 #include "signal64.h"
+#include "ramfs64.h"
 
 static int failures = 0;
 
@@ -101,6 +102,8 @@ extern const unsigned char futex64_elf[];
 extern const unsigned long futex64_elf_len;
 extern const unsigned char signal64_elf[];
 extern const unsigned long signal64_elf_len;
+extern const unsigned char fs64_elf[];
+extern const unsigned long fs64_elf_len;
 
 /* isr64.s - a load that is allowed to fault, and where to resume if it does. */
 extern uint64_t probe_read64(const void* addr);
@@ -1523,6 +1526,72 @@ void kernel_main(uint32_t magic, void* mbi) {
         serial64_puts(" delivered, ");
         serial64_putdec(signal64_returns());
         serial64_puts(" returned, exit ");
+        serial64_putdec(syscall64_exit_code());
+        serial64_putc('\n');
+    }
+
+    /* --- layer 22: a writable filesystem ---------------------------- */
+    /* Milestone 54's initrd could be read. This one can be written to,
+     * which is the difference that matters: a Wine prefix is thousands
+     * of files Wine *creates*. */
+    serial64_puts("NOVARIS64: -- a writable filesystem --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 16;
+        vmspace64_t kspace, space;
+        elf64_info_t info;
+        uint64_t i;
+        uint64_t written_before = syscall64_bytes_written();
+        int rc, stack_ok = 1;
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        syscall64_reset_files();
+
+        check("the filesystem came up with /tmp", ramfs64_lookup("/tmp") >= 0);
+        /* Whatever the initrd held is still readable, so this milestone
+         * adds writing rather than replacing reading. */
+        check("and the initrd's contents were carried into it",
+              ramfs64_lookup("/dlllib64.dll") >= 0);
+
+        vmspace64_kernel_space(&kspace);
+        check("a space for it", vmspace64_create(&space) != 0);
+
+        rc = elf64_load(fs64_elf, fs64_elf_len, &space, &info);
+        check("the filesystem program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&space, info.brk_start);
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        vmspace64_switch(&space);
+        enter_user_mode64(info.entry, STACK_TOP, 0);
+        vmspace64_switch(&kspace);
+        pf_diagnose = 0;
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("the program said so too",
+              syscall64_bytes_written() > written_before);
+        /* Each failure path in the program has its own status - 71 is a
+         * failed open, 75 a mismatched read-back, 77 a file that
+         * survived being unlinked - so a break says which step broke. */
+        check("open, write, seek, read-back, unlink all worked",
+              syscall64_exit_code() == 53);
+        check("and the file it removed is gone",
+              ramfs64_lookup("/tmp/novaris-fs-test") < 0);
+
+        serial64_puts("NOVARIS64: fs      = ");
+        serial64_putdec(ramfs64_count());
+        serial64_puts(" nodes, exit ");
         serial64_putdec(syscall64_exit_code());
         serial64_putc('\n');
     }

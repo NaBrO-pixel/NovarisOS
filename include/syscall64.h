@@ -32,6 +32,24 @@
  * something real rather than against a private convention. */
 #define SYS64_READ            0
 #define SYS64_WRITE           1
+#define SYS64_OPEN            2
+#define SYS64_CLOSE           3
+#define SYS64_LSEEK           8
+#define SYS64_MKDIR           83
+#define SYS64_UNLINK          87
+#define SYS64_OPENAT          257
+
+/* open(2) flags, Linux's values for x86-64. */
+#define O_WRONLY   0x0001
+#define O_RDWR     0x0002
+#define O_CREAT    0x0040
+#define O_TRUNC    0x0200
+#define O_APPEND   0x0400
+
+/* lseek(2) whence */
+#define SEEK_SET_  0
+#define SEEK_CUR_  1
+#define SEEK_END_  2
 #define SYS64_FSTAT           5
 #define SYS64_MMAP            9
 #define SYS64_MPROTECT        10
@@ -132,6 +150,10 @@ uint64_t syscall64_unimplemented_count(void);
  * otherwise bury the program's own output in the serial transcript the
  * tests match against. */
 void syscall64_set_trace(int on);
+
+/* Closes every open descriptor. A real kernel does this as part of
+ * process teardown; here the layers share one table. */
+void syscall64_reset_files(void);
 
 /* Threads that ended through exit(2) while siblings were still running -
  * the case that does NOT end the process. */

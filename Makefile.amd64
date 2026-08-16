@@ -79,6 +79,8 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/futex64_blob.o \
        $(BUILD_DIR)/signal64_blob.o \
        $(BUILD_DIR)/signal64.o \
+       $(BUILD_DIR)/fs64_blob.o \
+       $(BUILD_DIR)/ramfs64.o \
        $(BUILD_DIR)/initrd64.o \
        $(BUILD_DIR)/hello64_blob.o \
        $(BUILD_DIR)/glibc64_blob.o \
@@ -123,6 +125,18 @@ $(BUILD_DIR)/thread64_blob.c: $(BUILD_DIR)/thread64.elf userland/embed64.py
 	python3 userland/embed64.py $< $@ thread64_elf
 
 $(BUILD_DIR)/thread64_blob.o: $(BUILD_DIR)/thread64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Ordinary POSIX file I/O, so it runs against a real filesystem on the
+# host and a RAM one on the guest, and both have to agree.
+$(BUILD_DIR)/fs64.elf: userland/fs64.s | $(BUILD_DIR)
+	$(AS) -f elf64 $< -o $(BUILD_DIR)/fs64.o
+	$(LD) -m elf_x86_64 -o $@ $(BUILD_DIR)/fs64.o
+
+$(BUILD_DIR)/fs64_blob.c: $(BUILD_DIR)/fs64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ fs64_elf
+
+$(BUILD_DIR)/fs64_blob.o: $(BUILD_DIR)/fs64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Catches SIGSEGV and rewrites RIP - Wine's exception dispatch in
@@ -348,6 +362,17 @@ test: iso
 	    || (echo "FAIL: the host run of the signal binary did not exit 41"; \
 	        exit 1)
 	@echo "PASS: SIGSEGV is caught and resumed the same, and exits 41, on both"
+	@# And the filesystem one. It writes under /tmp and unlinks what it
+	@# made, so the host run leaves nothing behind.
+	@timeout 20 ./$(BUILD_DIR)/fs64.elf > $(BUILD_DIR)/fs64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/fs64.host.status
+	@grep -qFf $(BUILD_DIR)/fs64.host.txt $(BUILD_DIR)/serial.log \
+	    || (echo "FAIL: the guest did not print what the host prints"; \
+	        exit 1)
+	@[ "`cat $(BUILD_DIR)/fs64.host.status`" = "53" ] \
+	    || (echo "FAIL: the host run of the filesystem binary did not exit 53"; \
+	        exit 1)
+	@echo "PASS: files behave the same, and exit 53, on both"
 
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR) $(ISO)

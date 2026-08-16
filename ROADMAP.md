@@ -7125,8 +7125,8 @@ its own TLS in BoringSSL - and none of them are what stands in the way.
 3. **Per-task kernel stacks** - still absent, and Milestone 57 explains
    why futex did not need them.
 4. ~~Signals~~ - fault signals done in Milestone 58; asynchronous ones
-   (`kill`, masking, queueing) are not. A writable filesystem and
-   file-backed `mmap` remain.
+   (`kill`, masking, queueing) are not. ~~A writable filesystem~~ - done
+   in Milestone 59. File-backed `mmap` remains.
 
 ## Milestone 56 — 64-bit: exit(2) ends a thread, not the process ✅ DONE
 
@@ -7315,6 +7315,56 @@ The frame is also written to the faulting thread's stack **unchecked**.
 A thread that faulted *because* its stack pointer was bad will fault
 again inside the kernel while the frame is being written. Linux handles
 that with an alternate signal stack; this does not.
+
+## Milestone 59 — 64-bit: a filesystem that can be written to ✅ DONE
+
+190 assertions and a seventh differential. Milestone 54's initrd could
+be *read*; this one can be written, which is the difference Wine needs -
+a prefix is thousands of files Wine creates.
+
+`userland/fs64.s` is ordinary POSIX: open, write, lseek, read, compare,
+close, unlink. It runs on Linux against a real filesystem and on Novaris
+against a RAM one, and both have to agree. It writes under `/tmp` and
+removes what it made, so a host run leaves nothing behind.
+
+```
+NOVARIS64: --- its output follows ---
+wrote a file, read it back, and removed it
+NOVARIS64: --- end of its output ---
+NOVARIS64: fs      = 2 nodes, exit 53
+```
+
+Syscalls: `open`, `openat`, `close`, `read`, `write`, `lseek`, `mkdir`,
+`unlink`. `write` now tells a descriptor from a console: 1 and 2 still
+go to the serial port, 3 and up go to the filesystem.
+
+### The read-back is the assertion
+
+Every other check in that program is a syscall return value, and a
+filesystem that accepted writes and stored nothing would satisfy all of
+them. The comparison is what catches it. **Falsified exactly that way** -
+`ramfs64_write` made to accept the data and drop it - and the program
+exits **75**, which is the status it reserves for a mismatched
+read-back. Each failure path has its own number, so the failure names
+the step rather than only reporting that one happened.
+
+### What it is, honestly
+
+A flat table keyed by whole path, not a directory tree. `/a/b/c` is an
+entry whose name contains slashes and a lookup is an exact string match.
+That is enough for open/read/write on known paths; it is not enough for
+`readdir`, for renaming a directory, or for `..`, and Wine will want all
+three. The 32-bit tree's `ramfs.c` is 877 lines for those reasons.
+
+Also missing, and each one is a real divergence rather than an omission:
+
+- **No reference counting.** `unlink` frees the data immediately, so a
+  program that unlinks a file it still has open - a common idiom for
+  temporary files - reads freed memory here and works on Linux.
+- **No permissions.** The mode argument to `open` is accepted and
+  ignored, and every file is readable and writable by everyone.
+- **Nothing survives a reboot**, since there is no disk driver. The
+  initrd seeds the filesystem at boot and writes go nowhere else.
 
 ## Where chrome.exe actually is from here
 

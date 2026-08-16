@@ -17,6 +17,7 @@
 #include "win32_64.h"
 #include "sched64.h"
 #include "signal64.h"
+#include "ramfs64.h"
 
 #define IA32_EFER   0xC0000080u
 #define IA32_STAR   0xC0000081u
@@ -88,6 +89,42 @@ static uint64_t thread_exits;
  * it is the only place that value exists - the frame the stub builds
  * describes the registers but not the stack they came off. */
 extern uint64_t saved_user_rsp;
+
+/* Open files. One table, because there is one process: a real kernel
+ * keeps this per process and closes it on exit. 0-2 are never allocated,
+ * so that a program's stdin/stdout/stderr keep meaning what they mean. */
+#define FD_MAX 32
+
+static struct {
+    int      node;
+    uint64_t pos;
+    int      used;
+} fds[FD_MAX];
+
+void syscall64_reset_files(void) {
+    for (int i = 0; i < FD_MAX; i++) fds[i].used = 0;
+}
+
+static uint64_t do_open(const char* path, uint64_t flags) {
+    int node = ramfs64_lookup(path);
+    int fd;
+
+    if (node < 0) {
+        if (!(flags & O_CREAT)) return (uint64_t)-2;   /* -ENOENT */
+        node = ramfs64_create(path, 0);
+        if (node < 0) return (uint64_t)-28;            /* -ENOSPC */
+    } else if (flags & O_TRUNC) {
+        ramfs64_truncate(node);
+    }
+
+    for (fd = 3; fd < FD_MAX; fd++) if (!fds[fd].used) break;
+    if (fd == FD_MAX) return (uint64_t)-24;            /* -EMFILE */
+
+    fds[fd].node = node;
+    fds[fd].pos  = (flags & O_APPEND) ? ramfs64_size(node) : 0;
+    fds[fd].used = 1;
+    return (uint64_t)fd;
+}
 
 /* The calling thread's complete user state, as a frame it could be
  * resumed from, with `rax` set to what the syscall will return.
@@ -194,7 +231,19 @@ static uint64_t dispatch(syscall64_args_t* args) {
          * so without racing the caller. Nothing here does that yet. */
         const char* buf = (const char*)a2;
         uint64_t n = a3;
-        if (a1 != 1 && a1 != 2) return (uint64_t)-1;   /* stdout/stderr */
+
+        /* A real file descriptor goes to the filesystem; 1 and 2 are the
+         * serial port. Nothing here has a descriptor table entry for
+         * stdout, so the two cases are told apart by number. */
+        if (a1 >= 3) {
+            int64_t w;
+            if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+            w = ramfs64_write(fds[a1].node, fds[a1].pos, buf, n);
+            if (w > 0) fds[a1].pos += (uint64_t)w;
+            return (uint64_t)w;
+        }
+
+        if (a1 != 1 && a1 != 2) return (uint64_t)-9;   /* -EBADF */
         for (uint64_t i = 0; i < n; i++) serial64_putc(buf[i]);
         bytes_written += n;
         return n;
@@ -418,8 +467,53 @@ static uint64_t dispatch(syscall64_args_t* args) {
          * whether or not it wanted to hear about it. */
         return 0;
 
-    case SYS64_READ:
-        return 0;                                      /* end of file */
+    /* --- files ---------------------------------------------------- */
+
+    case SYS64_OPEN:
+        return do_open((const char*)a1, a2);
+
+    case SYS64_OPENAT:
+        /* openat(dirfd, path, flags, mode). glibc uses this in
+         * preference to open(2). Only AT_FDCWD (-100) with an absolute
+         * path is supported; there is no working directory here, so a
+         * relative path has nothing to be relative to. */
+        if ((int64_t)(int32_t)a1 != -100) return (uint64_t)-9;  /* -EBADF */
+        if (((const char*)a2)[0] != '/')  return (uint64_t)-2;  /* -ENOENT */
+        return do_open((const char*)a2, a3);
+
+    case SYS64_CLOSE:
+        if (a1 < 3 || a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        fds[a1].used = 0;
+        return 0;
+
+    case SYS64_LSEEK: {
+        uint64_t base;
+        if (a1 < 3 || a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        switch (a3) {
+        case SEEK_SET_: base = 0; break;
+        case SEEK_CUR_: base = fds[a1].pos; break;
+        case SEEK_END_: base = ramfs64_size(fds[a1].node); break;
+        default: return (uint64_t)-22;
+        }
+        fds[a1].pos = base + a2;
+        return fds[a1].pos;
+    }
+
+    case SYS64_MKDIR:
+        return ramfs64_create((const char*)a1, 1) >= 0
+               ? 0 : (uint64_t)-28;                    /* -ENOSPC */
+
+    case SYS64_UNLINK:
+        return (uint64_t)(int64_t)ramfs64_unlink((const char*)a1);
+
+    case SYS64_READ: {
+        int64_t n;
+        if (a1 < 3) return 0;                          /* stdin: end of file */
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        n = ramfs64_read(fds[a1].node, fds[a1].pos, (void*)a2, a3);
+        if (n > 0) fds[a1].pos += (uint64_t)n;
+        return (uint64_t)n;
+    }
 
     case SYS64_ECHO:
         last_arg = a1;
