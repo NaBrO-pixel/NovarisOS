@@ -169,6 +169,14 @@ static void page_fault_handler(registers64_t* r) {
         serial64_puts("\nNOVARIS64:   err="); serial64_puthex(pf_err);
         serial64_puts(" cs=");               serial64_puthex(r->cs);
         serial64_puts(" rsp=");              serial64_puthex(r->rsp);
+        /* The registers matter as much as the address: a fault reading
+         * through a pointer says nothing until you can see which
+         * pointer, and where it came from. */
+        serial64_puts("\nNOVARIS64:   rax="); serial64_puthex(r->rax);
+        serial64_puts(" rbx=");              serial64_puthex(r->rbx);
+        serial64_puts(" rdi=");              serial64_puthex(r->rdi);
+        serial64_puts("\nNOVARIS64:   rsi="); serial64_puthex(r->rsi);
+        serial64_puts(" rbp=");              serial64_puthex(r->rbp);
         serial64_putc('\n');
 
         /* A ring-3 fault with nobody to catch it kills the program, the
@@ -1695,6 +1703,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         elf64_info_t exe, interp;
         const void* image;
         uint64_t len, rsp, i;
+        uint64_t written_before = syscall64_bytes_written();
         char interp_path[128];
         int rc, stack_ok = 1, have_interp;
 
@@ -1778,12 +1787,14 @@ void kernel_main(uint32_t magic, void* mbi) {
 
         /* Control goes to the INTERPRETER, not the program: ld.so runs
          * first and calls the program's entry when it is ready. */
+        /* Tracing is off now that this works. It is how the milestone
+         * was found - syscall64_set_trace(1) prints every call and its
+         * result - and leaving it on would bury the program's own
+         * output in the transcript the differential compares. */
         pf_diagnose = 1;
-        syscall64_set_trace(1);
         vmspace64_switch(&space);
         enter_user_mode64(interp.entry, rsp, 0);
         vmspace64_switch(&kspace);
-        syscall64_set_trace(0);
         pf_diagnose = 0;
 
         serial64_puts("NOVARIS64: --- end ---\n");
@@ -1793,14 +1804,14 @@ void kernel_main(uint32_t magic, void* mbi) {
         serial64_putdec(syscall64_unimplemented_count());
         serial64_putc('\n');
 
-        /* Deliberately not asserted on. This layer's job is to find out
-         * what the dynamic loader needs, not to claim it works: ld.so
-         * currently maps libc and dies inside glibc's own start-up, and
-         * a check here would either be a lie or a permanent red mark.
-         * What IS asserted is that the kernel survived it - a program
-         * that faults must not take the machine with it. */
-        check("the kernel survived the program it could not finish",
-              syscall64_exit_code() == 139 || syscall64_exit_code() == 67);
+        /* 67 is what dynhello64.c's main returns, and it is only
+         * reachable through the whole chain: ld.so relocated itself,
+         * found libc, mapped it, relocated it, resolved
+         * __libc_start_main, and called main. */
+        check("ld.so loaded libc and reached main",
+              syscall64_exit_code() == 67);
+        check("the program printed through the libc it linked against",
+              syscall64_bytes_written() > written_before);
     }
 
     /* --- verdict ---------------------------------------------------- */

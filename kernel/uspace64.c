@@ -44,7 +44,14 @@ void uspace64_reset(vmspace64_t* space, uint64_t brk_start) {
 /* Maps [start, end) as anonymous zeroed user memory. Returns 0 on
  * failure, having mapped whatever it managed - the callers below undo
  * their own partial work by simply not advancing their pointer. */
-static int map_anon(uint64_t start, uint64_t end, uint64_t flags) {
+/* `zero_existing` says what to do with a page that is already mapped in
+ * the range. A fresh mmap must hand back zeros, so it says yes; brk
+ * says no, because it grows the heap from an unaligned break and the
+ * page holding the break is full of live heap. Zeroing there wipes the
+ * allocator's own data, which presents as "stack smashing detected"
+ * from a program that never touched its stack. */
+static int map_anon(uint64_t start, uint64_t end, uint64_t flags,
+                    int zero_existing) {
     for (uint64_t va = start; va < end; va += PAGE64_SIZE) {
         uint64_t frame, existing;
 
@@ -55,8 +62,21 @@ static int map_anon(uint64_t start, uint64_t end, uint64_t flags) {
              * MAP_FIXED and the permissions that segment needs; leaving
              * the reservation's flags in place makes the data segment
              * read-only, and what that looks like is ld.so faulting on
-             * its own relocations. */
-            paging64_map(va, existing & ~(PAGE64_SIZE - 1), flags);
+             * its own relocations.
+             *
+             * And zero it. An anonymous mapping reads as zeros - that is
+             * the whole of what "anonymous" promises - and a page being
+             * recycled from an earlier mapping is exactly the case where
+             * that is easy to get wrong. A loader maps a library's whole
+             * span from the file, then maps the .bss over the tail of it
+             * with MAP_ANONYMOUS|MAP_FIXED; skip the zeroing and the
+             * .bss contains whatever the file had at that offset. What
+             * that looks like is a NULL list terminator that is not
+             * NULL, in a library whose relocations all applied fine. */
+            existing &= ~(PAGE64_SIZE - 1);
+            if (zero_existing)
+                kmemset((void*)(KERNEL_VMA + existing), 0, PAGE64_SIZE);
+            paging64_map(va, existing, flags);
             continue;
         }
 
@@ -85,7 +105,7 @@ uint64_t uspace64_brk(uint64_t addr) {
     want = (addr + PAGE64_SIZE - 1) & ~(PAGE64_SIZE - 1);
     if (want > brk_current) {
         if (!map_anon(brk_current, want,
-                      PAGE64_PRESENT | PAGE64_WRITE | PAGE64_USER))
+                      PAGE64_PRESENT | PAGE64_WRITE | PAGE64_USER, 0))
             return brk_current;   /* Linux reports failure this way */
     }
     brk_current = addr;
@@ -127,7 +147,7 @@ uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     pflags = PAGE64_PRESENT | PAGE64_USER;
     if (prot & 0x2) pflags |= PAGE64_WRITE;        /* PROT_WRITE */
 
-    if (!map_anon(start, end, pflags)) return (uint64_t)-12;  /* -ENOMEM */
+    if (!map_anon(start, end, pflags, 1)) return (uint64_t)-12; /* -ENOMEM */
 
     /* A fixed mapping does not move the bump pointer: it was placed by
      * the caller, in a range the caller is keeping track of. */

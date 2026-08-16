@@ -7528,6 +7528,64 @@ been sitting in the tree since Milestone 51 and passed every test up to
 this one, because nothing before ld.so ever asked them a question whose
 answer mattered.
 
+## Milestone 62 — 64-bit: a dynamically linked program runs ✅ DONE
+
+207 assertions and a ninth differential. Milestone 61 left ld.so dying
+inside glibc's `atexit` machinery. This is that bug, and it was one
+line - in a place the symptom pointed nowhere near.
+
+```
+NOVARIS64: --- its output follows ---
+a dynamically linked program reached main
+NOVARIS64: exit    = 67
+```
+
+67 is what `dynhello64.c`'s `main` returns, and it is reachable only
+through the whole chain: ld.so relocated itself, found libc, mapped it,
+relocated it, resolved `__libc_start_main`, and called `main`.
+
+### MAP_ANONYMOUS was handing back somebody else's data
+
+The fault was a read through a pointer that should have been NULL. The
+register dump - added for exactly this - showed the list *head* was a
+perfectly good address in libc's `.bss`, so relocation had worked; it
+was a `next` pointer one node in that read `0x20`.
+
+`.bss` is supposed to be zeros, and it was not. A loader maps a
+library's whole span from the file to reserve the address space, then
+maps each segment over it, and finally maps the `.bss` over the tail
+with `MAP_ANONYMOUS|MAP_FIXED`. Those pages already existed - from the
+file-backed reservation - and `map_anon` *reused* them without zeroing.
+So the `.bss` contained whatever bytes libc's file happened to have at
+that offset, and one of them was a list terminator that was not NULL.
+
+**An anonymous mapping reading as zeros is the entire content of the
+word "anonymous"**, and the one case where it is easy to get wrong is a
+page being recycled from an earlier mapping.
+
+### And the over-correction, which broke something else
+
+Zeroing every recycled page broke the *static* glibc test with
+`*** stack smashing detected ***` - from a program that never touched
+its stack. `brk` grows the heap through the same helper, starting at the
+current break, which is **not page aligned**: the page holding the break
+is full of live heap, and zeroing it destroys the allocator's own
+bookkeeping.
+
+So the zeroing is now a parameter rather than a policy: `mmap` asks for
+it, because a fresh mapping owes the caller zeros; `brk` does not,
+because it is extending a region whose existing contents are the point.
+
+Two bugs, opposite in shape - one from not zeroing what it should, one
+from zeroing what it should not - and both presented as corruption a
+long way from the mapping code.
+
+### What this unblocks
+
+Wine's loader is a dynamically linked PIE needing exactly this. Running
+it is now a question of whether the syscalls it makes are implemented,
+rather than of whether it can start at all.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the

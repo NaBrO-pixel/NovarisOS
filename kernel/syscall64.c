@@ -260,6 +260,18 @@ uint64_t syscall64_dispatch(syscall64_args_t* args) {
     serial64_puthex(args->a2);
     serial64_puts(", ");
     serial64_puthex(args->a3);
+    /* mmap's interesting arguments are the ones past the third: whether
+     * it is anonymous, which file, and at what offset. A trace of a
+     * loader without them cannot be compared to what the ELF says. */
+    if (args->nr == SYS64_MMAP) {
+        serial64_puts(" flags=");
+        serial64_puthex(args->a4);
+        serial64_puts(" fd=");
+        serial64_putdec(args->a5);
+        serial64_puts(" off=");
+        serial64_puthex(args->a6);
+    }
+
     serial64_puts(")");
     r = dispatch(args);
     serial64_puts(" = ");

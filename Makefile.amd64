@@ -420,6 +420,20 @@ test: iso
 	    || (echo "FAIL: the host run of the mmap binary did not exit 61"; \
 	        exit 1)
 	@echo "PASS: a mapped file reads the same, and exits 61, on both"
+	@# The dynamic one. It runs against the host's own ld.so and libc -
+	@# the very same files the guest has in its initrd - so agreement
+	@# here means the kernel satisfied a dynamic loader it did not write
+	@# and cannot influence.
+	@timeout 20 ./$(BUILD_DIR)/dynhello64.elf \
+	    > $(BUILD_DIR)/dynhello64.host.txt 2>/dev/null; \
+	    echo $$? > $(BUILD_DIR)/dynhello64.host.status
+	@grep -qFf $(BUILD_DIR)/dynhello64.host.txt $(BUILD_DIR)/serial.log \
+	    || (echo "FAIL: the guest did not print what the host prints"; \
+	        exit 1)
+	@[ "`cat $(BUILD_DIR)/dynhello64.host.status`" = "67" ] \
+	    || (echo "FAIL: the host run of the dynamic binary did not exit 67"; \
+	        exit 1)
+	@echo "PASS: a dynamically linked program runs the same, and exits 67, on both"
 
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR) $(ISO)
