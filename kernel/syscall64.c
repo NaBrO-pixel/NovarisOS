@@ -18,6 +18,7 @@
 #include "sched64.h"
 #include "signal64.h"
 #include "ramfs64.h"
+#include "paging64.h"
 
 #define IA32_EFER   0xC0000080u
 #define IA32_STAR   0xC0000081u
@@ -165,6 +166,13 @@ uint64_t syscall64_thread_exits(void) { return thread_exits; }
  * look identical from outside, and only the first is worth claiming. */
 static uint64_t futex_waits, futex_wakes;
 
+/* File-backed mappings made. Counted for the same reason the futex
+ * counters are: a program can be handed a correct-looking pointer by
+ * the anonymous path and never notice the file was not involved. */
+static uint64_t file_maps;
+
+uint64_t syscall64_file_maps(void) { return file_maps; }
+
 uint64_t syscall64_futex_waits(void) { return futex_waits; }
 uint64_t syscall64_futex_wakes(void) { return futex_wakes; }
 
@@ -267,11 +275,60 @@ static uint64_t dispatch(syscall64_args_t* args) {
     case SYS64_BRK:
         return uspace64_brk(a1);
 
-    case SYS64_MMAP:
-        /* Only anonymous mappings. A file mapping would need a
-         * filesystem, which the 64-bit tree does not have. */
-        if (!(args->a4 & 0x20)) return (uint64_t)-19;  /* MAP_ANONYMOUS */
-        return uspace64_mmap(a1, a2, a3, args->a4);
+    /* mmap(addr, length, prot, flags, fd, offset) */
+    case SYS64_MMAP: {
+        uint64_t flags = args->a4;
+        uint64_t off   = args->a6;
+        int64_t  fd    = (int64_t)args->a5;
+        uint64_t mapped;
+        int node;
+
+        if (flags & MAP_ANONYMOUS)
+            return uspace64_mmap(a1, a2, a3, flags);
+
+        /* --- a file mapping ---
+         *
+         * MAP_PRIVATE is a copy: the pages are the process's own, and
+         * writing them does not change the file. That is exactly what a
+         * loader wants, and it is what makes this implementable by
+         * copying rather than by sharing frames - the filesystem keeps
+         * a file's bytes in a heap allocation, which is not page
+         * aligned and cannot be mapped directly.
+         *
+         * MAP_SHARED would have to write back, so it is allowed only
+         * where there is nothing to write back: a read-only mapping. */
+        if ((flags & MAP_SHARED) && (a3 & PROT_WRITE))
+            return (uint64_t)-19;                      /* -ENODEV */
+
+        if (fd < 3 || fd >= FD_MAX || !fds[fd].used) return (uint64_t)-9;
+        if (off & (PAGE64_SIZE - 1)) return (uint64_t)-22;  /* -EINVAL */
+        node = fds[fd].node;
+
+        /* Mapped writable whatever the caller asked for, because the
+         * kernel is about to write the file's contents into it. */
+        mapped = uspace64_mmap(a1, a2, PROT_READ | PROT_WRITE,
+                               flags | MAP_ANONYMOUS);
+        if ((int64_t)mapped < 0) return mapped;
+
+        /* The pages arrive zeroed, so a mapping that runs past the end
+         * of the file reads as zeros there - which is what Linux does
+         * for the tail of the last page. Beyond that last page Linux
+         * raises SIGBUS; this does not, and simply keeps reading zeros. */
+        {
+            uint64_t avail = ramfs64_size(node);
+            uint64_t want  = a2;
+            if (off < avail) {
+                if (off + want > avail) want = avail - off;
+                ramfs64_read(node, off, (void*)mapped, want);
+            }
+        }
+
+        if (!(a3 & PROT_WRITE))
+            uspace64_protect(mapped, a2, a3);
+
+        file_maps++;
+        return mapped;
+    }
 
     case SYS64_MUNMAP:
         return uspace64_munmap(a1, a2);

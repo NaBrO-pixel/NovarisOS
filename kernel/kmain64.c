@@ -104,6 +104,8 @@ extern const unsigned char signal64_elf[];
 extern const unsigned long signal64_elf_len;
 extern const unsigned char fs64_elf[];
 extern const unsigned long fs64_elf_len;
+extern const unsigned char mmapfile64_elf[];
+extern const unsigned long mmapfile64_elf_len;
 
 /* isr64.s - a load that is allowed to fault, and where to resume if it does. */
 extern uint64_t probe_read64(const void* addr);
@@ -1592,6 +1594,65 @@ void kernel_main(uint32_t magic, void* mbi) {
         serial64_puts("NOVARIS64: fs      = ");
         serial64_putdec(ramfs64_count());
         serial64_puts(" nodes, exit ");
+        serial64_putdec(syscall64_exit_code());
+        serial64_putc('\n');
+    }
+
+    /* --- layer 23: a file, mapped ----------------------------------- */
+    /* How a loader loads. ld.so maps an ELF's segments and Wine maps a
+     * PE's; every image this kernel has run so far was copied in by the
+     * kernel rather than mapped by the program. */
+    serial64_puts("NOVARIS64: -- file-backed mmap --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 16;
+        vmspace64_t kspace, space;
+        elf64_info_t info;
+        uint64_t i;
+        uint64_t written_before = syscall64_bytes_written();
+        uint64_t maps_before    = syscall64_file_maps();
+        int rc, stack_ok = 1;
+
+        syscall64_reset_files();
+        vmspace64_kernel_space(&kspace);
+        check("a space for it", vmspace64_create(&space) != 0);
+
+        rc = elf64_load(mmapfile64_elf, mmapfile64_elf_len, &space, &info);
+        check("the mmap program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&space, info.brk_start);
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        vmspace64_switch(&space);
+        enter_user_mode64(info.entry, STACK_TOP, 0);
+        vmspace64_switch(&kspace);
+        pf_diagnose = 0;
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("the program reported success",
+              syscall64_bytes_written() > written_before);
+        /* 94 would mean the mapping held the wrong bytes, 96 that a
+         * MAP_PRIVATE write reached the file. 61 is both correct. */
+        check("the mapping held the file's bytes, and stayed private",
+              syscall64_exit_code() == 61);
+        /* Without this the run proves nothing about files: the
+         * anonymous path returns a perfectly good pointer. */
+        check("and it really was a file-backed mapping",
+              syscall64_file_maps() == maps_before + 1);
+
+        serial64_puts("NOVARIS64: maps    = ");
+        serial64_putdec(syscall64_file_maps() - maps_before);
+        serial64_puts(" file-backed, exit ");
         serial64_putdec(syscall64_exit_code());
         serial64_putc('\n');
     }

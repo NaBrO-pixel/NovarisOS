@@ -80,6 +80,7 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/signal64_blob.o \
        $(BUILD_DIR)/signal64.o \
        $(BUILD_DIR)/fs64_blob.o \
+       $(BUILD_DIR)/mmapfile64_blob.o \
        $(BUILD_DIR)/ramfs64.o \
        $(BUILD_DIR)/initrd64.o \
        $(BUILD_DIR)/hello64_blob.o \
@@ -125,6 +126,17 @@ $(BUILD_DIR)/thread64_blob.c: $(BUILD_DIR)/thread64.elf userland/embed64.py
 	python3 userland/embed64.py $< $@ thread64_elf
 
 $(BUILD_DIR)/thread64_blob.o: $(BUILD_DIR)/thread64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Maps a file and reads it through the mapping - how a loader loads.
+$(BUILD_DIR)/mmapfile64.elf: userland/mmapfile64.s | $(BUILD_DIR)
+	$(AS) -f elf64 $< -o $(BUILD_DIR)/mmapfile64.o
+	$(LD) -m elf_x86_64 -o $@ $(BUILD_DIR)/mmapfile64.o
+
+$(BUILD_DIR)/mmapfile64_blob.c: $(BUILD_DIR)/mmapfile64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ mmapfile64_elf
+
+$(BUILD_DIR)/mmapfile64_blob.o: $(BUILD_DIR)/mmapfile64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Ordinary POSIX file I/O, so it runs against a real filesystem on the
@@ -373,6 +385,19 @@ test: iso
 	    || (echo "FAIL: the host run of the filesystem binary did not exit 53"; \
 	        exit 1)
 	@echo "PASS: files behave the same, and exit 53, on both"
+	@# And the file-mapping one, which also checks that MAP_PRIVATE is
+	@# private - a kernel sharing the frame instead of copying passes
+	@# the contents check and fails this.
+	@timeout 20 ./$(BUILD_DIR)/mmapfile64.elf \
+	    > $(BUILD_DIR)/mmapfile64.host.txt 2>/dev/null; \
+	    echo $$? > $(BUILD_DIR)/mmapfile64.host.status
+	@grep -qFf $(BUILD_DIR)/mmapfile64.host.txt $(BUILD_DIR)/serial.log \
+	    || (echo "FAIL: the guest did not print what the host prints"; \
+	        exit 1)
+	@[ "`cat $(BUILD_DIR)/mmapfile64.host.status`" = "61" ] \
+	    || (echo "FAIL: the host run of the mmap binary did not exit 61"; \
+	        exit 1)
+	@echo "PASS: a mapped file reads the same, and exits 61, on both"
 
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR) $(ISO)

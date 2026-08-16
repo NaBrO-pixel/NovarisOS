@@ -46,6 +46,15 @@
 #define O_TRUNC    0x0200
 #define O_APPEND   0x0400
 
+/* mmap(2) protection and flags, Linux's values. */
+#define PROT_READ      0x1
+#define PROT_WRITE     0x2
+#define PROT_EXEC      0x4
+#define MAP_SHARED     0x01
+#define MAP_PRIVATE    0x02
+#define MAP_FIXED      0x10
+#define MAP_ANONYMOUS  0x20
+
 /* lseek(2) whence */
 #define SEEK_SET_  0
 #define SEEK_CUR_  1
@@ -164,5 +173,9 @@ uint64_t syscall64_thread_exits(void);
  * still pass everything else. */
 uint64_t syscall64_futex_waits(void);
 uint64_t syscall64_futex_wakes(void);
+
+/* File-backed mmap(2) calls served. Zero would mean every mapping in a
+ * run took the anonymous path. */
+uint64_t syscall64_file_maps(void);
 
 #endif

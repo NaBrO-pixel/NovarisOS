@@ -29,6 +29,12 @@ uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                        uint64_t flags);
 uint64_t uspace64_munmap(uint64_t addr, uint64_t length);
 
+/* Narrows an existing mapping's permissions. Used by the file-mapping
+ * path: the kernel has to write the file's bytes in, so the pages are
+ * mapped writable and then closed down if the caller asked for
+ * PROT_READ alone. */
+void uspace64_protect(uint64_t addr, uint64_t length, uint64_t prot);
+
 /* Builds argc/argv/envp/auxv at the top of the mapped stack and returns
  * the rsp the program should start on. `stack_top` is one past the last
  * mapped byte; the pages below it must already be mapped writable. */

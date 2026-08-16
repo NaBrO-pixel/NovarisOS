@@ -7124,9 +7124,9 @@ its own TLS in BoringSSL - and none of them are what stands in the way.
 2. ~~**futex**~~ - done in Milestone 57.
 3. **Per-task kernel stacks** - still absent, and Milestone 57 explains
    why futex did not need them.
-4. ~~Signals~~ - fault signals done in Milestone 58; asynchronous ones
-   (`kill`, masking, queueing) are not. ~~A writable filesystem~~ - done
-   in Milestone 59. File-backed `mmap` remains.
+4. ~~Signals~~ (fault signals, Milestone 58 - asynchronous ones are
+   not), ~~a writable filesystem~~ (59), ~~file-backed `mmap`~~ (60).
+   **All four structural prerequisites are now present.**
 
 ## Milestone 56 — 64-bit: exit(2) ends a thread, not the process ✅ DONE
 
@@ -7365,6 +7365,83 @@ Also missing, and each one is a real divergence rather than an omission:
   ignored, and every file is readable and writable by everyone.
 - **Nothing survives a reboot**, since there is no disk driver. The
   initrd seeds the filesystem at boot and writes go nowhere else.
+
+## Milestone 60 — 64-bit: a file, mapped ✅ DONE
+
+196 assertions and an eighth differential. This is how a loader loads:
+`ld.so` maps an ELF's segments and Wine maps a PE's. Every image this
+kernel has run so far was *copied in by the kernel* rather than mapped
+by the program.
+
+```
+NOVARIS64: --- its output follows ---
+mapped a file, read it through the mapping, kept it private
+NOVARIS64: --- end of its output ---
+NOVARIS64: maps    = 1 file-backed, exit 61
+```
+
+### MAP_PRIVATE is a copy, and that is not a shortcut
+
+The filesystem keeps a file's bytes in a heap allocation, which is not
+page aligned and cannot be handed to the MMU directly. So a file mapping
+allocates fresh frames and copies into them - which is exactly what
+`MAP_PRIVATE` means anyway: the pages are the process's own and writing
+them does not change the file.
+
+`MAP_SHARED` would have to write back, so it is permitted only where
+there is nothing to write back - a read-only mapping - and refused with
+-ENODEV otherwise, rather than silently giving a program private pages
+where it asked for shared ones.
+
+The pages arrive zeroed, so a mapping running past the end of the file
+reads as zeros there, which is what Linux does for the tail of the last
+page. Past that last page Linux raises SIGBUS; this keeps reading zeros.
+
+### The test checks the thing that is easy to fake
+
+Two assertions, and the second is the one worth having:
+
+1. **The bytes are the file's.** A kernel returning a zeroed anonymous
+   page hands back a perfectly good pointer and fails only here.
+   Falsified by skipping the copy: the program exits **94**, its status
+   for wrong contents - and the `file_maps` counter still read 1, so the
+   counter alone would not have caught it.
+2. **Private means private.** The program writes through the mapping and
+   then reads the same offset with `read(2)`; the original byte must
+   still be there. A kernel that shared the frame instead of copying
+   passes (1) and fails this with status 96.
+
+Pages are mapped writable while the kernel copies the file in, then
+narrowed if the caller asked for `PROT_READ` alone - so a read-only
+mapping really is read-only, unlike `mprotect`, which remains a no-op.
+
+## The four prerequisites are done. What that does and does not mean
+
+Milestone 55 listed what Wine needs from this kernel: threads, signals,
+a writable filesystem, file-backed `mmap`. All four now exist, and each
+is checked against Linux with the same binary.
+
+That is worth stating precisely, because it is easy to over-read. It
+means the **mechanisms** are present and behave like Linux's on the
+paths a test exercises. It does not mean Wine runs. Wine will exercise
+them far past where these tests stop:
+
+- The filesystem is a **flat path table**, and a Wine prefix is a deep
+  directory tree that Wine walks with `readdir` and `..`, neither of
+  which exist.
+- There is **no `execve`**, so nothing can start a second program; Wine
+  is a loader whose whole job is starting programs.
+- Signals are **fault-only**: no `kill`, no masking, no queueing.
+- `unlink` has **no reference counting**, and Wine uses the
+  unlink-while-open idiom.
+- `mprotect` is a **no-op**, and Wine relies on it for PE section
+  permissions.
+
+The next honest step is not another prerequisite. It is to point Wine's
+loader at this kernel and read the first thing it complains about - the
+`[enosys]` line from Milestone 51's tracer is designed for exactly that.
+Everything after that is driven by what it asks for, rather than by a
+list written in advance.
 
 ## Where chrome.exe actually is from here
 

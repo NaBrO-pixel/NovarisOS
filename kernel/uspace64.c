@@ -111,6 +111,20 @@ uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     return start;
 }
 
+void uspace64_protect(uint64_t addr, uint64_t length, uint64_t prot) {
+    uint64_t start = addr & ~(PAGE64_SIZE - 1);
+    uint64_t end = start + ((length + PAGE64_SIZE - 1) & ~(PAGE64_SIZE - 1));
+    uint64_t flags = PAGE64_PRESENT | PAGE64_USER;
+
+    if (prot & 0x2) flags |= PAGE64_WRITE;             /* PROT_WRITE */
+
+    for (uint64_t va = start; va < end; va += PAGE64_SIZE) {
+        uint64_t frame;
+        if (paging64_translate(va, &frame) != PAGING64_OK) continue;
+        paging64_map(va, frame & ~(PAGE64_SIZE - 1), flags);
+    }
+}
+
 uint64_t uspace64_munmap(uint64_t addr, uint64_t length) {
     uint64_t start = addr & ~(PAGE64_SIZE - 1);
     uint64_t end;
