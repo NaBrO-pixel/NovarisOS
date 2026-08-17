@@ -7,7 +7,6 @@
 #include "kstring.h"
 
 #define KERNEL_VMA  0xFFFFFFFF80000000ULL
-#define PHYS_WINDOW 0x40000000ULL
 
 #define ADDR_MASK   0x000FFFFFFFFFF000ULL
 #define REC         510ULL          /* must match paging64.c */
@@ -37,6 +36,9 @@ void vmspace64_switch(const vmspace64_t* vs) {
 }
 
 int vmspace64_create(vmspace64_t* vs) {
+    /* Low on purpose, unlike the pages this space will hold: a PML4 is a
+     * kernel structure, and keeping page tables out of the high pool
+     * leaves that pool contiguous for the things that are large. */
     uint64_t frame = pmm64_alloc_frame();
     uint64_t* fresh;
     const uint64_t* current = paging64_pml4();
@@ -183,8 +185,8 @@ int vmspace64_clone(vmspace64_t* dst) {
         __asm__ __volatile__("mov %0, %%cr3" :: "r"(dst->pml4_phys) : "memory");
 
         for (uint64_t i = 0; i < count; i++) {
-            uint64_t fresh = pmm64_alloc_frame();
-            if (!fresh || fresh >= PHYS_WINDOW) {
+            uint64_t fresh = pmm64_alloc_high();
+            if (!fresh) {
                 if (fresh) pmm64_free_frame(fresh);
                 rc = 0;
                 break;
@@ -192,8 +194,8 @@ int vmspace64_clone(vmspace64_t* dst) {
             /* Both frames are reachable through the kernel window, which
              * is mapped identically in every space - so the copy does
              * not care which space is loaded. */
-            kmemcpy((void*)(KERNEL_VMA + fresh),
-                    (const void*)(KERNEL_VMA + list[i].frame), PAGE64_SIZE);
+            kmemcpy(phys64_to_virt(fresh),
+                    (const void*)phys64_to_virt(list[i].frame), PAGE64_SIZE);
 
             if (paging64_map(list[i].va, fresh, list[i].flags)
                     != PAGING64_OK) {

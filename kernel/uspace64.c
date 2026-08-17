@@ -7,7 +7,6 @@
 #include "proc64.h"
 
 #define KERNEL_VMA  0xFFFFFFFF80000000ULL
-#define PHYS_WINDOW 0x40000000ULL
 
 /* The auxiliary vector types glibc's startup actually reads. */
 #define AT_NULL   0
@@ -84,18 +83,17 @@ static int map_anon(uint64_t start, uint64_t end, uint64_t flags,
              * NULL, in a library whose relocations all applied fine. */
             existing &= ~(PAGE64_SIZE - 1);
             if (zero_existing)
-                kmemset((void*)(KERNEL_VMA + existing), 0, PAGE64_SIZE);
+                kmemset(phys64_to_virt(existing), 0, PAGE64_SIZE);
             paging64_map(va, existing, flags);
             continue;
         }
 
-        frame = pmm64_alloc_frame();
+        frame = pmm64_alloc_high();
         if (!frame) return 0;
-        /* Zeroed through the physical window, which only reaches the
-         * first gigabyte. Beyond that a temporary mapping would be
-         * needed, and this kernel has not needed one yet. */
-        if (frame >= PHYS_WINDOW) { pmm64_free_frame(frame); return 0; }
-        kmemset((void*)(KERNEL_VMA + frame), 0, PAGE64_SIZE);
+        /* Zeroed through the direct map, which reaches all of RAM since
+         * Milestone 66 - so a frame's address no longer decides whether
+         * a process is allowed to have it. */
+        kmemset(phys64_to_virt(frame), 0, PAGE64_SIZE);
 
         if (paging64_map(va, frame, flags) != PAGING64_OK) {
             pmm64_free_frame(frame);

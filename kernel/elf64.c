@@ -6,7 +6,6 @@
 #include "kstring.h"
 
 #define KERNEL_VMA   0xFFFFFFFF80000000ULL
-#define PHYS_WINDOW  0x40000000ULL      /* what boot64.s maps at KERNEL_VMA */
 
 #define PT_LOAD 1
 #define PF_X    0x1
@@ -52,7 +51,7 @@ static uint64_t pages_mapped;
 uint64_t elf64_pages_mapped(void) { return pages_mapped; }
 
 static inline void* window(uint64_t phys) {
-    return (void*)(KERNEL_VMA + phys);
+    return phys64_to_virt(phys);
 }
 
 #define PT_INTERP 3
@@ -158,9 +157,8 @@ int elf64_load_at(const void* image, uint64_t size, vmspace64_t* space,
                 if (flags & PAGE64_WRITE)
                     paging64_map(va, frame, flags);
             } else {
-                frame = pmm64_alloc_frame();
+                frame = pmm64_alloc_high();
                 if (!frame) { rc = ELF64_NOMEM; break; }
-                if (frame >= PHYS_WINDOW) { rc = ELF64_NOMEM; break; }
                 if (paging64_map(va, frame, flags) != PAGING64_OK) {
                     pmm64_free_frame(frame);
                     rc = ELF64_MAP_FAILED;

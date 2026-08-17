@@ -382,14 +382,20 @@ iso: $(KERNEL) $(INITRD)
 	grub-mkrescue -o $(ISO) $(ISO_DIR) 2>/dev/null
 	@echo "  built $(ISO)"
 
+# 2GB, not QEMU's 128MB default. The number is a test requirement, not a
+# preference: Milestone 66's whole claim is that a frame above the 1GB
+# boot window is usable, and with 128MB there is no such frame - the test
+# would report SKIP and prove nothing.
+QEMU_RAM ?= 2G
+
 run: iso
-	qemu-system-x86_64 -cdrom $(ISO) -serial stdio
+	qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -serial stdio
 
 # The bring-up test. kernel_main halts rather than exiting, so the run is
 # bounded by `timeout` and judged by what reached the serial port.
 test: iso
 	@rm -f $(BUILD_DIR)/serial.log
-	@timeout 30 qemu-system-x86_64 -cdrom $(ISO) -display none \
+	@timeout 30 qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -display none \
 	    -serial file:$(BUILD_DIR)/serial.log -no-reboot >/dev/null 2>&1 || true
 	@echo "--- serial ---"
 	@cat $(BUILD_DIR)/serial.log 2>/dev/null || true

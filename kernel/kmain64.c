@@ -313,8 +313,17 @@ void kernel_main(uint32_t magic, void* mbi) {
         pmm64_init((const multiboot_info_t*)mbi, kphys_start, kphys_end);
 
         /* Immediately after, and before anything allocates: the initrd
-         * sits in RAM the allocator was just told is free, and it
-         * reserves its own pages as part of coming up. */
+         * sits in RAM the allocator was just told is free. */
+        initrd64_reserve((const multiboot_info_t*)mbi);
+
+        /* Paging and the direct map come up here rather than in layer 6
+         * below, because reading the archive needs the direct map and
+         * building the direct map needs the frame allocator - so the
+         * three have exactly one legal order. Layer 6 still tests them;
+         * it just no longer starts them. */
+        paging64_init();
+        paging64_physmap_init(pmm64_highest_addr());
+
         initrd64_init((const multiboot_info_t*)mbi);
 
         /* There is always a current process from here on. Everything
@@ -390,7 +399,8 @@ void kernel_main(uint32_t magic, void* mbi) {
         volatile uint64_t* p;
         int rc;
 
-        paging64_init();
+        /* paging64_init and paging64_physmap_init already ran, in layer
+         * 5 - see the note there. */
 
         /* The self-reference, read through itself: if the recursive
          * address were wrong this load would fault rather than answer. */
@@ -428,9 +438,9 @@ void kernel_main(uint32_t magic, void* mbi) {
          * through the new virtual address must be visible at that
          * physical frame's other address. A mapping that merely does not
          * fault would pass everything above and fail this. */
-        if (frame < 0x40000000ULL) {
+        {
             volatile uint64_t* through_phys =
-                (volatile uint64_t*)(0xFFFFFFFF80000000ULL + frame);
+                (volatile uint64_t*)phys64_to_virt(frame);
             check("the write landed in that physical frame",
                   *through_phys == MAGIC);
         }
@@ -472,6 +482,78 @@ void kernel_main(uint32_t magic, void* mbi) {
         serial64_puts("NOVARIS64: tables  = ");
         serial64_putdec(paging64_tables_allocated());
         serial64_puts(" allocated\n");
+    }
+
+    /* --- layer 6b: the direct map (Milestone 66) --------------------- */
+    serial64_puts("NOVARIS64: -- direct map --\n");
+    {
+        const uint64_t BOOT_WINDOW = 0x40000000ULL;   /* what boot64.s maps */
+        const uint64_t MAGIC = 0x00D15EA5EB0A7ULL;
+        uint64_t mapped = paging64_physmap_bytes();
+        uint64_t high, got;
+
+        check("the direct map covers memory", mapped > 0);
+        check("it covers all the RAM that was found",
+              mapped >= pmm64_highest_addr());
+
+        /* The kernel image is at a known physical address and its first
+         * bytes are the multiboot header, so the direct map can be checked
+         * against something whose value is not of this test's choosing. */
+        {
+            uint64_t kphys = (uint64_t)_kernel_physical_start;
+            const uint32_t* via_boot =
+                (const uint32_t*)(0xFFFFFFFF80000000ULL + kphys);
+            const uint32_t* via_map = (const uint32_t*)phys64_to_virt(kphys);
+            check("the direct map and the boot window agree on the kernel",
+                  *via_map == *via_boot);
+        }
+
+        check("a 2MB page translates through the direct map",
+              paging64_translate(PHYSMAP64_BASE + 0x100000ULL, &got)
+              == PAGING64_OK && got == 0x100000ULL);
+
+        /* The ceiling itself. A frame above the boot window is unreachable
+         * through KERNEL_VMA by construction - before this milestone the
+         * kernel could not have written this line. */
+        high = pmm64_alloc_above(BOOT_WINDOW);
+        if (!high) {
+            /* Under 1GB of RAM: the wall cannot be demonstrated, and
+             * saying so beats a test that passes by not running. */
+            serial64_puts("NOVARIS64: SKIP  no RAM above 1GB to test with\n");
+        } else {
+            volatile uint64_t* p = (volatile uint64_t*)phys64_to_virt(high);
+
+            check("a frame above the old 1GB ceiling was allocated",
+                  high >= BOOT_WINDOW);
+            *p = MAGIC;
+            check("the kernel can write to it through the direct map",
+                  *p == MAGIC);
+
+            /* And that it is genuinely that frame, not an aliased one:
+             * mapped a second time at a scratch address, the same bytes
+             * must appear. */
+            {
+                const uint64_t SCRATCH = 0xFFFFC00000400000ULL;
+                check("it maps at a second address",
+                      paging64_map(SCRATCH, high,
+                                   PAGE64_PRESENT | PAGE64_WRITE)
+                      == PAGING64_OK);
+                check("and the same bytes are there",
+                      *(volatile uint64_t*)SCRATCH == MAGIC);
+                *(volatile uint64_t*)SCRATCH = ~MAGIC;
+                check("a write through one address is seen at the other",
+                      *p == ~MAGIC);
+                paging64_unmap(SCRATCH);
+            }
+
+            pmm64_free_frame(high);
+        }
+
+        serial64_puts("NOVARIS64: physmap = ");
+        serial64_putdec(mapped / (1024 * 1024));
+        serial64_puts(" MB at ");
+        serial64_puthex(PHYSMAP64_BASE);
+        serial64_putc('\n');
     }
 
     /* --- layer 7: the kernel heap ----------------------------------- */
@@ -992,6 +1074,24 @@ void kernel_main(uint32_t magic, void* mbi) {
         check("the ELF64 loaded", rc == ELF64_OK);
         check("it has an entry point", entry != 0);
         check("and something was mapped for it", elf64_pages_mapped() >= 1);
+
+        /* Milestone 66, asked of the ordinary path rather than of a
+         * test written to reach high memory: this program's own text was
+         * loaded into a frame the kernel could not have touched before
+         * the direct map existed. On a machine with under 1GB there is
+         * no such frame and the question does not arise. */
+        if (pmm64_highest_addr() > 0x40000000ULL) {
+            uint64_t code_phys = 0;
+            vmspace64_switch(&space);
+            rc = paging64_translate(entry, &code_phys);
+            vmspace64_switch(&kspace);
+            check("the program's code is mapped", rc == PAGING64_OK);
+            check("and it lives above the old 1GB ceiling",
+                  code_phys >= 0x40000000ULL);
+            serial64_puts("NOVARIS64: code at = ");
+            serial64_puthex(code_phys);
+            serial64_putc('\n');
+        }
 
         stack_frame = pmm64_alloc_frame();
         check("a stack for it", stack_frame != 0);

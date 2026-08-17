@@ -25,6 +25,16 @@ void     pmm64_init(const multiboot_info_t* mbi,
 /* 0 means out of memory. A real frame is never at physical 0: the first
  * megabyte is reserved unconditionally. */
 uint64_t pmm64_alloc_frame(void);
+
+/* A frame for a user page, taken from the top of RAM downwards. Falls
+ * back to pmm64_alloc_frame when high memory runs out. See the comment
+ * in pmm64.c for why user pages and kernel pages come from opposite
+ * ends. */
+uint64_t pmm64_alloc_high(void);
+
+/* A frame at or above min_phys, or 0 if there is none. Exists so a test
+ * can obtain high memory deliberately rather than hoping for it. */
+uint64_t pmm64_alloc_above(uint64_t min_phys);
 void     pmm64_free_frame(uint64_t phys);
 void     pmm64_reserve_region(uint64_t start_addr, uint64_t end_addr);
 

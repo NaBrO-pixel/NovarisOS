@@ -198,6 +198,56 @@ int paging64_translate(uint64_t virt, uint64_t* phys_out) {
     return PAGING64_OK;
 }
 
+#define HUGE_SIZE 0x200000ULL
+
+int paging64_map_huge(uint64_t virt, uint64_t phys, uint64_t flags) {
+    uint64_t* pml4 = pml4_addr();
+    uint64_t* pdpt = pdpt_addr(virt);
+    uint64_t* pd   = pd_addr(virt);
+    int rc;
+
+    virt &= ~(HUGE_SIZE - 1);
+    phys &= ~(HUGE_SIZE - 1);
+
+    rc = ensure_table(pml4, PML4_IDX(virt), pdpt, flags);
+    if (rc != PAGING64_OK) return rc;
+    if (pdpt[PDPT_IDX(virt)] & PAGE64_HUGE) return PAGING64_HUGE_IN_WAY;
+
+    rc = ensure_table(pdpt, PDPT_IDX(virt), pd, flags);
+    if (rc != PAGING64_OK) return rc;
+
+    /* PS in a PD entry means "this is 2MB of memory, not a page table".
+     * There is no level below it to build. */
+    pd[PD_IDX(virt)] = phys | flags | PAGE64_PRESENT | PAGE64_HUGE;
+    invlpg(virt);
+    return PAGING64_OK;
+}
+
+static uint64_t physmap_bytes;
+
+uint64_t paging64_physmap_bytes(void) { return physmap_bytes; }
+
+int paging64_physmap_init(uint64_t bytes) {
+    uint64_t covered;
+
+    /* Rounded up: a machine whose last megabyte is not a whole 2MB page
+     * still has that megabyte, and mapping past the end of RAM is
+     * harmless - nothing hands out those frames. */
+    bytes = (bytes + HUGE_SIZE - 1) & ~(HUGE_SIZE - 1);
+
+    for (covered = 0; covered < bytes; covered += HUGE_SIZE) {
+        if (paging64_map_huge(PHYSMAP64_BASE + covered, covered,
+                              PAGE64_PRESENT | PAGE64_WRITE)
+                != PAGING64_OK) {
+            physmap_bytes = covered;
+            return 0;
+        }
+    }
+
+    physmap_bytes = bytes;
+    return 1;
+}
+
 uint64_t* paging64_pml4(void) { return pml4_addr(); }
 
 uint64_t paging64_tables_allocated(void) { return tables_allocated; }

@@ -7774,6 +7774,109 @@ permissions, no timestamps, and `unlink` still frees a file that is
 still open. `RAMFS64_MAX_NODES` is 192, which a Wine prefix would exhaust
 immediately.
 
+## Milestone 66 — the memory ceiling ✅ DONE
+
+237 assertions. Until now every page a process could own had to come from
+the first gigabyte of physical memory.
+
+Not because of a policy - because of an accident of the boot code.
+`boot64.s` maps the first 1GB of RAM twice, once identity and once at
+`KERNEL_VMA`, and that second window was the *only* way the kernel could
+reach a physical address. But the kernel has to touch every page it hands
+out: it zeroes anonymous memory, it copies program text into it, it
+copies pages on fork. So four separate files carried the same line -
+
+```c
+if (frame >= PHYS_WINDOW) { /* refuse */ }
+```
+
+- and `chrome.dll` alone is 285MB. The ceiling was not a tuning
+parameter, it was a wall.
+
+### The direct map
+
+PML4 slot 272, `0xFFFF880000000000`, every byte of physical memory mapped
+in 2MB pages. `phys64_to_virt(phys)` is now the answer to "where can I
+touch this frame", and the four refusals are gone rather than raised.
+
+2MB pages, not 4KB, and the reason is arithmetic: 8GB of RAM needs four
+page directories at 2MB granularity and two million page tables at 4KB.
+
+### One thing the direct map cannot do for itself
+
+`paging64_physmap_init` allocates the page tables it maps with, so it
+needs the frame allocator, so the allocator's bitmap still lives in the
+1GB boot window. That is the one remaining thing whose physical address
+matters, and it now says so in a comment rather than being a coincidence.
+
+The same constraint reordered boot. The initrd is read through the direct
+map, the direct map needs the allocator, and the allocator must not hand
+out the initrd's frames - which has exactly one legal order:
+
+```
+pmm64_init  →  initrd64_reserve  →  paging64_init
+            →  paging64_physmap_init  →  initrd64_init
+```
+
+`initrd64_reserve` was split out of `initrd64_init` for precisely this.
+
+### User memory now comes from the top
+
+`pmm64_alloc_high()` allocates downwards; `pmm64_alloc_frame()` still
+allocates upwards. User pages take the former, page tables and the bitmap
+the latter.
+
+This is the part worth arguing for. A single test that reaches high
+memory on purpose proves the mechanism works and nothing about whether
+anything *uses* it. Serving every user page from the top of RAM means all
+eleven differentials, the ELF loader, the PE loader, fork's page copy and
+the dynamic loader now run on memory above the old ceiling on any machine
+with more than 1GB - so the claim "where a frame lives no longer matters"
+is carried by the ordinary path instead of by one assertion.
+
+Measured: with 2GB the test program's own text loads at `0x7ffde000`;
+with 6GB, at `0x1bfffe000`, on the far side of the 4GB PCI hole.
+
+### A bug that had been passing for twenty milestones
+
+The test machine had to grow from QEMU's default 128MB to 2GB - with
+128MB there is no frame above 1GB and the milestone's whole claim is
+untestable. That immediately produced 20 failures, and the cause was not
+in any of the new code.
+
+`pmm64_init` placed the frame bitmap "immediately above the kernel
+image". GRUB loads the initrd a few pages above the kernel image. At
+128MB the bitmap is 4KB and stopped 20KB short of the module; at 2GB it
+is 64KB and lands squarely on the initrd's header.
+
+The bitmap's size scales with RAM. Its distance from the module does not.
+It presented as "no filesystem" - eight files became zero - which is
+nowhere near "the frame allocator wrote on the initrd", and it had been
+one configuration change away from happening since Milestone 35.
+
+This is the same shape as the M61 lesson: the code was not missing, it
+was *lying* - stating a placement rule that was true only for the size it
+had been tested at.
+
+### Falsified three ways
+
+- Drop `PAGE64_HUGE` from the PD entry: the kernel triple-faults, because
+  the direct map becomes 512 page-table pointers into arbitrary RAM.
+- Restore the old bitmap placement: 20 failures, the initrd unreadable.
+- Zero user pages through `KERNEL_VMA` again: the kernel dies writing to
+  an unmapped address, because user pages are now above the window.
+
+Regression-tested at 128MB (the direct-map assertions report SKIP and say
+so, rather than passing by not running) and at 6GB.
+
+### Still missing
+
+Fork still copies every page rather than sharing them copy-on-write, so
+the ceiling being gone means a fork now costs high memory instead of
+failing. Nothing unmaps the direct map's tables, which is correct - they
+are permanent - but it does mean `paging64_tables_allocated()` counts
+them. `RAMFS64_MAX_NODES` is still 192.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the

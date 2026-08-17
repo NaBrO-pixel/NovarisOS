@@ -3,9 +3,14 @@
  * The bitmap is placed rather than declared. boot64.s maps the first
  * gigabyte of physical memory twice - once identity, once at KERNEL_VMA -
  * so anything below 1GB physical is reachable at KERNEL_VMA + phys with no
- * further work. The bitmap goes immediately above the kernel image, which
- * is loaded at 1MB, so it lands inside that window with room to spare: even
- * 64GB of RAM needs only a 2MB bitmap.
+ * further work. The bitmap goes above the kernel image and above whatever
+ * the bootloader loaded after it, which is still well inside that window:
+ * even 64GB of RAM needs only a 2MB bitmap.
+ *
+ * The bitmap has to live in that window rather than in the direct map,
+ * because the direct map is built out of page tables that come from this
+ * allocator. It is the one thing that cannot use the map that made
+ * everything else's physical address irrelevant.
  *
  * That window is the one real constraint here, and init checks it rather
  * than trusting it. If a machine ever turns up whose bitmap would not fit,
@@ -24,7 +29,8 @@ static uint64_t bitmap_size_bytes;
 static uint64_t frame_count;             /* frames the bitmap describes */
 static uint64_t highest_addr;
 static uint64_t double_frees;
-static uint64_t alloc_hint;              /* where the last scan left off */
+static uint64_t alloc_hint;              /* where the last upward scan left off */
+static uint64_t high_hint;               /* and the downward one */
 static int      ready;
 
 static inline void bitmap_set(uint64_t bit) {
@@ -105,9 +111,34 @@ void pmm64_init(const multiboot_info_t* mbi,
     frame_count = (highest_addr + PMM64_FRAME_SIZE - 1) / PMM64_FRAME_SIZE;
     bitmap_size_bytes = (frame_count + 7) / 8;
 
-    /* Immediately above the kernel, page aligned. */
-    place = (kernel_phys_end + PMM64_FRAME_SIZE - 1)
-            & ~(PMM64_FRAME_SIZE - 1);
+    /* Set here rather than to 0 above, because pmm64_free_frame raises
+     * this hint to include whatever was just returned - and 0 is a
+     * position, not an "unset" marker. Left at 0, the first free call
+     * would pin the downward scan near the bottom of RAM and the high
+     * allocator would quietly behave like the low one. */
+    high_hint = frame_count;
+
+    /* Above the kernel *and* above anything the bootloader loaded, page
+     * aligned.
+     *
+     * "Above the kernel" alone was wrong, and wrong in the way that
+     * survives testing: GRUB puts the initrd a few pages past the kernel
+     * image, and the bitmap is written before anything has had a chance
+     * to reserve that. With 128MB of RAM the bitmap was 4KB and stopped
+     * 20KB short of the module, so it passed for twenty milestones. At
+     * 2GB it is 64KB and lands squarely on the initrd's header - which
+     * presents as "no filesystem", not as "memory bug". The bitmap's
+     * size scales with RAM; its distance from the module does not. */
+    place = kernel_phys_end;
+    {
+        const multiboot_module_t* mods;
+        if ((mbi->flags & MULTIBOOT_INFO_MODS) && mbi->mods_count) {
+            mods = (const multiboot_module_t*)(uint64_t)mbi->mods_addr;
+            for (uint32_t i = 0; i < mbi->mods_count; i++)
+                if (mods[i].mod_end > place) place = mods[i].mod_end;
+        }
+    }
+    place = (place + PMM64_FRAME_SIZE - 1) & ~(PMM64_FRAME_SIZE - 1);
 
     if (place + bitmap_size_bytes > BOOT_WINDOW_BYTES) {
         /* Would fall outside what boot64.s mapped. Refusing is the only
@@ -164,6 +195,61 @@ uint64_t pmm64_alloc_frame(void) {
     return 0;
 }
 
+/* Allocates from the top of RAM downwards, for pages that will belong to
+ * a user process.
+ *
+ * The kernel's own frames - page tables, the frame bitmap, anything that
+ * has to be reachable before the direct map exists - want to be low.
+ * User pages have no such constraint now that the direct map reaches
+ * everything, and there are far more of them. Handing them out from the
+ * top keeps the two populations apart instead of letting a process eat
+ * the low memory the kernel still needs.
+ *
+ * It also means every existing userland test now runs on memory above
+ * the old 1GB ceiling, on any machine with more than 1GB. That is worth
+ * more than a single test that reaches high memory on purpose: the claim
+ * "where a frame lives no longer matters" is only believable if the
+ * ordinary path is the one exercising it. */
+uint64_t pmm64_alloc_high(void) {
+    if (!ready) return 0;
+    if (high_hint > frame_count) high_hint = frame_count;
+
+    for (int pass = 0; pass < 2; pass++) {
+        uint64_t start = pass == 0 ? high_hint : frame_count;
+        uint64_t stop  = pass == 0 ? 0 : high_hint;
+        for (uint64_t f = start; f-- > stop; ) {
+            if (!bitmap_test(f)) {
+                bitmap_set(f);
+                high_hint = f;
+                return f * PMM64_FRAME_SIZE;
+            }
+        }
+    }
+
+    /* Out of high memory is not out of memory: fall back rather than
+     * failing an allocation the low path could still have served. */
+    return pmm64_alloc_frame();
+}
+
+/* A frame at or above `min_phys`, so that a test can ask for exactly the
+ * kind of memory the kernel used to be unable to touch. Nothing in the
+ * kernel proper cares where a frame comes from - which is the point of
+ * Milestone 66 - so this exists to make the ceiling's absence provable
+ * rather than to be used by the allocator's normal callers. */
+uint64_t pmm64_alloc_above(uint64_t min_phys) {
+    uint64_t first = (min_phys + PMM64_FRAME_SIZE - 1) / PMM64_FRAME_SIZE;
+
+    if (!ready) return 0;
+
+    for (uint64_t f = first; f < frame_count; f++) {
+        if (!bitmap_test(f)) {
+            bitmap_set(f);
+            return f * PMM64_FRAME_SIZE;
+        }
+    }
+    return 0;
+}
+
 void pmm64_free_frame(uint64_t phys) {
     uint64_t f = phys / PMM64_FRAME_SIZE;
     if (!ready || f >= frame_count) return;
@@ -175,6 +261,9 @@ void pmm64_free_frame(uint64_t phys) {
     if (!bitmap_test(f)) { double_frees++; return; }
     bitmap_clear(f);
     if (f < alloc_hint) alloc_hint = f;
+    /* Both hints move to include the frame just returned, so neither
+     * allocator has to wrap around to find it again. */
+    if (f >= high_hint) high_hint = f + 1;
 }
 
 uint64_t pmm64_total_frames(void) { return ready ? frame_count : 0; }
