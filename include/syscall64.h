@@ -36,6 +36,8 @@
 #define SYS64_CLOSE           3
 #define SYS64_LSEEK           8
 #define SYS64_MKDIR           83
+#define SYS64_RMDIR           84
+#define SYS64_GETDENTS64      217
 #define SYS64_UNLINK          87
 #define SYS64_STAT            4
 #define SYS64_PREAD64         17

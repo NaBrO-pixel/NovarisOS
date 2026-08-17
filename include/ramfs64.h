@@ -4,49 +4,63 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* A writable filesystem, in RAM.
+/* A writable filesystem, in RAM, and since Milestone 65 a real tree.
  *
- * Milestone 54's initrd is read-only, and that is the thing standing in
- * Wine's way: a Wine prefix is thousands of files that Wine *creates*.
- * This is the smallest filesystem that can hold one - no disk, no
- * journal, nothing that survives a reboot. The 32-bit tree took
- * Milestone 26 to get a writable filesystem and Milestone 32 to put it
- * on a disk, in that order, for the same reason.
+ * It was a flat table keyed by whole path: "/a/b/c" was an entry whose
+ * name happened to contain slashes, and a lookup was a string compare.
+ * That is enough to open a file you can already name and not enough for
+ * anything that *explores* - `readdir` has nothing to enumerate, ".."
+ * has nowhere to go, and creating a file in a directory that does not
+ * exist succeeds. A Wine prefix is a deep tree that Wine walks, so the
+ * flat version stops being a simplification and starts being a lie.
  *
- * Honest about its shape: this is a flat table keyed by whole path, not
- * a directory tree. "/a/b/c" is an entry whose name happens to contain
- * slashes, and a lookup is an exact string match. That is enough for
- * open/read/write on known paths and is not enough for readdir or for
- * renaming a directory - both of which Wine will eventually want, and
- * both of which need a real tree.
+ * Now each node holds one path component and its parent, the root is
+ * node 0, and a path is resolved by walking it. Still no disk, no
+ * permissions, no links, and no working directory - every path is
+ * absolute, because there is no process attribute to make it relative
+ * to yet.
  */
 
-#define RAMFS64_MAX_NODES 128
+#define RAMFS64_MAX_NODES 192
+#define RAMFS64_NAME_MAX  64
 #define RAMFS64_PATH_MAX  128
 
 void ramfs64_init(void);
-
-/* Seeds the filesystem from the initrd, so that what was readable
- * before this milestone is still readable after it. */
 void ramfs64_seed_from_initrd(void);
 
-/* Returns a node index, or -1. `create` makes a regular file if it is
- * missing. */
+/* Resolves an absolute path, honouring "." and "..". Returns a node
+ * index, or -1. */
 int  ramfs64_lookup(const char* path);
+
+/* Creates one node. Its parent directory must already exist - which is
+ * the difference a tree makes, and the reason the seed below builds
+ * intermediate directories on the way down. */
 int  ramfs64_create(const char* path, int is_dir);
+
+/* Creates a directory and every missing directory above it. */
+int  ramfs64_mkdirp(const char* path);
 
 int64_t ramfs64_read(int node, uint64_t offset, void* buf, uint64_t len);
 int64_t ramfs64_write(int node, uint64_t offset, const void* buf,
                       uint64_t len);
 int     ramfs64_truncate(int node);
+
+/* unlink refuses a directory and rmdir refuses a non-empty one, which
+ * is what lets a program tell "wrong kind of thing" from "still in
+ * use". */
 int     ramfs64_unlink(const char* path);
+int     ramfs64_rmdir(const char* path);
 
-/* The file's bytes, contiguous in the kernel heap. execve needs the
- * whole image addressable at once to walk its program headers. */
+/* Enumeration. `index` counts children from 0; returns 0 when there are
+ * no more. "." and ".." are not stored as nodes - the caller synthesises
+ * them, the same way a real filesystem does. */
+int     ramfs64_child(int dir, uint64_t index, int* out_node);
+
+const char* ramfs64_name(int node);
 const void* ramfs64_data(int node);
-
-uint64_t ramfs64_size(int node);
-int      ramfs64_is_dir(int node);
-uint64_t ramfs64_count(void);
+uint64_t    ramfs64_size(int node);
+int         ramfs64_is_dir(int node);
+int         ramfs64_parent(int node);
+uint64_t    ramfs64_count(void);
 
 #endif

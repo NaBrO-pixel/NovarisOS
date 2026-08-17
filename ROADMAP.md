@@ -7723,6 +7723,57 @@ process group, no signal to a process, and `PROC64_MAX` is 4. Zombies
 are real: a child nobody waits for keeps its slot, which is correct
 behaviour and a leak in a kernel with four of them.
 
+## Milestone 65 — a directory tree ✅ DONE
+
+226 assertions and an eleventh differential. The filesystem was a flat
+table keyed by whole path: `/a/b/c` was an entry whose name happened to
+contain slashes, and a lookup was a string compare.
+
+That is enough to open a file you can already name, and not enough for
+anything that *explores*. `readdir` has nothing to enumerate. `..` has
+nowhere to go. Creating a file in a directory that does not exist
+succeeds. A Wine prefix is a deep tree that Wine walks, so the flat
+version stopped being a simplification and started being a lie.
+
+Each node now holds one path component and its parent; the root is node
+0; a path is resolved by walking it.
+
+### What the test does that the old one could not
+
+`userland/tree64.s` is ordinary POSIX and runs on both systems:
+
+- **nested `mkdir`**, where the inner one needs the outer to exist
+- **open through `..`** - `/tmp/nvtree/sub/../sub/leaf` has to *resolve*,
+  and a string compare cannot
+- **`getdents64`**, which needs a directory to have children, and
+  synthesises `.` and `..` the way a real filesystem does
+- **`rmdir` refusing a directory that still has something in it**,
+  because otherwise "empty" means nothing
+
+Falsified by making `..` a no-op rather than a step to the parent: the
+program exits **63**, which is the status it reserves for exactly that,
+and the kernel-side assertion catches it independently.
+
+### Two bugs in the test itself, both mine
+
+The failure labels were defined after a helper function, and NASM scopes
+a local label to the last *non-local* one - so `.fail_mkdir` silently
+became `streq.fail_mkdir` and every jump to it failed to assemble.
+
+Then `streq` used `cl`/`ch` while the caller held `d_reclen` in `rcx`.
+`ch` is the high byte of that register, so the scan stepped by a
+corrupted length and missed the entry it was looking for - which
+presents as "the directory does not contain what it contains". Both were
+caught by running it on Linux first, where the answer is known.
+
+### Still missing
+
+No working directory, so every path is absolute - there is no process
+attribute to make one relative to yet. No hard links, no symlinks, no
+permissions, no timestamps, and `unlink` still frees a file that is
+still open. `RAMFS64_MAX_NODES` is 192, which a Wine prefix would exhaust
+immediately.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the

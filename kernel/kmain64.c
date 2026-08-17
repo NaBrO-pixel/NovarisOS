@@ -97,6 +97,8 @@ extern const unsigned char dlluser64_exe[];
 extern const unsigned long dlluser64_exe_len;
 extern const unsigned char loader64_exe[];
 extern const unsigned long loader64_exe_len;
+extern const unsigned char tree64_elf[];
+extern const unsigned long tree64_elf_len;
 extern const unsigned char forkexec64_elf[];
 extern const unsigned long forkexec64_elf_len;
 extern const unsigned char thread64_elf[];
@@ -2031,6 +2033,96 @@ void kernel_main(uint32_t magic, void* mbi) {
         serial64_puts("NOVARIS64: procs   = ");
         serial64_putdec(proc64_count());
         serial64_puts(" left, exit ");
+        serial64_putdec(syscall64_exit_code());
+        serial64_putc('\n');
+    }
+
+    /* --- layer 27: a real directory tree ---------------------------- */
+    /* Everything a flat path table could not do: nested mkdir where the
+     * inner needs the outer, open through "..", getdents64 over actual
+     * children, and rmdir refusing a directory that still holds
+     * something. A Wine prefix is a deep tree Wine walks, so this is
+     * the difference between a simplification and a lie. */
+    serial64_puts("NOVARIS64: -- a directory tree --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 32;
+        vmspace64_t kspace;
+        elf64_info_t info;
+        uint64_t i, rsp;
+        uint64_t written_before = syscall64_bytes_written();
+        int rc, stack_ok = 1, pid;
+        proc64_t* p;
+        static const char* const tree_argv[] = { "/tree64", 0 };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        signal64_reset();
+        sched64_init();
+        proc64_init();
+        vmspace64_kernel_space(&kspace);
+
+        /* The seed had to build directories on the way down, which the
+         * flat version never needed to. */
+        check("the initrd's nested paths became real directories",
+              ramfs64_is_dir(ramfs64_lookup("/lib")) &&
+              ramfs64_is_dir(ramfs64_lookup("/lib/x86_64-linux-gnu")));
+        check("and the file at the bottom of them is a file",
+              ramfs64_lookup("/lib/x86_64-linux-gnu/libc.so.6") >= 0);
+        check("\"..\" resolves rather than matching a string",
+              ramfs64_lookup("/lib/x86_64-linux-gnu/../../etc/passwd") ==
+              ramfs64_lookup("/etc/passwd"));
+
+        pid = proc64_create();
+        proc64_set_current(pid);
+        p = proc64_current();
+
+        check("a space for it", vmspace64_create(&p->space) != 0);
+        rc = elf64_load(tree64_elf, tree64_elf_len, &p->space, &info);
+        check("the tree program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&p->space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&p->space, info.brk_start);
+        rsp = uspace64_build_stack(&p->space, STACK_TOP, STACK_PAGES,
+                                   tree_argv, &info, 0, 0);
+
+        {
+            registers64_t first;
+            for (i = 0; i < sizeof(first) / 8; i++)
+                ((uint64_t*)&first)[i] = 0;
+            sched64_add_frame_for(&first, &p->space, 0, pid);
+            sched64_set_current(0);
+        }
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        vmspace64_switch(&p->space);
+        enter_user_mode64(info.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+        pf_diagnose = 0;
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("the program said so too",
+              syscall64_bytes_written() > written_before);
+        /* Each step has its own status: 68 would mean getdents64 did not
+         * list the subdirectory, 69 that rmdir removed a directory that
+         * still had something in it, 63 that ".." did not resolve. */
+        check("mkdir, \"..\", getdents64 and rmdir all behaved",
+              syscall64_exit_code() == 83);
+        check("and it removed everything it made",
+              ramfs64_lookup("/tmp/nvtree") < 0);
+
+        serial64_puts("NOVARIS64: nodes   = ");
+        serial64_putdec(ramfs64_count());
+        serial64_puts(", exit ");
         serial64_putdec(syscall64_exit_code());
         serial64_putc('\n');
     }

@@ -84,6 +84,7 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/ramfs64.o \
        $(BUILD_DIR)/proc64.o \
        $(BUILD_DIR)/forkexec64_blob.o \
+       $(BUILD_DIR)/tree64_blob.o \
        $(BUILD_DIR)/initrd64.o \
        $(BUILD_DIR)/hello64_blob.o \
        $(BUILD_DIR)/glibc64_blob.o \
@@ -180,6 +181,18 @@ $(BUILD_DIR)/forkexec64_blob.c: $(BUILD_DIR)/forkexec64.elf userland/embed64.py
 	python3 userland/embed64.py $< $@ forkexec64_elf
 
 $(BUILD_DIR)/forkexec64_blob.o: $(BUILD_DIR)/forkexec64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# A directory tree used as a tree: nested mkdir, open through "..",
+# getdents64, and rmdir refusing a directory that is not empty.
+$(BUILD_DIR)/tree64.elf: userland/tree64.s | $(BUILD_DIR)
+	$(AS) -f elf64 $< -o $(BUILD_DIR)/tree64.o
+	$(LD) -m elf_x86_64 -o $@ $(BUILD_DIR)/tree64.o
+
+$(BUILD_DIR)/tree64_blob.c: $(BUILD_DIR)/tree64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ tree64_elf
+
+$(BUILD_DIR)/tree64_blob.o: $(BUILD_DIR)/tree64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Two threads handing off through a futex, with no spin to fall back on.
@@ -505,6 +518,19 @@ test: iso
 	    || (echo "FAIL: the host run of the fork binary did not exit 71"; \
 	        exit 1)
 	@echo "PASS: fork/execve/wait behave the same, and exit 71, on both"
+	@# The directory tree. Cleared first because the program's first act
+	@# is mkdir, which fails on a leftover from an interrupted run - and
+	@# it removes everything it made when it succeeds.
+	@rm -rf /tmp/nvtree
+	@timeout 20 ./$(BUILD_DIR)/tree64.elf > $(BUILD_DIR)/tree64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/tree64.host.status
+	@grep -qFf $(BUILD_DIR)/tree64.host.txt $(BUILD_DIR)/serial.log \
+	    || (echo "FAIL: the guest did not print what the host prints"; \
+	        exit 1)
+	@[ "`cat $(BUILD_DIR)/tree64.host.status`" = "83" ] \
+	    || (echo "FAIL: the host run of the tree binary did not exit 83"; \
+	        exit 1)
+	@echo "PASS: directories behave the same, and exit 83, on both"
 
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR) $(ISO)

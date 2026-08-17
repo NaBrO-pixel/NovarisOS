@@ -915,6 +915,66 @@ static uint64_t dispatch(syscall64_args_t* args) {
                                        (const void*)a2, a3);
     }
 
+    /* getdents64(fd, buf, count). The one call a flat path table could
+     * not have answered at all: it enumerates a directory, which needs
+     * children to enumerate.
+     *
+     * The file offset counts entries rather than bytes, which is legal -
+     * d_off is opaque to the caller and only ever fed back to lseek. */
+    case SYS64_GETDENTS64: {
+        uint8_t* out = (uint8_t*)a2;
+        uint64_t written = 0;
+        int dir;
+
+        if (a1 < 3 || a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        dir = fds[a1].node;
+        if (!ramfs64_is_dir(dir)) return (uint64_t)-20;   /* -ENOTDIR */
+
+        for (;;) {
+            uint64_t index = fds[a1].pos;
+            const char* name;
+            uint64_t ino, reclen, namelen;
+            uint8_t type;
+            int child;
+
+            /* "." and ".." are not stored as nodes; they are
+             * synthesised here, the way a real filesystem does. */
+            if (index == 0) {
+                name = "."; ino = (uint64_t)dir + 1; type = 4;
+            } else if (index == 1) {
+                int up = ramfs64_parent(dir);
+                name = ".."; ino = (uint64_t)(up < 0 ? dir : up) + 1;
+                type = 4;
+            } else if (ramfs64_child(dir, index - 2, &child)) {
+                name = ramfs64_name(child);
+                ino  = (uint64_t)child + 1;
+                type = ramfs64_is_dir(child) ? 4 : 8;   /* DT_DIR/DT_REG */
+            } else {
+                break;                                   /* end of it */
+            }
+
+            namelen = kstrlen(name);
+            /* d_ino(8) d_off(8) d_reclen(2) d_type(1) name+NUL, rounded
+             * to 8 so the next record starts aligned. */
+            reclen = (8 + 8 + 2 + 1 + namelen + 1 + 7) & ~7ULL;
+            if (written + reclen > a3) break;
+
+            *(uint64_t*)(out + written)      = ino;
+            *(uint64_t*)(out + written + 8)  = (int64_t)index + 1;
+            *(uint16_t*)(out + written + 16) = (uint16_t)reclen;
+            *(uint8_t*)(out + written + 18)  = type;
+            kmemcpy(out + written + 19, name, namelen);
+            out[written + 19 + namelen] = 0;
+
+            written += reclen;
+            fds[a1].pos++;
+        }
+        return written;
+    }
+
+    case SYS64_RMDIR:
+        return (uint64_t)(int64_t)ramfs64_rmdir((const char*)a1);
+
     case SYS64_MKDIR:
         return ramfs64_create((const char*)a1, 1) >= 0
                ? 0 : (uint64_t)-28;                    /* -ENOSPC */
