@@ -3,6 +3,11 @@
 #include "vmspace64.h"
 #include "paging64.h"
 #include "pmm64.h"
+#include "kheap64.h"
+#include "kstring.h"
+
+#define KERNEL_VMA  0xFFFFFFFF80000000ULL
+#define PHYS_WINDOW 0x40000000ULL
 
 #define ADDR_MASK   0x000FFFFFFFFFF000ULL
 #define REC         510ULL          /* must match paging64.c */
@@ -114,6 +119,95 @@ static void free_low_half_tables(void) {
         pmm64_free_frame(pml4e & ADDR_MASK);
         pml4[a] = 0;
     }
+}
+
+/* One page of the source, remembered while the source space is still
+ * loaded. The walk and the mapping cannot happen at the same time - the
+ * recursive addresses only ever describe the current space - so the
+ * whole low half is collected first and replayed second. */
+typedef struct {
+    uint64_t va;
+    uint64_t frame;
+    uint64_t flags;
+} clone_page_t;
+
+#define CLONE_MAX_PAGES 4096
+
+int vmspace64_clone(vmspace64_t* dst) {
+    uint64_t* pml4 = paging64_pml4();
+    clone_page_t* list;
+    uint64_t count = 0, saved;
+    int a, b, c, d, rc = 1;
+
+    list = (clone_page_t*)kmalloc64(CLONE_MAX_PAGES * sizeof(clone_page_t));
+    if (!list) return 0;
+
+    /* --- pass one: what is mapped, read from the source space --- */
+    for (a = 0; a < KERNEL_HALF && rc; a++) {
+        uint64_t* pdpt;
+        if (!(pml4[a] & PAGE64_PRESENT)) continue;
+        pdpt = (uint64_t*)(0xFFFF000000000000ULL | (REC << 39) | (REC << 30)
+                           | (REC << 21) | ((uint64_t)a << 12));
+
+        for (b = 0; b < 512 && rc; b++) {
+            uint64_t* pd;
+            if (!(pdpt[b] & PAGE64_PRESENT) || (pdpt[b] & PAGE64_HUGE)) continue;
+            pd = (uint64_t*)(0xFFFF000000000000ULL | (REC << 39) | (REC << 30)
+                             | ((uint64_t)a << 21) | ((uint64_t)b << 12));
+
+            for (c = 0; c < 512 && rc; c++) {
+                uint64_t* pt;
+                if (!(pd[c] & PAGE64_PRESENT) || (pd[c] & PAGE64_HUGE)) continue;
+                pt = (uint64_t*)(0xFFFF000000000000ULL | (REC << 39)
+                                 | ((uint64_t)a << 30) | ((uint64_t)b << 21)
+                                 | ((uint64_t)c << 12));
+
+                for (d = 0; d < 512; d++) {
+                    if (!(pt[d] & PAGE64_PRESENT)) continue;
+                    if (count == CLONE_MAX_PAGES) { rc = 0; break; }
+                    list[count].va = ((uint64_t)a << 39) | ((uint64_t)b << 30)
+                                   | ((uint64_t)c << 21) | ((uint64_t)d << 12);
+                    list[count].frame = pt[d] & ADDR_MASK;
+                    /* Permissions carry over; the copy is a copy. */
+                    list[count].flags = pt[d] & (PAGE64_PRESENT | PAGE64_WRITE
+                                                 | PAGE64_USER);
+                    count++;
+                }
+            }
+        }
+    }
+
+    /* --- pass two: build the same layout in the destination --- */
+    if (rc) {
+        __asm__ __volatile__("mov %%cr3, %0" : "=r"(saved));
+        __asm__ __volatile__("mov %0, %%cr3" :: "r"(dst->pml4_phys) : "memory");
+
+        for (uint64_t i = 0; i < count; i++) {
+            uint64_t fresh = pmm64_alloc_frame();
+            if (!fresh || fresh >= PHYS_WINDOW) {
+                if (fresh) pmm64_free_frame(fresh);
+                rc = 0;
+                break;
+            }
+            /* Both frames are reachable through the kernel window, which
+             * is mapped identically in every space - so the copy does
+             * not care which space is loaded. */
+            kmemcpy((void*)(KERNEL_VMA + fresh),
+                    (const void*)(KERNEL_VMA + list[i].frame), PAGE64_SIZE);
+
+            if (paging64_map(list[i].va, fresh, list[i].flags)
+                    != PAGING64_OK) {
+                pmm64_free_frame(fresh);
+                rc = 0;
+                break;
+            }
+        }
+
+        __asm__ __volatile__("mov %0, %%cr3" :: "r"(saved) : "memory");
+    }
+
+    kfree64(list);
+    return rc;
 }
 
 void vmspace64_destroy(vmspace64_t* vs) {

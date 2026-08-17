@@ -82,6 +82,8 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/fs64_blob.o \
        $(BUILD_DIR)/mmapfile64_blob.o \
        $(BUILD_DIR)/ramfs64.o \
+       $(BUILD_DIR)/proc64.o \
+       $(BUILD_DIR)/forkexec64_blob.o \
        $(BUILD_DIR)/initrd64.o \
        $(BUILD_DIR)/hello64_blob.o \
        $(BUILD_DIR)/glibc64_blob.o \
@@ -161,6 +163,23 @@ $(BUILD_DIR)/signal64_blob.c: $(BUILD_DIR)/signal64.elf userland/embed64.py
 	python3 userland/embed64.py $< $@ signal64_elf
 
 $(BUILD_DIR)/signal64_blob.o: $(BUILD_DIR)/signal64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# fork + execve + wait4. Two binaries, deliberately: execve has to
+# replace the address space with something that was never part of it, so
+# a "new" program that was already mapped would prove nothing.
+$(BUILD_DIR)/forkexec64.elf: userland/forkexec64.s | $(BUILD_DIR)
+	$(AS) -f elf64 $< -o $(BUILD_DIR)/forkexec64.o
+	$(LD) -m elf_x86_64 -o $@ $(BUILD_DIR)/forkexec64.o
+
+$(BUILD_DIR)/forkchild64.elf: userland/forkchild64.s | $(BUILD_DIR)
+	$(AS) -f elf64 $< -o $(BUILD_DIR)/forkchild64.o
+	$(LD) -m elf_x86_64 -o $@ $(BUILD_DIR)/forkchild64.o
+
+$(BUILD_DIR)/forkexec64_blob.c: $(BUILD_DIR)/forkexec64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ forkexec64_elf
+
+$(BUILD_DIR)/forkexec64_blob.o: $(BUILD_DIR)/forkexec64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Two threads handing off through a futex, with no spin to fall back on.
@@ -296,11 +315,13 @@ WINE64_NTDLL  ?= $(firstword $(wildcard \
     ../../../../wine64-build/dlls/ntdll/ntdll.so))
 
 $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
-           userland/mkinitrd.py
+           $(BUILD_DIR)/forkchild64.elf userland/mkinitrd.py
 	rm -rf $(INITRD_STAGE)
 	mkdir -p $(INITRD_STAGE)
 	cp $(BUILD_DIR)/dlllib64.dll $(INITRD_STAGE)/dlllib64.dll
 	cp $(BUILD_DIR)/dynhello64.elf $(INITRD_STAGE)/dynhello64
+	mkdir -p $(INITRD_STAGE)/tmp
+	cp $(BUILD_DIR)/forkchild64.elf $(INITRD_STAGE)/tmp/forkchild64
 	@# At the paths ld.so actually searches, which were read off its own
 	@# trace rather than guessed: it tries /lib/x86_64-linux-gnu first.
 	@# The filesystem matches whole paths, so a file at /libc.so.6 is
@@ -469,6 +490,21 @@ test: iso
 	    || (echo "FAIL: the host run of the dynamic binary did not exit 67"; \
 	        exit 1)
 	@echo "PASS: a dynamically linked program runs the same, and exits 67, on both"
+	@# fork/execve/wait4. The host run needs the child where the program
+	@# looks for it, and removes it afterwards.
+	@cp $(BUILD_DIR)/forkchild64.elf /tmp/forkchild64
+	@timeout 20 ./$(BUILD_DIR)/forkexec64.elf \
+	    > $(BUILD_DIR)/forkexec64.host.txt 2>/dev/null; \
+	    echo $$? > $(BUILD_DIR)/forkexec64.host.status
+	@rm -f /tmp/forkchild64
+	@while read -r line; do \
+	    grep -qF "$$line" $(BUILD_DIR)/serial.log \
+	        || { echo "FAIL: guest never printed: $$line"; exit 1; }; \
+	done < $(BUILD_DIR)/forkexec64.host.txt
+	@[ "`cat $(BUILD_DIR)/forkexec64.host.status`" = "71" ] \
+	    || (echo "FAIL: the host run of the fork binary did not exit 71"; \
+	        exit 1)
+	@echo "PASS: fork/execve/wait behave the same, and exit 71, on both"
 
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR) $(ISO)

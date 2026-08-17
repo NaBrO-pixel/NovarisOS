@@ -7650,6 +7650,79 @@ before Wine needs any of the things it is actually missing here:
 Those are the next three walls, in that order, and the first is the one
 everything else waits on.
 
+## Milestone 64 — fork, execve, wait ✅ DONE
+
+217 assertions and a tenth differential. The wall everything else was
+waiting on: Wine's architecture is client-server and `wineserver` is a
+separate process, so a kernel that cannot start a second program cannot
+host a program-starting program.
+
+```
+NOVARIS64: --- its output follows ---
+  (the execed child is running)
+forked, execed a different program, and waited for it
+NOVARIS64: procs   = 1 left, exit 71
+```
+
+### First, the state had to belong to a process
+
+Open files lived in a static array in `syscall64.c`, the heap and mmap
+bookkeeping in another in `uspace64.c`, and the address space was
+whatever the kernel had last switched to. That is indistinguishable from
+correct while there is one program and wrong the moment there are two: a
+child sharing its parent's descriptor table is not a child, it is the
+same process with two register sets. `proc64.c` owns that state now and
+the scheduler switches process and thread together.
+
+**fork copies the whole address space** - every mapped page in the low
+half, into fresh frames. A real fork shares them copy-on-write and
+duplicates on the first write; this pays the entire resident size up
+front. That is the right trade while the question is whether fork works
+and the wrong one the moment anything forks in a loop.
+
+**wait4 blocks and *restarts*.** A parent that calls it before its child
+has been scheduled has to wait, and there is no way to return a value
+that was not known when it blocked - so the frame it resumes from has
+`rip` rewound by the two bytes of the `syscall` instruction and the
+number put back in `rax`. Waking re-executes the call and re-checks.
+Linux does exactly this, for exactly this reason.
+
+### Four bugs, each visible only through another one's symptom
+
+1. **`exit_group` handed the CPU to a sibling.** It must end *every*
+   thread of the process; ending only the caller left the preemption
+   test's second task running and the kernel never got control back.
+2. **`sched64_add` never set a pid**, so a timer tick set the current
+   process to one nothing owned. Three layers later a syscall
+   dereferenced a null process - in the kernel, in `uspace64_brk`,
+   nowhere near the tick that caused it.
+3. **`execve` did not update the scheduler task's address space.** The
+   task carries its own copy and the scheduler reloads it on every
+   switch, so the next tick put the *old* space back while `rip` pointed
+   into the new program. Both test binaries link at 0x400000, so that
+   landed in real code and kept running - the child appeared to re-enter
+   `_start` and fork again, four times, until the process table filled.
+   A crash would have been kinder.
+4. **`sched64_wake` forced `rax = 0`**, which is right for futex and
+   destroys a restarting syscall's number. The restarted `wait4` came
+   back as call 0 - `read`. The wake value is per-task now.
+
+### And a C lesson worth keeping
+
+The first attempt made the per-process fields reachable through macros
+named after them - `#define fds (proc64_current()->fds)`. That expands
+inside `p->fds` too, producing a syntax error in code that looks
+correct. Accessor functions, or the macro used consistently, but never a
+macro sharing a name with the field it wraps.
+
+### What is still missing
+
+`fork` has no copy-on-write, `execve` does not honour `#!` or search a
+`PATH`, `wait4` ignores its options and its rusage argument, there is no
+process group, no signal to a process, and `PROC64_MAX` is 4. Zombies
+are real: a child nobody waits for keeps its slot, which is correct
+behaviour and a leak in a kernel with four of them.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the

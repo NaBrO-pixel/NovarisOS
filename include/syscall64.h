@@ -76,6 +76,11 @@
 #define SYS64_WRITEV          20
 #define SYS64_UNAME           63
 #define SYS64_READLINK        89
+#define SYS64_FORK            57
+#define SYS64_EXECVE          59
+#define SYS64_WAIT4           61
+#define SYS64_GETPID          39
+#define SYS64_GETPPID         110
 #define SYS64_CLONE           56
 #define SYS64_GETTID          186
 #define SYS64_ARCH_PRCTL      158
@@ -190,5 +195,10 @@ uint64_t syscall64_futex_wakes(void);
 /* File-backed mmap(2) calls served. Zero would mean every mapping in a
  * run took the anonymous path. */
 uint64_t syscall64_file_maps(void);
+
+/* Processes created and programs replaced. A run where a fork silently
+ * became a thread would look identical without these. */
+uint64_t syscall64_forks(void);
+uint64_t syscall64_execs(void);
 
 #endif

@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "idt64.h"
 #include "vmspace64.h"
+#include "proc64.h"
 
 /* Round-robin preemption for ring-3 tasks.
  *
@@ -45,8 +46,18 @@ int  sched64_add(uint64_t rip, uint64_t rsp, uint64_t arg,
 int  sched64_add_frame(const registers64_t* regs, const vmspace64_t* space,
                        uint64_t fs_base);
 
+/* The same, for a thread belonging to a *different* process - which is
+ * what fork produces, and the reason the two are separate calls. */
+int  sched64_exit_process(int pid, registers64_t* out_regs,
+                          vmspace64_t* out_space, uint64_t* out_fs_base);
+
+int  sched64_add_frame_for(const registers64_t* regs,
+                           const vmspace64_t* space,
+                           uint64_t fs_base, int pid);
+
 /* The address space and thread pointer of whatever is running, which is
  * what a thread inherits from the thread that cloned it. */
+void sched64_set_current_space(const vmspace64_t* space);
 const vmspace64_t* sched64_current_space(void);
 
 /* Ends the calling thread and picks a successor.
@@ -67,6 +78,7 @@ int sched64_exit_current(registers64_t* out_regs, vmspace64_t* out_space,
  * deadlock rather than stopping the machine.
  */
 int sched64_block_current(const registers64_t* regs, uint64_t addr,
+                          uint64_t wake_rax,
                           registers64_t* out_regs, vmspace64_t* out_space,
                           uint64_t* out_fs_base);
 

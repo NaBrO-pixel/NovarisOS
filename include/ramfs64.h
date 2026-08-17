@@ -41,6 +41,10 @@ int64_t ramfs64_write(int node, uint64_t offset, const void* buf,
 int     ramfs64_truncate(int node);
 int     ramfs64_unlink(const char* path);
 
+/* The file's bytes, contiguous in the kernel heap. execve needs the
+ * whole image addressable at once to walk its program headers. */
+const void* ramfs64_data(int node);
+
 uint64_t ramfs64_size(int node);
 int      ramfs64_is_dir(int node);
 uint64_t ramfs64_count(void);

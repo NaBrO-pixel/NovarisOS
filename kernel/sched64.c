@@ -12,6 +12,12 @@ typedef struct {
     vmspace64_t   space;
     uint64_t      fs_base;   /* the thread pointer, per thread          */
     uint64_t      wait_addr; /* the futex it is blocked on, 0 if awake  */
+    /* What rax becomes when this thread is woken. futex wants 0 - the
+     * value FUTEX_WAIT returns - but a syscall that blocks and then
+     * *restarts* needs its own number back there instead, or the
+     * re-executed `syscall` invokes whatever call 0 happens to be. */
+    uint64_t      wake_rax;
+    int           pid;       /* the process this thread belongs to      */
     int           blocked;
     int           used;
 } task64_t;
@@ -70,6 +76,11 @@ int sched64_add(uint64_t rip, uint64_t rsp, uint64_t arg,
     tasks[i].fs_base   = 0;  /* a task that has never run has no TLS yet */
     tasks[i].blocked   = 0;
     tasks[i].wait_addr = 0;
+    /* Belongs to whoever is running. Leaving this zero would make the
+     * next timer tick set the current process to a pid nothing owns,
+     * and every syscall after it would find no process at all - which
+     * is a null dereference in the kernel, layers later. */
+    tasks[i].pid       = proc64_current_pid();
     tasks[i].used      = 1;
     task_total++;
     return i;
@@ -77,11 +88,20 @@ int sched64_add(uint64_t rip, uint64_t rsp, uint64_t arg,
 
 int sched64_add_frame(const registers64_t* regs, const vmspace64_t* space,
                       uint64_t fs_base) {
+    /* A thread of the process that is running. clone(2) takes this
+     * path; fork(2) takes the one below, because its new thread belongs
+     * to a different process. */
+    return sched64_add_frame_for(regs, space, fs_base, proc64_current_pid());
+}
+
+int sched64_add_frame_for(const registers64_t* regs, const vmspace64_t* space,
+                          uint64_t fs_base, int pid) {
     int i;
 
     for (i = 0; i < SCHED64_MAX_TASKS; i++) if (!tasks[i].used) break;
     if (i == SCHED64_MAX_TASKS) return -1;
 
+    tasks[i].pid       = pid;
     tasks[i].regs      = *regs;
     tasks[i].space     = *space;
     tasks[i].fs_base   = fs_base;
@@ -90,6 +110,17 @@ int sched64_add_frame(const registers64_t* regs, const vmspace64_t* space,
     tasks[i].used      = 1;
     task_total++;
     return i;
+}
+
+void sched64_set_current_space(const vmspace64_t* space) {
+    /* execve replaces the address space under a running task. The task
+     * carries its own copy, and the scheduler reloads that copy on every
+     * switch - so without this the next timer tick puts the *old* space
+     * back while rip points into the new program. Both programs being
+     * linked at the same address makes that land in real code and keep
+     * running, which is the worst possible version of the bug. */
+    if (current < 0 || !tasks[current].used) return;
+    tasks[current].space = *space;
 }
 
 const vmspace64_t* sched64_current_space(void) {
@@ -147,6 +178,34 @@ int sched64_exit_current(registers64_t* out_regs, vmspace64_t* out_space,
     if (out_regs)     *out_regs     = tasks[next].regs;
     if (out_space)    *out_space    = tasks[next].space;
     if (out_fs_base)  *out_fs_base  = tasks[next].fs_base;
+    proc64_set_current(tasks[next].pid);
+    return 1;
+}
+
+int sched64_exit_process(int pid, registers64_t* out_regs,
+                         vmspace64_t* out_space, uint64_t* out_fs_base) {
+    int next;
+
+    /* exit_group ends every thread of the process, not just the one
+     * that called it. Ending only the caller would leave its siblings
+     * running in an address space nobody owns - and, when a test's two
+     * tasks belong to the same process, would hand the CPU to the other
+     * one instead of finishing the run. */
+    for (int i = 0; i < SCHED64_MAX_TASKS; i++) {
+        if (!tasks[i].used || tasks[i].pid != pid) continue;
+        tasks[i].used = 0;
+        if (task_total > 0) task_total--;
+    }
+
+    for (next = 0; next < SCHED64_MAX_TASKS; next++)
+        if (tasks[next].used) break;
+    if (next == SCHED64_MAX_TASKS) { current = -1; return 0; }
+
+    current = next;
+    if (out_regs)    *out_regs    = tasks[next].regs;
+    if (out_space)   *out_space   = tasks[next].space;
+    if (out_fs_base) *out_fs_base = tasks[next].fs_base;
+    proc64_set_current(tasks[next].pid);
     return 1;
 }
 
@@ -161,6 +220,7 @@ static int next_task(int from) {
 }
 
 int sched64_block_current(const registers64_t* regs, uint64_t addr,
+                          uint64_t wake_rax,
                           registers64_t* out_regs, vmspace64_t* out_space,
                           uint64_t* out_fs_base) {
     int next;
@@ -172,6 +232,7 @@ int sched64_block_current(const registers64_t* regs, uint64_t addr,
     tasks[current].regs      = *regs;
     tasks[current].blocked   = 1;
     tasks[current].wait_addr = addr;
+    tasks[current].wake_rax  = wake_rax;
 
     next = next_task(current);
     if (next == current || tasks[next].blocked) {
@@ -187,6 +248,7 @@ int sched64_block_current(const registers64_t* regs, uint64_t addr,
     if (out_regs)    *out_regs    = tasks[next].regs;
     if (out_space)   *out_space   = tasks[next].space;
     if (out_fs_base) *out_fs_base = tasks[next].fs_base;
+    proc64_set_current(tasks[next].pid);
     return 1;
 }
 
@@ -200,7 +262,7 @@ int sched64_wake(uint64_t addr, int max) {
         tasks[i].wait_addr = 0;
         /* futex(2) returns 0 to a waiter that was woken. The value goes
          * into the saved frame, because that frame IS the thread. */
-        tasks[i].regs.rax = 0;
+        tasks[i].regs.rax = tasks[i].wake_rax;
         woken++;
     }
     return woken;
@@ -227,6 +289,9 @@ void sched64_tick(registers64_t* frame) {
     *frame = tasks[current].regs;
     vmspace64_switch(&tasks[current].space);
     write_fs_base(tasks[current].fs_base);
+    /* The process changes with the thread. Miss this and the incoming
+     * thread runs with the outgoing one's open files and heap. */
+    proc64_set_current(tasks[current].pid);
     switch_count++;
 
     /* Ending the run by redirecting a resume rather than by counting

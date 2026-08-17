@@ -40,6 +40,18 @@ int  vmspace64_create(vmspace64_t* vs);
  * ownership stays with whoever mapped them. */
 void vmspace64_destroy(vmspace64_t* vs);
 
+/* Copies the CURRENT address space's low half into `dst`, which must be
+ * a space fresh from vmspace64_create.
+ *
+ * A real fork shares the pages copy-on-write and duplicates them only
+ * when one side writes; this copies everything up front. That is
+ * correct, much simpler, and much more expensive - a fork costs the
+ * whole resident size of the process. It is the right trade while the
+ * question is whether fork works at all, and the wrong one as soon as
+ * anything forks in a loop.
+ */
+int  vmspace64_clone(vmspace64_t* dst);
+
 void vmspace64_switch(const vmspace64_t* vs);
 
 /* The space the CPU is in, as a physical PML4 address (CR3 without its

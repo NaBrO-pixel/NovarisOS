@@ -39,6 +39,7 @@
 #include "initrd64.h"
 #include "signal64.h"
 #include "ramfs64.h"
+#include "proc64.h"
 
 static int failures = 0;
 
@@ -96,6 +97,8 @@ extern const unsigned char dlluser64_exe[];
 extern const unsigned long dlluser64_exe_len;
 extern const unsigned char loader64_exe[];
 extern const unsigned long loader64_exe_len;
+extern const unsigned char forkexec64_elf[];
+extern const unsigned long forkexec64_elf_len;
 extern const unsigned char thread64_elf[];
 extern const unsigned long thread64_elf_len;
 extern const unsigned char futex64_elf[];
@@ -311,6 +314,14 @@ void kernel_main(uint32_t magic, void* mbi) {
          * sits in RAM the allocator was just told is free, and it
          * reserves its own pages as part of coming up. */
         initrd64_init((const multiboot_info_t*)mbi);
+
+        /* There is always a current process from here on. Everything
+         * that used to be a kernel-wide static - open files, the heap,
+         * the path /proc/self/exe answers with - now lives in one, so a
+         * syscall arriving with no process is a null dereference in the
+         * kernel rather than a missing feature. */
+        proc64_init();
+        proc64_set_current(proc64_create());
 
         check("the frame allocator came up", pmm64_ready());
         total = pmm64_total_frames();
@@ -1400,8 +1411,10 @@ void kernel_main(uint32_t magic, void* mbi) {
         idt64_irq_set_mask(0, 1);
         serial64_puts("NOVARIS64: --- end of its output ---\n");
 
-        check("clone created a second thread",
-              sched64_current() >= 0 && sched64_switches() > 0);
+        /* Only the switch count: since Milestone 64 the last process to
+         * exit clears the current task, so asserting on that would be
+         * testing teardown rather than clone. */
+        check("clone created a second thread", sched64_switches() > 0);
         check("both threads ran, sharing one address space",
               syscall64_bytes_written() > written_before);
         /* 23 is the parent's own status. 81 or 82 would mean mmap or
@@ -1930,6 +1943,96 @@ void kernel_main(uint32_t magic, void* mbi) {
                   syscall64_exit_code() == 0);
         else
             check("no Wine to run, which is not a failure", 1);
+    }
+
+    /* --- layer 26: fork, execve, wait ------------------------------- */
+    /* The shape every shell has, and the one Wine's architecture is
+     * built on: a process copies itself, the copy becomes a different
+     * program, and the original waits to be told how it went. */
+    serial64_puts("NOVARIS64: -- fork and execve --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 32;
+        vmspace64_t kspace;
+        elf64_info_t info;
+        uint64_t i, rsp;
+        uint64_t written_before = syscall64_bytes_written();
+        uint64_t forks_before   = syscall64_forks();
+        uint64_t execs_before   = syscall64_execs();
+        int rc, stack_ok = 1, pid;
+        proc64_t* p;
+        static const char* const fe_argv[] = { "/forkexec64", 0 };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        signal64_reset();
+        sched64_init();
+        proc64_init();
+        vmspace64_kernel_space(&kspace);
+
+        check("the child program is in the filesystem",
+              ramfs64_lookup("/tmp/forkchild64") >= 0);
+
+        pid = proc64_create();
+        check("a process to start from", pid > 0);
+        proc64_set_current(pid);
+        p = proc64_current();
+
+        check("a space for it", vmspace64_create(&p->space) != 0);
+        rc = elf64_load(forkexec64_elf, forkexec64_elf_len, &p->space, &info);
+        check("the forking program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&p->space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&p->space, info.brk_start);
+        rsp = uspace64_build_stack(&p->space, STACK_TOP, STACK_PAGES,
+                                   fe_argv, &info, 0, 0);
+
+        /* The starting process has to be a scheduler task before it
+         * forks, so the child has somewhere to be a sibling of. */
+        {
+            registers64_t first;
+            for (i = 0; i < sizeof(first) / 8; i++)
+                ((uint64_t*)&first)[i] = 0;
+            sched64_add_frame_for(&first, &p->space, 0, pid);
+            sched64_set_current(0);
+        }
+
+        register_interrupt_handler64(32, sched_timer_handler);
+        idt64_irq_set_mask(0, 0);
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        vmspace64_switch(&p->space);
+        enter_user_mode64(info.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+        pf_diagnose = 0;
+        idt64_irq_set_mask(0, 1);
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("fork made a process", syscall64_forks() == forks_before + 1);
+        check("execve replaced one", syscall64_execs() == execs_before + 1);
+        check("both programs printed",
+              syscall64_bytes_written() > written_before);
+        /* 71 is the parent's own status, and it is only reachable if
+         * wait4 returned the child's pid AND the status carried the 24
+         * the execed program exited with. 96/97/98 would each name a
+         * different step. */
+        check("the parent waited and got the child's status back",
+              syscall64_exit_code() == 71);
+
+        serial64_puts("NOVARIS64: procs   = ");
+        serial64_putdec(proc64_count());
+        serial64_puts(" left, exit ");
+        serial64_putdec(syscall64_exit_code());
+        serial64_putc('\n');
     }
 
     /* --- verdict ---------------------------------------------------- */

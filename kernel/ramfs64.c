@@ -163,6 +163,11 @@ int ramfs64_unlink(const char* path) {
     return 0;
 }
 
+const void* ramfs64_data(int node) {
+    if (node < 0 || node >= RAMFS64_MAX_NODES || !nodes[node].used) return 0;
+    return nodes[node].data;
+}
+
 uint64_t ramfs64_size(int node) {
     if (node < 0 || node >= RAMFS64_MAX_NODES || !nodes[node].used) return 0;
     return nodes[node].size;

@@ -4,6 +4,7 @@
 #include "paging64.h"
 #include "pmm64.h"
 #include "kstring.h"
+#include "proc64.h"
 
 #define KERNEL_VMA  0xFFFFFFFF80000000ULL
 #define PHYS_WINDOW 0x40000000ULL
@@ -26,18 +27,26 @@
 #define AT_SECURE 23
 #define AT_RANDOM 25
 
-static vmspace64_t* proc_space;
-static uint64_t brk_base, brk_current;
-static uint64_t mmap_next;
 static uint64_t pages_allocated;
 
 uint64_t uspace64_pages_allocated(void) { return pages_allocated; }
 
+/* The heap and the mmap bump pointer live in the process now rather
+ * than here. A forked child gets its own copy of both; a static shared
+ * between them would give two processes one break.
+ *
+ * Reached through a function rather than a macro named after the field,
+ * which expands inside `p->brk_base` and produces a syntax error a long
+ * way from where it was written. */
+static proc64_t* cur(void) { return proc64_current(); }
+
 void uspace64_reset(vmspace64_t* space, uint64_t brk_start) {
-    proc_space  = space;
-    brk_base    = brk_start;
-    brk_current = brk_start;
-    mmap_next   = USPACE64_MMAP_BASE;
+    proc64_t* p = cur();
+    (void)space;
+    if (!p) return;
+    p->brk_base    = brk_start;
+    p->brk_current = brk_start;
+    p->mmap_next   = USPACE64_MMAP_BASE;
     pages_allocated = 0;
 }
 
@@ -100,16 +109,16 @@ static int map_anon(uint64_t start, uint64_t end, uint64_t flags,
 uint64_t uspace64_brk(uint64_t addr) {
     uint64_t want;
 
-    if (addr == 0 || addr < brk_base) return brk_current;
+    if (addr == 0 || addr < cur()->brk_base) return cur()->brk_current;
 
     want = (addr + PAGE64_SIZE - 1) & ~(PAGE64_SIZE - 1);
-    if (want > brk_current) {
-        if (!map_anon(brk_current, want,
+    if (want > cur()->brk_current) {
+        if (!map_anon(cur()->brk_current, want,
                       PAGE64_PRESENT | PAGE64_WRITE | PAGE64_USER, 0))
-            return brk_current;   /* Linux reports failure this way */
+            return cur()->brk_current;   /* Linux reports failure this way */
     }
-    brk_current = addr;
-    return brk_current;
+    cur()->brk_current = addr;
+    return cur()->brk_current;
 }
 
 #define MAP_FIXED 0x10
@@ -135,11 +144,11 @@ uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     } else {
         /* A hint is honoured only when it is free; anything else comes
          * out of the bump region. */
-        start = addr ? (addr & ~(PAGE64_SIZE - 1)) : mmap_next;
+        start = addr ? (addr & ~(PAGE64_SIZE - 1)) : cur()->mmap_next;
         if (addr) {
             uint64_t probe;
             if (paging64_translate(start, &probe) == PAGING64_OK)
-                start = mmap_next;
+                start = cur()->mmap_next;
         }
     }
     end = start + length;
@@ -151,7 +160,7 @@ uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 
     /* A fixed mapping does not move the bump pointer: it was placed by
      * the caller, in a range the caller is keeping track of. */
-    if (!(flags & MAP_FIXED) && start == mmap_next) mmap_next = end;
+    if (!(flags & MAP_FIXED) && start == cur()->mmap_next) cur()->mmap_next = end;
     return start;
 }
 
