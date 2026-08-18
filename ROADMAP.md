@@ -8005,6 +8005,158 @@ full-frame drawing fast rather than merely correct), no double buffering,
 no damage tracking, no text console, no compositor. The 32-bit tree's
 `gfx.c`, `wm.c` and `console.c` have no counterpart here.
 
+## Milestone 68 — a working directory, and links ✅ DONE
+
+266 assertions, and the first milestone whose size was chosen by
+measuring the thing it is for rather than by guessing.
+
+### What a prefix actually costs
+
+`wineboot -u` was run against the Wine tree beside this one and the
+result counted rather than estimated:
+
+```
+1049 nodes    119 directories, 917 files, 13 symlinks
+901 MB
+depth 18      longest component 93 chars, longest path 170
+```
+
+Every one of those numbers was over a limit in `ramfs64`:
+
+| | before | needed | now |
+|---|---|---|---|
+| nodes | 192 | 1049 | 4096 |
+| name | 64 | 93 | 256 |
+| path | 128 | 170 | 1024 |
+| symlinks | none | 13 | yes |
+
+A Wine prefix could not have been unpacked into this filesystem, let
+alone used. That is a more useful statement than "the filesystem is
+small", and it is the reason this milestone exists.
+
+### The two absences
+
+Neither was a bug. Both were things the tree had never needed before and
+said so in its own comments — `syscall64.c` on `openat`: *"there is no
+working directory here, so a relative path has nothing to be relative
+to"*, and `ramfs64.h`: *"no links, and no working directory"*.
+
+**Relative paths were answered `-ENOENT`.** Not an obscure gap: ld.so,
+make, `configure` and Wine all spend most of their path handling
+relative to where they are, and Wine's first act on a prefix is to
+`chdir` into it. The 32-bit tree's log carries the same failure from
+before it had one — "chdir to /disk/.wine : No such file or directory",
+recorded three separate times in `ata.c`, `fat32.c` and `ramfs.c`.
+
+**There were no symlinks.** A prefix is held together with them:
+`dosdevices/c:` is a link to `../drive_c`, and Wine reaches drive C by
+reading it.
+
+### What the child list is for
+
+Raising `RAMFS64_MAX_NODES` is one line. The line underneath it is the
+milestone: every lookup scanned the whole table, so resolving one path
+cost depth x MAX_NODES, and `create` scanned it again for a free slot.
+At 192 that is invisible. At 4096, with Wine opening a prefix's worth of
+files, it is Milestone 46's quadratic `kmalloc` in a different file.
+
+So directories now keep a child list and free nodes are threaded onto a
+free list. Neither is a tidy-up; both are the difference between a
+constant that was raised and a filesystem that can be used at the new
+size.
+
+### The working directory is stored as text, and canonically
+
+Per process, inherited by `fork`, kept across `execve`. Two decisions
+worth recording:
+
+- **Text, not a node index.** A node index goes stale — Linux lets a
+  process's directory be removed underneath it, and the process keeps
+  its cwd while every relative path from it fails.
+- **The canonical path, rebuilt from the tree**, not the text the
+  program supplied. So `getcwd` after `chdir("a/../b")` answers `/b`,
+  and after a chdir through a symlink answers where it landed rather
+  than how it got there.
+
+Every path syscall now passes through one function that makes it
+absolute against the cwd. `chdir`, `fchdir`, `getcwd`, `lstat`,
+`symlink`, `symlinkat`, `readlinkat`, `mkdirat` and `unlinkat` joined
+the table; `readlink` grew a second kind of answer beside its
+synthesised `/proc/self/exe`.
+
+`PROC64_MAX` went 4 → 32. Building a prefix runs wineserver, wineboot,
+services.exe and explorer.exe at once, and the fifth process to start is
+the one that fails.
+
+### The test picks nothing
+
+`userland/cwd64.c` is an ordinary C program against real glibc — the
+same argument as Milestone 51. It does not issue syscalls; it calls
+`mkdir`, `chdir`, `getcwd`, `symlink`, `readlink`, `stat`, `lstat` and
+`remove`, and **glibc** decides those mean `openat(AT_FDCWD)`,
+`unlinkat(AT_REMOVEDIR)` and `newfstatat`. This kernel has to answer
+whichever it picks, which is a much stronger claim than answering the
+calls a test chose to make.
+
+40 assertions, byte-identical on host and guest, exit 89. Among them:
+a relative target resolved against the directory the link sits in and
+not against the cwd (the classic symlink bug — it would resolve
+`../drive_c` to `/tmp/drive_c`), `stat` and `lstat` disagreeing about
+the same path, a dangling link that opens `ENOENT` but still answers
+`readlink`, and `unlink` on a link leaving the target alone.
+
+The differential compares **line by line**. The other twelve use
+`grep -qFf`, which succeeds if *any* pattern line matches — a guest that
+printed one `ok` and then died would pass that check. With forty
+assertions it would have passed it easily.
+
+### The sizing is tested, not asserted
+
+The kernel builds 1260 files across 60 directories and looks every one
+of them up again — 1338 nodes of 4096 — because nothing else in this
+tree builds 193 of anything, and a raised constant that is never
+exercised is exactly the kind of plausible-looking claim this repo keeps
+finding layers downstream.
+
+### Falsified
+
+Each mechanism was removed and the tests re-run, because a test that
+passes with the feature gone is testing nothing:
+
+| broken | failures |
+|---|---|
+| `abs_path` refuses relative paths (the pre-M68 behaviour) | 31 |
+| `walk` never follows a symlink | 9 |
+| `unlink` follows the final symlink | 4 |
+| `free_node` leaves the node in its parent's child list | 1 |
+
+The symlink loop limit is the one that cannot be falsified this way:
+removing it does not fail an assertion, it hangs the kernel, and the
+run times out instead.
+
+### Verified
+
+266 assertions, 0 failures, 13 host/guest differentials, at **2G and
+6G** — the RAM axis Milestone 66 established, and it matters more here
+than usual because the node table is now a 1.2MB heap allocation rather
+than BSS.
+
+### Still missing, and one thing not to claim
+
+**A prefix has not been created on this kernel.** This milestone removes
+the reasons it could not have been — the node ceiling, the name and path
+ceilings, the missing links, the missing working directory — and proves
+each of them individually. It does not run `wineboot`. The distance
+between "every ingredient is present and tested" and "the thing works"
+is exactly what this repo keeps getting wrong, and it is not being
+claimed here.
+
+Also still missing, and all of it needed before that run: **no
+copy-on-write fork** (the address space is copied eagerly, and
+wineserver forks), no rename, no file times, no permissions, no
+reference counting on an unlinked-but-open file, and 901MB of prefix
+against a filesystem that holds everything in the heap.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
@@ -8019,22 +8171,45 @@ all but eight of them.
 **So the target is Wine, not Chrome**, and what Wine needs from a kernel
 is the Linux side of this tree rather than the Windows side:
 
-1. ~~**Threads** (`clone`)~~ - done in Milestone 55, minus thread exit
-   and futex.
-2. **Signals**, delivered - Wine's exception dispatch is built on them.
-3. **A real filesystem**: Wine reads a prefix of thousands of files and
-   writes to it. This milestone's initrd is read-only and lives entirely
-   in RAM.
-4. **File-backed `mmap`**, which is how Wine maps a PE at all.
+1. ~~**Threads** (`clone`)~~ - done in Milestone 55; thread exit and
+   futex in 56 and 57.
+2. ~~**Signals**, delivered~~ - done in Milestone 58, with Linux's exact
+   `rt_sigframe` layout. Wine's exception dispatch is built on them.
+3. ~~**A real filesystem**: Wine reads a prefix of thousands of files
+   and writes to it.~~ - writable in Milestone 59, a real tree in 65,
+   and sized against a measured prefix in 68. Not yet holding one.
+4. ~~**File-backed `mmap`**, which is how Wine maps a PE at all.~~ -
+   done in Milestone 60.
 5. ~~**Wine itself reconfigured** `--enable-archs=x86_64`~~ - it
-   configures cleanly (Milestone 55). Compiling it is a separate
-   question, and running it a much larger one.
+   configures cleanly (Milestone 55), it compiles, and since Milestone
+   63 its loader answers `wine --version` -> wine-11.0, exit 0.
 
-Items 1-4 are all Milestone 44's item 4 - the syscall ABI - and the
-32-bit tree took Milestones 19-31 to get there. That is the honest
-distance: the Windows-side loader work (52, 53, 54) is real and was
-necessary, but the remaining bulk is Linux-side, and it is measured in
-milestones rather than in sessions.
+That list is now finished, which is worth saying plainly and worth not
+over-reading: it was the list of what Wine needs *to start*, and Wine
+does start. What stands between here and a Windows program is the next
+list, and it is shorter than the one above but not smaller:
+
+1. **A Wine prefix, created on this kernel.** Milestone 68 removed every
+   reason it could not be and proved each one; it did not run
+   `wineboot`. This is the next thing to attempt, and the first
+   milestone whose failure mode is interesting rather than predictable.
+2. **Copy-on-write `fork`.** The address space is copied eagerly.
+   wineserver forks, and a 901MB prefix's worth of process does not
+   survive being duplicated byte by byte.
+3. **Keyboard and mouse.** The 64-bit tree has a display (Milestone 67)
+   and no input at all. The 32-bit tree has both and none of it was
+   ported.
+4. **A compositor, double buffering, write-combining.** `gfx.c`, `wm.c`
+   and `console.c` have no 64-bit counterpart.
+5. **The other 601 Wine DLLs**, and `tools/install_wine.sh` installing
+   the 28 it already omits.
+
+Then, and only then, Chrome's own requirements: a GPU it has a flag to
+do without, and a sandbox it has a flag to do without.
+
+The honest distance: the Windows-side loader work (52, 53, 54) was real
+and necessary, but the bulk has been Linux-side throughout, and it is
+still measured in milestones rather than in sessions.
 
 ## The state of the tree, as found
 
