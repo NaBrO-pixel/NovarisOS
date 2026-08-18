@@ -29,12 +29,27 @@ uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                        uint64_t flags);
 uint64_t uspace64_munmap(uint64_t addr, uint64_t length);
 
+/* Narrows an existing mapping's permissions. Used by the file-mapping
+ * path: the kernel has to write the file's bytes in, so the pages are
+ * mapped writable and then closed down if the caller asked for
+ * PROT_READ alone. */
+/* Maps `length` bytes of physical memory at `phys` into the current
+ * process, uncacheable, at the next free mmap address. For devices - the
+ * frames are not the allocator's and are never given back to it. */
+uint64_t uspace64_map_phys(uint64_t length, uint64_t phys, uint64_t prot);
+
+void uspace64_protect(uint64_t addr, uint64_t length, uint64_t prot);
+
 /* Builds argc/argv/envp/auxv at the top of the mapped stack and returns
  * the rsp the program should start on. `stack_top` is one past the last
  * mapped byte; the pages below it must already be mapped writable. */
+/* `interp_base` is where the dynamic loader was mapped, and becomes
+ * AT_BASE. Zero for a static binary. */
 uint64_t uspace64_build_stack(vmspace64_t* space, uint64_t stack_top,
-                              uint64_t stack_pages, const char* argv0,
-                              const elf64_info_t* elf);
+                              uint64_t stack_pages, const char* const* argv,
+                              const elf64_info_t* elf,
+                              uint64_t interp_base,
+                              const char* const* envp);
 
 uint64_t uspace64_pages_allocated(void);
 

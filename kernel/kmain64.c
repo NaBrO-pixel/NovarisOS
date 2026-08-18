@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include "io.h"
 #include "serial64.h"
+#include "fb64.h"
 #include "gdt64.h"
 #include "idt64.h"
 #include "multiboot.h"
@@ -37,6 +38,9 @@
 #include "pe64.h"
 #include "win32_64.h"
 #include "initrd64.h"
+#include "signal64.h"
+#include "ramfs64.h"
+#include "proc64.h"
 
 static int failures = 0;
 
@@ -94,8 +98,22 @@ extern const unsigned char dlluser64_exe[];
 extern const unsigned long dlluser64_exe_len;
 extern const unsigned char loader64_exe[];
 extern const unsigned long loader64_exe_len;
+extern const unsigned char tree64_elf[];
+extern const unsigned long tree64_elf_len;
+extern const unsigned char fbdraw64_elf[];
+extern const unsigned long fbdraw64_elf_len;
+extern const unsigned char forkexec64_elf[];
+extern const unsigned long forkexec64_elf_len;
 extern const unsigned char thread64_elf[];
 extern const unsigned long thread64_elf_len;
+extern const unsigned char futex64_elf[];
+extern const unsigned long futex64_elf_len;
+extern const unsigned char signal64_elf[];
+extern const unsigned long signal64_elf_len;
+extern const unsigned char fs64_elf[];
+extern const unsigned long fs64_elf_len;
+extern const unsigned char mmapfile64_elf[];
+extern const unsigned long mmapfile64_elf_len;
 
 /* isr64.s - a load that is allowed to fault, and where to resume if it does. */
 extern uint64_t probe_read64(const void* addr);
@@ -136,11 +154,21 @@ static void sched_timer_handler(registers64_t* r) {
  * immediately, forever - a silent hang with nothing on the serial port,
  * which is exactly how the first attempt at running glibc presented. */
 static volatile int pf_diagnose;
+static volatile uint64_t pf_killed;
+
+/* syscall64.s */
+extern void enter_user_mode64_abort(void) __attribute__((noreturn));
 
 static void page_fault_handler(registers64_t* r) {
     pf_hits++;
     pf_cr2 = read_cr2();
     pf_err = r->err_code;
+
+    /* A ring-3 fault with a handler installed is the program's business,
+     * not a kernel failure - it is how Wine turns a bad access into a
+     * Windows exception. Tried before the diagnostic below, so that a
+     * fault with no handler still reports rather than vanishing. */
+    if (signal64_deliver(SIG64_SEGV, r, pf_cr2)) return;
 
     if (pf_diagnose) {
         serial64_puts("\nNOVARIS64: *** page fault in the program\n");
@@ -149,7 +177,28 @@ static void page_fault_handler(registers64_t* r) {
         serial64_puts("\nNOVARIS64:   err="); serial64_puthex(pf_err);
         serial64_puts(" cs=");               serial64_puthex(r->cs);
         serial64_puts(" rsp=");              serial64_puthex(r->rsp);
-        serial64_puts("\nNOVARIS64: *** halted\n");
+        /* The registers matter as much as the address: a fault reading
+         * through a pointer says nothing until you can see which
+         * pointer, and where it came from. */
+        serial64_puts("\nNOVARIS64:   rax="); serial64_puthex(r->rax);
+        serial64_puts(" rbx=");              serial64_puthex(r->rbx);
+        serial64_puts(" rdi=");              serial64_puthex(r->rdi);
+        serial64_puts("\nNOVARIS64:   rsi="); serial64_puthex(r->rsi);
+        serial64_puts(" rbp=");              serial64_puthex(r->rbp);
+        serial64_putc('\n');
+
+        /* A ring-3 fault with nobody to catch it kills the program, the
+         * way a real kernel does - 128 + SIGSEGV, which is the status a
+         * shell reports. Halting instead would be right for a test
+         * asserting nothing faults, and useless for one whose purpose
+         * is to find out how far a program gets. */
+        if ((r->cs & 3) == 3) {
+            pf_killed++;
+            syscall64_set_exit_code(139);
+            enter_user_mode64_abort();          /* never returns */
+        }
+
+        serial64_puts("NOVARIS64: *** halted (the fault was in the kernel)\n");
         for (;;) __asm__ __volatile__("cli; hlt");
     }
     /* #PF is a fault: rip points *at* the instruction that faulted, so
@@ -267,9 +316,26 @@ void kernel_main(uint32_t magic, void* mbi) {
         pmm64_init((const multiboot_info_t*)mbi, kphys_start, kphys_end);
 
         /* Immediately after, and before anything allocates: the initrd
-         * sits in RAM the allocator was just told is free, and it
-         * reserves its own pages as part of coming up. */
+         * sits in RAM the allocator was just told is free. */
+        initrd64_reserve((const multiboot_info_t*)mbi);
+
+        /* Paging and the direct map come up here rather than in layer 6
+         * below, because reading the archive needs the direct map and
+         * building the direct map needs the frame allocator - so the
+         * three have exactly one legal order. Layer 6 still tests them;
+         * it just no longer starts them. */
+        paging64_init();
+        paging64_physmap_init(pmm64_highest_addr());
+
         initrd64_init((const multiboot_info_t*)mbi);
+
+        /* There is always a current process from here on. Everything
+         * that used to be a kernel-wide static - open files, the heap,
+         * the path /proc/self/exe answers with - now lives in one, so a
+         * syscall arriving with no process is a null dereference in the
+         * kernel rather than a missing feature. */
+        proc64_init();
+        proc64_set_current(proc64_create());
 
         check("the frame allocator came up", pmm64_ready());
         total = pmm64_total_frames();
@@ -336,7 +402,8 @@ void kernel_main(uint32_t magic, void* mbi) {
         volatile uint64_t* p;
         int rc;
 
-        paging64_init();
+        /* paging64_init and paging64_physmap_init already ran, in layer
+         * 5 - see the note there. */
 
         /* The self-reference, read through itself: if the recursive
          * address were wrong this load would fault rather than answer. */
@@ -374,9 +441,9 @@ void kernel_main(uint32_t magic, void* mbi) {
          * through the new virtual address must be visible at that
          * physical frame's other address. A mapping that merely does not
          * fault would pass everything above and fail this. */
-        if (frame < 0x40000000ULL) {
+        {
             volatile uint64_t* through_phys =
-                (volatile uint64_t*)(0xFFFFFFFF80000000ULL + frame);
+                (volatile uint64_t*)phys64_to_virt(frame);
             check("the write landed in that physical frame",
                   *through_phys == MAGIC);
         }
@@ -418,6 +485,231 @@ void kernel_main(uint32_t magic, void* mbi) {
         serial64_puts("NOVARIS64: tables  = ");
         serial64_putdec(paging64_tables_allocated());
         serial64_puts(" allocated\n");
+    }
+
+    /* --- layer 6b: the direct map (Milestone 66) --------------------- */
+    serial64_puts("NOVARIS64: -- direct map --\n");
+    {
+        const uint64_t BOOT_WINDOW = 0x40000000ULL;   /* what boot64.s maps */
+        const uint64_t MAGIC = 0x00D15EA5EB0A7ULL;
+        uint64_t mapped = paging64_physmap_bytes();
+        uint64_t high, got;
+
+        check("the direct map covers memory", mapped > 0);
+        check("it covers all the RAM that was found",
+              mapped >= pmm64_highest_addr());
+
+        /* The kernel image is at a known physical address and its first
+         * bytes are the multiboot header, so the direct map can be checked
+         * against something whose value is not of this test's choosing. */
+        {
+            uint64_t kphys = (uint64_t)_kernel_physical_start;
+            const uint32_t* via_boot =
+                (const uint32_t*)(0xFFFFFFFF80000000ULL + kphys);
+            const uint32_t* via_map = (const uint32_t*)phys64_to_virt(kphys);
+            check("the direct map and the boot window agree on the kernel",
+                  *via_map == *via_boot);
+        }
+
+        check("a 2MB page translates through the direct map",
+              paging64_translate(PHYSMAP64_BASE + 0x100000ULL, &got)
+              == PAGING64_OK && got == 0x100000ULL);
+
+        /* The ceiling itself. A frame above the boot window is unreachable
+         * through KERNEL_VMA by construction - before this milestone the
+         * kernel could not have written this line. */
+        high = pmm64_alloc_above(BOOT_WINDOW);
+        if (!high) {
+            /* Under 1GB of RAM: the wall cannot be demonstrated, and
+             * saying so beats a test that passes by not running. */
+            serial64_puts("NOVARIS64: SKIP  no RAM above 1GB to test with\n");
+        } else {
+            volatile uint64_t* p = (volatile uint64_t*)phys64_to_virt(high);
+
+            check("a frame above the old 1GB ceiling was allocated",
+                  high >= BOOT_WINDOW);
+            *p = MAGIC;
+            check("the kernel can write to it through the direct map",
+                  *p == MAGIC);
+
+            /* And that it is genuinely that frame, not an aliased one:
+             * mapped a second time at a scratch address, the same bytes
+             * must appear. */
+            {
+                const uint64_t SCRATCH = 0xFFFFC00000400000ULL;
+                check("it maps at a second address",
+                      paging64_map(SCRATCH, high,
+                                   PAGE64_PRESENT | PAGE64_WRITE)
+                      == PAGING64_OK);
+                check("and the same bytes are there",
+                      *(volatile uint64_t*)SCRATCH == MAGIC);
+                *(volatile uint64_t*)SCRATCH = ~MAGIC;
+                check("a write through one address is seen at the other",
+                      *p == ~MAGIC);
+                paging64_unmap(SCRATCH);
+            }
+
+            pmm64_free_frame(high);
+        }
+
+        serial64_puts("NOVARIS64: physmap = ");
+        serial64_putdec(mapped / (1024 * 1024));
+        serial64_puts(" MB at ");
+        serial64_puthex(PHYSMAP64_BASE);
+        serial64_putc('\n');
+    }
+
+    /* --- layer 6c: the framebuffer (Milestone 67) -------------------- */
+    serial64_puts("NOVARIS64: -- framebuffer --\n");
+    {
+        const multiboot_info_t* m = (const multiboot_info_t*)mbi;
+        int rc = fb64_init(m);
+
+        if (rc != FB64_OK) {
+            /* A headless boot is a legitimate configuration, so it is
+             * reported rather than failed - but it is reported loudly,
+             * because a display test that silently tests nothing is how
+             * a driver rots. */
+            serial64_puts("NOVARIS64: SKIP  no usable framebuffer, rc = ");
+            serial64_putdec((uint64_t)(-rc));
+            serial64_putc('\n');
+        } else {
+            const uint32_t RED   = 0xFF0000, GREEN = 0x00FF00;
+            const uint32_t BLUE  = 0x0000FF, WHITE = 0xFFFFFF;
+            const uint32_t BG    = 0x102030;
+
+            check("the framebuffer came up", fb64_ready());
+            check("its geometry is the one the bootloader granted",
+                  fb64_width()  == m->framebuffer_width &&
+                  fb64_height() == m->framebuffer_height &&
+                  fb64_bpp()    == m->framebuffer_bpp);
+            check("it is at the physical address the bootloader named",
+                  fb64_phys() == m->framebuffer_addr);
+            /* A pitch shorter than a row of pixels would mean every
+             * scanline after the first is drawn in the wrong place. */
+            check("a scanline is at least as wide as the picture",
+                  fb64_pitch() >= fb64_width() * (fb64_bpp() / 8));
+
+            /* The round trip that proves the mapping. This reads back
+             * through an uncacheable mapping of a device that is not
+             * RAM, so a value that survives it really did reach VRAM -
+             * a stray mapping over ordinary memory would pass every
+             * assertion above and fail this one only by accident, which
+             * is why the colours are distinct rather than 0 and 1. */
+            fb64_put_pixel(0, 0, RED);
+            fb64_put_pixel(1, 0, GREEN);
+            fb64_put_pixel(0, 1, BLUE);
+            check("a pixel written to VRAM reads back",
+                  fb64_get_pixel(0, 0) == RED);
+            check("and its neighbour is not the same pixel",
+                  fb64_get_pixel(1, 0) == GREEN);
+            check("nor is the one on the next scanline",
+                  fb64_get_pixel(0, 1) == BLUE);
+
+            /* Reading outside the screen. This says only that
+             * fb64_get_pixel clamps, which is worth one line and is not
+             * a test of anything that writes. */
+            check("reading outside the screen answers 0, not memory",
+                  fb64_get_pixel(fb64_width(), 0) == 0);
+
+            /* Writing outside it, which is the one that matters - and
+             * which needs an observable consequence rather than a
+             * clamped read.
+             *
+             * The first version of this asked get_pixel about the
+             * out-of-bounds coordinate and asserted 0. That passes with
+             * the bounds check deleted, because get_pixel clamps too:
+             * the assertion was reading a different function's clip.
+             * Deleting the check and watching the test still pass is
+             * how it was found.
+             *
+             * With a scanline exactly one row of pixels wide, an
+             * unclipped store at (width, 0) computes the address of
+             * (0, 1) - so a known value there turns "wrote out of
+             * bounds" into something visible. Guarded on that equality
+             * rather than assumed, since a padded pitch would put the
+             * stray write in the padding where nothing can see it. */
+            if (fb64_pitch() == fb64_width() * (fb64_bpp() / 8)) {
+                fb64_put_pixel(0, 1, BLUE);
+                fb64_put_pixel(fb64_width(), 0, WHITE);
+                check("a write past the right edge does not land on the "
+                      "next row",
+                      fb64_get_pixel(0, 1) == BLUE);
+
+                /* The same question for a rectangle: 64 wide starting 4
+                 * from the edge, so 60 of it is off-screen and would
+                 * wrap onto row 5 if the clip trimmed nothing. */
+                fb64_fill_rect(fb64_width() - 4, 4, 64, 1, WHITE);
+                check("a rectangle running off the right edge is trimmed, "
+                      "not wrapped",
+                      fb64_get_pixel(0, 5) != WHITE);
+                check("and the part of it that is on screen was drawn",
+                      fb64_get_pixel(fb64_width() - 1, 4) == WHITE);
+            }
+
+            /* Past the bottom edge. Nothing can observe where an
+             * unclipped store would land - it is beyond the last
+             * scanline, inside the 2MB-rounded mapping - so this asserts
+             * only that the machine is still running afterwards, which
+             * every check below it does implicitly. */
+            fb64_put_pixel(0, fb64_height(), WHITE);
+
+            {
+                /* One blit, from a surface in RAM to a device above RAM
+                 * - which is the whole shape of what a compositor does,
+                 * and needs the direct map and the MMIO map to be two
+                 * different things that both work. */
+                static uint32_t tile[4 * 4];
+                int i;
+                for (i = 0; i < 16; i++) tile[i] = (i & 1) ? WHITE : RED;
+                fb64_blit(100, 100, 4, 4, tile, 4);
+                check("a blit from RAM landed in VRAM",
+                      fb64_get_pixel(100, 100) == RED &&
+                      fb64_get_pixel(101, 100) == WHITE);
+            }
+
+            /* The picture the host checks with a screenshot. Drawn last
+             * so nothing above overwrites it, and in flat colours at
+             * known coordinates so that verifying it is a pixel compare
+             * rather than a judgement.
+             *
+             * The coordinates are fixed, so they are guarded rather than
+             * assumed: everything above this point works at any
+             * geometry the bootloader hands over, and only the pattern
+             * needs a screen at least as big as the one boot64.s asks
+             * for. A smaller mode says so instead of failing. */
+            if (fb64_width() >= 1024 && fb64_height() >= 768) {
+                fb64_clear(BG);
+                fb64_fill_rect(100, 100, 200, 200, RED);
+                fb64_fill_rect(400, 100, 200, 200, GREEN);
+                fb64_fill_rect(100, 400, 200, 200, BLUE);
+                fb64_fill_rect(400, 400, 200, 200, WHITE);
+
+                check("the test pattern is on the screen",
+                      fb64_get_pixel(200, 200) == RED   &&
+                      fb64_get_pixel(500, 200) == GREEN &&
+                      fb64_get_pixel(200, 500) == BLUE  &&
+                      fb64_get_pixel(500, 500) == WHITE &&
+                      fb64_get_pixel(800, 700) == BG);
+            } else {
+                serial64_puts("NOVARIS64: SKIP  screen too small for the "
+                              "test pattern\n");
+            }
+
+            serial64_puts("NOVARIS64: screen  = ");
+            serial64_putdec(fb64_width());
+            serial64_putc('x');
+            serial64_putdec(fb64_height());
+            serial64_putc('x');
+            serial64_putdec(fb64_bpp());
+            serial64_puts(" at ");
+            serial64_puthex(fb64_phys());
+            serial64_puts(", pitch ");
+            serial64_putdec(fb64_pitch());
+            serial64_puts("\nNOVARIS64: drawn   = ");
+            serial64_putdec(fb64_pixels_written());
+            serial64_puts(" pixels\n");
+        }
     }
 
     /* --- layer 7: the kernel heap ----------------------------------- */
@@ -939,6 +1231,24 @@ void kernel_main(uint32_t magic, void* mbi) {
         check("it has an entry point", entry != 0);
         check("and something was mapped for it", elf64_pages_mapped() >= 1);
 
+        /* Milestone 66, asked of the ordinary path rather than of a
+         * test written to reach high memory: this program's own text was
+         * loaded into a frame the kernel could not have touched before
+         * the direct map existed. On a machine with under 1GB there is
+         * no such frame and the question does not arise. */
+        if (pmm64_highest_addr() > 0x40000000ULL) {
+            uint64_t code_phys = 0;
+            vmspace64_switch(&space);
+            rc = paging64_translate(entry, &code_phys);
+            vmspace64_switch(&kspace);
+            check("the program's code is mapped", rc == PAGING64_OK);
+            check("and it lives above the old 1GB ceiling",
+                  code_phys >= 0x40000000ULL);
+            serial64_puts("NOVARIS64: code at = ");
+            serial64_puthex(code_phys);
+            serial64_putc('\n');
+        }
+
         stack_frame = pmm64_alloc_frame();
         check("a stack for it", stack_frame != 0);
         check("its stack mapped",
@@ -993,6 +1303,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         uint64_t written_before = syscall64_bytes_written();
         uint64_t enosys_before  = syscall64_unimplemented_count();
         int rc, stack_ok = 1;
+        static const char* const glibc_argv[] = { "/hello_glibc64", 0 };
 
         vmspace64_kernel_space(&kspace);
         check("a space for glibc", vmspace64_create(&space) != 0);
@@ -1015,7 +1326,7 @@ void kernel_main(uint32_t magic, void* mbi) {
 
         uspace64_reset(&space, info.brk_start);
         rsp = uspace64_build_stack(&space, STACK_TOP, STACK_PAGES,
-                                   "/hello_glibc64", &info);
+                                   glibc_argv, &info, 0, 0);
         check("argc/argv/envp/auxv built on it", rsp != 0);
         check("and the stack pointer is 16-byte aligned", (rsp % 16) == 0);
 
@@ -1358,8 +1669,10 @@ void kernel_main(uint32_t magic, void* mbi) {
         idt64_irq_set_mask(0, 1);
         serial64_puts("NOVARIS64: --- end of its output ---\n");
 
-        check("clone created a second thread",
-              sched64_current() >= 0 && sched64_switches() > 0);
+        /* Only the switch count: since Milestone 64 the last process to
+         * exit clears the current task, so asserting on that would be
+         * testing teardown rather than clone. */
+        check("clone created a second thread", sched64_switches() > 0);
         check("both threads ran, sharing one address space",
               syscall64_bytes_written() > written_before);
         /* 23 is the parent's own status. 81 or 82 would mean mmap or
@@ -1378,6 +1691,787 @@ void kernel_main(uint32_t magic, void* mbi) {
         serial64_puts(", exit ");
         serial64_putdec(syscall64_exit_code());
         serial64_putc('\n');
+    }
+
+    /* --- layer 20: a futex ------------------------------------------ */
+    /* thread64.s spun. This one sleeps, which is the difference that
+     * matters: a kernel implementing FUTEX_WAIT as "return 0" would
+     * still pass that test - the parent would loop again - and cannot
+     * pass this one, because there is no loop to fall back into. */
+    serial64_puts("NOVARIS64: -- futex --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 16;
+        vmspace64_t kspace, space;
+        elf64_info_t info;
+        uint64_t i;
+        uint64_t written_before = syscall64_bytes_written();
+        uint64_t waits_before   = syscall64_futex_waits();
+        uint64_t wakes_before   = syscall64_futex_wakes();
+        int rc, stack_ok = 1, main_tid;
+        registers64_t placeholder;
+
+        vmspace64_kernel_space(&kspace);
+        check("a space for it", vmspace64_create(&space) != 0);
+
+        rc = elf64_load(futex64_elf, futex64_elf_len, &space, &info);
+        check("the futex program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&space, info.brk_start);
+
+        sched64_init();
+        for (i = 0; i < sizeof(placeholder) / 8; i++)
+            ((uint64_t*)&placeholder)[i] = 0;
+        main_tid = sched64_add_frame(&placeholder, &space, 0);
+        sched64_set_current(main_tid);
+
+        register_interrupt_handler64(32, sched_timer_handler);
+        idt64_irq_set_mask(0, 0);
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        vmspace64_switch(&space);
+        enter_user_mode64(info.entry, STACK_TOP, 0);
+        vmspace64_switch(&kspace);
+        pf_diagnose = 0;
+        idt64_irq_set_mask(0, 1);
+        sched64_init();
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("the handoff happened",
+              syscall64_bytes_written() > written_before);
+        check("and the program exited with its own status, 31",
+              syscall64_exit_code() == 31);
+        /* Without these two the run proves nothing: a parent that never
+         * contended would take the fast path, never sleep, and pass
+         * every assertion above. */
+        check("a thread really blocked in futex(2)",
+              syscall64_futex_waits() > waits_before);
+        check("and a wakeup really woke one",
+              syscall64_futex_wakes() > wakes_before);
+
+        serial64_puts("NOVARIS64: waits   = ");
+        serial64_putdec(syscall64_futex_waits() - waits_before);
+        serial64_puts(", wakes ");
+        serial64_putdec(syscall64_futex_wakes() - wakes_before);
+        serial64_puts(", exit ");
+        serial64_putdec(syscall64_exit_code());
+        serial64_putc('\n');
+    }
+
+    /* --- layer 21: a signal handler that resumes elsewhere ---------- */
+    /* Wine's exception dispatch in miniature: take SIGSEGV, read the
+     * saved registers out of the ucontext, write RIP back, carry on.
+     * Every layer before this treated a ring-3 fault as the end of the
+     * program. */
+    serial64_puts("NOVARIS64: -- signals --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 16;
+        vmspace64_t kspace, space;
+        elf64_info_t info;
+        uint64_t i;
+        uint64_t written_before = syscall64_bytes_written();
+        int rc, stack_ok = 1;
+
+        vmspace64_kernel_space(&kspace);
+        signal64_reset();
+        check("a space for it", vmspace64_create(&space) != 0);
+
+        rc = elf64_load(signal64_elf, signal64_elf_len, &space, &info);
+        check("the signal program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&space, info.brk_start);
+
+        /* pf_diagnose stays OFF: this program is *supposed* to fault,
+         * and the diagnostic path halts the machine. */
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        vmspace64_switch(&space);
+        enter_user_mode64(info.entry, STACK_TOP, 0);
+        vmspace64_switch(&kspace);
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("the fault reached a ring-3 handler",
+              signal64_delivered() == 1);
+        check("and the handler returned through rt_sigreturn",
+              signal64_returns() == 1);
+        check("the program resumed and printed",
+              syscall64_bytes_written() > written_before);
+        /* 41 is only reachable through the resume path: the faulting
+         * instruction is followed by nothing else that leads there. */
+        check("it exited with the status that means it recovered",
+              syscall64_exit_code() == 41);
+
+        serial64_puts("NOVARIS64: signals = ");
+        serial64_putdec(signal64_delivered());
+        serial64_puts(" delivered, ");
+        serial64_putdec(signal64_returns());
+        serial64_puts(" returned, exit ");
+        serial64_putdec(syscall64_exit_code());
+        serial64_putc('\n');
+    }
+
+    /* --- layer 22: a writable filesystem ---------------------------- */
+    /* Milestone 54's initrd could be read. This one can be written to,
+     * which is the difference that matters: a Wine prefix is thousands
+     * of files Wine *creates*. */
+    serial64_puts("NOVARIS64: -- a writable filesystem --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 16;
+        vmspace64_t kspace, space;
+        elf64_info_t info;
+        uint64_t i;
+        uint64_t written_before = syscall64_bytes_written();
+        int rc, stack_ok = 1;
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        syscall64_reset_files();
+
+        check("the filesystem came up with /tmp", ramfs64_lookup("/tmp") >= 0);
+        /* Whatever the initrd held is still readable, so this milestone
+         * adds writing rather than replacing reading. */
+        check("and the initrd's contents were carried into it",
+              ramfs64_lookup("/dlllib64.dll") >= 0);
+
+        vmspace64_kernel_space(&kspace);
+        check("a space for it", vmspace64_create(&space) != 0);
+
+        rc = elf64_load(fs64_elf, fs64_elf_len, &space, &info);
+        check("the filesystem program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&space, info.brk_start);
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        vmspace64_switch(&space);
+        enter_user_mode64(info.entry, STACK_TOP, 0);
+        vmspace64_switch(&kspace);
+        pf_diagnose = 0;
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("the program said so too",
+              syscall64_bytes_written() > written_before);
+        /* Each failure path in the program has its own status - 71 is a
+         * failed open, 75 a mismatched read-back, 77 a file that
+         * survived being unlinked - so a break says which step broke. */
+        check("open, write, seek, read-back, unlink all worked",
+              syscall64_exit_code() == 53);
+        check("and the file it removed is gone",
+              ramfs64_lookup("/tmp/novaris-fs-test") < 0);
+
+        serial64_puts("NOVARIS64: fs      = ");
+        serial64_putdec(ramfs64_count());
+        serial64_puts(" nodes, exit ");
+        serial64_putdec(syscall64_exit_code());
+        serial64_putc('\n');
+    }
+
+    /* --- layer 23: a file, mapped ----------------------------------- */
+    /* How a loader loads. ld.so maps an ELF's segments and Wine maps a
+     * PE's; every image this kernel has run so far was copied in by the
+     * kernel rather than mapped by the program. */
+    serial64_puts("NOVARIS64: -- file-backed mmap --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 16;
+        vmspace64_t kspace, space;
+        elf64_info_t info;
+        uint64_t i;
+        uint64_t written_before = syscall64_bytes_written();
+        uint64_t maps_before    = syscall64_file_maps();
+        int rc, stack_ok = 1;
+
+        syscall64_reset_files();
+        vmspace64_kernel_space(&kspace);
+        check("a space for it", vmspace64_create(&space) != 0);
+
+        rc = elf64_load(mmapfile64_elf, mmapfile64_elf_len, &space, &info);
+        check("the mmap program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&space, info.brk_start);
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        vmspace64_switch(&space);
+        enter_user_mode64(info.entry, STACK_TOP, 0);
+        vmspace64_switch(&kspace);
+        pf_diagnose = 0;
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("the program reported success",
+              syscall64_bytes_written() > written_before);
+        /* 94 would mean the mapping held the wrong bytes, 96 that a
+         * MAP_PRIVATE write reached the file. 61 is both correct. */
+        check("the mapping held the file's bytes, and stayed private",
+              syscall64_exit_code() == 61);
+        /* Without this the run proves nothing about files: the
+         * anonymous path returns a perfectly good pointer. */
+        check("and it really was a file-backed mapping",
+              syscall64_file_maps() == maps_before + 1);
+
+        serial64_puts("NOVARIS64: maps    = ");
+        serial64_putdec(syscall64_file_maps() - maps_before);
+        serial64_puts(" file-backed, exit ");
+        serial64_putdec(syscall64_exit_code());
+        serial64_putc('\n');
+    }
+
+    /* --- layer 24: the dynamic loader ------------------------------- */
+    /* Wine's loader is a dynamically linked PIE needing
+     * /lib64/ld-linux-x86-64.so.2 and libc.so.6, so nothing about Wine
+     * can be attempted until ld.so itself runs. This is that experiment
+     * at its smallest: load a dynamic program, hand control to its
+     * interpreter, and see how far it gets. Tracing is ON - what this
+     * layer is for is finding out what ld.so asks for. */
+    serial64_puts("NOVARIS64: -- the dynamic loader --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        /* 512KB. ld.so uses far more stack than a hand-written program:
+         * it relocates, resolves symbols, and runs initialisers, all
+         * recursively. The kernel does not grow a stack on fault the way
+         * Linux does, so what it gets at the start is all it gets. */
+        const uint64_t STACK_PAGES = 128;
+        const uint64_t EXE_BIAS    = 0x0000555555554000ULL;
+        const uint64_t INTERP_BASE = 0x00007FFFF7000000ULL;
+        vmspace64_t kspace, space;
+        elf64_info_t exe, interp;
+        const void* image;
+        uint64_t len, rsp, i;
+        uint64_t written_before = syscall64_bytes_written();
+        char interp_path[128];
+        int rc, stack_ok = 1, have_interp;
+        static const char* const dyn_argv[] = { "/dynhello64", 0 };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        syscall64_reset_files();
+        /* Layer 21 installed a SIGSEGV handler and the table outlives
+         * its program, so without this a fault here is delivered to a
+         * handler belonging to a binary that is no longer loaded - and
+         * the frame is written onto this program's stack. Process
+         * teardown does this in a real kernel. */
+        signal64_reset();
+        vmspace64_kernel_space(&kspace);
+        check("a space for it", vmspace64_create(&space) != 0);
+
+        check("the dynamic program is in the filesystem",
+              initrd64_open("dynhello64", &image, &len) == INITRD64_OK);
+
+        have_interp = elf64_interp(image, len, interp_path,
+                                   sizeof(interp_path));
+        check("it names a dynamic loader", have_interp == 1);
+        serial64_puts("NOVARIS64: interp  = ");
+        serial64_puts(have_interp ? interp_path : "(none)");
+        serial64_putc('\n');
+
+        /* An ET_DYN executable asks to be placed at 0; the loader
+         * chooses. The two biases here are the addresses Linux itself
+         * tends to use, which keeps the layout familiar when comparing
+         * a trace against a host one. */
+        rc = elf64_load_at(image, len, &space, EXE_BIAS, &exe);
+        check("the program loaded", rc == ELF64_OK);
+        check("and it is position independent", exe.is_dyn == 1);
+
+        {
+            const void* ld_image;
+            uint64_t ld_len;
+            /* The path in PT_INTERP is absolute and the filesystem is
+             * flat, so the loader is looked up by its base name. */
+            int found = initrd64_open("lib64/ld-linux-x86-64.so.2",
+                                      &ld_image, &ld_len) == INITRD64_OK;
+            check("the dynamic loader is in the filesystem", found);
+            if (found) {
+                rc = elf64_load_at(ld_image, ld_len, &space, INTERP_BASE,
+                                   &interp);
+                check("the dynamic loader loaded", rc == ELF64_OK);
+            }
+        }
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&space, exe.brk_start);
+
+        /* AT_BASE tells ld.so where it was mapped - it has to relocate
+         * its own image before it can relocate anything else - and
+         * AT_ENTRY where the program it is loading starts. */
+        rsp = uspace64_build_stack(&space, STACK_TOP, STACK_PAGES,
+                                   dyn_argv, &exe, INTERP_BASE, 0);
+        check("a stack with AT_BASE on it", rsp != 0);
+
+        {
+            int libc_node = ramfs64_lookup("/lib/x86_64-linux-gnu/libc.so.6");
+            serial64_puts("NOVARIS64: libc    = node ");
+            serial64_putdec((uint64_t)(libc_node < 0 ? 0 : libc_node));
+            serial64_puts(", ");
+            serial64_putdec(ramfs64_size(libc_node));
+            serial64_puts(" bytes\n");
+        }
+
+        serial64_puts("NOVARIS64: exe     = ");
+        serial64_puthex(exe.entry);
+        serial64_puts(", ld.so entry ");
+        serial64_puthex(interp.entry);
+        serial64_puts("\nNOVARIS64: --- what it asks for ---\n");
+
+        /* Control goes to the INTERPRETER, not the program: ld.so runs
+         * first and calls the program's entry when it is ready. */
+        /* Tracing is off now that this works. It is how the milestone
+         * was found - syscall64_set_trace(1) prints every call and its
+         * result - and leaving it on would bury the program's own
+         * output in the transcript the differential compares. */
+        pf_diagnose = 1;
+        vmspace64_switch(&space);
+        enter_user_mode64(interp.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+        pf_diagnose = 0;
+
+        serial64_puts("NOVARIS64: --- end ---\n");
+        serial64_puts("NOVARIS64: exit    = ");
+        serial64_putdec(syscall64_exit_code());
+        serial64_puts(", enosys seen ");
+        serial64_putdec(syscall64_unimplemented_count());
+        serial64_putc('\n');
+
+        /* 67 is what dynhello64.c's main returns, and it is only
+         * reachable through the whole chain: ld.so relocated itself,
+         * found libc, mapped it, relocated it, resolved
+         * __libc_start_main, and called main. */
+        check("ld.so loaded libc and reached main",
+              syscall64_exit_code() == 67);
+        check("the program printed through the libc it linked against",
+              syscall64_bytes_written() > written_before);
+    }
+
+    /* --- layer 25: Wine's own loader -------------------------------- */
+    /* The point of the whole 64-bit port, pointed at the kernel to see
+     * what it says. Wine's loader is a dynamically linked PIE, which
+     * Milestone 62 made runnable; whether it gets anywhere is a
+     * different question, and this layer exists to read the answer
+     * rather than to assert one. Tracing is ON. */
+    serial64_puts("NOVARIS64: -- Wine's loader --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 128;
+        const uint64_t EXE_BIAS    = 0x0000555555554000ULL;
+        const uint64_t INTERP_BASE = 0x00007FFFF7000000ULL;
+        vmspace64_t kspace, space;
+        elf64_info_t exe, interp;
+        const void* image;
+        const void* ld_image;
+        uint64_t len, ld_len, rsp, i;
+        uint64_t enosys_before = syscall64_unimplemented_count();
+        int rc, stack_ok = 1, have_wine;
+
+        /* Wine derives its prefix from HOME, and glibc derives HOME from
+         * the passwd database when the variable is absent - which is a
+         * long way to travel for a value that can simply be handed
+         * over. WINEDLLPATH is where it looks for the rest of its
+         * libraries once ntdll is up. */
+        /* Ask it for its version. With no arguments it prints usage,
+         * which proves it started; --version makes it go further and
+         * answer from ntdll. */
+        static const char* const wine_argv[] = { "/wine", "--version", 0 };
+
+        static const char* const wine_env[] = {
+            "HOME=/root",
+            "USER=root",
+            "WINEPREFIX=/root/.wine",
+            "WINEDLLPATH=/",
+            "WINEDEBUG=+loaddll",
+            0
+        };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        syscall64_reset_files();
+        signal64_reset();
+        sched64_init();
+        vmspace64_kernel_space(&kspace);
+
+        have_wine = initrd64_open("wine", &image, &len) == INITRD64_OK;
+        if (!have_wine) {
+            /* Not a failure: the build does not require anyone to have
+             * spent an hour compiling Wine first. */
+            serial64_puts("NOVARIS64: no Wine loader in the initrd - "
+                          "build one with configure --enable-archs=x86_64\n");
+        } else if (vmspace64_create(&space) &&
+                   initrd64_open("lib64/ld-linux-x86-64.so.2",
+                                 &ld_image, &ld_len) == INITRD64_OK) {
+
+            serial64_puts("NOVARIS64: wine    = ");
+            serial64_putdec(len);
+            serial64_puts(" bytes\n");
+
+            /* Wine reads /proc/self/exe to work out where it is
+             * installed, and derives the path to ntdll.so from it. */
+            syscall64_set_exe_path("/wine");
+
+            rc = elf64_load_at(image, len, &space, EXE_BIAS, &exe);
+            if (rc == ELF64_OK)
+                rc = elf64_load_at(ld_image, ld_len, &space, INTERP_BASE,
+                                   &interp);
+
+            for (i = 0; i < STACK_PAGES; i++) {
+                uint64_t f = pmm64_alloc_frame();
+                if (!f || vmspace64_map(&space,
+                                        STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                        PAGE64_PRESENT | PAGE64_WRITE |
+                                        PAGE64_USER) != PAGING64_OK)
+                    stack_ok = 0;
+            }
+            uspace64_reset(&space, exe.brk_start);
+            rsp = uspace64_build_stack(&space, STACK_TOP, STACK_PAGES,
+                                       wine_argv, &exe, INTERP_BASE,
+                                       wine_env);
+
+            if (rc == ELF64_OK && stack_ok && rsp) {
+                serial64_puts("NOVARIS64: --- what Wine asks for ---\n");
+                pf_diagnose = 1;
+                syscall64_set_trace(1);
+                vmspace64_switch(&space);
+                enter_user_mode64(interp.entry, rsp, 0);
+                vmspace64_switch(&kspace);
+                syscall64_set_trace(0);
+                pf_diagnose = 0;
+                serial64_puts("NOVARIS64: --- end ---\n");
+            } else {
+                serial64_puts("NOVARIS64: could not lay it out\n");
+            }
+        }
+
+        serial64_puts("NOVARIS64: wine exit= ");
+        serial64_putdec(syscall64_exit_code());
+        serial64_puts(", enosys ");
+        serial64_putdec(syscall64_unimplemented_count() - enosys_before);
+        serial64_puts(", last ");
+        serial64_putdec(syscall64_unimplemented());
+        serial64_putc('\n');
+
+        /* Asserted only when a Wine was actually built to run: the
+         * repository must not require an hour of compiling Wine before
+         * `make test` passes. When it is there, `wine --version` exits
+         * 0 and nothing else in this kernel produces that. */
+        if (have_wine)
+            check("Wine's loader ran and answered --version",
+                  syscall64_exit_code() == 0);
+        else
+            check("no Wine to run, which is not a failure", 1);
+    }
+
+    /* --- layer 26: fork, execve, wait ------------------------------- */
+    /* The shape every shell has, and the one Wine's architecture is
+     * built on: a process copies itself, the copy becomes a different
+     * program, and the original waits to be told how it went. */
+    serial64_puts("NOVARIS64: -- fork and execve --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 32;
+        vmspace64_t kspace;
+        elf64_info_t info;
+        uint64_t i, rsp;
+        uint64_t written_before = syscall64_bytes_written();
+        uint64_t forks_before   = syscall64_forks();
+        uint64_t execs_before   = syscall64_execs();
+        int rc, stack_ok = 1, pid;
+        proc64_t* p;
+        static const char* const fe_argv[] = { "/forkexec64", 0 };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        signal64_reset();
+        sched64_init();
+        proc64_init();
+        vmspace64_kernel_space(&kspace);
+
+        check("the child program is in the filesystem",
+              ramfs64_lookup("/tmp/forkchild64") >= 0);
+
+        pid = proc64_create();
+        check("a process to start from", pid > 0);
+        proc64_set_current(pid);
+        p = proc64_current();
+
+        check("a space for it", vmspace64_create(&p->space) != 0);
+        rc = elf64_load(forkexec64_elf, forkexec64_elf_len, &p->space, &info);
+        check("the forking program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&p->space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&p->space, info.brk_start);
+        rsp = uspace64_build_stack(&p->space, STACK_TOP, STACK_PAGES,
+                                   fe_argv, &info, 0, 0);
+
+        /* The starting process has to be a scheduler task before it
+         * forks, so the child has somewhere to be a sibling of. */
+        {
+            registers64_t first;
+            for (i = 0; i < sizeof(first) / 8; i++)
+                ((uint64_t*)&first)[i] = 0;
+            sched64_add_frame_for(&first, &p->space, 0, pid);
+            sched64_set_current(0);
+        }
+
+        register_interrupt_handler64(32, sched_timer_handler);
+        idt64_irq_set_mask(0, 0);
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        vmspace64_switch(&p->space);
+        enter_user_mode64(info.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+        pf_diagnose = 0;
+        idt64_irq_set_mask(0, 1);
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("fork made a process", syscall64_forks() == forks_before + 1);
+        check("execve replaced one", syscall64_execs() == execs_before + 1);
+        check("both programs printed",
+              syscall64_bytes_written() > written_before);
+        /* 71 is the parent's own status, and it is only reachable if
+         * wait4 returned the child's pid AND the status carried the 24
+         * the execed program exited with. 96/97/98 would each name a
+         * different step. */
+        check("the parent waited and got the child's status back",
+              syscall64_exit_code() == 71);
+
+        serial64_puts("NOVARIS64: procs   = ");
+        serial64_putdec(proc64_count());
+        serial64_puts(" left, exit ");
+        serial64_putdec(syscall64_exit_code());
+        serial64_putc('\n');
+    }
+
+    /* --- layer 27: a real directory tree ---------------------------- */
+    /* Everything a flat path table could not do: nested mkdir where the
+     * inner needs the outer, open through "..", getdents64 over actual
+     * children, and rmdir refusing a directory that still holds
+     * something. A Wine prefix is a deep tree Wine walks, so this is
+     * the difference between a simplification and a lie. */
+    serial64_puts("NOVARIS64: -- a directory tree --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 32;
+        vmspace64_t kspace;
+        elf64_info_t info;
+        uint64_t i, rsp;
+        uint64_t written_before = syscall64_bytes_written();
+        int rc, stack_ok = 1, pid;
+        proc64_t* p;
+        static const char* const tree_argv[] = { "/tree64", 0 };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        signal64_reset();
+        sched64_init();
+        proc64_init();
+        vmspace64_kernel_space(&kspace);
+
+        /* The seed had to build directories on the way down, which the
+         * flat version never needed to. */
+        check("the initrd's nested paths became real directories",
+              ramfs64_is_dir(ramfs64_lookup("/lib")) &&
+              ramfs64_is_dir(ramfs64_lookup("/lib/x86_64-linux-gnu")));
+        check("and the file at the bottom of them is a file",
+              ramfs64_lookup("/lib/x86_64-linux-gnu/libc.so.6") >= 0);
+        check("\"..\" resolves rather than matching a string",
+              ramfs64_lookup("/lib/x86_64-linux-gnu/../../etc/passwd") ==
+              ramfs64_lookup("/etc/passwd"));
+
+        pid = proc64_create();
+        proc64_set_current(pid);
+        p = proc64_current();
+
+        check("a space for it", vmspace64_create(&p->space) != 0);
+        rc = elf64_load(tree64_elf, tree64_elf_len, &p->space, &info);
+        check("the tree program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&p->space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&p->space, info.brk_start);
+        rsp = uspace64_build_stack(&p->space, STACK_TOP, STACK_PAGES,
+                                   tree_argv, &info, 0, 0);
+
+        {
+            registers64_t first;
+            for (i = 0; i < sizeof(first) / 8; i++)
+                ((uint64_t*)&first)[i] = 0;
+            sched64_add_frame_for(&first, &p->space, 0, pid);
+            sched64_set_current(0);
+        }
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        vmspace64_switch(&p->space);
+        enter_user_mode64(info.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+        pf_diagnose = 0;
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("the program said so too",
+              syscall64_bytes_written() > written_before);
+        /* Each step has its own status: 68 would mean getdents64 did not
+         * list the subdirectory, 69 that rmdir removed a directory that
+         * still had something in it, 63 that ".." did not resolve. */
+        check("mkdir, \"..\", getdents64 and rmdir all behaved",
+              syscall64_exit_code() == 83);
+        check("and it removed everything it made",
+              ramfs64_lookup("/tmp/nvtree") < 0);
+
+        serial64_puts("NOVARIS64: nodes   = ");
+        serial64_putdec(ramfs64_count());
+        serial64_puts(", exit ");
+        serial64_putdec(syscall64_exit_code());
+        serial64_putc('\n');
+    }
+
+    /* --- layer 28: a process draws on the screen (Milestone 67) ----- */
+    /* The kernel drawing to its own framebuffer proves the driver. This
+     * proves the *interface*: an ordinary Linux fbdev client, built by
+     * the host compiler, opening /dev/fb0 and asking the two FBIOGET
+     * questions before mapping it and drawing - which is the shape of
+     * every display driver that would ever sit above this kernel,
+     * Wine's included. */
+    serial64_puts("NOVARIS64: -- a process draws --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 32;
+        vmspace64_t space, kspace;
+        elf64_info_t info;
+        uint64_t i, rsp;
+        int rc, stack_ok = 1;
+        static const char* const fb_argv[] = { "/fbdraw64", 0 };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        proc64_init();
+        proc64_set_current(proc64_create());
+        vmspace64_kernel_space(&kspace);
+
+        if (!fb64_ready()) {
+            serial64_puts("NOVARIS64: SKIP  no framebuffer to draw on\n");
+        } else if (fb64_width() < 1024 || fb64_height() < 768) {
+            /* The program refuses a screen it cannot address, and says
+             * so with a status of its own - so this is still an
+             * assertion about behaviour, not a skipped test. */
+            serial64_puts("NOVARIS64: SKIP  screen too small for fbdraw\n");
+        } else {
+            check("the framebuffer registered as /dev/fb0", fb64_register());
+            check("and /dev/fb0 is in the filesystem",
+                  ramfs64_lookup("/dev/fb0") >= 0);
+            check("it is a device, not an ordinary file",
+                  ramfs64_device(ramfs64_lookup("/dev/fb0"))
+                  == RAMFS64_DEV_FB);
+
+            check("a space for it", vmspace64_create(&space) != 0);
+            rc = elf64_load(fbdraw64_elf, fbdraw64_elf_len, &space, &info);
+            check("the drawing program loaded", rc == ELF64_OK);
+
+            for (i = 0; i < STACK_PAGES; i++) {
+                uint64_t f = pmm64_alloc_frame();
+                if (!f || vmspace64_map(&space,
+                                        STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                        PAGE64_PRESENT | PAGE64_WRITE |
+                                        PAGE64_USER) != PAGING64_OK)
+                    stack_ok = 0;
+            }
+            check("a stack for it", stack_ok);
+            uspace64_reset(&space, info.brk_start);
+            rsp = uspace64_build_stack(&space, STACK_TOP, STACK_PAGES,
+                                       fb_argv, &info, 0, 0);
+
+            /* The band is not on the screen yet, and has to not be:
+             * otherwise "the process drew it" and "something else did"
+             * are the same observation. */
+            check("the screen is untouched where the program will draw",
+                  fb64_get_pixel(500, 650) != 0x00FF00FF);
+
+            serial64_puts("NOVARIS64: --- its output follows ---\n");
+            pf_diagnose = 1;
+            vmspace64_switch(&space);
+            enter_user_mode64(info.entry, rsp, 0);
+            vmspace64_switch(&kspace);
+            pf_diagnose = 0;
+            serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+            check("the program drew and verified its own pixels",
+                  syscall64_exit_code() == 0);
+
+            /* The strong one. The kernel reads VRAM through its own
+             * mapping and finds what a ring-3 process wrote through a
+             * completely different one. A private copy - which is what
+             * every other file mapping in this kernel is - would leave
+             * this pixel unchanged and the program would still have
+             * exited 0, because from inside the process the two are
+             * indistinguishable. */
+            check("and those pixels are in the kernel's view of VRAM",
+                  fb64_get_pixel(500, 650) == 0x00FF00FF);
+            check("the band has edges where the program put them",
+                  fb64_get_pixel(500, 619) != 0x00FF00FF &&
+                  fb64_get_pixel(99,  650) != 0x00FF00FF);
+
+            serial64_puts("NOVARIS64: fbdraw  = exit ");
+            serial64_putdec(syscall64_exit_code());
+            serial64_putc('\n');
+        }
     }
 
     /* --- verdict ---------------------------------------------------- */

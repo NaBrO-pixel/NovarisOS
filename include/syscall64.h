@@ -32,6 +32,40 @@
  * something real rather than against a private convention. */
 #define SYS64_READ            0
 #define SYS64_WRITE           1
+#define SYS64_OPEN            2
+#define SYS64_CLOSE           3
+#define SYS64_LSEEK           8
+#define SYS64_MKDIR           83
+#define SYS64_RMDIR           84
+#define SYS64_GETDENTS64      217
+#define SYS64_UNLINK          87
+#define SYS64_STAT            4
+#define SYS64_PREAD64         17
+#define SYS64_PWRITE64        18
+#define SYS64_ACCESS          21
+#define SYS64_NEWFSTATAT      262
+#define SYS64_OPENAT          257
+
+/* open(2) flags, Linux's values for x86-64. */
+#define O_WRONLY   0x0001
+#define O_RDWR     0x0002
+#define O_CREAT    0x0040
+#define O_TRUNC    0x0200
+#define O_APPEND   0x0400
+
+/* mmap(2) protection and flags, Linux's values. */
+#define PROT_READ      0x1
+#define PROT_WRITE     0x2
+#define PROT_EXEC      0x4
+#define MAP_SHARED     0x01
+#define MAP_PRIVATE    0x02
+#define MAP_FIXED      0x10
+#define MAP_ANONYMOUS  0x20
+
+/* lseek(2) whence */
+#define SEEK_SET_  0
+#define SEEK_CUR_  1
+#define SEEK_END_  2
 #define SYS64_FSTAT           5
 #define SYS64_MMAP            9
 #define SYS64_MPROTECT        10
@@ -39,10 +73,16 @@
 #define SYS64_BRK             12
 #define SYS64_RT_SIGACTION    13
 #define SYS64_RT_SIGPROCMASK  14
+#define SYS64_RT_SIGRETURN    15
 #define SYS64_IOCTL           16
 #define SYS64_WRITEV          20
 #define SYS64_UNAME           63
 #define SYS64_READLINK        89
+#define SYS64_FORK            57
+#define SYS64_EXECVE          59
+#define SYS64_WAIT4           61
+#define SYS64_GETPID          39
+#define SYS64_GETPPID         110
 #define SYS64_CLONE           56
 #define SYS64_GETTID          186
 #define SYS64_ARCH_PRCTL      158
@@ -54,6 +94,14 @@
 #define SYS64_GETRANDOM       318
 #define SYS64_RSEQ            334
 #define SYS64_EXIT            60
+
+/* futex(2) operations, Linux's values. FUTEX_PRIVATE_FLAG is masked off
+ * rather than acted on: it lets Linux skip a global hash lookup, which
+ * is an optimisation rather than a semantic, and with no shared memory
+ * here private and shared behave identically. */
+#define FUTEX_WAIT          0
+#define FUTEX_WAKE          1
+#define FUTEX_PRIVATE_FLAG  128
 
 /* clone() flag bits, Linux's values. Only these are acted on. */
 #define CLONE_VM      0x00000100
@@ -124,8 +172,35 @@ uint64_t syscall64_unimplemented_count(void);
  * tests match against. */
 void syscall64_set_trace(int on);
 
+/* Closes every open descriptor. A real kernel does this as part of
+ * process teardown; here the layers share one table. */
+void syscall64_reset_files(void);
+
+/* What readlink("/proc/self/exe") answers. There is no /proc here, so
+ * the loader records it. */
+void syscall64_set_exe_path(const char* path);
+
+/* Set by the kernel when it ends a program itself, so the recorded
+ * status is the kernel's rather than a leftover. */
+void syscall64_set_exit_code(uint64_t code);
+
 /* Threads that ended through exit(2) while siblings were still running -
  * the case that does NOT end the process. */
 uint64_t syscall64_thread_exits(void);
+
+/* Threads that actually blocked in futex(2), and wakeups that actually
+ * woke one. A run where nothing ever contended would show zero here and
+ * still pass everything else. */
+uint64_t syscall64_futex_waits(void);
+uint64_t syscall64_futex_wakes(void);
+
+/* File-backed mmap(2) calls served. Zero would mean every mapping in a
+ * run took the anonymous path. */
+uint64_t syscall64_file_maps(void);
+
+/* Processes created and programs replaced. A run where a fork silently
+ * became a thread would look identical without these. */
+uint64_t syscall64_forks(void);
+uint64_t syscall64_execs(void);
 
 #endif

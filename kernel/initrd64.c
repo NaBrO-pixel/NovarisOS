@@ -4,8 +4,7 @@
 #include "kstring.h"
 #include "pmm64.h"
 
-#define KERNEL_VMA   0xFFFFFFFF80000000ULL
-#define PHYS_WINDOW  0x40000000ULL       /* what boot64.s maps at KERNEL_VMA */
+#include "paging64.h"
 
 #define INITRD_MAGIC 0x324C5453u         /* 'STL2' */
 #define FILE_MAGIC   0xBEEFCAFEu
@@ -23,13 +22,44 @@ typedef struct {
     uint32_t length;
 } __attribute__((packed)) initrd_file_t;
 
-static const uint8_t*        archive;    /* through the KERNEL_VMA window */
+static const uint8_t*        archive;    /* through the direct map */
 static const initrd_file_t*  files;
 static uint64_t              nfiles;
 static uint64_t              archive_len;
 
-int initrd64_init(const multiboot_info_t* mbi) {
+/* Where GRUB put the archive, or 0,0 if it did not load one. Reads the
+ * multiboot info through the boot identity map, which is still live this
+ * early - so this works no matter how high the module itself sits. */
+static void module_range(const multiboot_info_t* mbi,
+                         uint64_t* start, uint64_t* end) {
     const multiboot_module_t* mods;
+
+    *start = *end = 0;
+    if (!(mbi->flags & MULTIBOOT_INFO_MODS) || mbi->mods_count == 0) return;
+
+    mods = (const multiboot_module_t*)(uint64_t)mbi->mods_addr;
+    *start = mods[0].mod_start;
+    *end   = mods[0].mod_end;
+}
+
+/* Split out of initrd64_init because of an ordering problem that only
+ * appeared once the machine had more than a gigabyte of RAM (Milestone
+ * 66): the archive has to be reserved before anything allocates, but it
+ * can only be *read* through the direct map, and building the direct map
+ * allocates page tables. So: reserve here, build the map, then init.
+ *
+ * GRUB put the archive in ordinary RAM, which the frame allocator has
+ * just been told is free. Without this it gets handed out as a page like
+ * any other and the initrd is quietly overwritten by whatever allocates
+ * next - which presents as a corrupt archive much later, nowhere near
+ * the cause. */
+void initrd64_reserve(const multiboot_info_t* mbi) {
+    uint64_t start, end;
+    module_range(mbi, &start, &end);
+    if (end > start) pmm64_reserve_region(start, end);
+}
+
+int initrd64_init(const multiboot_info_t* mbi) {
     const initrd_header_t* hdr;
     uint64_t start, end;
 
@@ -38,31 +68,15 @@ int initrd64_init(const multiboot_info_t* mbi) {
     nfiles = 0;
     archive_len = 0;
 
-    if (!(mbi->flags & MULTIBOOT_INFO_MODS) || mbi->mods_count == 0)
-        return INITRD64_NO_MODULE;
-
-    /* The identity mapping is still live here, so a physical address is
-     * a usable pointer - which is the whole reason this runs early. */
-    mods = (const multiboot_module_t*)(uint64_t)mbi->mods_addr;
-    start = mods[0].mod_start;
-    end   = mods[0].mod_end;
-
+    module_range(mbi, &start, &end);
     if (end <= start) return INITRD64_NO_MODULE;
 
-    /* Everything after this point addresses the archive through the
-     * higher half, so that it stays readable once a process address
-     * space is loaded and the identity map is gone. That window covers
-     * the first gigabyte only. */
-    if (end > PHYS_WINDOW) return INITRD64_TOO_HIGH;
-
-    /* GRUB put the archive in ordinary RAM, which the frame allocator
-     * has just been told is free. Without this it gets handed out as a
-     * page like any other and the initrd is quietly overwritten by
-     * whatever allocates next - which presents as a corrupt archive
-     * much later, nowhere near the cause. */
-    pmm64_reserve_region(start, end);
-
-    archive     = (const uint8_t*)(KERNEL_VMA + start);
+    /* Through the direct map, so that the archive stays readable once a
+     * process address space is loaded and the identity map is gone - and
+     * so that where GRUB chose to put it stops mattering. With 2GB of
+     * RAM it lands above the old 1GB window, and before this milestone
+     * that was the difference between a filesystem and none. */
+    archive     = (const uint8_t*)phys64_to_virt(start);
     archive_len = end - start;
 
     if (archive_len < sizeof(initrd_header_t)) return INITRD64_BAD_MAGIC;

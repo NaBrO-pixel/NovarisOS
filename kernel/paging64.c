@@ -198,6 +198,85 @@ int paging64_translate(uint64_t virt, uint64_t* phys_out) {
     return PAGING64_OK;
 }
 
+#define HUGE_SIZE 0x200000ULL
+
+int paging64_map_huge(uint64_t virt, uint64_t phys, uint64_t flags) {
+    uint64_t* pml4 = pml4_addr();
+    uint64_t* pdpt = pdpt_addr(virt);
+    uint64_t* pd   = pd_addr(virt);
+    int rc;
+
+    virt &= ~(HUGE_SIZE - 1);
+    phys &= ~(HUGE_SIZE - 1);
+
+    rc = ensure_table(pml4, PML4_IDX(virt), pdpt, flags);
+    if (rc != PAGING64_OK) return rc;
+    if (pdpt[PDPT_IDX(virt)] & PAGE64_HUGE) return PAGING64_HUGE_IN_WAY;
+
+    rc = ensure_table(pdpt, PDPT_IDX(virt), pd, flags);
+    if (rc != PAGING64_OK) return rc;
+
+    /* PS in a PD entry means "this is 2MB of memory, not a page table".
+     * There is no level below it to build. */
+    pd[PD_IDX(virt)] = phys | flags | PAGE64_PRESENT | PAGE64_HUGE;
+    invlpg(virt);
+    return PAGING64_OK;
+}
+
+static uint64_t physmap_bytes;
+
+uint64_t paging64_physmap_bytes(void) { return physmap_bytes; }
+
+int paging64_physmap_init(uint64_t bytes) {
+    uint64_t covered;
+
+    /* Rounded up: a machine whose last megabyte is not a whole 2MB page
+     * still has that megabyte, and mapping past the end of RAM is
+     * harmless - nothing hands out those frames. */
+    bytes = (bytes + HUGE_SIZE - 1) & ~(HUGE_SIZE - 1);
+
+    for (covered = 0; covered < bytes; covered += HUGE_SIZE) {
+        if (paging64_map_huge(PHYSMAP64_BASE + covered, covered,
+                              PAGE64_PRESENT | PAGE64_WRITE)
+                != PAGING64_OK) {
+            physmap_bytes = covered;
+            return 0;
+        }
+    }
+
+    physmap_bytes = bytes;
+    return 1;
+}
+
+/* Device memory, which the direct map deliberately does not cover.
+ *
+ * paging64_physmap_init maps RAM, and a framebuffer is not RAM: on this
+ * machine it sits at 0xFD000000 while RAM stops at 0x7FFE0000. Extending
+ * the direct map to reach it would mean mapping the 1.9GB hole between
+ * them, most of which decodes to nothing.
+ *
+ * Mapped uncacheable. A write-back cached framebuffer is not a
+ * performance question, it is a correctness one: stores sit in the cache
+ * until something evicts them, so what is on screen is whatever the
+ * cache last felt like writing out. Write-combining would be the right
+ * answer and needs PAT set up, which this milestone does not do - see
+ * the note in fb64.c. */
+int paging64_map_mmio(uint64_t virt, uint64_t phys, uint64_t bytes) {
+    uint64_t end = phys + bytes;
+    uint64_t off;
+
+    /* A 2MB page cannot start midway through one. */
+    if ((virt | phys) & (HUGE_SIZE - 1)) return PAGING64_NOT_MAPPED;
+
+    for (off = 0; phys + off < end; off += HUGE_SIZE) {
+        int rc = paging64_map_huge(virt + off, phys + off,
+                                   PAGE64_PRESENT | PAGE64_WRITE
+                                   | PAGE64_PCD | PAGE64_PWT);
+        if (rc != PAGING64_OK) return rc;
+    }
+    return PAGING64_OK;
+}
+
 uint64_t* paging64_pml4(void) { return pml4_addr(); }
 
 uint64_t paging64_tables_allocated(void) { return tables_allocated; }

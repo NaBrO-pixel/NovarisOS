@@ -7,7 +7,6 @@
 #include "win32_64.h"
 
 #define KERNEL_VMA  0xFFFFFFFF80000000ULL
-#define PHYS_WINDOW 0x40000000ULL
 
 #define IMAGE_FILE_MACHINE_AMD64 0x8664
 #define PE32PLUS_MAGIC           0x20B
@@ -222,12 +221,12 @@ static int map_pages(uint64_t start, uint64_t end, uint64_t* pages) {
     for (uint64_t va = start; va < end; va += PAGE64_SIZE) {
         uint64_t frame, existing;
         if (paging64_translate(va, &existing) == PAGING64_OK) continue;
-        frame = pmm64_alloc_frame();
-        if (!frame || frame >= PHYS_WINDOW) {
+        frame = pmm64_alloc_high();
+        if (!frame) {
             if (frame) pmm64_free_frame(frame);
             return 0;
         }
-        kmemset((void*)(KERNEL_VMA + frame), 0, PAGE64_SIZE);
+        kmemset(phys64_to_virt(frame), 0, PAGE64_SIZE);
         /* Mapped writable and executable throughout. Honouring the
          * sections' own characteristics would need NX, and would break
          * the import thunks, which live in a page this loader writes and

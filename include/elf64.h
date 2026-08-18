@@ -26,12 +26,26 @@
  * walks its own program headers at startup to find PT_TLS and PT_GNU_RELRO,
  * so it has to be told where they were mapped. */
 typedef struct {
-    uint64_t entry;      /* e_entry                                  */
+    uint64_t entry;      /* e_entry, already biased                   */
     uint64_t phdr_va;    /* where the program headers landed, AT_PHDR */
     uint64_t phent;      /* AT_PHENT                                  */
     uint64_t phnum;      /* AT_PHNUM                                  */
     uint64_t brk_start;  /* first page past the last segment          */
+    uint64_t base;       /* the bias this image was loaded at         */
+    int      is_dyn;     /* ET_DYN: position independent, needs a bias */
+    int      has_interp; /* it names a dynamic loader                 */
 } elf64_info_t;
+
+/* Copies the PT_INTERP string - the path of the dynamic loader the
+ * image wants - into `buf`. Returns 0 if the image is static, which is
+ * the case for everything before Milestone 61. */
+int elf64_interp(const void* image, uint64_t size, char* buf, uint64_t n);
+
+/* Loads at `bias` past the addresses in the file. Zero reproduces
+ * elf64_load; a non-zero bias is what an ET_DYN image needs, since it
+ * asks to be placed at 0 and expects the loader to choose. */
+int elf64_load_at(const void* image, uint64_t size, vmspace64_t* space,
+                  uint64_t bias, elf64_info_t* out);
 
 /* Loads every PT_LOAD segment of `image` into `space`, allocating and
  * mapping frames as it goes.

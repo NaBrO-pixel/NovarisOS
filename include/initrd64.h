@@ -29,10 +29,20 @@
 #define INITRD64_OK        0
 #define INITRD64_NO_MODULE -1
 #define INITRD64_BAD_MAGIC -2
-#define INITRD64_TOO_HIGH  -3   /* outside the window the kernel can see */
+/* No longer returned. Kept so the number is never reused: until
+ * Milestone 66 an archive above 1GB was unreadable, and a stale caller
+ * comparing against -3 should not silently start matching something
+ * else. */
+#define INITRD64_TOO_HIGH  -3
 
-/* Must run while the boot identity mapping is still live, since the
- * Multiboot info it reads is a physical address. */
+/* Reserves the archive's frames so the allocator cannot hand them out.
+ * Must run immediately after pmm64_init, before anything allocates, and
+ * before initrd64_init - which needs the direct map, which needs the
+ * allocator. Reads the Multiboot info through the boot identity map. */
+void initrd64_reserve(const multiboot_info_t* mbi);
+
+/* Must run after paging64_physmap_init: the archive is read through the
+ * direct map, and may sit anywhere in RAM. */
 int initrd64_init(const multiboot_info_t* mbi);
 
 /* Exact path match. `data` comes back pointing into the archive itself,

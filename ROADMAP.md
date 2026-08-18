@@ -7121,6 +7121,12 @@ its own TLS in BoringSSL - and none of them are what stands in the way.
 ### Still missing, in the order Wine will hit them
 
 1. ~~**Thread exit**~~ - done in Milestone 56.
+2. ~~**futex**~~ - done in Milestone 57.
+3. **Per-task kernel stacks** - still absent, and Milestone 57 explains
+   why futex did not need them.
+4. ~~Signals~~ (fault signals, Milestone 58 - asynchronous ones are
+   not), ~~a writable filesystem~~ (59), ~~file-backed `mmap`~~ (60).
+   **All four structural prerequisites are now present.**
 2. **futex**, which is how every real thread library waits. The spin in
    this test is what a program does when it has no futex.
 3. **Per-task kernel stacks.** One syscall stack is shared by all
@@ -7172,6 +7178,832 @@ delta now. Worth noting only because it is the third time in this port
 that a test's first failure was the test being wrong rather than the
 kernel, and each time the alternative was a green run that proved
 nothing.
+
+## Milestone 57 — 64-bit: futex, and a full x86-64 Wine ✅ DONE
+
+175 assertions and a fifth differential. Two results again: threads can
+now **sleep**, and a complete 64-bit Wine exists.
+
+### Blocking without a per-task kernel stack
+
+Milestone 55 said futex would force per-task kernel stacks, because one
+shared syscall stack is safe only while no syscall blocks. It did not,
+and the reason is worth writing down.
+
+A thread that blocks in `FUTEX_WAIT` does not leave a half-finished
+kernel call behind. Its entire continuation is a `registers64_t` built
+from the syscall frame - the same construction `clone` uses - so the
+kernel call *ends*, the shared stack is free, and the scheduler enters
+another thread through `sched64_resume`. Waking the thread is setting
+`rax = 0` in that saved frame and marking it runnable; the next switch
+returns to ring 3 exactly where it left.
+
+That works because these syscalls have no kernel-side work left to do
+after they block. A syscall that must block, wake, *and then continue in
+the kernel* - a real `read` on a device, say - has nowhere to keep its
+locals, and that is the one that will finally require per-task stacks.
+
+`FUTEX_PRIVATE_FLAG` is masked off rather than acted on: it lets Linux
+skip a global hash lookup, which is an optimisation rather than a
+semantic, and with no shared memory here private and shared behave
+identically.
+
+### The test had to be made honest twice
+
+**First**, the program's output proves nothing on its own. A kernel that
+implemented `FUTEX_WAIT` as `return 0` still prints the right line - the
+parent just falls back into its recheck loop and spins. So the test
+asserts on kernel counters: a thread *really blocked*, and a wakeup
+*really woke one*. Falsified exactly that way, and the counter assertion
+is what fails while the output stays correct.
+
+**Second**, and more interesting: the first version was **flaky, about
+one run in three**. Nothing in the protocol forces the parent to reach
+`FUTEX_WAIT` before the child sets the flag - and when the child wins,
+the parent takes the fast path, never blocks, and the counters are
+legitimately zero. The kernel was fine; the assertion was asserting
+something the program did not guarantee.
+
+The fix uses the kernel as the oracle. `FUTEX_WAKE` returns how many
+threads it woke, so the child spins on it until it returns non-zero -
+which makes "the parent is asleep" an **observed fact** rather than a
+hope - and only then hands over. Five consecutive runs now report
+`waits = 1, wakes = 1`.
+
+A flaky test that passes two runs in three is worse than a failing one,
+because the third run gets blamed on the machine.
+
+### A full x86-64 Wine
+
+```
+Wine build complete.
+$ ls dlls/*/x86_64-windows/*.dll | wc -l
+602
+$ file dlls/ntdll/x86_64-windows/ntdll.dll
+PE32+ executable for WINE (DLL), x86-64, 19 sections
+```
+
+602 PE32+ x86-64 DLLs and the `wine` loader, built out-of-tree in
+`wine64-build/` so the working i386 tree is untouched. **That is the
+same format `pe64.c` already reads.**
+
+It is not running on Novaris and nothing here has tried. Wine's loader is
+an ELF binary that wants a filesystem, a prefix it can write, file-backed
+`mmap` and signal delivery - none of which exist yet. But the artifact
+Chrome ultimately needs now exists on this machine, in the right
+architecture, and the gap to it is a list rather than a question.
+
+## Milestone 58 — 64-bit: a fault becomes a signal ✅ DONE
+
+182 assertions and a sixth differential. A ring-3 fault is no longer the
+end of a program: it is delivered to a handler, which can look at the
+saved registers and decide where to resume.
+
+This is Wine's exception dispatch in miniature, and not by analogy. Wine
+installs a SIGSEGV handler; when a Windows program faults it reads the
+register set out of the `ucontext`, builds an `EXCEPTION_RECORD`, and
+very often **writes RIP back** so execution continues somewhere else. A
+handler that cannot do that is no use to it, which is why the test does
+exactly that and nothing less.
+
+```
+NOVARIS64: --- its output follows ---
+caught SIGSEGV, rewrote RIP, and carried on
+NOVARIS64: --- end of its output ---
+NOVARIS64: signals = 1 delivered, 1 returned, exit 41
+```
+
+### The layout is copied, not invented
+
+`ucontext`, `sigcontext_64` and `rt_sigframe` are Linux's exactly, field
+order included. That is what makes the sixth differential possible:
+`userland/signal64.s` reads the saved RIP at `uc + 40 + 128` because
+that is where Linux puts it, and the same binary catches its fault and
+recovers on both systems. A frame that were merely Novaris-shaped would
+be self-consistent and untestable.
+
+The offsets are `_Static_assert`ed. **Falsified by inserting one padding
+field into `ucontext`**, which does not produce a subtly wrong handler -
+it stops the build:
+
+```
+error: static assertion failed: "uc_mcontext must be at offset 40 in ucontext"
+```
+
+That is a better guarantee than a runtime check, because it cannot be
+forgotten and cannot pass by luck.
+
+### Details that are load-bearing
+
+- **The red zone.** The frame goes 128 bytes below `rsp`, because the
+  ABI lets a leaf function use that space without adjusting the stack
+  pointer. Writing the frame at `rsp` would corrupt the locals of the
+  function that faulted.
+- **`SA_RESTORER` is mandatory** on x86-64 and rejected without, the way
+  Linux does. The kernel supplies no return trampoline, so a handler
+  installed without one returns into whatever `pretcode` happened to be.
+- **`rt_sigreturn` does not return.** It rebuilds a register set from
+  the frame and resumes the thread through `sched64_resume` - the same
+  mechanism as futex and thread exit. Three different syscalls now end
+  by becoming a thread rather than by returning to one.
+- **The selectors and IF are the kernel's, not the frame's.** A process
+  that could write its own `cs` through a signal frame, or clear IF,
+  would be writing itself into ring 0. Only the flag bits a program may
+  legitimately change are taken from the saved context.
+
+### What is not here
+
+Asynchronous signals: no `kill`, no `tgkill`, no queueing, no masking
+(`rt_sigprocmask` is still accepted and ignored), no `SA_ONSTACK`. All
+of that matters for a signal *sent* to a thread; a fault is delivered to
+the thread that caused it, at the instant it causes it, and that is the
+half Wine's exception path needs.
+
+The frame is also written to the faulting thread's stack **unchecked**.
+A thread that faulted *because* its stack pointer was bad will fault
+again inside the kernel while the frame is being written. Linux handles
+that with an alternate signal stack; this does not.
+
+## Milestone 59 — 64-bit: a filesystem that can be written to ✅ DONE
+
+190 assertions and a seventh differential. Milestone 54's initrd could
+be *read*; this one can be written, which is the difference Wine needs -
+a prefix is thousands of files Wine creates.
+
+`userland/fs64.s` is ordinary POSIX: open, write, lseek, read, compare,
+close, unlink. It runs on Linux against a real filesystem and on Novaris
+against a RAM one, and both have to agree. It writes under `/tmp` and
+removes what it made, so a host run leaves nothing behind.
+
+```
+NOVARIS64: --- its output follows ---
+wrote a file, read it back, and removed it
+NOVARIS64: --- end of its output ---
+NOVARIS64: fs      = 2 nodes, exit 53
+```
+
+Syscalls: `open`, `openat`, `close`, `read`, `write`, `lseek`, `mkdir`,
+`unlink`. `write` now tells a descriptor from a console: 1 and 2 still
+go to the serial port, 3 and up go to the filesystem.
+
+### The read-back is the assertion
+
+Every other check in that program is a syscall return value, and a
+filesystem that accepted writes and stored nothing would satisfy all of
+them. The comparison is what catches it. **Falsified exactly that way** -
+`ramfs64_write` made to accept the data and drop it - and the program
+exits **75**, which is the status it reserves for a mismatched
+read-back. Each failure path has its own number, so the failure names
+the step rather than only reporting that one happened.
+
+### What it is, honestly
+
+A flat table keyed by whole path, not a directory tree. `/a/b/c` is an
+entry whose name contains slashes and a lookup is an exact string match.
+That is enough for open/read/write on known paths; it is not enough for
+`readdir`, for renaming a directory, or for `..`, and Wine will want all
+three. The 32-bit tree's `ramfs.c` is 877 lines for those reasons.
+
+Also missing, and each one is a real divergence rather than an omission:
+
+- **No reference counting.** `unlink` frees the data immediately, so a
+  program that unlinks a file it still has open - a common idiom for
+  temporary files - reads freed memory here and works on Linux.
+- **No permissions.** The mode argument to `open` is accepted and
+  ignored, and every file is readable and writable by everyone.
+- **Nothing survives a reboot**, since there is no disk driver. The
+  initrd seeds the filesystem at boot and writes go nowhere else.
+
+## Milestone 60 — 64-bit: a file, mapped ✅ DONE
+
+196 assertions and an eighth differential. This is how a loader loads:
+`ld.so` maps an ELF's segments and Wine maps a PE's. Every image this
+kernel has run so far was *copied in by the kernel* rather than mapped
+by the program.
+
+```
+NOVARIS64: --- its output follows ---
+mapped a file, read it through the mapping, kept it private
+NOVARIS64: --- end of its output ---
+NOVARIS64: maps    = 1 file-backed, exit 61
+```
+
+### MAP_PRIVATE is a copy, and that is not a shortcut
+
+The filesystem keeps a file's bytes in a heap allocation, which is not
+page aligned and cannot be handed to the MMU directly. So a file mapping
+allocates fresh frames and copies into them - which is exactly what
+`MAP_PRIVATE` means anyway: the pages are the process's own and writing
+them does not change the file.
+
+`MAP_SHARED` would have to write back, so it is permitted only where
+there is nothing to write back - a read-only mapping - and refused with
+-ENODEV otherwise, rather than silently giving a program private pages
+where it asked for shared ones.
+
+The pages arrive zeroed, so a mapping running past the end of the file
+reads as zeros there, which is what Linux does for the tail of the last
+page. Past that last page Linux raises SIGBUS; this keeps reading zeros.
+
+### The test checks the thing that is easy to fake
+
+Two assertions, and the second is the one worth having:
+
+1. **The bytes are the file's.** A kernel returning a zeroed anonymous
+   page hands back a perfectly good pointer and fails only here.
+   Falsified by skipping the copy: the program exits **94**, its status
+   for wrong contents - and the `file_maps` counter still read 1, so the
+   counter alone would not have caught it.
+2. **Private means private.** The program writes through the mapping and
+   then reads the same offset with `read(2)`; the original byte must
+   still be there. A kernel that shared the frame instead of copying
+   passes (1) and fails this with status 96.
+
+Pages are mapped writable while the kernel copies the file in, then
+narrowed if the caller asked for `PROT_READ` alone - so a read-only
+mapping really is read-only, unlike `mprotect`, which remains a no-op.
+
+## The four prerequisites are done. What that does and does not mean
+
+Milestone 55 listed what Wine needs from this kernel: threads, signals,
+a writable filesystem, file-backed `mmap`. All four now exist, and each
+is checked against Linux with the same binary.
+
+That is worth stating precisely, because it is easy to over-read. It
+means the **mechanisms** are present and behave like Linux's on the
+paths a test exercises. It does not mean Wine runs. Wine will exercise
+them far past where these tests stop:
+
+- The filesystem is a **flat path table**, and a Wine prefix is a deep
+  directory tree that Wine walks with `readdir` and `..`, neither of
+  which exist.
+- There is **no `execve`**, so nothing can start a second program; Wine
+  is a loader whose whole job is starting programs.
+- Signals are **fault-only**: no `kill`, no masking, no queueing.
+- `unlink` has **no reference counting**, and Wine uses the
+  unlink-while-open idiom.
+- `mprotect` is a **no-op**, and Wine relies on it for PE section
+  permissions.
+
+The next honest step is not another prerequisite. It is to point Wine's
+loader at this kernel and read the first thing it complains about - the
+`[enosys]` line from Milestone 51's tracer is designed for exactly that.
+Everything after that is driven by what it asks for, rather than by a
+list written in advance.
+
+## Milestone 61 — 64-bit: the dynamic loader, and what it asked for ✅ DONE
+
+206 assertions. Wine's loader is a dynamically linked PIE needing
+`/lib64/ld-linux-x86-64.so.2` and `libc.so.6`, so **nothing about Wine
+can be attempted until ld.so itself runs**. This milestone ran it and
+followed what it asked for, which is a different way of working from
+every milestone before it: the list was written by the program, not in
+advance.
+
+`PT_INTERP` support, `elf64_load_at` with a load bias so an ET_DYN image
+can be placed, `AT_BASE` on the initial stack, and the host's real
+`ld-linux-x86-64.so.2` and `libc.so.6` in the initrd at the paths ld.so
+actually searches.
+
+### What it asked for, in the order it asked
+
+Each of these was found by running it and reading the trace, then fixed,
+then run again. Five kernel defects, and only the first was a missing
+feature:
+
+1. **`access(2)`** - ld.so probes `/etc/ld.so.preload` before anything
+   else. Missing.
+2. **`newfstatat(2)`** and **`pread64(2)`** - missing. `pread64` is how
+   it reads a library's program headers without losing its place.
+3. **`fstat` lied.** Since Milestone 51 it answered "character device,
+   size 0" for *every* descriptor. Right for stdout, fatal for a
+   library: ld.so fstats what it just opened, sees something unmappable
+   with no length, and gives up.
+4. **`st_dev`/`st_ino` were always 0.** ld.so identifies an
+   already-loaded object by that pair, so every file looked like the
+   same file - it opened libc, compared it against the main executable,
+   concluded they were the same object, and closed it without mapping.
+   What that looks like from outside is `undefined symbol:
+   __libc_start_main`, a very long way from the stat that caused it.
+5. **`MAP_FIXED` was ignored, and worse, ignored twice.** A loader
+   reserves a library's whole range read-only, then maps each segment
+   into place with `MAP_FIXED`. The address was being reallocated
+   instead of honoured; and once that was fixed, the pages already
+   present from the reservation kept the reservation's *read-only*
+   flags, so libc's data segment was read-only and ld.so faulted
+   relocating its own library.
+
+The trace prints paths for path-taking calls now. Without that, a
+dynamic loader's trace is a wall of pointers and the one question worth
+asking - which file could it not find - is the one thing it does not
+answer.
+
+### Where it stops
+
+ld.so now finds libc, maps all four of its segments at the right
+addresses, applies RELRO with `mprotect`, sets up TLS, and begins
+executing **inside glibc**. It dies there, in glibc's own `atexit`
+machinery, on `mov 0x8(%rsi),%rax` with `rsi = 0x20` - a list pointer
+that should be a pointer and is not.
+
+That is not asserted as working, and there is no green check pretending
+it is. What *is* asserted is that the kernel survives it: an unhandled
+ring-3 fault now **kills the program** with status 139 (128 + SIGSEGV),
+the way a real kernel does, instead of halting the machine.
+`enter_user_mode64_abort` does that, and it is useful well beyond this
+layer - a bring-up test that asserts nothing faults wants a halt, and
+one whose purpose is finding out how far a program gets does not.
+
+Remaining `-ENOSYS` in that run: 5, all tolerated - `rseq`, `prlimit64`,
+and `readlinkat`.
+
+### The pattern worth keeping
+
+Four of the five defects were **lies rather than gaps**: a stub that
+returned a plausible answer instead of the true one. A missing syscall
+announces itself with `-ENOSYS` and gets fixed in minutes; a stub that
+answers wrongly is found three layers downstream, wearing a symptom that
+points somewhere else entirely. The `fstat` and `st_ino` bugs had both
+been sitting in the tree since Milestone 51 and passed every test up to
+this one, because nothing before ld.so ever asked them a question whose
+answer mattered.
+
+## Milestone 62 — 64-bit: a dynamically linked program runs ✅ DONE
+
+207 assertions and a ninth differential. Milestone 61 left ld.so dying
+inside glibc's `atexit` machinery. This is that bug, and it was one
+line - in a place the symptom pointed nowhere near.
+
+```
+NOVARIS64: --- its output follows ---
+a dynamically linked program reached main
+NOVARIS64: exit    = 67
+```
+
+67 is what `dynhello64.c`'s `main` returns, and it is reachable only
+through the whole chain: ld.so relocated itself, found libc, mapped it,
+relocated it, resolved `__libc_start_main`, and called `main`.
+
+### MAP_ANONYMOUS was handing back somebody else's data
+
+The fault was a read through a pointer that should have been NULL. The
+register dump - added for exactly this - showed the list *head* was a
+perfectly good address in libc's `.bss`, so relocation had worked; it
+was a `next` pointer one node in that read `0x20`.
+
+`.bss` is supposed to be zeros, and it was not. A loader maps a
+library's whole span from the file to reserve the address space, then
+maps each segment over it, and finally maps the `.bss` over the tail
+with `MAP_ANONYMOUS|MAP_FIXED`. Those pages already existed - from the
+file-backed reservation - and `map_anon` *reused* them without zeroing.
+So the `.bss` contained whatever bytes libc's file happened to have at
+that offset, and one of them was a list terminator that was not NULL.
+
+**An anonymous mapping reading as zeros is the entire content of the
+word "anonymous"**, and the one case where it is easy to get wrong is a
+page being recycled from an earlier mapping.
+
+### And the over-correction, which broke something else
+
+Zeroing every recycled page broke the *static* glibc test with
+`*** stack smashing detected ***` - from a program that never touched
+its stack. `brk` grows the heap through the same helper, starting at the
+current break, which is **not page aligned**: the page holding the break
+is full of live heap, and zeroing it destroys the allocator's own
+bookkeeping.
+
+So the zeroing is now a parameter rather than a policy: `mmap` asks for
+it, because a fresh mapping owes the caller zeros; `brk` does not,
+because it is extending a region whose existing contents are the point.
+
+Two bugs, opposite in shape - one from not zeroing what it should, one
+from zeroing what it should not - and both presented as corruption a
+long way from the mapping code.
+
+### What this unblocks
+
+Wine's loader is a dynamically linked PIE needing exactly this. Running
+it is now a question of whether the syscalls it makes are implemented,
+rather than of whether it can start at all.
+
+## Milestone 63 — Wine runs ✅ DONE
+
+```
+NOVARIS64: --- what Wine asks for ---
+...
+NOVARIS64: [call] 1(0x1, 0x55555555abd0, 0xa)wine-11.0
+NOVARIS64: [call] 231(0x0, ...) = 0x0
+```
+
+Wine's loader started, loaded `ntdll.so`, initialised, parsed its
+arguments, answered `--version` and exited 0. On a kernel written from
+nothing.
+
+208 assertions. The layer asserts this **only when a 64-bit Wine has
+been built beside the tree** - `make test` must not require an hour of
+compiling Wine first - and says so when there is none.
+
+### What it took, in the order Wine asked
+
+The whole milestone was reading a trace and answering it. Nothing here
+was predicted in advance:
+
+1. **`readlink("/proc/self/exe")`** - missing, and Wine derives the path
+   to `ntdll.so` from it. Without it Wine computed that path as `(null)`
+   and stopped. There is no `/proc` here, so the loader records the
+   answer instead.
+2. **`ntdll.so` at `/ntdll.so`** - Wine takes the directory of
+   `/proc/self/exe` and appends the library name. The loader is at
+   `/wine`, so that is where it looked.
+3. **`libgcc_s.so.1`** - `ntdll.so` needs it for its unwinder.
+4. **An environment.** Programs here had *no environment variables at
+   all*. glibc looks the user up to answer `getpwuid`, Wine asks it
+   where `HOME` is, and the absence turned into a NULL dereference deep
+   inside a library. `HOME`, `USER`, `WINEPREFIX` and `WINEDLLPATH` are
+   handed over now, and `uspace64_build_stack` lays out a real `envp`.
+5. **`/etc/passwd` and `/etc/nsswitch.conf`** - created by `ramfs64_init`,
+   because a passwd lookup that returns NULL is checked by nobody.
+6. **`argv`.** The stack builder took a single `argv0`; `wine --version`
+   needs two arguments, so it takes an array.
+
+### What this does and does not mean
+
+It means the Linux ABI this kernel implements is good enough to start
+Wine and get it through `ntdll.so`'s initialisation - the syscalls, the
+dynamic loader, the auxiliary vector, TLS, signals, the filesystem and
+`mmap` all held up under a program that was not written with them in
+mind and cannot be adjusted to suit them.
+
+It does not mean Wine can run a Windows program. `--version` is answered
+before Wine needs any of the things it is actually missing here:
+
+- **No second process.** Wine's architecture is client-server, and
+  `wineserver` is a separate process. There is no `fork` and no
+  `execve`.
+- **No prefix.** Creating one means thousands of files in a deep
+  directory tree, and this filesystem is a flat path table with no
+  `readdir` and no `..`.
+- **Only `ntdll.so` is present.** The other 601 DLLs are not in the
+  initrd, and would not fit: the initrd is RAM-backed and user pages
+  must come from the first gigabyte.
+
+Those are the next three walls, in that order, and the first is the one
+everything else waits on.
+
+## Milestone 64 — fork, execve, wait ✅ DONE
+
+217 assertions and a tenth differential. The wall everything else was
+waiting on: Wine's architecture is client-server and `wineserver` is a
+separate process, so a kernel that cannot start a second program cannot
+host a program-starting program.
+
+```
+NOVARIS64: --- its output follows ---
+  (the execed child is running)
+forked, execed a different program, and waited for it
+NOVARIS64: procs   = 1 left, exit 71
+```
+
+### First, the state had to belong to a process
+
+Open files lived in a static array in `syscall64.c`, the heap and mmap
+bookkeeping in another in `uspace64.c`, and the address space was
+whatever the kernel had last switched to. That is indistinguishable from
+correct while there is one program and wrong the moment there are two: a
+child sharing its parent's descriptor table is not a child, it is the
+same process with two register sets. `proc64.c` owns that state now and
+the scheduler switches process and thread together.
+
+**fork copies the whole address space** - every mapped page in the low
+half, into fresh frames. A real fork shares them copy-on-write and
+duplicates on the first write; this pays the entire resident size up
+front. That is the right trade while the question is whether fork works
+and the wrong one the moment anything forks in a loop.
+
+**wait4 blocks and *restarts*.** A parent that calls it before its child
+has been scheduled has to wait, and there is no way to return a value
+that was not known when it blocked - so the frame it resumes from has
+`rip` rewound by the two bytes of the `syscall` instruction and the
+number put back in `rax`. Waking re-executes the call and re-checks.
+Linux does exactly this, for exactly this reason.
+
+### Four bugs, each visible only through another one's symptom
+
+1. **`exit_group` handed the CPU to a sibling.** It must end *every*
+   thread of the process; ending only the caller left the preemption
+   test's second task running and the kernel never got control back.
+2. **`sched64_add` never set a pid**, so a timer tick set the current
+   process to one nothing owned. Three layers later a syscall
+   dereferenced a null process - in the kernel, in `uspace64_brk`,
+   nowhere near the tick that caused it.
+3. **`execve` did not update the scheduler task's address space.** The
+   task carries its own copy and the scheduler reloads it on every
+   switch, so the next tick put the *old* space back while `rip` pointed
+   into the new program. Both test binaries link at 0x400000, so that
+   landed in real code and kept running - the child appeared to re-enter
+   `_start` and fork again, four times, until the process table filled.
+   A crash would have been kinder.
+4. **`sched64_wake` forced `rax = 0`**, which is right for futex and
+   destroys a restarting syscall's number. The restarted `wait4` came
+   back as call 0 - `read`. The wake value is per-task now.
+
+### And a C lesson worth keeping
+
+The first attempt made the per-process fields reachable through macros
+named after them - `#define fds (proc64_current()->fds)`. That expands
+inside `p->fds` too, producing a syntax error in code that looks
+correct. Accessor functions, or the macro used consistently, but never a
+macro sharing a name with the field it wraps.
+
+### What is still missing
+
+`fork` has no copy-on-write, `execve` does not honour `#!` or search a
+`PATH`, `wait4` ignores its options and its rusage argument, there is no
+process group, no signal to a process, and `PROC64_MAX` is 4. Zombies
+are real: a child nobody waits for keeps its slot, which is correct
+behaviour and a leak in a kernel with four of them.
+
+## Milestone 65 — a directory tree ✅ DONE
+
+226 assertions and an eleventh differential. The filesystem was a flat
+table keyed by whole path: `/a/b/c` was an entry whose name happened to
+contain slashes, and a lookup was a string compare.
+
+That is enough to open a file you can already name, and not enough for
+anything that *explores*. `readdir` has nothing to enumerate. `..` has
+nowhere to go. Creating a file in a directory that does not exist
+succeeds. A Wine prefix is a deep tree that Wine walks, so the flat
+version stopped being a simplification and started being a lie.
+
+Each node now holds one path component and its parent; the root is node
+0; a path is resolved by walking it.
+
+### What the test does that the old one could not
+
+`userland/tree64.s` is ordinary POSIX and runs on both systems:
+
+- **nested `mkdir`**, where the inner one needs the outer to exist
+- **open through `..`** - `/tmp/nvtree/sub/../sub/leaf` has to *resolve*,
+  and a string compare cannot
+- **`getdents64`**, which needs a directory to have children, and
+  synthesises `.` and `..` the way a real filesystem does
+- **`rmdir` refusing a directory that still has something in it**,
+  because otherwise "empty" means nothing
+
+Falsified by making `..` a no-op rather than a step to the parent: the
+program exits **63**, which is the status it reserves for exactly that,
+and the kernel-side assertion catches it independently.
+
+### Two bugs in the test itself, both mine
+
+The failure labels were defined after a helper function, and NASM scopes
+a local label to the last *non-local* one - so `.fail_mkdir` silently
+became `streq.fail_mkdir` and every jump to it failed to assemble.
+
+Then `streq` used `cl`/`ch` while the caller held `d_reclen` in `rcx`.
+`ch` is the high byte of that register, so the scan stepped by a
+corrupted length and missed the entry it was looking for - which
+presents as "the directory does not contain what it contains". Both were
+caught by running it on Linux first, where the answer is known.
+
+### Still missing
+
+No working directory, so every path is absolute - there is no process
+attribute to make one relative to yet. No hard links, no symlinks, no
+permissions, no timestamps, and `unlink` still frees a file that is
+still open. `RAMFS64_MAX_NODES` is 192, which a Wine prefix would exhaust
+immediately.
+
+## Milestone 66 — the memory ceiling ✅ DONE
+
+237 assertions. Until now every page a process could own had to come from
+the first gigabyte of physical memory.
+
+Not because of a policy - because of an accident of the boot code.
+`boot64.s` maps the first 1GB of RAM twice, once identity and once at
+`KERNEL_VMA`, and that second window was the *only* way the kernel could
+reach a physical address. But the kernel has to touch every page it hands
+out: it zeroes anonymous memory, it copies program text into it, it
+copies pages on fork. So four separate files carried the same line -
+
+```c
+if (frame >= PHYS_WINDOW) { /* refuse */ }
+```
+
+- and `chrome.dll` alone is 285MB. The ceiling was not a tuning
+parameter, it was a wall.
+
+### The direct map
+
+PML4 slot 272, `0xFFFF880000000000`, every byte of physical memory mapped
+in 2MB pages. `phys64_to_virt(phys)` is now the answer to "where can I
+touch this frame", and the four refusals are gone rather than raised.
+
+2MB pages, not 4KB, and the reason is arithmetic: 8GB of RAM needs four
+page directories at 2MB granularity and two million page tables at 4KB.
+
+### One thing the direct map cannot do for itself
+
+`paging64_physmap_init` allocates the page tables it maps with, so it
+needs the frame allocator, so the allocator's bitmap still lives in the
+1GB boot window. That is the one remaining thing whose physical address
+matters, and it now says so in a comment rather than being a coincidence.
+
+The same constraint reordered boot. The initrd is read through the direct
+map, the direct map needs the allocator, and the allocator must not hand
+out the initrd's frames - which has exactly one legal order:
+
+```
+pmm64_init  →  initrd64_reserve  →  paging64_init
+            →  paging64_physmap_init  →  initrd64_init
+```
+
+`initrd64_reserve` was split out of `initrd64_init` for precisely this.
+
+### User memory now comes from the top
+
+`pmm64_alloc_high()` allocates downwards; `pmm64_alloc_frame()` still
+allocates upwards. User pages take the former, page tables and the bitmap
+the latter.
+
+This is the part worth arguing for. A single test that reaches high
+memory on purpose proves the mechanism works and nothing about whether
+anything *uses* it. Serving every user page from the top of RAM means all
+eleven differentials, the ELF loader, the PE loader, fork's page copy and
+the dynamic loader now run on memory above the old ceiling on any machine
+with more than 1GB - so the claim "where a frame lives no longer matters"
+is carried by the ordinary path instead of by one assertion.
+
+Measured: with 2GB the test program's own text loads at `0x7ffde000`;
+with 6GB, at `0x1bfffe000`, on the far side of the 4GB PCI hole.
+
+### A bug that had been passing for twenty milestones
+
+The test machine had to grow from QEMU's default 128MB to 2GB - with
+128MB there is no frame above 1GB and the milestone's whole claim is
+untestable. That immediately produced 20 failures, and the cause was not
+in any of the new code.
+
+`pmm64_init` placed the frame bitmap "immediately above the kernel
+image". GRUB loads the initrd a few pages above the kernel image. At
+128MB the bitmap is 4KB and stopped 20KB short of the module; at 2GB it
+is 64KB and lands squarely on the initrd's header.
+
+The bitmap's size scales with RAM. Its distance from the module does not.
+It presented as "no filesystem" - eight files became zero - which is
+nowhere near "the frame allocator wrote on the initrd", and it had been
+one configuration change away from happening since Milestone 35.
+
+This is the same shape as the M61 lesson: the code was not missing, it
+was *lying* - stating a placement rule that was true only for the size it
+had been tested at.
+
+### Falsified three ways
+
+- Drop `PAGE64_HUGE` from the PD entry: the kernel triple-faults, because
+  the direct map becomes 512 page-table pointers into arbitrary RAM.
+- Restore the old bitmap placement: 20 failures, the initrd unreadable.
+- Zero user pages through `KERNEL_VMA` again: the kernel dies writing to
+  an unmapped address, because user pages are now above the window.
+
+Regression-tested at 128MB (the direct-map assertions report SKIP and say
+so, rather than passing by not running) and at 6GB.
+
+### Still missing
+
+Fork still copies every page rather than sharing them copy-on-write, so
+the ceiling being gone means a fork now costs high memory instead of
+failing. Nothing unmaps the direct map's tables, which is correct - they
+are permanent - but it does mean `paging64_tables_allocated()` counts
+them. `RAMFS64_MAX_NODES` is still 192.
+
+## Milestone 67 — the display ✅ DONE
+
+260 assertions, and a test that asks QEMU what is on the screen rather
+than asking the kernel.
+
+### The framebuffer was already there
+
+`boot64.s` has had the Multiboot `VIDMODE` bit set and a 1024x768x32
+request in its header since it was written. GRUB has been granting it
+every boot since. Nothing ever read the answer, so for twenty-two
+milestones this kernel booted onto a working linear framebuffer and drew
+nothing on it.
+
+Measured before anything was built, by printing the handoff:
+
+```
+flags=0x1a6f fb=0xfd000000 w=1024 h=768 bpp=32 type=1 pitch=4096
+```
+
+### Why it could not have been done before Milestone 66
+
+VRAM is at `0xFD000000`. RAM stops at `0x7FFE0000`. The framebuffer is
+not merely above the old 1GB boot window - it is above *memory*.
+
+Until the direct map there was no mechanism in this kernel for reaching a
+physical address the boot window did not cover, so the 64-bit tree had no
+display for a reason that had nothing to do with graphics. The ceiling
+and the blank screen were the same fact.
+
+The direct map does not cover it either, and should not: mapping RAM is
+`paging64_physmap_init`'s job, and stretching it to `0xFD000000` would
+mean mapping the 1.9GB hole in between, most of which decodes to nothing.
+Device memory gets its own mapping at PML4 slot 273, in 2MB pages,
+uncacheable.
+
+### The part that matters for Wine
+
+A driver only the kernel can draw with is not a display driver. The
+milestone is really the interface:
+
+- **`/dev/fb0`**, a device node - the filesystem gained the concept, and
+  deliberately knows nothing beyond a number, exactly as Linux keeps its
+  device model out of tmpfs.
+- **`FBIOGET_VSCREENINFO` and `FBIOGET_FSCREENINFO`**, filled at Linux's
+  own structure offsets, so a program asks the driver what the screen is
+  instead of being told out of band.
+- **`mmap` that genuinely shares**. Every other file mapping in this
+  kernel is a private copy; this one hands the process the actual VRAM
+  frames, because a framebuffer nobody else can see is not a framebuffer.
+
+`userland/fbdraw64.c` is an ordinary Linux fbdev client - open, two
+ioctls, mmap, draw - built by the host compiler and running unmodified.
+It is the shape of every display driver that would sit above this kernel,
+Wine's included.
+
+### Two tests that a weaker version would have passed
+
+The kernel reading back what the kernel just wrote proves the mapping and
+nothing else: a framebuffer mapped over ordinary RAM passes every such
+assertion and shows a black screen. So:
+
+- **`tools/fbtest.py`** boots the ISO, waits for the kernel to say it has
+  finished, and takes a QEMU `screendump` - the emulated display device's
+  own surface, the far side of the driver. 16 pixels are checked,
+  including four *outside* each block, because a picture drawn at the
+  wrong offset or with the wrong stride passes an inside-only check.
+- **The kernel checks the band the ring-3 program drew.** A private copy
+  would let `fbdraw64` exit 0 - from inside the process the two are
+  indistinguishable - while the screen stayed empty. Confirmed by
+  falsification: with the device mmap replaced by an anonymous mapping,
+  the program still reports success and the kernel sees nothing.
+
+### One ordering bug, and one falsification that passed
+
+`mmap` refused every writable `MAP_SHARED` before asking what was being
+mapped, so `/dev/fb0` could be opened, described, and never mapped. The
+device case now comes first.
+
+Then the useful failure. The clipping assertion was
+
+```c
+fb64_put_pixel(fb64_width(), 0, WHITE);
+check("writing outside the screen is ignored",
+      fb64_get_pixel(fb64_width(), 0) == 0);
+```
+
+which passes with the bounds check deleted, because `fb64_get_pixel`
+clamps too - the assertion was reading a *different function's* clip.
+Deleting the check and watching the test still pass is how it was found,
+which is the same lesson as Milestone 50: a falsification that passes is
+information.
+
+It now writes a known value at `(0, 1)` and asserts an unclipped store at
+`(width, 0)` - which computes that exact address - does not destroy it.
+Both `put_pixel` and `fill_rect` clipping fail their tests when removed.
+
+### Verified
+
+260 assertions, 0 failures, 3/3 deterministic runs, 11 host/guest
+differentials, plus the screendump check. Also booted at **800x600** and
+**1280x800** (asked for 1366x768; GRUB granted 1280x800, and the kernel
+used what it was given) - the driver reads its geometry rather than
+assuming it, and the two fixed-coordinate tests report SKIP on a screen
+too small instead of failing. Booted with `-vga none`: reports
+`FB64_NO_MODE` and carries on, 0 failures.
+
+### Still missing, and two things not to claim
+
+**No input at all** - no keyboard, no mouse. The 32-bit tree has both;
+none of it was ported. A display without input is half a desktop.
+
+**The uncacheable bits are not tested.** `PAGE64_PCD | PAGE64_PWT` is
+architecturally required - a write-back mapping of VRAM leaves the screen
+showing whatever the cache last evicted - but QEMU does not emulate cache
+incoherency, so removing them passes every test including the screenshot.
+It is correct by argument, not by measurement.
+
+**A padded pitch is never exercised.** `pitch` is threaded through every
+calculation, but every mode this bootloader and device produce has
+`pitch == width * bytes-per-pixel` (4096, 3200, 5120 at the three
+resolutions tried), so the one case where stride handling matters has
+not actually occurred.
+
+Beyond that: no write-combining (which needs PAT, and is what makes
+full-frame drawing fast rather than merely correct), no double buffering,
+no damage tracking, no text console, no compositor. The 32-bit tree's
+`gfx.c`, `wm.c` and `console.c` have no counterpart here.
 
 ## Where chrome.exe actually is from here
 

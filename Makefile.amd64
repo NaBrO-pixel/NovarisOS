@@ -63,6 +63,8 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/gdt64.o \
        $(BUILD_DIR)/idt64.o \
        $(BUILD_DIR)/serial64.o \
+       $(BUILD_DIR)/fb64.o \
+       $(BUILD_DIR)/fbdraw64_blob.o \
        $(BUILD_DIR)/pmm64.o \
        $(BUILD_DIR)/paging64.o \
        $(BUILD_DIR)/vmspace64.o \
@@ -76,6 +78,15 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/dlluser64_blob.o \
        $(BUILD_DIR)/loader64_blob.o \
        $(BUILD_DIR)/thread64_blob.o \
+       $(BUILD_DIR)/futex64_blob.o \
+       $(BUILD_DIR)/signal64_blob.o \
+       $(BUILD_DIR)/signal64.o \
+       $(BUILD_DIR)/fs64_blob.o \
+       $(BUILD_DIR)/mmapfile64_blob.o \
+       $(BUILD_DIR)/ramfs64.o \
+       $(BUILD_DIR)/proc64.o \
+       $(BUILD_DIR)/forkexec64_blob.o \
+       $(BUILD_DIR)/tree64_blob.o \
        $(BUILD_DIR)/initrd64.o \
        $(BUILD_DIR)/hello64_blob.o \
        $(BUILD_DIR)/glibc64_blob.o \
@@ -122,6 +133,81 @@ $(BUILD_DIR)/thread64_blob.c: $(BUILD_DIR)/thread64.elf userland/embed64.py
 $(BUILD_DIR)/thread64_blob.o: $(BUILD_DIR)/thread64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# Maps a file and reads it through the mapping - how a loader loads.
+$(BUILD_DIR)/mmapfile64.elf: userland/mmapfile64.s | $(BUILD_DIR)
+	$(AS) -f elf64 $< -o $(BUILD_DIR)/mmapfile64.o
+	$(LD) -m elf_x86_64 -o $@ $(BUILD_DIR)/mmapfile64.o
+
+$(BUILD_DIR)/mmapfile64_blob.c: $(BUILD_DIR)/mmapfile64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ mmapfile64_elf
+
+$(BUILD_DIR)/mmapfile64_blob.o: $(BUILD_DIR)/mmapfile64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Ordinary POSIX file I/O, so it runs against a real filesystem on the
+# host and a RAM one on the guest, and both have to agree.
+$(BUILD_DIR)/fs64.elf: userland/fs64.s | $(BUILD_DIR)
+	$(AS) -f elf64 $< -o $(BUILD_DIR)/fs64.o
+	$(LD) -m elf_x86_64 -o $@ $(BUILD_DIR)/fs64.o
+
+$(BUILD_DIR)/fs64_blob.c: $(BUILD_DIR)/fs64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ fs64_elf
+
+$(BUILD_DIR)/fs64_blob.o: $(BUILD_DIR)/fs64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Catches SIGSEGV and rewrites RIP - Wine's exception dispatch in
+# miniature, and the reason the frame layout has to be Linux's exactly.
+$(BUILD_DIR)/signal64.elf: userland/signal64.s | $(BUILD_DIR)
+	$(AS) -f elf64 $< -o $(BUILD_DIR)/signal64_user.o
+	$(LD) -m elf_x86_64 -o $@ $(BUILD_DIR)/signal64_user.o
+
+$(BUILD_DIR)/signal64_blob.c: $(BUILD_DIR)/signal64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ signal64_elf
+
+$(BUILD_DIR)/signal64_blob.o: $(BUILD_DIR)/signal64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# fork + execve + wait4. Two binaries, deliberately: execve has to
+# replace the address space with something that was never part of it, so
+# a "new" program that was already mapped would prove nothing.
+$(BUILD_DIR)/forkexec64.elf: userland/forkexec64.s | $(BUILD_DIR)
+	$(AS) -f elf64 $< -o $(BUILD_DIR)/forkexec64.o
+	$(LD) -m elf_x86_64 -o $@ $(BUILD_DIR)/forkexec64.o
+
+$(BUILD_DIR)/forkchild64.elf: userland/forkchild64.s | $(BUILD_DIR)
+	$(AS) -f elf64 $< -o $(BUILD_DIR)/forkchild64.o
+	$(LD) -m elf_x86_64 -o $@ $(BUILD_DIR)/forkchild64.o
+
+$(BUILD_DIR)/forkexec64_blob.c: $(BUILD_DIR)/forkexec64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ forkexec64_elf
+
+$(BUILD_DIR)/forkexec64_blob.o: $(BUILD_DIR)/forkexec64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# A directory tree used as a tree: nested mkdir, open through "..",
+# getdents64, and rmdir refusing a directory that is not empty.
+$(BUILD_DIR)/tree64.elf: userland/tree64.s | $(BUILD_DIR)
+	$(AS) -f elf64 $< -o $(BUILD_DIR)/tree64.o
+	$(LD) -m elf_x86_64 -o $@ $(BUILD_DIR)/tree64.o
+
+$(BUILD_DIR)/tree64_blob.c: $(BUILD_DIR)/tree64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ tree64_elf
+
+$(BUILD_DIR)/tree64_blob.o: $(BUILD_DIR)/tree64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Two threads handing off through a futex, with no spin to fall back on.
+$(BUILD_DIR)/futex64.elf: userland/futex64.s | $(BUILD_DIR)
+	$(AS) -f elf64 $< -o $(BUILD_DIR)/futex64.o
+	$(LD) -m elf_x86_64 -o $@ $(BUILD_DIR)/futex64.o
+
+$(BUILD_DIR)/futex64_blob.c: $(BUILD_DIR)/futex64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ futex64_elf
+
+$(BUILD_DIR)/futex64_blob.o: $(BUILD_DIR)/futex64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/hello64_blob.c: $(BUILD_DIR)/hello64.elf userland/embed64.py
 	python3 userland/embed64.py $< $@ hello64_elf
 
@@ -144,6 +230,21 @@ $(BUILD_DIR)/glibc64_blob.c: $(BUILD_DIR)/hello_glibc64.elf userland/embed64.py
 	python3 userland/embed64.py $< $@ glibc64_elf
 
 $(BUILD_DIR)/glibc64_blob.o: $(BUILD_DIR)/glibc64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# An ordinary Linux fbdev client: open /dev/fb0, two FBIOGET ioctls,
+# mmap, draw. Static for the same reason as above, and built by the host
+# compiler against the host's headers - so the structure offsets it
+# reads are the ones Linux uses, not ones this project chose.
+$(BUILD_DIR)/fbdraw64.elf: userland/fbdraw64.c | $(BUILD_DIR)
+	gcc -static -O2 -o $@ $<
+	@file $@ | grep -q "statically linked" \
+	    || (echo "ERROR: $@ is not static"; false)
+
+$(BUILD_DIR)/fbdraw64_blob.c: $(BUILD_DIR)/fbdraw64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ fbdraw64_elf
+
+$(BUILD_DIR)/fbdraw64_blob.o: $(BUILD_DIR)/fbdraw64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # A real 64-bit Windows executable - the format chrome.exe is in. Built
@@ -225,11 +326,70 @@ $(KERNEL): $(OBJS) linker64.ld
 INITRD_STAGE = $(BUILD_DIR)/initrd64
 INITRD       = $(BUILD_DIR)/initrd64.img
 
-$(INITRD): $(BUILD_DIR)/dlllib64.dll userland/mkinitrd.py
+# The host's dynamic loader and C library, so that a dynamically linked
+# program has something to link against. Resolved rather than hardcoded:
+# ld-linux-x86-64.so.2 is a symlink and the real file moves between
+# distributions.
+LD_SO  := $(shell readlink -f /lib64/ld-linux-x86-64.so.2)
+LIBC   := $(shell readlink -f /lib/x86_64-linux-gnu/libc.so.6)
+LIBGCC := $(shell readlink -f /lib/x86_64-linux-gnu/libgcc_s.so.1 2>/dev/null)
+
+# An x86-64 Wine built out-of-tree beside the repository, if there is
+# one. Two candidates because a git worktree sits four levels below the
+# checkout it belongs to, and the build has to work from either.
+# Override with `make -f Makefile.amd64 WINE64_LOADER=/path/to/wine`.
+WINE64_LOADER ?= $(firstword $(wildcard \
+    ../wine64-build/loader/wine ../../../../wine64-build/loader/wine))
+WINE64_NTDLL  ?= $(firstword $(wildcard \
+    ../wine64-build/dlls/ntdll/ntdll.so \
+    ../../../../wine64-build/dlls/ntdll/ntdll.so))
+
+$(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
+           $(BUILD_DIR)/forkchild64.elf userland/mkinitrd.py
 	rm -rf $(INITRD_STAGE)
 	mkdir -p $(INITRD_STAGE)
 	cp $(BUILD_DIR)/dlllib64.dll $(INITRD_STAGE)/dlllib64.dll
+	cp $(BUILD_DIR)/dynhello64.elf $(INITRD_STAGE)/dynhello64
+	mkdir -p $(INITRD_STAGE)/tmp
+	cp $(BUILD_DIR)/forkchild64.elf $(INITRD_STAGE)/tmp/forkchild64
+	@# At the paths ld.so actually searches, which were read off its own
+	@# trace rather than guessed: it tries /lib/x86_64-linux-gnu first.
+	@# The filesystem matches whole paths, so a file at /libc.so.6 is
+	@# invisible to a loader looking in /lib.
+	mkdir -p $(INITRD_STAGE)/lib/x86_64-linux-gnu $(INITRD_STAGE)/lib64
+	cp $(LD_SO) $(INITRD_STAGE)/lib64/ld-linux-x86-64.so.2
+	cp $(LIBC)  $(INITRD_STAGE)/lib/x86_64-linux-gnu/libc.so.6
+	@# ntdll.so needs libgcc_s for its unwinder. Copied unconditionally
+	@# rather than only alongside Wine: it is small, and a missing
+	@# dependency is a much more confusing failure than a spare file.
+	@if [ -f "$(LIBGCC)" ]; then \
+	    cp "$(LIBGCC)" $(INITRD_STAGE)/lib/x86_64-linux-gnu/libgcc_s.so.1; \
+	 fi
+	@# Wine's own loader, if a 64-bit Wine has been built beside the
+	@# tree. Optional: the build must not depend on somebody having
+	@# spent an hour compiling Wine, so this is copied when present and
+	@# skipped when not, and the layer that runs it says which.
+	@# ntdll.so goes beside it, because that is where Wine looks: it
+	@# reads /proc/self/exe, takes the directory, and appends the
+	@# library name. With the loader at /wine that is /ntdll.so.
+	@if [ -x "$(WINE64_LOADER)" ]; then \
+	    cp "$(WINE64_LOADER)" $(INITRD_STAGE)/wine; \
+	    if [ -f "$(WINE64_NTDLL)" ]; then \
+	        cp "$(WINE64_NTDLL)" $(INITRD_STAGE)/ntdll.so; \
+	        echo "  initrd: including Wine's loader and ntdll.so"; \
+	    else \
+	        echo "  initrd: Wine loader without ntdll.so"; \
+	    fi; \
+	 else \
+	    echo "  initrd: no Wine loader at $(WINE64_LOADER), skipping"; \
+	 fi
 	python3 userland/mkinitrd.py $(INITRD_STAGE) $@
+
+# A dynamically linked program - the smallest thing that makes ld.so run.
+$(BUILD_DIR)/dynhello64.elf: userland/dynhello64.c | $(BUILD_DIR)
+	gcc -O2 -o $@ $<
+	@file $@ | grep -q "dynamically linked" \
+	    || (echo "ERROR: $@ is not dynamically linked"; false)
 
 iso: $(KERNEL) $(INITRD)
 	mkdir -p $(ISO_DIR)/boot/grub
@@ -239,14 +399,20 @@ iso: $(KERNEL) $(INITRD)
 	grub-mkrescue -o $(ISO) $(ISO_DIR) 2>/dev/null
 	@echo "  built $(ISO)"
 
+# 2GB, not QEMU's 128MB default. The number is a test requirement, not a
+# preference: Milestone 66's whole claim is that a frame above the 1GB
+# boot window is usable, and with 128MB there is no such frame - the test
+# would report SKIP and prove nothing.
+QEMU_RAM ?= 2G
+
 run: iso
-	qemu-system-x86_64 -cdrom $(ISO) -serial stdio
+	qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -serial stdio
 
 # The bring-up test. kernel_main halts rather than exiting, so the run is
 # bounded by `timeout` and judged by what reached the serial port.
 test: iso
 	@rm -f $(BUILD_DIR)/serial.log
-	@timeout 30 qemu-system-x86_64 -cdrom $(ISO) -display none \
+	@timeout 30 qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -display none \
 	    -serial file:$(BUILD_DIR)/serial.log -no-reboot >/dev/null 2>&1 || true
 	@echo "--- serial ---"
 	@cat $(BUILD_DIR)/serial.log 2>/dev/null || true
@@ -269,6 +435,11 @@ test: iso
 	@[ "`cat $(BUILD_DIR)/hello64.host.status`" = "42" ] \
 	    || (echo "FAIL: the host run did not exit 42 either"; exit 1)
 	@echo "PASS: the same ELF prints the same bytes, and exits 42, on both"
+	@# The display, asked of QEMU rather than of the kernel. Every
+	@# assertion in layer 6c is the kernel reading back what the kernel
+	@# wrote, which a framebuffer mapped over ordinary RAM would also
+	@# pass. `screendump` is the far side of the driver.
+	@python3 tools/fbtest.py $(ISO) $(QEMU_RAM) $(BUILD_DIR) || exit 1
 	@# The same differential for the glibc binary, which is the stronger
 	@# of the two: its output is produced by printf, through stdio,
 	@# after glibc's startup has set up TLS, read the auxv and
@@ -297,6 +468,97 @@ test: iso
 	    || (echo "FAIL: the host run of the threaded binary did not exit 23"; \
 	        exit 1)
 	@echo "PASS: clone(2) behaves the same, and exits 23, on both"
+	@# And the futex one, which is the strongest of the four: it blocks
+	@# and is woken rather than spinning, so a kernel that faked
+	@# FUTEX_WAIT could not produce this on either side.
+	@timeout 20 ./$(BUILD_DIR)/futex64.elf > $(BUILD_DIR)/futex64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/futex64.host.status
+	@grep -qFf $(BUILD_DIR)/futex64.host.txt $(BUILD_DIR)/serial.log \
+	    || (echo "FAIL: the guest did not print what the host prints"; \
+	        exit 1)
+	@[ "`cat $(BUILD_DIR)/futex64.host.status`" = "31" ] \
+	    || (echo "FAIL: the host run of the futex binary did not exit 31"; \
+	        exit 1)
+	@echo "PASS: futex(2) blocks and wakes the same, and exits 31, on both"
+	@# The signal one. This is the differential that matters most, because
+	@# the frame layout is not something a guest-only test can check: a
+	@# handler that reads uc_mcontext by Linux's offsets only works if the
+	@# kernel wrote them there, and only Linux can confirm the offsets.
+	@timeout 20 ./$(BUILD_DIR)/signal64.elf > $(BUILD_DIR)/signal64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/signal64.host.status
+	@grep -qFf $(BUILD_DIR)/signal64.host.txt $(BUILD_DIR)/serial.log \
+	    || (echo "FAIL: the guest did not print what the host prints"; \
+	        exit 1)
+	@[ "`cat $(BUILD_DIR)/signal64.host.status`" = "41" ] \
+	    || (echo "FAIL: the host run of the signal binary did not exit 41"; \
+	        exit 1)
+	@echo "PASS: SIGSEGV is caught and resumed the same, and exits 41, on both"
+	@# And the filesystem one. It writes under /tmp and unlinks what it
+	@# made, so the host run leaves nothing behind.
+	@timeout 20 ./$(BUILD_DIR)/fs64.elf > $(BUILD_DIR)/fs64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/fs64.host.status
+	@grep -qFf $(BUILD_DIR)/fs64.host.txt $(BUILD_DIR)/serial.log \
+	    || (echo "FAIL: the guest did not print what the host prints"; \
+	        exit 1)
+	@[ "`cat $(BUILD_DIR)/fs64.host.status`" = "53" ] \
+	    || (echo "FAIL: the host run of the filesystem binary did not exit 53"; \
+	        exit 1)
+	@echo "PASS: files behave the same, and exit 53, on both"
+	@# And the file-mapping one, which also checks that MAP_PRIVATE is
+	@# private - a kernel sharing the frame instead of copying passes
+	@# the contents check and fails this.
+	@timeout 20 ./$(BUILD_DIR)/mmapfile64.elf \
+	    > $(BUILD_DIR)/mmapfile64.host.txt 2>/dev/null; \
+	    echo $$? > $(BUILD_DIR)/mmapfile64.host.status
+	@grep -qFf $(BUILD_DIR)/mmapfile64.host.txt $(BUILD_DIR)/serial.log \
+	    || (echo "FAIL: the guest did not print what the host prints"; \
+	        exit 1)
+	@[ "`cat $(BUILD_DIR)/mmapfile64.host.status`" = "61" ] \
+	    || (echo "FAIL: the host run of the mmap binary did not exit 61"; \
+	        exit 1)
+	@echo "PASS: a mapped file reads the same, and exits 61, on both"
+	@# The dynamic one. It runs against the host's own ld.so and libc -
+	@# the very same files the guest has in its initrd - so agreement
+	@# here means the kernel satisfied a dynamic loader it did not write
+	@# and cannot influence.
+	@timeout 20 ./$(BUILD_DIR)/dynhello64.elf \
+	    > $(BUILD_DIR)/dynhello64.host.txt 2>/dev/null; \
+	    echo $$? > $(BUILD_DIR)/dynhello64.host.status
+	@grep -qFf $(BUILD_DIR)/dynhello64.host.txt $(BUILD_DIR)/serial.log \
+	    || (echo "FAIL: the guest did not print what the host prints"; \
+	        exit 1)
+	@[ "`cat $(BUILD_DIR)/dynhello64.host.status`" = "67" ] \
+	    || (echo "FAIL: the host run of the dynamic binary did not exit 67"; \
+	        exit 1)
+	@echo "PASS: a dynamically linked program runs the same, and exits 67, on both"
+	@# fork/execve/wait4. The host run needs the child where the program
+	@# looks for it, and removes it afterwards.
+	@cp $(BUILD_DIR)/forkchild64.elf /tmp/forkchild64
+	@timeout 20 ./$(BUILD_DIR)/forkexec64.elf \
+	    > $(BUILD_DIR)/forkexec64.host.txt 2>/dev/null; \
+	    echo $$? > $(BUILD_DIR)/forkexec64.host.status
+	@rm -f /tmp/forkchild64
+	@while read -r line; do \
+	    grep -qF "$$line" $(BUILD_DIR)/serial.log \
+	        || { echo "FAIL: guest never printed: $$line"; exit 1; }; \
+	done < $(BUILD_DIR)/forkexec64.host.txt
+	@[ "`cat $(BUILD_DIR)/forkexec64.host.status`" = "71" ] \
+	    || (echo "FAIL: the host run of the fork binary did not exit 71"; \
+	        exit 1)
+	@echo "PASS: fork/execve/wait behave the same, and exit 71, on both"
+	@# The directory tree. Cleared first because the program's first act
+	@# is mkdir, which fails on a leftover from an interrupted run - and
+	@# it removes everything it made when it succeeds.
+	@rm -rf /tmp/nvtree
+	@timeout 20 ./$(BUILD_DIR)/tree64.elf > $(BUILD_DIR)/tree64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/tree64.host.status
+	@grep -qFf $(BUILD_DIR)/tree64.host.txt $(BUILD_DIR)/serial.log \
+	    || (echo "FAIL: the guest did not print what the host prints"; \
+	        exit 1)
+	@[ "`cat $(BUILD_DIR)/tree64.host.status`" = "83" ] \
+	    || (echo "FAIL: the host run of the tree binary did not exit 83"; \
+	        exit 1)
+	@echo "PASS: directories behave the same, and exit 83, on both"
 
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR) $(ISO)

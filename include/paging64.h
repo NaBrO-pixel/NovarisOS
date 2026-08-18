@@ -38,7 +38,45 @@
 
 /* Installs the self-reference. Must run after pmm64_init, because every
  * map() after it may need a frame. */
+/* The direct map: every byte of physical memory, readable by the kernel
+ * at a fixed offset.
+ *
+ * Until Milestone 66 the kernel could only reach the first gigabyte -
+ * the window boot64.s builds at KERNEL_VMA - so every frame handed to a
+ * user process had to come from below that line, because the kernel has
+ * to zero it, copy into it, or load a program into it. chrome.dll alone
+ * is 285MB; the ceiling was not a tuning parameter, it was a wall.
+ *
+ * PML4 slot 272. Linux puts its own direct map two slots along, for the
+ * same reason: it is high-half, so it is shared by every address space,
+ * and it is nowhere near anything else this kernel uses. */
+#define PHYSMAP64_BASE 0xFFFF880000000000ULL
+
+static inline void* phys64_to_virt(uint64_t phys) {
+    return (void*)(PHYSMAP64_BASE + phys);
+}
+
 void paging64_init(void);
+
+/* Builds the direct map over `bytes` of physical memory, in 2MB pages.
+ * Must run after pmm64_init, which is what knows how much there is. */
+int  paging64_physmap_init(uint64_t bytes);
+
+/* Maps one 2MB page. The direct map would need 500,000 page tables at
+ * 4KB granularity for a modest machine, and four at 2MB. */
+int  paging64_map_huge(uint64_t virt, uint64_t phys, uint64_t flags);
+
+uint64_t paging64_physmap_bytes(void);
+
+/* Where device memory gets mapped. PML4 slot 273, immediately after the
+ * direct map, for the same reasons: high half, so it is in every address
+ * space, and nothing else is near it. */
+#define MMIO64_BASE 0xFFFF888000000000ULL
+
+/* Maps a physical device range uncacheable, in 2MB pages. Both addresses
+ * must be 2MB aligned. Used for the framebuffer, which sits far above
+ * RAM and so is not in the direct map. */
+int  paging64_map_mmio(uint64_t virt, uint64_t phys, uint64_t bytes);
 
 int  paging64_map(uint64_t virt, uint64_t phys, uint64_t flags);
 int  paging64_unmap(uint64_t virt);
