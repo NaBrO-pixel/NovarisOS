@@ -46,6 +46,24 @@
 #define SYS64_NEWFSTATAT      262
 #define SYS64_OPENAT          257
 
+/* The working directory, and the links a Wine prefix is held together
+ * with (Milestone 68). */
+#define SYS64_LSTAT           6
+#define SYS64_GETCWD          79
+#define SYS64_CHDIR           80
+#define SYS64_FCHDIR          81
+#define SYS64_SYMLINK         88
+#define SYS64_MKDIRAT         258
+#define SYS64_UNLINKAT        263
+#define SYS64_SYMLINKAT       266
+#define SYS64_READLINKAT      267
+
+/* The "relative to the working directory" dirfd, and the flag that asks
+ * a stat not to follow a final symlink. */
+#define AT_FDCWD_             (-100)
+#define AT_SYMLINK_NOFOLLOW_  0x100
+#define AT_REMOVEDIR_         0x200
+
 /* open(2) flags, Linux's values for x86-64. */
 #define O_WRONLY   0x0001
 #define O_RDWR     0x0002

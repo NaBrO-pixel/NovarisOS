@@ -19,9 +19,15 @@
  * task belongs to and switches both together.
  */
 
-#define PROC64_MAX     4
+/* Four was enough while the only thing that forked was a test. Building
+ * a Wine prefix runs wineserver, wineboot, services.exe and explorer.exe
+ * at once, and the fifth process to start is the one that fails. */
+#define PROC64_MAX     32
 #define PROC64_FD_MAX  32
-#define PROC64_PATH_MAX 128
+
+/* 128 was under the 170 characters a real prefix's deepest path needs -
+ * measured, see ramfs64.h. */
+#define PROC64_PATH_MAX 1024
 
 typedef struct {
     int      node;
@@ -44,6 +50,18 @@ typedef struct {
 
     proc64_fd_t fds[PROC64_FD_MAX];
     char        exe_path[PROC64_PATH_MAX];
+
+    /* The working directory, as text rather than as a node index.
+     *
+     * A node index would go stale: the directory a process sits in can
+     * be removed underneath it, and Linux lets that happen - the process
+     * keeps its cwd and every relative path from it fails. Text also
+     * means getcwd is a copy rather than a reconstruction, which is what
+     * a program comparing its own cwd against a path it built expects.
+     *
+     * Always absolute, always without a trailing slash except for the
+     * root itself. fork inherits it and execve keeps it. */
+    char        cwd[PROC64_PATH_MAX];
 } proc64_t;
 
 void      proc64_init(void);

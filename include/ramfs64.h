@@ -15,22 +15,59 @@
  * flat version stops being a simplification and starts being a lie.
  *
  * Now each node holds one path component and its parent, the root is
- * node 0, and a path is resolved by walking it. Still no disk, no
- * permissions, no links, and no working directory - every path is
- * absolute, because there is no process attribute to make it relative
- * to yet.
+ * node 0, and a path is resolved by walking it. Still no disk and no
+ * permissions.
+ *
+ * Milestone 68 sized it against the thing it exists for. A prefix built
+ * by this very Wine tree, counted rather than estimated, is 1049 nodes
+ * (119 directories, 917 files, 13 symlinks), its longest component is
+ * 93 characters and its longest path 170. Every one of those numbers
+ * was over a limit here: 192 nodes, 64-character names, 128-character
+ * paths, and no symlinks at all. A prefix could not have been unpacked
+ * into this filesystem, let alone used.
+ *
+ * Two structural changes came with the sizing:
+ *
+ * - **The node table is in the heap**, not in BSS, because 4096 nodes at
+ *   this name length is 1.2MB and the kernel image is not the place for
+ *   it.
+ * - **Directories keep a child list.** Every lookup used to scan the
+ *   whole table, so resolving one path cost depth x MAX_NODES. At 192
+ *   that is invisible and at 4096 it is the quadratic kmalloc of
+ *   Milestone 46 all over again - Wine opens a prefix's worth of files,
+ *   and the cost is paid on every component of every one of them.
  */
 
-#define RAMFS64_MAX_NODES 192
-#define RAMFS64_NAME_MAX  64
-#define RAMFS64_PATH_MAX  128
+#define RAMFS64_MAX_NODES 4096
+#define RAMFS64_NAME_MAX  256
+#define RAMFS64_PATH_MAX  1024
+
+/* How many symlinks one resolution may follow before it is called a
+ * loop. Linux uses 40 and so does this. */
+#define RAMFS64_LINK_MAX  40
 
 void ramfs64_init(void);
 void ramfs64_seed_from_initrd(void);
 
-/* Resolves an absolute path, honouring "." and "..". Returns a node
- * index, or -1. */
+/* Resolves an absolute path, honouring ".", ".." and symlinks. Returns
+ * a node index, or -1. */
 int  ramfs64_lookup(const char* path);
+
+/* The same walk, except that a symlink named as the final component is
+ * returned as itself rather than followed. This is the difference
+ * between stat and lstat, and it is what readlink and unlink need - a
+ * readlink that followed the link would describe the target and never
+ * the link. */
+int  ramfs64_lookup_nofollow(const char* path);
+
+/* Creates a symlink. `target` is stored verbatim and interpreted only
+ * when something walks through it, exactly as a real filesystem does:
+ * a link to a path that does not exist is legal and dangles. */
+int  ramfs64_symlink(const char* path, const char* target);
+
+/* The stored target text, or 0 if this node is not a symlink. */
+const char* ramfs64_readlink(int node);
+int         ramfs64_is_link(int node);
 
 /* Creates one node. Its parent directory must already exist - which is
  * the difference a tree makes, and the reason the seed below builds
@@ -55,6 +92,13 @@ int     ramfs64_rmdir(const char* path);
  * no more. "." and ".." are not stored as nodes - the caller synthesises
  * them, the same way a real filesystem does. */
 int     ramfs64_child(int dir, uint64_t index, int* out_node);
+
+/* Writes the absolute path of `node` into `out`. This is the walk the
+ * other way - up the parent chain to the root - and it is what getcwd
+ * and fchdir are: a directory the kernel holds as a node index has to
+ * be turned back into the text a program asked for. Returns the length,
+ * or -1 if it would not fit. */
+int ramfs64_path(int node, char* out, uint64_t size);
 
 const char* ramfs64_name(int node);
 const void* ramfs64_data(int node);

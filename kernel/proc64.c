@@ -34,6 +34,9 @@ int proc64_create(void) {
     procs[i].used   = 1;
     procs[i].pid    = next_pid++;
     procs[i].parent = 0;
+    /* A process always has a working directory. The root is the only
+     * one that is certain to exist this early. */
+    kstrlcpy(procs[i].cwd, "/", PROC64_PATH_MAX);
     return procs[i].pid;
 }
 
@@ -58,6 +61,7 @@ int proc64_fork_from(int pid) {
     child->brk_current = parent->brk_current;
     child->mmap_next   = parent->mmap_next;
     kstrlcpy(child->exe_path, parent->exe_path, PROC64_PATH_MAX);
+    kstrlcpy(child->cwd, parent->cwd, PROC64_PATH_MAX);
     child->parent = parent->pid;
 
     return child_pid;
