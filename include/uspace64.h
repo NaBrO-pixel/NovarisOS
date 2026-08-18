@@ -33,6 +33,11 @@ uint64_t uspace64_munmap(uint64_t addr, uint64_t length);
  * path: the kernel has to write the file's bytes in, so the pages are
  * mapped writable and then closed down if the caller asked for
  * PROT_READ alone. */
+/* Maps `length` bytes of physical memory at `phys` into the current
+ * process, uncacheable, at the next free mmap address. For devices - the
+ * frames are not the allocator's and are never given back to it. */
+uint64_t uspace64_map_phys(uint64_t length, uint64_t phys, uint64_t prot);
+
 void uspace64_protect(uint64_t addr, uint64_t length, uint64_t prot);
 
 /* Builds argc/argv/envp/auxv at the top of the mapped stack and returns

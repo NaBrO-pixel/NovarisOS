@@ -63,6 +63,8 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/gdt64.o \
        $(BUILD_DIR)/idt64.o \
        $(BUILD_DIR)/serial64.o \
+       $(BUILD_DIR)/fb64.o \
+       $(BUILD_DIR)/fbdraw64_blob.o \
        $(BUILD_DIR)/pmm64.o \
        $(BUILD_DIR)/paging64.o \
        $(BUILD_DIR)/vmspace64.o \
@@ -228,6 +230,21 @@ $(BUILD_DIR)/glibc64_blob.c: $(BUILD_DIR)/hello_glibc64.elf userland/embed64.py
 	python3 userland/embed64.py $< $@ glibc64_elf
 
 $(BUILD_DIR)/glibc64_blob.o: $(BUILD_DIR)/glibc64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# An ordinary Linux fbdev client: open /dev/fb0, two FBIOGET ioctls,
+# mmap, draw. Static for the same reason as above, and built by the host
+# compiler against the host's headers - so the structure offsets it
+# reads are the ones Linux uses, not ones this project chose.
+$(BUILD_DIR)/fbdraw64.elf: userland/fbdraw64.c | $(BUILD_DIR)
+	gcc -static -O2 -o $@ $<
+	@file $@ | grep -q "statically linked" \
+	    || (echo "ERROR: $@ is not static"; false)
+
+$(BUILD_DIR)/fbdraw64_blob.c: $(BUILD_DIR)/fbdraw64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ fbdraw64_elf
+
+$(BUILD_DIR)/fbdraw64_blob.o: $(BUILD_DIR)/fbdraw64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # A real 64-bit Windows executable - the format chrome.exe is in. Built
@@ -418,6 +435,11 @@ test: iso
 	@[ "`cat $(BUILD_DIR)/hello64.host.status`" = "42" ] \
 	    || (echo "FAIL: the host run did not exit 42 either"; exit 1)
 	@echo "PASS: the same ELF prints the same bytes, and exits 42, on both"
+	@# The display, asked of QEMU rather than of the kernel. Every
+	@# assertion in layer 6c is the kernel reading back what the kernel
+	@# wrote, which a framebuffer mapped over ordinary RAM would also
+	@# pass. `screendump` is the far side of the driver.
+	@python3 tools/fbtest.py $(ISO) $(QEMU_RAM) $(BUILD_DIR) || exit 1
 	@# The same differential for the glibc binary, which is the stronger
 	@# of the two: its output is produced by printf, through stdio,
 	@# after glibc's startup has set up TLS, read the auxv and

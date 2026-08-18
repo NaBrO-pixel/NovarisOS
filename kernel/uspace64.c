@@ -162,6 +162,44 @@ uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     return start;
 }
 
+/* Maps a fixed range of physical memory into the calling process.
+ *
+ * Every other mapping in this file hands out frames from the allocator,
+ * and the process may have them. This one hands out a device that
+ * already exists at an address nobody chose - so it takes the physical
+ * address as an argument instead of asking for one, and it must not ever
+ * be freed back to the allocator, which is why munmap of it only tears
+ * down the page tables.
+ *
+ * Uncacheable for the same reason the kernel's own mapping is: a process
+ * writing to VRAM through a write-back mapping is writing to the cache,
+ * and the screen shows whatever gets evicted. */
+uint64_t uspace64_map_phys(uint64_t length, uint64_t phys, uint64_t prot) {
+    uint64_t start, off, pflags;
+
+    if (length == 0) return (uint64_t)-22;            /* -EINVAL */
+    length = (length + PAGE64_SIZE - 1) & ~(PAGE64_SIZE - 1);
+    if (phys & (PAGE64_SIZE - 1)) return (uint64_t)-22;
+
+    start = cur()->mmap_next;
+
+    pflags = PAGE64_PRESENT | PAGE64_USER | PAGE64_PCD | PAGE64_PWT;
+    if (prot & 0x2) pflags |= PAGE64_WRITE;           /* PROT_WRITE */
+
+    for (off = 0; off < length; off += PAGE64_SIZE) {
+        if (paging64_map(start + off, phys + off, pflags) != PAGING64_OK) {
+            /* Undo the part that was mapped, so a failure leaves the
+             * address space as it was rather than half a framebuffer. */
+            for (uint64_t done = 0; done < off; done += PAGE64_SIZE)
+                paging64_unmap(start + done);
+            return (uint64_t)-12;                     /* -ENOMEM */
+        }
+    }
+
+    cur()->mmap_next = start + length;
+    return start;
+}
+
 void uspace64_protect(uint64_t addr, uint64_t length, uint64_t prot) {
     uint64_t start = addr & ~(PAGE64_SIZE - 1);
     uint64_t end = start + ((length + PAGE64_SIZE - 1) & ~(PAGE64_SIZE - 1));

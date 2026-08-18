@@ -7877,6 +7877,134 @@ failing. Nothing unmaps the direct map's tables, which is correct - they
 are permanent - but it does mean `paging64_tables_allocated()` counts
 them. `RAMFS64_MAX_NODES` is still 192.
 
+## Milestone 67 — the display ✅ DONE
+
+260 assertions, and a test that asks QEMU what is on the screen rather
+than asking the kernel.
+
+### The framebuffer was already there
+
+`boot64.s` has had the Multiboot `VIDMODE` bit set and a 1024x768x32
+request in its header since it was written. GRUB has been granting it
+every boot since. Nothing ever read the answer, so for twenty-two
+milestones this kernel booted onto a working linear framebuffer and drew
+nothing on it.
+
+Measured before anything was built, by printing the handoff:
+
+```
+flags=0x1a6f fb=0xfd000000 w=1024 h=768 bpp=32 type=1 pitch=4096
+```
+
+### Why it could not have been done before Milestone 66
+
+VRAM is at `0xFD000000`. RAM stops at `0x7FFE0000`. The framebuffer is
+not merely above the old 1GB boot window - it is above *memory*.
+
+Until the direct map there was no mechanism in this kernel for reaching a
+physical address the boot window did not cover, so the 64-bit tree had no
+display for a reason that had nothing to do with graphics. The ceiling
+and the blank screen were the same fact.
+
+The direct map does not cover it either, and should not: mapping RAM is
+`paging64_physmap_init`'s job, and stretching it to `0xFD000000` would
+mean mapping the 1.9GB hole in between, most of which decodes to nothing.
+Device memory gets its own mapping at PML4 slot 273, in 2MB pages,
+uncacheable.
+
+### The part that matters for Wine
+
+A driver only the kernel can draw with is not a display driver. The
+milestone is really the interface:
+
+- **`/dev/fb0`**, a device node - the filesystem gained the concept, and
+  deliberately knows nothing beyond a number, exactly as Linux keeps its
+  device model out of tmpfs.
+- **`FBIOGET_VSCREENINFO` and `FBIOGET_FSCREENINFO`**, filled at Linux's
+  own structure offsets, so a program asks the driver what the screen is
+  instead of being told out of band.
+- **`mmap` that genuinely shares**. Every other file mapping in this
+  kernel is a private copy; this one hands the process the actual VRAM
+  frames, because a framebuffer nobody else can see is not a framebuffer.
+
+`userland/fbdraw64.c` is an ordinary Linux fbdev client - open, two
+ioctls, mmap, draw - built by the host compiler and running unmodified.
+It is the shape of every display driver that would sit above this kernel,
+Wine's included.
+
+### Two tests that a weaker version would have passed
+
+The kernel reading back what the kernel just wrote proves the mapping and
+nothing else: a framebuffer mapped over ordinary RAM passes every such
+assertion and shows a black screen. So:
+
+- **`tools/fbtest.py`** boots the ISO, waits for the kernel to say it has
+  finished, and takes a QEMU `screendump` - the emulated display device's
+  own surface, the far side of the driver. 16 pixels are checked,
+  including four *outside* each block, because a picture drawn at the
+  wrong offset or with the wrong stride passes an inside-only check.
+- **The kernel checks the band the ring-3 program drew.** A private copy
+  would let `fbdraw64` exit 0 - from inside the process the two are
+  indistinguishable - while the screen stayed empty. Confirmed by
+  falsification: with the device mmap replaced by an anonymous mapping,
+  the program still reports success and the kernel sees nothing.
+
+### One ordering bug, and one falsification that passed
+
+`mmap` refused every writable `MAP_SHARED` before asking what was being
+mapped, so `/dev/fb0` could be opened, described, and never mapped. The
+device case now comes first.
+
+Then the useful failure. The clipping assertion was
+
+```c
+fb64_put_pixel(fb64_width(), 0, WHITE);
+check("writing outside the screen is ignored",
+      fb64_get_pixel(fb64_width(), 0) == 0);
+```
+
+which passes with the bounds check deleted, because `fb64_get_pixel`
+clamps too - the assertion was reading a *different function's* clip.
+Deleting the check and watching the test still pass is how it was found,
+which is the same lesson as Milestone 50: a falsification that passes is
+information.
+
+It now writes a known value at `(0, 1)` and asserts an unclipped store at
+`(width, 0)` - which computes that exact address - does not destroy it.
+Both `put_pixel` and `fill_rect` clipping fail their tests when removed.
+
+### Verified
+
+260 assertions, 0 failures, 3/3 deterministic runs, 11 host/guest
+differentials, plus the screendump check. Also booted at **800x600** and
+**1280x800** (asked for 1366x768; GRUB granted 1280x800, and the kernel
+used what it was given) - the driver reads its geometry rather than
+assuming it, and the two fixed-coordinate tests report SKIP on a screen
+too small instead of failing. Booted with `-vga none`: reports
+`FB64_NO_MODE` and carries on, 0 failures.
+
+### Still missing, and two things not to claim
+
+**No input at all** - no keyboard, no mouse. The 32-bit tree has both;
+none of it was ported. A display without input is half a desktop.
+
+**The uncacheable bits are not tested.** `PAGE64_PCD | PAGE64_PWT` is
+architecturally required - a write-back mapping of VRAM leaves the screen
+showing whatever the cache last evicted - but QEMU does not emulate cache
+incoherency, so removing them passes every test including the screenshot.
+It is correct by argument, not by measurement.
+
+**A padded pitch is never exercised.** `pitch` is threaded through every
+calculation, but every mode this bootloader and device produce has
+`pitch == width * bytes-per-pixel` (4096, 3200, 5120 at the three
+resolutions tried), so the one case where stride handling matters has
+not actually occurred.
+
+Beyond that: no write-combining (which needs PAT, and is what makes
+full-frame drawing fast rather than merely correct), no double buffering,
+no damage tracking, no text console, no compositor. The 32-bit tree's
+`gfx.c`, `wm.c` and `console.c` have no counterpart here.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the

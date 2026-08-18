@@ -61,6 +61,14 @@ const void* ramfs64_data(int node);
 uint64_t    ramfs64_size(int node);
 int         ramfs64_is_dir(int node);
 int         ramfs64_parent(int node);
+
+/* Device nodes. A file marked with one of these has no bytes of its own;
+ * what read/mmap/ioctl mean for it is decided by syscall64.c. */
+#define RAMFS64_DEV_NONE 0
+#define RAMFS64_DEV_FB   1        /* /dev/fb0 - the linear framebuffer */
+
+int         ramfs64_set_device(int node, int device);
+int         ramfs64_device(int node);
 uint64_t    ramfs64_count(void);
 
 #endif

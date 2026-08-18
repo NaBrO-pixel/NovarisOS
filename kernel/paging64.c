@@ -248,6 +248,35 @@ int paging64_physmap_init(uint64_t bytes) {
     return 1;
 }
 
+/* Device memory, which the direct map deliberately does not cover.
+ *
+ * paging64_physmap_init maps RAM, and a framebuffer is not RAM: on this
+ * machine it sits at 0xFD000000 while RAM stops at 0x7FFE0000. Extending
+ * the direct map to reach it would mean mapping the 1.9GB hole between
+ * them, most of which decodes to nothing.
+ *
+ * Mapped uncacheable. A write-back cached framebuffer is not a
+ * performance question, it is a correctness one: stores sit in the cache
+ * until something evicts them, so what is on screen is whatever the
+ * cache last felt like writing out. Write-combining would be the right
+ * answer and needs PAT set up, which this milestone does not do - see
+ * the note in fb64.c. */
+int paging64_map_mmio(uint64_t virt, uint64_t phys, uint64_t bytes) {
+    uint64_t end = phys + bytes;
+    uint64_t off;
+
+    /* A 2MB page cannot start midway through one. */
+    if ((virt | phys) & (HUGE_SIZE - 1)) return PAGING64_NOT_MAPPED;
+
+    for (off = 0; phys + off < end; off += HUGE_SIZE) {
+        int rc = paging64_map_huge(virt + off, phys + off,
+                                   PAGE64_PRESENT | PAGE64_WRITE
+                                   | PAGE64_PCD | PAGE64_PWT);
+        if (rc != PAGING64_OK) return rc;
+    }
+    return PAGING64_OK;
+}
+
 uint64_t* paging64_pml4(void) { return pml4_addr(); }
 
 uint64_t paging64_tables_allocated(void) { return tables_allocated; }

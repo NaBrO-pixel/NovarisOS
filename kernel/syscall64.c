@@ -24,6 +24,7 @@
 #include "elf64.h"
 #include "initrd64.h"
 #include "pmm64.h"
+#include "fb64.h"
 
 #define IA32_EFER   0xC0000080u
 #define IA32_STAR   0xC0000081u
@@ -476,7 +477,32 @@ static uint64_t dispatch(syscall64_args_t* args) {
         if (flags & MAP_ANONYMOUS)
             return uspace64_mmap(a1, a2, a3, flags);
 
-        /* --- a file mapping ---
+        if (fd < 3 || fd >= FD_MAX || !fds[fd].used) return (uint64_t)-9;
+        if (off & (PAGE64_SIZE - 1)) return (uint64_t)-22;  /* -EINVAL */
+        node = fds[fd].node;
+
+        /* /dev/fb0, decided before the rule below rather than after.
+         *
+         * This is the one mapping in this kernel that is genuinely
+         * shared rather than copied: the whole point of mapping a
+         * framebuffer is that the process's stores land on the screen,
+         * so MAP_SHARED here is real and MAP_PRIVATE would be useless.
+         * Ordering matters and is the bug this comment replaces - with
+         * the file rule first, every writable MAP_SHARED was refused
+         * before anyone asked what was being mapped, so /dev/fb0 could
+         * be opened and described but never mapped.
+         *
+         * This is what a display driver above the kernel needs: Wine's
+         * would open /dev/fb0, mmap it, and composite into it. */
+        if (ramfs64_device(node) == RAMFS64_DEV_FB) {
+            uint64_t span = fb64_bytes();
+            if (!fb64_ready()) return (uint64_t)-19;        /* -ENODEV */
+            if (off >= span) return (uint64_t)-22;
+            if (a2 > span - off) return (uint64_t)-22;
+            return uspace64_map_phys(a2, fb64_phys() + off, a3);
+        }
+
+        /* --- an ordinary file mapping ---
          *
          * MAP_PRIVATE is a copy: the pages are the process's own, and
          * writing them does not change the file. That is exactly what a
@@ -489,10 +515,6 @@ static uint64_t dispatch(syscall64_args_t* args) {
          * where there is nothing to write back: a read-only mapping. */
         if ((flags & MAP_SHARED) && (a3 & PROT_WRITE))
             return (uint64_t)-19;                      /* -ENODEV */
-
-        if (fd < 3 || fd >= FD_MAX || !fds[fd].used) return (uint64_t)-9;
-        if (off & (PAGE64_SIZE - 1)) return (uint64_t)-22;  /* -EINVAL */
-        node = fds[fd].node;
 
         /* Mapped writable whatever the caller asked for, because the
          * kernel is about to write the file's contents into it. */
@@ -706,11 +728,66 @@ static uint64_t dispatch(syscall64_args_t* args) {
     case SYS64_SET_ROBUST_LIST:
         return 0;
 
-    case SYS64_IOCTL:
+    case SYS64_IOCTL: {
+        /* The two fbdev queries, with Linux's own structure layouts -
+         * offsets taken from <linux/fb.h> for x86-64. A program asks the
+         * driver what the screen is rather than being told out of band,
+         * because that is the interface everything from SDL to Wine's
+         * fbdev path already speaks.
+         *
+         * Getting these offsets wrong is the classic way to produce a
+         * driver that "works" and paints diagonal stripes: xres and
+         * line_length land in the wrong fields and every scanline is
+         * placed from a wrong stride. The differential test in
+         * userland/fbdraw64.c checks the values, not just the call. */
+        #define FBIOGET_VSCREENINFO 0x4600
+        #define FBIOGET_FSCREENINFO 0x4602
+
+        if ((a2 == FBIOGET_VSCREENINFO || a2 == FBIOGET_FSCREENINFO) &&
+            a1 >= 3 && a1 < FD_MAX && fds[a1].used &&
+            ramfs64_device(fds[a1].node) == RAMFS64_DEV_FB) {
+            uint8_t* out = (uint8_t*)a3;
+            uint32_t i;
+
+            if (!fb64_ready()) return (uint64_t)-19;       /* -ENODEV */
+            if (!out) return (uint64_t)-14;               /* -EFAULT */
+
+            if (a2 == FBIOGET_VSCREENINFO) {
+                for (i = 0; i < 160; i++) out[i] = 0;
+                *(uint32_t*)(out +  0) = fb64_width();     /* xres */
+                *(uint32_t*)(out +  4) = fb64_height();    /* yres */
+                *(uint32_t*)(out +  8) = fb64_width();     /* xres_virtual */
+                *(uint32_t*)(out + 12) = fb64_height();    /* yres_virtual */
+                *(uint32_t*)(out + 24) = fb64_bpp();       /* bits_per_pixel */
+                /* The colour layout, as bit offsets into a pixel. This
+                 * is what says 0x00RRGGBB rather than leaving a caller
+                 * to guess from the depth. */
+                *(uint32_t*)(out + 32) = 16; *(uint32_t*)(out + 36) = 8; /* red */
+                *(uint32_t*)(out + 44) =  8; *(uint32_t*)(out + 48) = 8; /* green */
+                *(uint32_t*)(out + 56) =  0; *(uint32_t*)(out + 60) = 8; /* blue */
+                /* transp length stays 0: the fourth byte is padding this
+                 * driver writes as zero, not an alpha channel. */
+                return 0;
+            }
+
+            for (i = 0; i < 80; i++) out[i] = 0;
+            {
+                static const char id[] = "novarisfb";
+                for (i = 0; id[i]; i++) out[i] = (uint8_t)id[i];
+            }
+            *(uint64_t*)(out + 16) = fb64_phys();          /* smem_start */
+            *(uint32_t*)(out + 24) = (uint32_t)fb64_bytes(); /* smem_len */
+            *(uint32_t*)(out + 28) = 0;                    /* PACKED_PIXELS */
+            *(uint32_t*)(out + 36) = 2;                    /* TRUECOLOR */
+            *(uint32_t*)(out + 48) = fb64_pitch();         /* line_length */
+            return 0;
+        }
+
         /* glibc asks whether fd 1 is a terminal to choose line
          * buffering. -ENOTTY makes it a fully buffered stream, which is
          * correct here: this is a serial port, not a tty. */
         return (uint64_t)-25;
+    }
 
     case SYS64_FSTAT: {
         uint8_t* st = (uint8_t*)a2;

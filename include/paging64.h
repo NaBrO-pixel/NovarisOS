@@ -68,6 +68,16 @@ int  paging64_map_huge(uint64_t virt, uint64_t phys, uint64_t flags);
 
 uint64_t paging64_physmap_bytes(void);
 
+/* Where device memory gets mapped. PML4 slot 273, immediately after the
+ * direct map, for the same reasons: high half, so it is in every address
+ * space, and nothing else is near it. */
+#define MMIO64_BASE 0xFFFF888000000000ULL
+
+/* Maps a physical device range uncacheable, in 2MB pages. Both addresses
+ * must be 2MB aligned. Used for the framebuffer, which sits far above
+ * RAM and so is not in the direct map. */
+int  paging64_map_mmio(uint64_t virt, uint64_t phys, uint64_t bytes);
+
 int  paging64_map(uint64_t virt, uint64_t phys, uint64_t flags);
 int  paging64_unmap(uint64_t virt);
 

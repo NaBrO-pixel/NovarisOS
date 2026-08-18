@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include "io.h"
 #include "serial64.h"
+#include "fb64.h"
 #include "gdt64.h"
 #include "idt64.h"
 #include "multiboot.h"
@@ -99,6 +100,8 @@ extern const unsigned char loader64_exe[];
 extern const unsigned long loader64_exe_len;
 extern const unsigned char tree64_elf[];
 extern const unsigned long tree64_elf_len;
+extern const unsigned char fbdraw64_elf[];
+extern const unsigned long fbdraw64_elf_len;
 extern const unsigned char forkexec64_elf[];
 extern const unsigned long forkexec64_elf_len;
 extern const unsigned char thread64_elf[];
@@ -554,6 +557,159 @@ void kernel_main(uint32_t magic, void* mbi) {
         serial64_puts(" MB at ");
         serial64_puthex(PHYSMAP64_BASE);
         serial64_putc('\n');
+    }
+
+    /* --- layer 6c: the framebuffer (Milestone 67) -------------------- */
+    serial64_puts("NOVARIS64: -- framebuffer --\n");
+    {
+        const multiboot_info_t* m = (const multiboot_info_t*)mbi;
+        int rc = fb64_init(m);
+
+        if (rc != FB64_OK) {
+            /* A headless boot is a legitimate configuration, so it is
+             * reported rather than failed - but it is reported loudly,
+             * because a display test that silently tests nothing is how
+             * a driver rots. */
+            serial64_puts("NOVARIS64: SKIP  no usable framebuffer, rc = ");
+            serial64_putdec((uint64_t)(-rc));
+            serial64_putc('\n');
+        } else {
+            const uint32_t RED   = 0xFF0000, GREEN = 0x00FF00;
+            const uint32_t BLUE  = 0x0000FF, WHITE = 0xFFFFFF;
+            const uint32_t BG    = 0x102030;
+
+            check("the framebuffer came up", fb64_ready());
+            check("its geometry is the one the bootloader granted",
+                  fb64_width()  == m->framebuffer_width &&
+                  fb64_height() == m->framebuffer_height &&
+                  fb64_bpp()    == m->framebuffer_bpp);
+            check("it is at the physical address the bootloader named",
+                  fb64_phys() == m->framebuffer_addr);
+            /* A pitch shorter than a row of pixels would mean every
+             * scanline after the first is drawn in the wrong place. */
+            check("a scanline is at least as wide as the picture",
+                  fb64_pitch() >= fb64_width() * (fb64_bpp() / 8));
+
+            /* The round trip that proves the mapping. This reads back
+             * through an uncacheable mapping of a device that is not
+             * RAM, so a value that survives it really did reach VRAM -
+             * a stray mapping over ordinary memory would pass every
+             * assertion above and fail this one only by accident, which
+             * is why the colours are distinct rather than 0 and 1. */
+            fb64_put_pixel(0, 0, RED);
+            fb64_put_pixel(1, 0, GREEN);
+            fb64_put_pixel(0, 1, BLUE);
+            check("a pixel written to VRAM reads back",
+                  fb64_get_pixel(0, 0) == RED);
+            check("and its neighbour is not the same pixel",
+                  fb64_get_pixel(1, 0) == GREEN);
+            check("nor is the one on the next scanline",
+                  fb64_get_pixel(0, 1) == BLUE);
+
+            /* Reading outside the screen. This says only that
+             * fb64_get_pixel clamps, which is worth one line and is not
+             * a test of anything that writes. */
+            check("reading outside the screen answers 0, not memory",
+                  fb64_get_pixel(fb64_width(), 0) == 0);
+
+            /* Writing outside it, which is the one that matters - and
+             * which needs an observable consequence rather than a
+             * clamped read.
+             *
+             * The first version of this asked get_pixel about the
+             * out-of-bounds coordinate and asserted 0. That passes with
+             * the bounds check deleted, because get_pixel clamps too:
+             * the assertion was reading a different function's clip.
+             * Deleting the check and watching the test still pass is
+             * how it was found.
+             *
+             * With a scanline exactly one row of pixels wide, an
+             * unclipped store at (width, 0) computes the address of
+             * (0, 1) - so a known value there turns "wrote out of
+             * bounds" into something visible. Guarded on that equality
+             * rather than assumed, since a padded pitch would put the
+             * stray write in the padding where nothing can see it. */
+            if (fb64_pitch() == fb64_width() * (fb64_bpp() / 8)) {
+                fb64_put_pixel(0, 1, BLUE);
+                fb64_put_pixel(fb64_width(), 0, WHITE);
+                check("a write past the right edge does not land on the "
+                      "next row",
+                      fb64_get_pixel(0, 1) == BLUE);
+
+                /* The same question for a rectangle: 64 wide starting 4
+                 * from the edge, so 60 of it is off-screen and would
+                 * wrap onto row 5 if the clip trimmed nothing. */
+                fb64_fill_rect(fb64_width() - 4, 4, 64, 1, WHITE);
+                check("a rectangle running off the right edge is trimmed, "
+                      "not wrapped",
+                      fb64_get_pixel(0, 5) != WHITE);
+                check("and the part of it that is on screen was drawn",
+                      fb64_get_pixel(fb64_width() - 1, 4) == WHITE);
+            }
+
+            /* Past the bottom edge. Nothing can observe where an
+             * unclipped store would land - it is beyond the last
+             * scanline, inside the 2MB-rounded mapping - so this asserts
+             * only that the machine is still running afterwards, which
+             * every check below it does implicitly. */
+            fb64_put_pixel(0, fb64_height(), WHITE);
+
+            {
+                /* One blit, from a surface in RAM to a device above RAM
+                 * - which is the whole shape of what a compositor does,
+                 * and needs the direct map and the MMIO map to be two
+                 * different things that both work. */
+                static uint32_t tile[4 * 4];
+                int i;
+                for (i = 0; i < 16; i++) tile[i] = (i & 1) ? WHITE : RED;
+                fb64_blit(100, 100, 4, 4, tile, 4);
+                check("a blit from RAM landed in VRAM",
+                      fb64_get_pixel(100, 100) == RED &&
+                      fb64_get_pixel(101, 100) == WHITE);
+            }
+
+            /* The picture the host checks with a screenshot. Drawn last
+             * so nothing above overwrites it, and in flat colours at
+             * known coordinates so that verifying it is a pixel compare
+             * rather than a judgement.
+             *
+             * The coordinates are fixed, so they are guarded rather than
+             * assumed: everything above this point works at any
+             * geometry the bootloader hands over, and only the pattern
+             * needs a screen at least as big as the one boot64.s asks
+             * for. A smaller mode says so instead of failing. */
+            if (fb64_width() >= 1024 && fb64_height() >= 768) {
+                fb64_clear(BG);
+                fb64_fill_rect(100, 100, 200, 200, RED);
+                fb64_fill_rect(400, 100, 200, 200, GREEN);
+                fb64_fill_rect(100, 400, 200, 200, BLUE);
+                fb64_fill_rect(400, 400, 200, 200, WHITE);
+
+                check("the test pattern is on the screen",
+                      fb64_get_pixel(200, 200) == RED   &&
+                      fb64_get_pixel(500, 200) == GREEN &&
+                      fb64_get_pixel(200, 500) == BLUE  &&
+                      fb64_get_pixel(500, 500) == WHITE &&
+                      fb64_get_pixel(800, 700) == BG);
+            } else {
+                serial64_puts("NOVARIS64: SKIP  screen too small for the "
+                              "test pattern\n");
+            }
+
+            serial64_puts("NOVARIS64: screen  = ");
+            serial64_putdec(fb64_width());
+            serial64_putc('x');
+            serial64_putdec(fb64_height());
+            serial64_putc('x');
+            serial64_putdec(fb64_bpp());
+            serial64_puts(" at ");
+            serial64_puthex(fb64_phys());
+            serial64_puts(", pitch ");
+            serial64_putdec(fb64_pitch());
+            serial64_puts("\nNOVARIS64: drawn   = ");
+            serial64_putdec(fb64_pixels_written());
+            serial64_puts(" pixels\n");
+        }
     }
 
     /* --- layer 7: the kernel heap ----------------------------------- */
@@ -2225,6 +2381,97 @@ void kernel_main(uint32_t magic, void* mbi) {
         serial64_puts(", exit ");
         serial64_putdec(syscall64_exit_code());
         serial64_putc('\n');
+    }
+
+    /* --- layer 28: a process draws on the screen (Milestone 67) ----- */
+    /* The kernel drawing to its own framebuffer proves the driver. This
+     * proves the *interface*: an ordinary Linux fbdev client, built by
+     * the host compiler, opening /dev/fb0 and asking the two FBIOGET
+     * questions before mapping it and drawing - which is the shape of
+     * every display driver that would ever sit above this kernel,
+     * Wine's included. */
+    serial64_puts("NOVARIS64: -- a process draws --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 32;
+        vmspace64_t space, kspace;
+        elf64_info_t info;
+        uint64_t i, rsp;
+        int rc, stack_ok = 1;
+        static const char* const fb_argv[] = { "/fbdraw64", 0 };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        proc64_init();
+        proc64_set_current(proc64_create());
+        vmspace64_kernel_space(&kspace);
+
+        if (!fb64_ready()) {
+            serial64_puts("NOVARIS64: SKIP  no framebuffer to draw on\n");
+        } else if (fb64_width() < 1024 || fb64_height() < 768) {
+            /* The program refuses a screen it cannot address, and says
+             * so with a status of its own - so this is still an
+             * assertion about behaviour, not a skipped test. */
+            serial64_puts("NOVARIS64: SKIP  screen too small for fbdraw\n");
+        } else {
+            check("the framebuffer registered as /dev/fb0", fb64_register());
+            check("and /dev/fb0 is in the filesystem",
+                  ramfs64_lookup("/dev/fb0") >= 0);
+            check("it is a device, not an ordinary file",
+                  ramfs64_device(ramfs64_lookup("/dev/fb0"))
+                  == RAMFS64_DEV_FB);
+
+            check("a space for it", vmspace64_create(&space) != 0);
+            rc = elf64_load(fbdraw64_elf, fbdraw64_elf_len, &space, &info);
+            check("the drawing program loaded", rc == ELF64_OK);
+
+            for (i = 0; i < STACK_PAGES; i++) {
+                uint64_t f = pmm64_alloc_frame();
+                if (!f || vmspace64_map(&space,
+                                        STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                        PAGE64_PRESENT | PAGE64_WRITE |
+                                        PAGE64_USER) != PAGING64_OK)
+                    stack_ok = 0;
+            }
+            check("a stack for it", stack_ok);
+            uspace64_reset(&space, info.brk_start);
+            rsp = uspace64_build_stack(&space, STACK_TOP, STACK_PAGES,
+                                       fb_argv, &info, 0, 0);
+
+            /* The band is not on the screen yet, and has to not be:
+             * otherwise "the process drew it" and "something else did"
+             * are the same observation. */
+            check("the screen is untouched where the program will draw",
+                  fb64_get_pixel(500, 650) != 0x00FF00FF);
+
+            serial64_puts("NOVARIS64: --- its output follows ---\n");
+            pf_diagnose = 1;
+            vmspace64_switch(&space);
+            enter_user_mode64(info.entry, rsp, 0);
+            vmspace64_switch(&kspace);
+            pf_diagnose = 0;
+            serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+            check("the program drew and verified its own pixels",
+                  syscall64_exit_code() == 0);
+
+            /* The strong one. The kernel reads VRAM through its own
+             * mapping and finds what a ring-3 process wrote through a
+             * completely different one. A private copy - which is what
+             * every other file mapping in this kernel is - would leave
+             * this pixel unchanged and the program would still have
+             * exited 0, because from inside the process the two are
+             * indistinguishable. */
+            check("and those pixels are in the kernel's view of VRAM",
+                  fb64_get_pixel(500, 650) == 0x00FF00FF);
+            check("the band has edges where the program put them",
+                  fb64_get_pixel(500, 619) != 0x00FF00FF &&
+                  fb64_get_pixel(99,  650) != 0x00FF00FF);
+
+            serial64_puts("NOVARIS64: fbdraw  = exit ");
+            serial64_putdec(syscall64_exit_code());
+            serial64_putc('\n');
+        }
     }
 
     /* --- verdict ---------------------------------------------------- */

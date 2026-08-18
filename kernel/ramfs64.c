@@ -12,6 +12,7 @@ typedef struct {
     uint64_t size;
     uint64_t capacity;
     int      is_dir;
+    int      device;                   /* RAMFS64_DEV_*; 0 = an ordinary file */
     int      used;
 } node64_t;
 
@@ -32,6 +33,7 @@ static int alloc_node(const char* name, int parent, int is_dir) {
     nodes[i].size     = 0;
     nodes[i].capacity = 0;
     nodes[i].is_dir   = is_dir;
+    nodes[i].device   = RAMFS64_DEV_NONE;
     nodes[i].used     = 1;
     node_count++;
     return i;
@@ -311,6 +313,24 @@ int ramfs64_is_dir(int node) {
 int ramfs64_parent(int node) {
     if (node < 0 || node >= RAMFS64_MAX_NODES || !nodes[node].used) return -1;
     return nodes[node].parent;
+}
+
+/* A device node is a file whose bytes are not in the heap - what open,
+ * mmap and ioctl do with it depends on which device it is. The
+ * filesystem itself deliberately knows nothing beyond the number: it is
+ * syscall64.c that decides that RAMFS64_DEV_FB means "mmap this to the
+ * framebuffer", exactly as Linux keeps its device model out of tmpfs. */
+int ramfs64_set_device(int node, int device) {
+    if (node < 0 || node >= RAMFS64_MAX_NODES || !nodes[node].used) return 0;
+    if (nodes[node].is_dir) return 0;
+    nodes[node].device = device;
+    return 1;
+}
+
+int ramfs64_device(int node) {
+    if (node < 0 || node >= RAMFS64_MAX_NODES || !nodes[node].used)
+        return RAMFS64_DEV_NONE;
+    return nodes[node].device;
 }
 
 uint64_t ramfs64_count(void) { return node_count; }
