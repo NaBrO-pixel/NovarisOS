@@ -120,6 +120,57 @@ void syscall64_set_exe_path(const char* path) {
     kstrlcpy(p->exe_path, path, PROC64_PATH_MAX);
 }
 
+/* Every path a program hands this kernel goes through here first.
+ *
+ * Until Milestone 68 a relative path was answered -ENOENT, and the
+ * comment on openat said why: there was no working directory to measure
+ * one against. That is not an obscure gap - `configure`, `ld.so`, make,
+ * and Wine all spend most of their path handling relative to where they
+ * are, and Wine's very first act on a prefix is to chdir into it.
+ *
+ * The result is absolute but not textually normalised: "." , ".." and
+ * doubled slashes are left for ramfs64's walker, which has to handle
+ * them anyway because an absolute path can contain them too. Resolving
+ * them here as text would also be wrong - ".." after a symlink is not
+ * the parent directory of the link.
+ *
+ * Returns 0, or a negative errno.
+ */
+static int64_t abs_path(const char* in, char* out) {
+    proc64_t* p = proc64_current();
+    uint64_t n = 0, i;
+
+    if (!in) return -14;                               /* -EFAULT */
+    if (!in[0]) return -2;                             /* -ENOENT */
+
+    if (in[0] == '/') {
+        for (i = 0; in[i]; i++) {
+            if (n + 1 >= PROC64_PATH_MAX) return -36;  /* -ENAMETOOLONG */
+            out[n++] = in[i];
+        }
+        out[n] = 0;
+        return 0;
+    }
+
+    if (!p) return -2;
+
+    for (i = 0; p->cwd[i]; i++) {
+        if (n + 1 >= PROC64_PATH_MAX) return -36;
+        out[n++] = p->cwd[i];
+    }
+    /* "/" already ends in one; anything else needs the separator. */
+    if (n == 0 || out[n - 1] != '/') {
+        if (n + 1 >= PROC64_PATH_MAX) return -36;
+        out[n++] = '/';
+    }
+    for (i = 0; in[i]; i++) {
+        if (n + 1 >= PROC64_PATH_MAX) return -36;
+        out[n++] = in[i];
+    }
+    out[n] = 0;
+    return 0;
+}
+
 static uint64_t do_open(const char* path, uint64_t flags) {
     int node = ramfs64_lookup(path);
     int fd;
@@ -163,21 +214,74 @@ static void fill_ids(uint8_t* st, int node) {
 /* struct stat, x86-64. Only the fields anything here reads are filled;
  * the offsets are the kernel's and must not be tidied.
  *   0 st_dev  8 st_ino  16 st_nlink  24 st_mode  48 st_size  56 st_blksize */
-static uint64_t do_stat(const char* path, void* out) {
-    int node = ramfs64_lookup(path);
+static uint64_t do_stat(const char* path, void* out, int follow) {
+    int node = follow ? ramfs64_lookup(path)
+                      : ramfs64_lookup_nofollow(path);
     uint8_t* st = (uint8_t*)out;
 
     if (node < 0) return (uint64_t)-2;                 /* -ENOENT */
     for (int i = 0; i < 144; i++) st[i] = 0;
     fill_ids(st, node);
 
-    /* S_IFDIR or S_IFREG. ld.so checks this to decide whether a path it
-     * is about to search is a directory at all. */
-    *(uint32_t*)(st + 24) = ramfs64_is_dir(node)
-                            ? 0040755u : 0100644u;
+    /* S_IFDIR, S_IFLNK or S_IFREG. ld.so checks this to decide whether a
+     * path it is about to search is a directory at all, and anything
+     * walking a tree checks it to decide whether to recurse - an lstat
+     * that reported a symlink as an ordinary file would send `cp -r`
+     * and Wine's prefix updater into the target instead of copying the
+     * link. */
+    *(uint32_t*)(st + 24) = ramfs64_is_dir(node)  ? 0040755u
+                          : ramfs64_is_link(node) ? 0120777u
+                                                  : 0100644u;
     *(uint64_t*)(st + 48) = ramfs64_size(node);
     *(uint64_t*)(st + 56) = 4096;
     return 0;
+}
+
+/* readlink(path, buf, bufsiz).
+ *
+ * Two kinds of answer. /proc/self/exe is synthesised - there is no /proc
+ * here, so the path is remembered when the program is loaded - and it
+ * earns its place because it is how a program finds out where it was
+ * installed: Wine uses it to locate its own lib directory, and without
+ * it Wine computes the path to ntdll.so as (null) and stops.
+ *
+ * The other kind is a real symlink, which this filesystem has had since
+ * Milestone 68. A prefix is held together with them: dosdevices/c: is a
+ * link to ../drive_c, and Wine reaches drive C by reading it.
+ *
+ * readlink does not NUL-terminate, and a caller that assumed it did
+ * would read past what it was given.
+ */
+static uint64_t do_readlink(const char* given, char* buf, uint64_t size) {
+    char path[PROC64_PATH_MAX];
+    proc64_t* me = proc64_current();
+    const char* target;
+    uint64_t n;
+    int node;
+    int64_t e;
+
+    if (!buf) return (uint64_t)-14;                    /* -EFAULT */
+
+    if (kstrcmp(given, "/proc/self/exe") == 0) {
+        if (!me || !me->exe_path[0]) return (uint64_t)-2;
+        target = me->exe_path;
+    } else {
+        e = abs_path(given, path);
+        if (e) return (uint64_t)e;
+
+        node = ramfs64_lookup_nofollow(path);
+        if (node < 0) return (uint64_t)-2;             /* -ENOENT */
+
+        target = ramfs64_readlink(node);
+        /* Not a symlink. -EINVAL, which is how a caller tells "there is
+         * nothing here" from "the thing here is not a link". */
+        if (!target) return (uint64_t)-22;
+    }
+
+    n = kstrlen(target);
+    if (n > size) n = size;
+    kmemcpy(buf, target, n);
+    return n;
 }
 
 static uint64_t forks, execs;
@@ -263,11 +367,16 @@ uint64_t syscall64_dispatch(syscall64_args_t* args) {
      * which file could it not find - is the one thing it does not
      * answer. The argument holding the path differs per call. */
     if (args->nr == SYS64_OPEN || args->nr == SYS64_ACCESS ||
-        args->nr == SYS64_STAT || args->nr == SYS64_UNLINK) {
+        args->nr == SYS64_STAT || args->nr == SYS64_UNLINK ||
+        args->nr == SYS64_LSTAT || args->nr == SYS64_CHDIR ||
+        args->nr == SYS64_MKDIR || args->nr == SYS64_RMDIR ||
+        args->nr == SYS64_READLINK) {
         serial64_puts(" \"");
         serial64_puts((const char*)args->a1);
         serial64_puts("\"");
-    } else if (args->nr == SYS64_OPENAT || args->nr == SYS64_NEWFSTATAT) {
+    } else if (args->nr == SYS64_OPENAT || args->nr == SYS64_NEWFSTATAT ||
+               args->nr == SYS64_READLINKAT || args->nr == SYS64_UNLINKAT ||
+               args->nr == SYS64_MKDIRAT) {
         serial64_puts(" \"");
         serial64_puts((const char*)args->a2);
         serial64_puts("\"");
@@ -333,7 +442,10 @@ static uint64_t do_execve(const char* path, const char* const* argv,
     if (!p) return (uint64_t)-1;
     (void)args;
 
-    kstrlcpy(kpath, path, sizeof(kpath));
+    /* Made absolute against the working directory here, so that
+     * execve("./configure") works and so that /proc/self/exe answers
+     * with a path that still means something after a chdir. */
+    if (abs_path(path, kpath) != 0) return (uint64_t)-2;
     for (; argv && argv[nargv] && nargv < EXECVE_MAX_ARGS; nargv++) {
         kstrlcpy(kargv_store[nargv], argv[nargv], sizeof(kargv_store[0]));
         kargv[nargv] = kargv_store[nargv];
@@ -905,17 +1017,108 @@ static uint64_t dispatch(syscall64_args_t* args) {
 
     /* --- files ---------------------------------------------------- */
 
-    case SYS64_OPEN:
-        return do_open((const char*)a1, a2);
+    case SYS64_OPEN: {
+        char path[PROC64_PATH_MAX];
+        int64_t e = abs_path((const char*)a1, path);
+        if (e) return (uint64_t)e;
+        return do_open(path, a2);
+    }
 
-    case SYS64_OPENAT:
+    case SYS64_OPENAT: {
         /* openat(dirfd, path, flags, mode). glibc uses this in
-         * preference to open(2). Only AT_FDCWD (-100) with an absolute
-         * path is supported; there is no working directory here, so a
-         * relative path has nothing to be relative to. */
-        if ((int64_t)(int32_t)a1 != -100) return (uint64_t)-9;  /* -EBADF */
-        if (((const char*)a2)[0] != '/')  return (uint64_t)-2;  /* -ENOENT */
-        return do_open((const char*)a2, a3);
+         * preference to open(2).
+         *
+         * AT_FDCWD means "relative to the working directory", which is
+         * now a thing this kernel has. A real dirfd - relative to some
+         * other open directory - is answered for the case that actually
+         * occurs, an absolute path, where the dirfd is ignored by
+         * definition; anything else is -EBADF rather than silently
+         * resolved against the wrong directory. */
+        char path[PROC64_PATH_MAX];
+        const char* given = (const char*)a2;
+        int64_t e;
+
+        if ((int64_t)(int32_t)a1 != AT_FDCWD_ && given && given[0] != '/')
+            return (uint64_t)-9;                       /* -EBADF */
+
+        e = abs_path(given, path);
+        if (e) return (uint64_t)e;
+        return do_open(path, a3);
+    }
+
+    /* chdir(path). Wine's first act on a prefix is to chdir into it, and
+     * the 32-bit tree's log is full of "chdir to /disk/.wine : No such
+     * file or directory" from before it had one. */
+    case SYS64_CHDIR: {
+        char path[PROC64_PATH_MAX];
+        proc64_t* me = proc64_current();
+        int node;
+        int64_t e;
+
+        if (!me) return (uint64_t)-2;
+        e = abs_path((const char*)a1, path);
+        if (e) return (uint64_t)e;
+
+        node = ramfs64_lookup(path);
+        if (node < 0) return (uint64_t)-2;             /* -ENOENT */
+        if (!ramfs64_is_dir(node)) return (uint64_t)-20; /* -ENOTDIR */
+
+        /* Stored as the canonical path built back up from the node, not
+         * as the text the program supplied - so that getcwd after
+         * chdir("a/../b") answers "/b", and after a chdir through a
+         * symlink answers where it landed rather than how it got
+         * there. */
+        if (ramfs64_path(node, me->cwd, PROC64_PATH_MAX) < 0)
+            return (uint64_t)-36;                      /* -ENAMETOOLONG */
+        return 0;
+    }
+
+    case SYS64_FCHDIR: {
+        proc64_t* me = proc64_current();
+        if (!me) return (uint64_t)-2;
+        if (a1 < 3 || a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (!ramfs64_is_dir(fds[a1].node)) return (uint64_t)-20;
+        if (ramfs64_path(fds[a1].node, me->cwd, PROC64_PATH_MAX) < 0)
+            return (uint64_t)-36;
+        return 0;
+    }
+
+    /* getcwd(buf, size). Returns the length including the NUL, which is
+     * the kernel's contract and not glibc's - glibc returns the pointer
+     * and gets the length from here. */
+    case SYS64_GETCWD: {
+        proc64_t* me = proc64_current();
+        char* buf = (char*)a1;
+        uint64_t n;
+
+        if (!me || !buf) return (uint64_t)-14;         /* -EFAULT */
+        n = kstrlen(me->cwd) + 1;
+        if (a2 < n) return (uint64_t)-34;              /* -ERANGE */
+        kmemcpy(buf, me->cwd, n);
+        return n;
+    }
+
+    case SYS64_SYMLINK: {
+        /* symlink(target, linkpath) - the target is not a path this
+         * kernel resolves, so only the second argument is made
+         * absolute. */
+        char path[PROC64_PATH_MAX];
+        int64_t e = abs_path((const char*)a2, path);
+        if (e) return (uint64_t)e;
+        e = ramfs64_symlink(path, (const char*)a1);
+        return e < 0 ? (uint64_t)e : 0;
+    }
+
+    case SYS64_SYMLINKAT: {
+        char path[PROC64_PATH_MAX];
+        int64_t e;
+        if ((int64_t)(int32_t)a2 != AT_FDCWD_
+            && ((const char*)a3)[0] != '/') return (uint64_t)-9;
+        e = abs_path((const char*)a3, path);
+        if (e) return (uint64_t)e;
+        e = ramfs64_symlink(path, (const char*)a1);
+        return e < 0 ? (uint64_t)e : 0;
+    }
 
     case SYS64_CLOSE:
         if (a1 < 3 || a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
@@ -950,31 +1153,45 @@ static uint64_t dispatch(syscall64_args_t* args) {
      *
      * readlink does not NUL-terminate, and a caller that assumed it did
      * would read past what it was given. */
-    case SYS64_READLINK: {
-        char* buf = (char*)a2;
-        proc64_t* me = proc64_current();
-        uint64_t n;
+    case SYS64_READLINK:
+        return do_readlink((const char*)a1, (char*)a2, a3);
 
-        if (kstrcmp((const char*)a1, "/proc/self/exe") != 0)
-            return (uint64_t)-22;                      /* -EINVAL */
-        if (!me || !me->exe_path[0]) return (uint64_t)-2;  /* -ENOENT */
+    case SYS64_READLINKAT:
+        if ((int64_t)(int32_t)a1 != AT_FDCWD_
+            && ((const char*)a2)[0] != '/') return (uint64_t)-9;
+        return do_readlink((const char*)a2, (char*)a3, args->a4);
 
-        n = kstrlen(me->exe_path);
-        if (n > a3) n = a3;
-        kmemcpy(buf, me->exe_path, n);
-        return n;
+    case SYS64_ACCESS: {
+        char path[PROC64_PATH_MAX];
+        int64_t e = abs_path((const char*)a1, path);
+        if (e) return (uint64_t)e;
+        return ramfs64_lookup(path) >= 0 ? 0 : (uint64_t)-2;
     }
 
-    case SYS64_ACCESS:
-        return ramfs64_lookup((const char*)a1) >= 0
-               ? 0 : (uint64_t)-2;                     /* -ENOENT */
+    case SYS64_STAT: {
+        char path[PROC64_PATH_MAX];
+        int64_t e = abs_path((const char*)a1, path);
+        if (e) return (uint64_t)e;
+        return do_stat(path, (void*)a2, 1);
+    }
 
-    case SYS64_STAT:
-        return do_stat((const char*)a1, (void*)a2);
+    case SYS64_LSTAT: {
+        char path[PROC64_PATH_MAX];
+        int64_t e = abs_path((const char*)a1, path);
+        if (e) return (uint64_t)e;
+        return do_stat(path, (void*)a2, 0);
+    }
 
-    case SYS64_NEWFSTATAT:
-        if ((int64_t)(int32_t)a1 != -100) return (uint64_t)-9;
-        return do_stat((const char*)a2, (void*)a3);
+    case SYS64_NEWFSTATAT: {
+        char path[PROC64_PATH_MAX];
+        int64_t e;
+        if ((int64_t)(int32_t)a1 != AT_FDCWD_
+            && ((const char*)a2)[0] != '/') return (uint64_t)-9;
+        e = abs_path((const char*)a2, path);
+        if (e) return (uint64_t)e;
+        return do_stat(path, (void*)a3,
+                       !(args->a4 & AT_SYMLINK_NOFOLLOW_));
+    }
 
     /* pread64/pwrite64(fd, buf, count, offset). A positioned read that
      * does not move the file offset - which is how ld.so reads a
@@ -1049,15 +1266,51 @@ static uint64_t dispatch(syscall64_args_t* args) {
         return written;
     }
 
-    case SYS64_RMDIR:
-        return (uint64_t)(int64_t)ramfs64_rmdir((const char*)a1);
+    case SYS64_RMDIR: {
+        char path[PROC64_PATH_MAX];
+        int64_t e = abs_path((const char*)a1, path);
+        if (e) return (uint64_t)e;
+        return (uint64_t)(int64_t)ramfs64_rmdir(path);
+    }
 
-    case SYS64_MKDIR:
-        return ramfs64_create((const char*)a1, 1) >= 0
-               ? 0 : (uint64_t)-28;                    /* -ENOSPC */
+    case SYS64_MKDIR: {
+        char path[PROC64_PATH_MAX];
+        int64_t e = abs_path((const char*)a1, path);
+        if (e) return (uint64_t)e;
+        return ramfs64_create(path, 1) >= 0 ? 0 : (uint64_t)-28;
+    }
 
-    case SYS64_UNLINK:
-        return (uint64_t)(int64_t)ramfs64_unlink((const char*)a1);
+    case SYS64_MKDIRAT: {
+        char path[PROC64_PATH_MAX];
+        int64_t e;
+        if ((int64_t)(int32_t)a1 != AT_FDCWD_
+            && ((const char*)a2)[0] != '/') return (uint64_t)-9;
+        e = abs_path((const char*)a2, path);
+        if (e) return (uint64_t)e;
+        return ramfs64_create(path, 1) >= 0 ? 0 : (uint64_t)-28;
+    }
+
+    case SYS64_UNLINK: {
+        char path[PROC64_PATH_MAX];
+        int64_t e = abs_path((const char*)a1, path);
+        if (e) return (uint64_t)e;
+        return (uint64_t)(int64_t)ramfs64_unlink(path);
+    }
+
+    /* unlinkat(dirfd, path, flags). One call for two operations: with
+     * AT_REMOVEDIR it is rmdir and without it is unlink. glibc's
+     * remove() and rmdir() both arrive here. */
+    case SYS64_UNLINKAT: {
+        char path[PROC64_PATH_MAX];
+        int64_t e;
+        if ((int64_t)(int32_t)a1 != AT_FDCWD_
+            && ((const char*)a2)[0] != '/') return (uint64_t)-9;
+        e = abs_path((const char*)a2, path);
+        if (e) return (uint64_t)e;
+        return (uint64_t)(int64_t)((a3 & AT_REMOVEDIR_)
+                                   ? ramfs64_rmdir(path)
+                                   : ramfs64_unlink(path));
+    }
 
     case SYS64_READ: {
         int64_t n;

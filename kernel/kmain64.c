@@ -100,6 +100,8 @@ extern const unsigned char loader64_exe[];
 extern const unsigned long loader64_exe_len;
 extern const unsigned char tree64_elf[];
 extern const unsigned long tree64_elf_len;
+extern const unsigned char cwd64_elf[];
+extern const unsigned long cwd64_elf_len;
 extern const unsigned char fbdraw64_elf[];
 extern const unsigned long fbdraw64_elf_len;
 extern const unsigned char forkexec64_elf[];
@@ -2472,6 +2474,188 @@ void kernel_main(uint32_t magic, void* mbi) {
             serial64_putdec(syscall64_exit_code());
             serial64_putc('\n');
         }
+    }
+
+    /* --- layer 29: a working directory, and links (Milestone 68) ---- */
+    /* The last two things standing between this kernel and a Wine
+     * prefix, and both were absences rather than bugs: every relative
+     * path was answered -ENOENT because there was no directory to
+     * measure one against, and there were no symlinks at all - which is
+     * how a prefix reaches drive C.
+     *
+     * userland/cwd64.c is an ordinary C program against real glibc, so
+     * glibc picks the calls (openat with AT_FDCWD, unlinkat with
+     * AT_REMOVEDIR, newfstatat) and this kernel answers whichever it
+     * picks. The host runs the same file, and the two outputs are
+     * compared byte for byte. */
+    serial64_puts("NOVARIS64: -- a working directory --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 32;
+        vmspace64_t kspace;
+        elf64_info_t info;
+        uint64_t i, rsp;
+        int rc, stack_ok = 1, pid;
+        proc64_t* p;
+        static const char* const cwd_argv[] = { "/cwd64", 0 };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        signal64_reset();
+        sched64_init();
+        proc64_init();
+        vmspace64_kernel_space(&kspace);
+
+        /* Three the kernel can settle before the program runs, because
+         * a wrong answer here would show up inside it as something
+         * else entirely. */
+        check("a fresh process starts at the root",
+              (pid = proc64_create()) > 0 &&
+              kstrcmp(proc64_get(pid)->cwd, "/") == 0);
+        {
+            int link = ramfs64_symlink("/tmp/etc-link", "../etc");
+            check("a symlink can be made", link >= 0);
+            check("and it resolves through to its target",
+                  ramfs64_lookup("/tmp/etc-link/passwd") ==
+                  ramfs64_lookup("/etc/passwd"));
+            check("while lookup_nofollow stops at the link itself",
+                  ramfs64_lookup_nofollow("/tmp/etc-link") == link);
+            ramfs64_unlink("/tmp/etc-link");
+        }
+        /* A loop must be refused rather than hang the kernel. Nothing
+         * below this line would ever run if it did. */
+        {
+            ramfs64_symlink("/tmp/loop_a", "/tmp/loop_b");
+            ramfs64_symlink("/tmp/loop_b", "/tmp/loop_a");
+            check("a symlink loop is refused, not followed",
+                  ramfs64_lookup("/tmp/loop_a") < 0);
+            ramfs64_unlink("/tmp/loop_a");
+            ramfs64_unlink("/tmp/loop_b");
+        }
+
+        /* The sizing, tested rather than asserted.
+         *
+         * Raising RAMFS64_MAX_NODES from 192 to 4096 is one line and
+         * proves nothing on its own - the old table would have failed
+         * on the 193rd node, and nothing above builds 193 of anything.
+         * So build a tree the shape of the thing this is for: a prefix
+         * measured at 1049 nodes, so 60 directories of 21 files is
+         * 1320, comfortably past both the old ceiling and the real
+         * requirement.
+         *
+         * It also exercises the child lists. With the old whole-table
+         * scan every one of these creates walked 4096 entries looking
+         * for a free slot and every lookup walked it again looking for
+         * a sibling; at this size that is the quadratic kmalloc of
+         * Milestone 46 in a different file. */
+        {
+            uint64_t before = ramfs64_count();
+            int made = 0, found = 0;
+            char path[128];
+
+            for (int d = 0; d < 60; d++) {
+                char dir[64];
+                uint64_t n = 0;
+                kstrlcpy(dir, "/tmp/pfx/d", sizeof(dir));
+                n = kstrlen(dir);
+                n += ku32_to_dec((uint32_t)d, dir + n);
+                dir[n] = 0;
+                if (ramfs64_mkdirp(dir) < 0) continue;
+
+                for (int f = 0; f < 21; f++) {
+                    uint64_t m;
+                    kstrlcpy(path, dir, sizeof(path));
+                    m = kstrlen(path);
+                    path[m++] = '/';
+                    path[m++] = 'f';
+                    m += ku32_to_dec((uint32_t)f, path + m);
+                    path[m] = 0;
+                    if (ramfs64_create(path, 0) >= 0) made++;
+                }
+            }
+
+            /* Every one of them still findable - which is the claim a
+             * child list has to earn, since a broken sibling pointer
+             * loses a whole directory silently. */
+            for (int d = 0; d < 60; d++) {
+                for (int f = 0; f < 21; f++) {
+                    uint64_t m;
+                    kstrlcpy(path, "/tmp/pfx/d", sizeof(path));
+                    m = kstrlen(path);
+                    m += ku32_to_dec((uint32_t)d, path + m);
+                    path[m++] = '/';
+                    path[m++] = 'f';
+                    m += ku32_to_dec((uint32_t)f, path + m);
+                    path[m] = 0;
+                    if (ramfs64_lookup(path) >= 0) found++;
+                }
+            }
+
+            check("a prefix-sized tree fits (1260 files past the old 192)",
+                  made == 1260);
+            check("and every file in it is still findable", found == 1260);
+            check("the node count agrees with what was made",
+                  ramfs64_count() == before + 1260 + 61);
+
+            serial64_puts("NOVARIS64: nodes   = ");
+            serial64_putdec(ramfs64_count());
+            serial64_puts(" of ");
+            serial64_putdec(RAMFS64_MAX_NODES);
+            serial64_putc('\n');
+
+            /* Back to a clean filesystem for the program below, which
+             * asserts on what it finds. */
+            ramfs64_init();
+            ramfs64_seed_from_initrd();
+        }
+
+        proc64_set_current(pid);
+        p = proc64_current();
+
+        check("a space for it", vmspace64_create(&p->space) != 0);
+        rc = elf64_load(cwd64_elf, cwd64_elf_len, &p->space, &info);
+        check("the cwd program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&p->space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&p->space, info.brk_start);
+        rsp = uspace64_build_stack(&p->space, STACK_TOP, STACK_PAGES,
+                                   cwd_argv, &info, 0, 0);
+
+        {
+            registers64_t first;
+            for (i = 0; i < sizeof(first) / 8; i++)
+                ((uint64_t*)&first)[i] = 0;
+            sched64_add_frame_for(&first, &p->space, 0, pid);
+            sched64_set_current(0);
+        }
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        vmspace64_switch(&p->space);
+        enter_user_mode64(info.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+        pf_diagnose = 0;
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        /* 89 means every one of its own assertions passed. 1 means it
+         * ran to the end and disagreed with Linux somewhere, which the
+         * differential in Makefile.amd64 will name. */
+        check("the working directory and symlinks behaved",
+              syscall64_exit_code() == 89);
+        check("and it left nothing behind",
+              ramfs64_lookup("/tmp/novaris_cwd_test") < 0);
+
+        serial64_puts("NOVARIS64: cwd64   = exit ");
+        serial64_putdec(syscall64_exit_code());
+        serial64_putc('\n');
     }
 
     /* --- verdict ---------------------------------------------------- */

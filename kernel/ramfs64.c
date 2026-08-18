@@ -8,62 +8,136 @@
 typedef struct {
     char     name[RAMFS64_NAME_MAX];   /* one component, not a path */
     int      parent;                   /* node index; -1 for the root */
-    uint8_t* data;
+    uint8_t* data;                     /* a symlink keeps its target here */
     uint64_t size;
     uint64_t capacity;
     int      is_dir;
+    int      is_link;
     int      device;                   /* RAMFS64_DEV_*; 0 = an ordinary file */
     int      used;
+
+    /* The child list. A directory points at its first child and each
+     * child at the next; both are node indices, -1 for "no more". This
+     * is what stops a lookup having to scan the whole table - see the
+     * note in ramfs64.h about why that stopped being affordable. */
+    int      first_child;
+    int      next_sibling;
 } node64_t;
 
-static node64_t nodes[RAMFS64_MAX_NODES];
-static uint64_t node_count;
+/* In the heap rather than in BSS: 4096 x sizeof(node64_t) is about
+ * 1.2MB, and a kernel image does not need to carry it. */
+static node64_t* nodes;
+static uint64_t  node_count;
+
+/* Free nodes, threaded through next_sibling. Without this, allocating
+ * the 4000th node means scanning 4000 entries to find the one hole. */
+static int free_head;
 
 #define ROOT 0
+
+static int ensure_capacity(node64_t* nd, uint64_t want);
+
+static int valid(int n) {
+    return nodes && n >= 0 && n < RAMFS64_MAX_NODES && nodes[n].used;
+}
 
 static int alloc_node(const char* name, int parent, int is_dir) {
     int i;
 
-    for (i = 0; i < RAMFS64_MAX_NODES; i++) if (!nodes[i].used) break;
-    if (i == RAMFS64_MAX_NODES) return -1;
+    if (!nodes || free_head < 0) return -1;
+    i         = free_head;
+    free_head = nodes[i].next_sibling;
 
     kstrlcpy(nodes[i].name, name, RAMFS64_NAME_MAX);
-    nodes[i].parent   = parent;
-    nodes[i].data     = 0;
-    nodes[i].size     = 0;
-    nodes[i].capacity = 0;
-    nodes[i].is_dir   = is_dir;
-    nodes[i].device   = RAMFS64_DEV_NONE;
-    nodes[i].used     = 1;
+    nodes[i].parent       = parent;
+    nodes[i].data         = 0;
+    nodes[i].size         = 0;
+    nodes[i].capacity     = 0;
+    nodes[i].is_dir       = is_dir;
+    nodes[i].is_link      = 0;
+    nodes[i].device       = RAMFS64_DEV_NONE;
+    nodes[i].used         = 1;
+    nodes[i].first_child  = -1;
+    nodes[i].next_sibling = -1;
+
+    /* Into the parent's child list. At the front, because appending
+     * would mean walking the list and the order of a directory is not
+     * promised to anyone - readdir on Linux does not sort either. */
+    if (parent >= 0 && parent < RAMFS64_MAX_NODES) {
+        nodes[i].next_sibling      = nodes[parent].first_child;
+        nodes[parent].first_child  = i;
+    }
+
     node_count++;
     return i;
 }
 
+/* Unlinks a node from its parent's child list and returns it to the
+ * free list. The caller has already decided this is allowed. */
+static void free_node(int n) {
+    int parent = nodes[n].parent;
+
+    if (parent >= 0 && parent < RAMFS64_MAX_NODES) {
+        int c = nodes[parent].first_child;
+        if (c == n) {
+            nodes[parent].first_child = nodes[n].next_sibling;
+        } else {
+            while (c >= 0 && nodes[c].next_sibling != n)
+                c = nodes[c].next_sibling;
+            if (c >= 0) nodes[c].next_sibling = nodes[n].next_sibling;
+        }
+    }
+
+    nodes[n].used         = 0;
+    nodes[n].first_child  = -1;
+    nodes[n].next_sibling = free_head;
+    free_head             = n;
+    if (node_count) node_count--;
+}
+
 /* One component of a path, by name, in one directory. */
 static int find_child(int dir, const char* name, uint64_t len) {
-    if (dir < 0 || !nodes[dir].used || !nodes[dir].is_dir) return -1;
+    if (!valid(dir) || !nodes[dir].is_dir) return -1;
 
-    for (int i = 0; i < RAMFS64_MAX_NODES; i++) {
-        if (!nodes[i].used || nodes[i].parent != dir) continue;
+    for (int i = nodes[dir].first_child; i >= 0; i = nodes[i].next_sibling) {
         if (kstrnlen(nodes[i].name, RAMFS64_NAME_MAX) != len) continue;
         if (kstrncmp(nodes[i].name, name, len) == 0) return i;
     }
     return -1;
 }
 
-/* Walks `path` from the root. If `stop_at_parent`, resolves all but the
- * last component and hands back the final name - which is what create
- * needs, since the thing it is about to make does not exist yet. */
-static int resolve(const char* path, int stop_at_parent,
-                   const char** last, uint64_t* last_len) {
-    int node = ROOT;
-    const char* p = path;
+/* Walks `path` from the root.
+ *
+ * `want_parent` resolves all but the last component and copies the
+ * final name into `name_out` - which is what create needs, since the
+ * thing it is about to make does not exist yet. It is a copy and not a
+ * pointer into `path` because following a symlink rewrites the path
+ * into a buffer local to this function, and a pointer into that buffer
+ * would dangle the moment it returned.
+ *
+ * `follow_final` decides what happens when the last component is itself
+ * a symlink: stat follows it, lstat and readlink do not. Components in
+ * the middle are always followed - "through a link" is what a link is
+ * for.
+ */
+static int walk(const char* path, int want_parent, int follow_final,
+                char* name_out) {
+    /* Two, alternating: expanding a link builds a new path out of the
+     * old one, and the old one may itself be one of these buffers. */
+    char bufs[2][RAMFS64_PATH_MAX];
+    int  which = 0, links = 0;
+    const char* p;
+    int node;
 
-    if (!path || path[0] != '/') return -1;    /* absolute paths only */
+    if (!nodes || !path || path[0] != '/') return -1;   /* absolute only */
+
+    p    = path;
+    node = ROOT;
 
     while (*p) {
         const char* start;
         uint64_t len = 0;
+        int child, is_last;
 
         while (*p == '/') p++;
         if (!*p) break;
@@ -71,15 +145,19 @@ static int resolve(const char* path, int stop_at_parent,
         start = p;
         while (*p && *p != '/') { p++; len++; }
 
-        /* The last component, when the caller wants its parent. */
         {
             const char* probe = p;
             while (*probe == '/') probe++;
-            if (!*probe && stop_at_parent) {
-                if (last)     *last     = start;
-                if (last_len) *last_len = len;
-                return node;
+            is_last = !*probe;
+        }
+
+        if (is_last && want_parent) {
+            if (!len || len >= RAMFS64_NAME_MAX) return -1;
+            if (name_out) {
+                kmemcpy(name_out, start, len);
+                name_out[len] = 0;
             }
+            return node;
         }
 
         if (len == 1 && start[0] == '.') continue;
@@ -89,20 +167,72 @@ static int resolve(const char* path, int stop_at_parent,
             continue;
         }
 
-        node = find_child(node, start, len);
-        if (node < 0) return -1;
+        child = find_child(node, start, len);
+        if (child < 0) return -1;
+
+        if (nodes[child].is_link && (!is_last || follow_final)) {
+            char*    out = bufs[which];
+            uint64_t n   = 0;
+            const char* target = (const char*)nodes[child].data;
+            uint64_t tlen = nodes[child].size;
+
+            if (++links > RAMFS64_LINK_MAX) return -1;   /* -ELOOP */
+            if (!target || !tlen) return -1;
+            if (tlen >= RAMFS64_PATH_MAX) return -1;
+
+            /* The new path is the link's target with whatever was left
+             * of the old one appended. A target starting with '/' is
+             * resolved from the root; otherwise it is relative to the
+             * directory the link sits in, which is where `node` already
+             * is - we have not stepped into the link. */
+            kmemcpy(out, target, tlen);
+            n = tlen;
+
+            for (const char* rest = p; *rest; rest++) {
+                if (n + 2 >= RAMFS64_PATH_MAX) return -1;
+                if (rest == p && *rest != '/') out[n++] = '/';
+                out[n++] = *rest;
+            }
+            out[n] = 0;
+
+            /* An absolute target restarts at the root; a relative one
+             * carries on from `node`, the directory the link lives in.
+             * The component loop itself does not care which, so this is
+             * the only line that has to. */
+            if (out[0] == '/') node = ROOT;
+
+            p     = out;
+            which = !which;
+            continue;
+        }
+
+        node = child;
     }
 
-    if (stop_at_parent) return -1;    /* the path was just "/" */
+    if (want_parent) return -1;       /* the path was just "/" */
     return node;
 }
 
 void ramfs64_init(void) {
-    for (int i = 0; i < RAMFS64_MAX_NODES; i++) {
-        if (nodes[i].used && nodes[i].data) kfree64(nodes[i].data);
-        nodes[i].used = 0;
-        nodes[i].data = 0;
+    if (!nodes) {
+        nodes = (node64_t*)kmalloc64(sizeof(node64_t) * RAMFS64_MAX_NODES);
+        if (!nodes) return;              /* nothing else here can work */
+    } else {
+        for (int i = 0; i < RAMFS64_MAX_NODES; i++)
+            if (nodes[i].used && nodes[i].data) kfree64(nodes[i].data);
     }
+
+    /* Every node free, threaded into one list, so allocating the last
+     * one costs the same as allocating the first. */
+    for (int i = 0; i < RAMFS64_MAX_NODES; i++) {
+        nodes[i].used         = 0;
+        nodes[i].data         = 0;
+        nodes[i].capacity     = 0;
+        nodes[i].size         = 0;
+        nodes[i].first_child  = -1;
+        nodes[i].next_sibling = i + 1 < RAMFS64_MAX_NODES ? i + 1 : -1;
+    }
+    free_head  = 0;
     node_count = 0;
 
     /* The root, and it must be node 0 - resolve() starts there. */
@@ -133,24 +263,94 @@ void ramfs64_init(void) {
 }
 
 int ramfs64_lookup(const char* path) {
-    return resolve(path, 0, 0, 0);
+    return walk(path, 0, 1, 0);
+}
+
+int ramfs64_lookup_nofollow(const char* path) {
+    return walk(path, 0, 0, 0);
 }
 
 int ramfs64_create(const char* path, int is_dir) {
-    const char* name = 0;
-    uint64_t len = 0;
-    int parent, existing;
     char component[RAMFS64_NAME_MAX];
+    int parent, existing;
 
-    parent = resolve(path, 1, &name, &len);
-    if (parent < 0 || !len || len >= RAMFS64_NAME_MAX) return -1;
+    parent = walk(path, 1, 1, component);
+    if (parent < 0) return -1;
 
-    existing = find_child(parent, name, len);
+    existing = find_child(parent, component,
+                          kstrnlen(component, RAMFS64_NAME_MAX));
     if (existing >= 0) return existing;
 
-    kmemcpy(component, name, len);
-    component[len] = 0;
     return alloc_node(component, parent, is_dir);
+}
+
+int ramfs64_symlink(const char* path, const char* target) {
+    char component[RAMFS64_NAME_MAX];
+    int parent, node;
+    uint64_t tlen;
+
+    if (!target || !*target) return -22;                /* -EINVAL */
+    tlen = kstrlen(target);
+    if (tlen >= RAMFS64_PATH_MAX) return -36;           /* -ENAMETOOLONG */
+
+    parent = walk(path, 1, 1, component);
+    if (parent < 0) return -2;                          /* -ENOENT */
+    if (find_child(parent, component,
+                   kstrnlen(component, RAMFS64_NAME_MAX)) >= 0)
+        return -17;                                     /* -EEXIST */
+
+    node = alloc_node(component, parent, 0);
+    if (node < 0) return -28;                           /* -ENOSPC */
+
+    /* The target is the node's contents. It is never interpreted here -
+     * a link to a path that does not exist is legal and dangles, which
+     * is why this does not check it. */
+    nodes[node].is_link = 1;
+    if (!ensure_capacity(&nodes[node], tlen + 1)) { free_node(node); return -12; }
+    kmemcpy(nodes[node].data, target, tlen);
+    nodes[node].data[tlen] = 0;
+    nodes[node].size = tlen;
+    return node;
+}
+
+const char* ramfs64_readlink(int node) {
+    if (!valid(node) || !nodes[node].is_link) return 0;
+    return (const char*)nodes[node].data;
+}
+
+int ramfs64_is_link(int node) {
+    return valid(node) && nodes[node].is_link;
+}
+
+/* Up the parent chain, then reversed - the components arrive in the
+ * wrong order and the only way to emit them in the right one is to
+ * collect them first. */
+int ramfs64_path(int node, char* out, uint64_t size) {
+    int chain[64];
+    int depth = 0;
+    uint64_t n = 0;
+
+    if (!valid(node) || !out || size < 2) return -1;
+
+    while (node > 0 && depth < 64) {
+        chain[depth++] = node;
+        node = nodes[node].parent;
+    }
+    if (node > 0) return -1;             /* deeper than this can describe */
+
+    if (depth == 0) { out[0] = '/'; out[1] = 0; return 1; }
+
+    while (depth-- > 0) {
+        const char* nm = nodes[chain[depth]].name;
+        uint64_t len = kstrnlen(nm, RAMFS64_NAME_MAX);
+
+        if (n + len + 2 > size) return -1;
+        out[n++] = '/';
+        kmemcpy(out + n, nm, len);
+        n += len;
+    }
+    out[n] = 0;
+    return (int)n;
 }
 
 int ramfs64_mkdirp(const char* path) {
@@ -208,7 +408,7 @@ static int ensure_capacity(node64_t* nd, uint64_t want) {
 int64_t ramfs64_read(int node, uint64_t offset, void* buf, uint64_t len) {
     node64_t* nd;
 
-    if (node < 0 || node >= RAMFS64_MAX_NODES || !nodes[node].used) return -9;
+    if (!valid(node)) return -9;
     nd = &nodes[node];
     if (nd->is_dir) return -21;                     /* -EISDIR */
 
@@ -223,7 +423,7 @@ int64_t ramfs64_write(int node, uint64_t offset, const void* buf,
                       uint64_t len) {
     node64_t* nd;
 
-    if (node < 0 || node >= RAMFS64_MAX_NODES || !nodes[node].used) return -9;
+    if (!valid(node)) return -9;
     nd = &nodes[node];
     if (nd->is_dir) return -21;
 
@@ -235,19 +435,19 @@ int64_t ramfs64_write(int node, uint64_t offset, const void* buf,
 }
 
 int ramfs64_truncate(int node) {
-    if (node < 0 || node >= RAMFS64_MAX_NODES || !nodes[node].used) return -9;
+    if (!valid(node)) return -9;
     nodes[node].size = 0;
     return 0;
 }
 
 static int has_children(int dir) {
-    for (int i = 0; i < RAMFS64_MAX_NODES; i++)
-        if (nodes[i].used && nodes[i].parent == dir) return 1;
-    return 0;
+    return valid(dir) && nodes[dir].first_child >= 0;
 }
 
 int ramfs64_unlink(const char* path) {
-    int i = ramfs64_lookup(path);
+    /* Deliberately does not follow a final symlink: unlinking a link
+     * removes the link, not the file it names. */
+    int i = ramfs64_lookup_nofollow(path);
 
     if (i < 0) return -2;                           /* -ENOENT */
     if (nodes[i].is_dir) return -21;                /* -EISDIR */
@@ -257,33 +457,29 @@ int ramfs64_unlink(const char* path) {
      * a program relying on that reads freed memory here. */
     if (nodes[i].data) kfree64(nodes[i].data);
     nodes[i].data = 0;
-    nodes[i].used = 0;
-    if (node_count) node_count--;
+    free_node(i);
     return 0;
 }
 
 int ramfs64_rmdir(const char* path) {
-    int i = ramfs64_lookup(path);
+    int i = ramfs64_lookup_nofollow(path);
 
     if (i < 0) return -2;
     if (!nodes[i].is_dir) return -20;               /* -ENOTDIR */
     if (i == ROOT) return -16;                      /* -EBUSY */
     if (has_children(i)) return -39;                /* -ENOTEMPTY */
 
-    nodes[i].used = 0;
-    if (node_count) node_count--;
+    free_node(i);
     return 0;
 }
 
 int ramfs64_child(int dir, uint64_t index, int* out_node) {
     uint64_t seen = 0;
 
-    if (dir < 0 || dir >= RAMFS64_MAX_NODES || !nodes[dir].used) return 0;
+    if (!valid(dir)) return 0;
     if (!nodes[dir].is_dir) return 0;
 
-    for (int i = 0; i < RAMFS64_MAX_NODES; i++) {
-        if (!nodes[i].used || nodes[i].parent != dir) continue;
-        if (i == ROOT) continue;
+    for (int i = nodes[dir].first_child; i >= 0; i = nodes[i].next_sibling) {
         if (seen == index) { if (out_node) *out_node = i; return 1; }
         seen++;
     }
@@ -291,27 +487,27 @@ int ramfs64_child(int dir, uint64_t index, int* out_node) {
 }
 
 const char* ramfs64_name(int node) {
-    if (node < 0 || node >= RAMFS64_MAX_NODES || !nodes[node].used) return 0;
+    if (!valid(node)) return 0;
     return nodes[node].name;
 }
 
 const void* ramfs64_data(int node) {
-    if (node < 0 || node >= RAMFS64_MAX_NODES || !nodes[node].used) return 0;
+    if (!valid(node)) return 0;
     return nodes[node].data;
 }
 
 uint64_t ramfs64_size(int node) {
-    if (node < 0 || node >= RAMFS64_MAX_NODES || !nodes[node].used) return 0;
+    if (!valid(node)) return 0;
     return nodes[node].size;
 }
 
 int ramfs64_is_dir(int node) {
-    if (node < 0 || node >= RAMFS64_MAX_NODES || !nodes[node].used) return 0;
+    if (!valid(node)) return 0;
     return nodes[node].is_dir;
 }
 
 int ramfs64_parent(int node) {
-    if (node < 0 || node >= RAMFS64_MAX_NODES || !nodes[node].used) return -1;
+    if (!valid(node)) return -1;
     return nodes[node].parent;
 }
 
@@ -321,14 +517,14 @@ int ramfs64_parent(int node) {
  * syscall64.c that decides that RAMFS64_DEV_FB means "mmap this to the
  * framebuffer", exactly as Linux keeps its device model out of tmpfs. */
 int ramfs64_set_device(int node, int device) {
-    if (node < 0 || node >= RAMFS64_MAX_NODES || !nodes[node].used) return 0;
+    if (!valid(node)) return 0;
     if (nodes[node].is_dir) return 0;
     nodes[node].device = device;
     return 1;
 }
 
 int ramfs64_device(int node) {
-    if (node < 0 || node >= RAMFS64_MAX_NODES || !nodes[node].used)
+    if (!valid(node))
         return RAMFS64_DEV_NONE;
     return nodes[node].device;
 }
