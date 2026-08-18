@@ -219,6 +219,9 @@ uint64_t syscall64_file_maps(void);
 /* Processes created and programs replaced. A run where a fork silently
  * became a thread would look identical without these. */
 uint64_t syscall64_forks(void);
+/* Frames consumed by the most recent fork - the measurement that tells
+ * a shared clone from a copied one (Milestone 69). */
+uint64_t syscall64_last_fork_frames(void);
 uint64_t syscall64_execs(void);
 
 #endif

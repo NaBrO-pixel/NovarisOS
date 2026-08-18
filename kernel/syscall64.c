@@ -285,9 +285,82 @@ static uint64_t do_readlink(const char* given, char* buf, uint64_t size) {
 }
 
 static uint64_t forks, execs;
+static uint64_t last_fork_frames;
+
+static void frame_from_args(const syscall64_args_t* args, uint64_t rax,
+                            registers64_t* out);
+
+/* fork(2). The child is the parent with a different address space, a
+ * different pid, and 0 where the parent gets the child's pid.
+ *
+ * Reached from two syscalls: SYS_fork, and SYS_clone without CLONE_VM,
+ * which is what glibc's fork() actually issues.
+ *
+ * Ordering matters: the address space is the part that can fail, so it
+ * happens before anything is committed. A half-built process is worse
+ * than a failed fork.
+ */
+static uint64_t do_fork(const syscall64_args_t* args) {
+    registers64_t child;
+    int child_pid;
+    proc64_t* cp;
+    /* What the fork itself cost, in frames. This is the only place the
+     * difference between sharing and copying is visible: both produce a
+     * correct child, and only one of them charges the resident size of
+     * the process for it. */
+    uint64_t free_before = pmm64_free_frames();
+
+    child_pid = proc64_fork_from(proc64_current_pid());
+    if (child_pid < 0) return (uint64_t)-11;           /* -EAGAIN */
+    cp = proc64_get(child_pid);
+
+    if (!vmspace64_create(&cp->space)) {
+        proc64_exit(child_pid, 0);
+        proc64_reap_child(proc64_current_pid(), 0);
+        return (uint64_t)-12;                          /* -ENOMEM */
+    }
+    /* Shared, not copied (Milestone 69). The eager clone is still there
+     * and still correct; it cost the whole resident size of the process
+     * and stopped at 16MB, which is not a fork anything the size of
+     * Wine can use. */
+    if (!vmspace64_clone_cow(vmspace64_current_phys(), &cp->space)) {
+        vmspace64_destroy(&cp->space);
+        proc64_exit(child_pid, 0);
+        proc64_reap_child(proc64_current_pid(), 0);
+        return (uint64_t)-12;
+    }
+
+    /* The child resumes exactly where the parent is about to, with a 0
+     * in rax - which is the whole of how the two tell each other
+     * apart. */
+    frame_from_args(args, 0, &child);
+
+    /* The child inherits the parent's thread pointer.
+     *
+     * Passing 0 here - "a task that has never run has no TLS yet" - is
+     * right for a brand new program, which will call arch_prctl before
+     * it touches TLS, and wrong for a fork, which is a copy of a
+     * process that already did. The child comes back from clone inside
+     * glibc, whose very next act is to read the thread descriptor at
+     * fs:0x10; with FS_BASE at 0 that is a read of linear address 0x10
+     * and the child dies on a null dereference that has nothing
+     * visibly to do with fork. */
+    if (sched64_add_frame_for(&child, &cp->space,
+                              read_msr(0xC0000100u), child_pid) < 0) {
+        vmspace64_destroy(&cp->space);
+        return (uint64_t)-11;
+    }
+    forks++;
+    {
+        uint64_t now = pmm64_free_frames();
+        last_fork_frames = free_before > now ? free_before - now : 0;
+    }
+    return (uint64_t)child_pid;
+}
 
 uint64_t syscall64_forks(void) { return forks; }
 uint64_t syscall64_execs(void) { return execs; }
+uint64_t syscall64_last_fork_frames(void) { return last_fork_frames; }
 
 /* The calling thread's complete user state, as a frame it could be
  * resumed from, with `rax` set to what the syscall will return.
@@ -697,7 +770,16 @@ static uint64_t dispatch(syscall64_args_t* args) {
         const vmspace64_t* space;
         int tid;
 
-        if (!(a1 & CLONE_VM))    return (uint64_t)-38;  /* -ENOSYS: fork */
+        /* clone without CLONE_VM is a fork, and this is not a corner
+         * case: it is how glibc implements fork(2). There is no
+         * fork(2) in glibc's source - it calls
+         * clone(CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID|SIGCHLD) - so a
+         * kernel that answers -ENOSYS here has no fork as far as any
+         * ordinary C program is concerned, however complete its
+         * SYS_fork happens to be. That is exactly what this kernel
+         * was: the raw-assembly fork test passed and every glibc
+         * program's fork() failed. */
+        if (!(a1 & CLONE_VM)) return do_fork(args);
         if (!a2)                 return (uint64_t)-22;  /* -EINVAL       */
 
         space = sched64_current_space();
@@ -742,38 +824,8 @@ static uint64_t dispatch(syscall64_args_t* args) {
      * Ordering matters: the address space copy is the expensive part
      * and the part that can fail, so it happens before anything is
      * committed. A half-built process is worse than a failed fork. */
-    case SYS64_FORK: {
-        registers64_t child;
-        int child_pid;
-        proc64_t* cp;
-
-        child_pid = proc64_fork_from(proc64_current_pid());
-        if (child_pid < 0) return (uint64_t)-11;       /* -EAGAIN */
-        cp = proc64_get(child_pid);
-
-        if (!vmspace64_create(&cp->space)) {
-            proc64_exit(child_pid, 0);
-            proc64_reap_child(proc64_current_pid(), 0);
-            return (uint64_t)-12;                      /* -ENOMEM */
-        }
-        if (!vmspace64_clone(&cp->space)) {
-            vmspace64_destroy(&cp->space);
-            proc64_exit(child_pid, 0);
-            proc64_reap_child(proc64_current_pid(), 0);
-            return (uint64_t)-12;
-        }
-
-        /* The child resumes exactly where the parent is about to, with
-         * a 0 in rax - which is the whole of how the two tell each
-         * other apart. */
-        frame_from_args(args, 0, &child);
-        if (sched64_add_frame_for(&child, &cp->space, 0, child_pid) < 0) {
-            vmspace64_destroy(&cp->space);
-            return (uint64_t)-11;
-        }
-        forks++;
-        return (uint64_t)child_pid;
-    }
+    case SYS64_FORK:
+        return do_fork(args);
 
     /* execve(path, argv, envp). Replaces the calling process rather
      * than returning to it, so on success there is nothing to return

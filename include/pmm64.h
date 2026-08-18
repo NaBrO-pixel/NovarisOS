@@ -48,6 +48,16 @@ uint64_t pmm64_highest_addr(void);
 
 /* Where the bitmap was placed, and how big it is - reported rather than
  * assumed, because a boot where it did not fit needs to say so. */
+/* Sharing, for copy-on-write (Milestone 69). A frame carries a count of
+ * its owners; freeing at more than one drops an owner rather than the
+ * frame. Zero extra owners is the default, so nothing that allocated
+ * before this existed has to change. */
+int      pmm64_ref_frame(uint64_t phys);
+uint64_t pmm64_frame_owners(uint64_t phys);
+int      pmm64_owns(uint64_t phys);
+uint64_t pmm64_refs_phys(void);
+uint64_t pmm64_refs_bytes(void);
+
 uint64_t pmm64_bitmap_phys(void);
 uint64_t pmm64_bitmap_bytes(void);
 

@@ -27,6 +27,23 @@ static uint8_t* bitmap;                  /* through the KERNEL_VMA window */
 static uint64_t bitmap_phys_addr;
 static uint64_t bitmap_size_bytes;
 static uint64_t frame_count;             /* frames the bitmap describes */
+
+/* How many *extra* owners a frame has, one byte each, laid out beside the
+ * bitmap and by the same argument (Milestone 69).
+ *
+ * Zero means one owner, which is what every allocation before
+ * copy-on-write existed had - so nothing that already calls
+ * pmm64_free_frame has to change, and a frame nobody shared is freed on
+ * the first free exactly as before. pmm64_ref_frame raises it, and a
+ * free at a non-zero count drops an owner rather than the frame.
+ *
+ * A byte saturates at 255. Saturating silently would leak; refusing to
+ * share past that is the caller's cue to copy instead, which is what
+ * vmspace64's clone does. */
+static uint8_t* refs;
+static uint64_t refs_phys_addr;
+static uint64_t refs_size_bytes;
+#define REF_MAX 255
 static uint64_t highest_addr;
 static uint64_t double_frees;
 static uint64_t alloc_hint;              /* where the last upward scan left off */
@@ -140,16 +157,26 @@ void pmm64_init(const multiboot_info_t* mbi,
     }
     place = (place + PMM64_FRAME_SIZE - 1) & ~(PMM64_FRAME_SIZE - 1);
 
-    if (place + bitmap_size_bytes > BOOT_WINDOW_BYTES) {
+    /* The refcount table is eight times the bitmap and goes immediately
+     * after it, so both are covered by the one window check below. At
+     * 6GB that is 1.5MB of bitmap-plus-counts against a 1GB window. */
+    refs_size_bytes = frame_count;
+
+    if (place + bitmap_size_bytes + refs_size_bytes > BOOT_WINDOW_BYTES) {
         /* Would fall outside what boot64.s mapped. Refusing is the only
          * safe answer: the write would land somewhere unmapped, or worse,
          * somewhere mapped and in use. */
         bitmap_phys_addr = 0;
+        refs_phys_addr   = 0;
         return;
     }
 
     bitmap_phys_addr = place;
     bitmap = (uint8_t*)(KERNEL_VMA + place);
+
+    refs_phys_addr = place + bitmap_size_bytes;
+    refs = (uint8_t*)(KERNEL_VMA + refs_phys_addr);
+    for (uint64_t i = 0; i < refs_size_bytes; i++) refs[i] = 0;
 
     /* Everything used, then free only what the bootloader vouched for.
      * The reverse - assume free, mark the exceptions - hands out MMIO and
@@ -162,8 +189,12 @@ void pmm64_init(const multiboot_info_t* mbi,
     mark_range(0, 0x100000ULL / PMM64_FRAME_SIZE, 1);
 
     pmm64_reserve_region(kernel_phys_start, kernel_phys_end);
+    /* Both tables, in one reservation. Reserving only the bitmap is the
+     * Milestone 66 bug with a new name: the refcount table is eight
+     * times the size, so it is the one that would reach whatever sits
+     * above it, and it would do so only at the RAM sizes nobody tested. */
     pmm64_reserve_region(bitmap_phys_addr,
-                         bitmap_phys_addr + bitmap_size_bytes);
+                         refs_phys_addr + refs_size_bytes);
 
     ready = 1;
 }
@@ -259,6 +290,13 @@ void pmm64_free_frame(uint64_t phys) {
      * now share it and the damage surfaces somewhere else entirely. Count
      * it rather than clearing the bit a second time. */
     if (!bitmap_test(f)) { double_frees++; return; }
+
+    /* Shared: this drops one owner, not the frame. The frame goes back
+     * only when the last owner lets go, which is the whole contract
+     * copy-on-write is built on - a page mapped into a parent and a
+     * child must survive either of them exiting. */
+    if (refs && refs[f]) { refs[f]--; return; }
+
     bitmap_clear(f);
     if (f < alloc_hint) alloc_hint = f;
     /* Both hints move to include the frame just returned, so neither
@@ -285,3 +323,38 @@ uint64_t pmm64_highest_addr(void) { return highest_addr; }
 uint64_t pmm64_bitmap_phys(void)  { return bitmap_phys_addr; }
 uint64_t pmm64_bitmap_bytes(void) { return bitmap_size_bytes; }
 int      pmm64_ready(void)        { return ready; }
+
+/* --- sharing (Milestone 69) ----------------------------------------- */
+
+/* Adds an owner. Returns 0 if the frame cannot take another - either it
+ * is not a frame this allocator owns, or the count has saturated - and
+ * the caller must copy rather than share. */
+int pmm64_ref_frame(uint64_t phys) {
+    uint64_t f = phys / PMM64_FRAME_SIZE;
+
+    if (!ready || !refs || f >= frame_count) return 0;
+    if (!bitmap_test(f)) return 0;          /* not allocated: not shareable */
+    if (refs[f] >= REF_MAX) return 0;
+    refs[f]++;
+    return 1;
+}
+
+/* How many owners the frame has: 1 for an ordinary allocation, more once
+ * it has been shared. 0 means it is not allocated at all. */
+uint64_t pmm64_frame_owners(uint64_t phys) {
+    uint64_t f = phys / PMM64_FRAME_SIZE;
+
+    if (!ready || f >= frame_count) return 0;
+    if (!bitmap_test(f)) return 0;
+    return 1 + (refs ? refs[f] : 0);
+}
+
+/* Whether this address is RAM this allocator manages at all. VRAM and
+ * anything else above the memory map is not, and freeing it would either
+ * do nothing or corrupt the bitmap's idea of the world. */
+int pmm64_owns(uint64_t phys) {
+    return ready && (phys / PMM64_FRAME_SIZE) < frame_count;
+}
+
+uint64_t pmm64_refs_phys(void)  { return refs_phys_addr; }
+uint64_t pmm64_refs_bytes(void) { return refs_size_bytes; }

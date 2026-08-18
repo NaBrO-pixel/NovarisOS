@@ -228,7 +228,18 @@ int sched64_block_current(const registers64_t* regs, uint64_t addr,
     if (current < 0 || !tasks[current].used) return 0;
 
     /* The frame the caller built is this thread's entire continuation:
-     * when something wakes it, execution resumes from exactly here. */
+     * when something wakes it, execution resumes from exactly here.
+     *
+     * The thread pointer is part of that continuation and was not being
+     * saved. The timer's switch-out saves it (see sched64_tick), so a
+     * thread that was preempted at least once after setting up its TLS
+     * carried a correct value by luck; one that blocked before that
+     * woke with whatever its slot was created with - 0 for the first
+     * task of a process. What that looks like from ring 3 is fs:0x10
+     * reading as zero, and the crash is wherever glibc first
+     * dereferences the thread descriptor - inside the *next* syscall
+     * wrapper, with nothing pointing back at the wait that caused it. */
+    tasks[current].fs_base   = read_fs_base();
     tasks[current].regs      = *regs;
     tasks[current].blocked   = 1;
     tasks[current].wait_addr = addr;

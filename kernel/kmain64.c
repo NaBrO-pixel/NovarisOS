@@ -100,6 +100,8 @@ extern const unsigned char loader64_exe[];
 extern const unsigned long loader64_exe_len;
 extern const unsigned char tree64_elf[];
 extern const unsigned long tree64_elf_len;
+extern const unsigned char cowfork64_elf[];
+extern const unsigned long cowfork64_elf_len;
 extern const unsigned char cwd64_elf[];
 extern const unsigned long cwd64_elf_len;
 extern const unsigned char fbdraw64_elf[];
@@ -161,10 +163,32 @@ static volatile uint64_t pf_killed;
 /* syscall64.s */
 extern void enter_user_mode64_abort(void) __attribute__((noreturn));
 
+static uint64_t cow_breaks;
+
 static void page_fault_handler(registers64_t* r) {
     pf_hits++;
     pf_cr2 = read_cr2();
     pf_err = r->err_code;
+
+    /* A write to a page fork shared (Milestone 69). First, and before
+     * the diagnostic and the signal both: this is not an error, it is
+     * the mechanism, and it happens on perfectly ordinary writes to
+     * perfectly ordinary memory.
+     *
+     * Bit 0 of the error code is "the page was present" and bit 1 is
+     * "it was a write". A copy-on-write fault is always both - the page
+     * is there and readable, and only the write is refused. Bit 2 says
+     * whether ring 3 or the kernel did it, and it is deliberately not
+     * checked: with CR0.WP set the kernel faults on these too, which is
+     * the whole reason WP is on.
+     *
+     * break_cow returns 0 for a page that was not shared, so a genuine
+     * write to genuinely read-only memory still falls through to
+     * everything below. */
+    if ((r->err_code & 0x3) == 0x3 && vmspace64_break_cow(pf_cr2)) {
+        cow_breaks++;
+        return;
+    }
 
     /* A ring-3 fault with a handler installed is the program's business,
      * not a kernel failure - it is how Wine turns a bad access into a
@@ -214,6 +238,23 @@ void kernel_main(uint32_t magic, void* mbi) {
     uint64_t before, after, probed;
 
     serial64_init();
+
+    /* CR0.WP, before anything maps a page read-only (Milestone 69).
+     *
+     * Without it the write-protect bit in a PTE binds ring 3 only, and
+     * the kernel writes straight through a read-only mapping. That is
+     * survivable until copy-on-write exists and silently wrong the
+     * moment it does: a read() into a forked child's buffer, or an
+     * argv copied onto its stack, would be written by the kernel into
+     * the page the *parent* is still using, with no fault and no way to
+     * notice. Setting it makes one fault path serve both rings.
+     *
+     * GRUB leaves it clear and boot64.s only ever touched the low 16
+     * bits of CR0, so nothing before this line had it on. */
+    __asm__ __volatile__("mov %%cr0, %%rax\n\t"
+                         "or  $(1 << 16), %%rax\n\t"
+                         "mov %%rax, %%cr0"
+                         ::: "rax", "memory");
 
     cr0  = read_cr0();
     cr4  = read_cr4();
@@ -2656,6 +2697,120 @@ void kernel_main(uint32_t magic, void* mbi) {
         serial64_puts("NOVARIS64: cwd64   = exit ");
         serial64_putdec(syscall64_exit_code());
         serial64_putc('\n');
+    }
+
+    /* --- layer 30: fork that shares (Milestone 69) ------------------- */
+    /* The program below cannot tell copy-on-write from an eager copy -
+     * both produce exactly its output, which is the point: correctness
+     * is what it checks. The difference is a cost, and a cost is only
+     * visible from here, by counting frames across the fork itself. */
+    serial64_puts("NOVARIS64: -- fork that shares --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 64;
+        vmspace64_t kspace;
+        elf64_info_t info;
+        uint64_t i, rsp;
+        uint64_t breaks_before = cow_breaks;
+        uint64_t dbl_before = pmm64_double_frees();
+        int rc, stack_ok = 1, pid;
+        proc64_t* p;
+        static const char* const cow_argv[] = { "/cowfork64", 0 };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        signal64_reset();
+        sched64_init();
+        proc64_init();
+        vmspace64_kernel_space(&kspace);
+
+        /* The refcount table, before anything shares anything. */
+        {
+            uint64_t f = pmm64_alloc_frame();
+            check("a fresh frame has exactly one owner",
+                  pmm64_frame_owners(f) == 1);
+            check("sharing it adds an owner",
+                  pmm64_ref_frame(f) && pmm64_frame_owners(f) == 2);
+            check("freeing it once drops the owner, not the frame",
+                  (pmm64_free_frame(f), pmm64_frame_owners(f) == 1));
+            pmm64_free_frame(f);
+            check("and freeing it again returns it",
+                  pmm64_frame_owners(f) == 0);
+            check("VRAM is not a frame this allocator owns",
+                  !pmm64_owns(fb64_phys()));
+        }
+
+        pid = proc64_create();
+        proc64_set_current(pid);
+        p = proc64_current();
+
+        check("a space for it", vmspace64_create(&p->space) != 0);
+        rc = elf64_load(cowfork64_elf, cowfork64_elf_len, &p->space, &info);
+        check("the cow program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&p->space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&p->space, info.brk_start);
+        rsp = uspace64_build_stack(&p->space, STACK_TOP, STACK_PAGES,
+                                   cow_argv, &info, 0, 0);
+
+        {
+            registers64_t first;
+            for (i = 0; i < sizeof(first) / 8; i++)
+                ((uint64_t*)&first)[i] = 0;
+            sched64_add_frame_for(&first, &p->space, 0, pid);
+            sched64_set_current(0);
+        }
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        vmspace64_switch(&p->space);
+        enter_user_mode64(info.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+        pf_diagnose = 0;
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        /* A frame freed twice is handed out while somebody still holds
+         * it, and the next allocation zeroes it - which presents as
+         * memory that was correct a moment ago now reading as zeroes,
+         * a long way from the free that caused it. */
+        serial64_puts("NOVARIS64: dblfree = ");
+        serial64_putdec(pmm64_double_frees() - dbl_before);
+        serial64_putc('\n');
+        check("no frame was freed twice across the fork",
+              pmm64_double_frees() == dbl_before);
+
+        check("the parent and the child stayed independent",
+              syscall64_exit_code() == 97);
+
+        /* The measurement. The program holds 8MB - 2048 frames - and an
+         * eager clone charges every one of them to the fork. Sharing
+         * charges only the page tables needed to describe them, which
+         * for 8MB is four page tables plus the levels above.
+         *
+         * 512 is not a tuned number: it is a quarter of what copying
+         * costs, so the assertion cannot be satisfied by a fork that
+         * copied even a quarter of the buffer. */
+        serial64_puts("NOVARIS64: fork    = ");
+        serial64_putdec(syscall64_last_fork_frames());
+        serial64_puts(" frames for an 8MB process, ");
+        serial64_putdec(cow_breaks - breaks_before);
+        serial64_puts(" pages copied on write\n");
+
+        check("the fork did not pay for the process it forked",
+              syscall64_last_fork_frames() < 512);
+        /* And it did share: a fork that had copied eagerly would break
+         * nothing later, because nothing would be shared to break. The
+         * child writes 8MB, so this is thousands. */
+        check("writing to the shared pages copied them one at a time",
+              cow_breaks - breaks_before > 1024);
     }
 
     /* --- verdict ---------------------------------------------------- */
