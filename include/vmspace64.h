@@ -52,6 +52,24 @@ void vmspace64_destroy(vmspace64_t* vs);
  */
 int  vmspace64_clone(vmspace64_t* dst);
 
+/* The same thing, sharing rather than copying (Milestone 69).
+ *
+ * Every page of the source's low half is mapped into `dst` as well, both
+ * sides made read-only and marked PAGE64_COW, and the frame gains an
+ * owner. The copy happens in the page fault handler, one page at a time,
+ * and only for pages somebody actually writes.
+ *
+ * It walks the tables through the direct map, so - unlike the eager
+ * clone - it needs no intermediate page list and has no size ceiling.
+ * `src_pml4` is a physical PML4 address, normally the current one.
+ */
+int  vmspace64_clone_cow(uint64_t src_pml4, vmspace64_t* dst);
+
+/* Handles a write fault on a shared page: copies it if anyone else still
+ * holds it, reclaims it if not. Returns 0 if `va` was not a
+ * copy-on-write page, which means the fault was a real one. */
+int  vmspace64_break_cow(uint64_t va);
+
 void vmspace64_switch(const vmspace64_t* vs);
 
 /* The space the CPU is in, as a physical PML4 address (CR3 without its

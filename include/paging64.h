@@ -29,6 +29,21 @@
 #define PAGE64_DIRTY     (1ULL << 6)
 #define PAGE64_HUGE      (1ULL << 7)
 #define PAGE64_GLOBAL    (1ULL << 8)
+/* Bits 9-11 are ignored by the hardware and belong to the OS.
+ *
+ * COW marks a page that is mapped into more than one address space and
+ * must be copied before it is written. The mapping itself is made
+ * read-only, so the copy happens in the page fault handler.
+ *
+ * COW_RW records what the mapping was before that: a page that was
+ * writable becomes writable again once it has been copied, and a page
+ * that was genuinely read-only stays read-only and a write to it is a
+ * real fault. Without this second bit the two are indistinguishable
+ * after the fact, and every read-only page in a forked child would
+ * silently become writable. */
+#define PAGE64_COW       (1ULL << 9)
+#define PAGE64_COW_RW    (1ULL << 10)
+
 #define PAGE64_NX        (1ULL << 63)
 
 #define PAGING64_OK            0
