@@ -44,6 +44,25 @@ static uint8_t* refs;
 static uint64_t refs_phys_addr;
 static uint64_t refs_size_bytes;
 #define REF_MAX 255
+
+/* Which frames are RAM at all, as opposed to allocated.
+ *
+ * The allocation bitmap cannot answer that question: it starts with
+ * everything marked used and only clears what the memory map vouched
+ * for, so a hole in the map and a frame in use are the same bit. That
+ * is fine for allocating and wrong for asking "is this address memory",
+ * which copy-on-write has to ask about every page it shares - the
+ * framebuffer is mapped into processes and must never be refcounted or
+ * copied, because a private copy of VRAM is a window onto nothing.
+ *
+ * It only became wrong at a particular RAM size, which is the shape of
+ * bug this tree keeps finding. VRAM sits at 0xFD000000. With 2GB of RAM
+ * the bitmap stops below it and "is it a frame we own" answers no by
+ * accident. With 6GB it stops above it, and the same question answers
+ * yes. */
+static uint8_t* ram;
+static uint64_t ram_phys_addr;
+static uint64_t ram_size_bytes;
 static uint64_t highest_addr;
 static uint64_t double_frees;
 static uint64_t alloc_hint;              /* where the last upward scan left off */
@@ -111,6 +130,13 @@ static void free_region(uint64_t start, uint64_t end) {
                                                 * not a whole frame, so it
                                                 * stays marked used */
     if (ef > sf) mark_range(sf, ef - sf, 0);
+
+    /* And, separately from whether it is free, that it is memory. This
+     * is set once and never cleared - reserving a region takes it out
+     * of the allocator, not out of existence. */
+    if (ram)
+        for (uint64_t f = sf; f < ef && f < frame_count; f++)
+            ram[f >> 3] |= (uint8_t)(1u << (f & 7));
 }
 
 void pmm64_init(const multiboot_info_t* mbi,
@@ -161,13 +187,16 @@ void pmm64_init(const multiboot_info_t* mbi,
      * after it, so both are covered by the one window check below. At
      * 6GB that is 1.5MB of bitmap-plus-counts against a 1GB window. */
     refs_size_bytes = frame_count;
+    ram_size_bytes  = (frame_count + 7) / 8;
 
-    if (place + bitmap_size_bytes + refs_size_bytes > BOOT_WINDOW_BYTES) {
+    if (place + bitmap_size_bytes + refs_size_bytes + ram_size_bytes
+            > BOOT_WINDOW_BYTES) {
         /* Would fall outside what boot64.s mapped. Refusing is the only
          * safe answer: the write would land somewhere unmapped, or worse,
          * somewhere mapped and in use. */
         bitmap_phys_addr = 0;
         refs_phys_addr   = 0;
+        ram_phys_addr    = 0;
         return;
     }
 
@@ -177,6 +206,10 @@ void pmm64_init(const multiboot_info_t* mbi,
     refs_phys_addr = place + bitmap_size_bytes;
     refs = (uint8_t*)(KERNEL_VMA + refs_phys_addr);
     for (uint64_t i = 0; i < refs_size_bytes; i++) refs[i] = 0;
+
+    ram_phys_addr = refs_phys_addr + refs_size_bytes;
+    ram = (uint8_t*)(KERNEL_VMA + ram_phys_addr);
+    for (uint64_t i = 0; i < ram_size_bytes; i++) ram[i] = 0;
 
     /* Everything used, then free only what the bootloader vouched for.
      * The reverse - assume free, mark the exceptions - hands out MMIO and
@@ -194,7 +227,7 @@ void pmm64_init(const multiboot_info_t* mbi,
      * times the size, so it is the one that would reach whatever sits
      * above it, and it would do so only at the RAM sizes nobody tested. */
     pmm64_reserve_region(bitmap_phys_addr,
-                         refs_phys_addr + refs_size_bytes);
+                         ram_phys_addr + ram_size_bytes);
 
     ready = 1;
 }
@@ -349,11 +382,15 @@ uint64_t pmm64_frame_owners(uint64_t phys) {
     return 1 + (refs ? refs[f] : 0);
 }
 
-/* Whether this address is RAM this allocator manages at all. VRAM and
- * anything else above the memory map is not, and freeing it would either
- * do nothing or corrupt the bitmap's idea of the world. */
+/* Whether this address is RAM at all - not whether it is free, and not
+ * merely whether it is below the top of the memory map. VRAM is below
+ * the top of the map on a machine with enough memory, and it is still
+ * not RAM. */
 int pmm64_owns(uint64_t phys) {
-    return ready && (phys / PMM64_FRAME_SIZE) < frame_count;
+    uint64_t f = phys / PMM64_FRAME_SIZE;
+
+    if (!ready || !ram || f >= frame_count) return 0;
+    return (ram[f >> 3] >> (f & 7)) & 1;
 }
 
 uint64_t pmm64_refs_phys(void)  { return refs_phys_addr; }

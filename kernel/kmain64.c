@@ -2952,6 +2952,146 @@ void kernel_main(uint32_t magic, void* mbi) {
     serial64_puts("NOVARIS64: failures = ");
     serial64_putdec((uint64_t)failures);
     serial64_putc('\n');
+    /* --- layer 32: a Wine prefix (Milestone 71) ---------------------- */
+    /* Milestone 68 removed every reason a prefix could not exist here -
+     * the node ceiling, the name and path ceilings, the missing links,
+     * the missing working directory - and proved each one separately.
+     * It did not run wineboot. This does.
+     *
+     * It runs only when a whole Wine installation is in the initrd,
+     * which is off by default because it is 64MB:
+     *
+     *     make -f Makefile.amd64 WINE64_INSTALL=1 test-wine-prefix
+     *
+     * 64MB is not a guess either. Wine builds 602 PE DLLs; creating a
+     * prefix was measured to load 93 of them (tools/wine_prefix_modules
+     * .txt), which is 174MB in the build tree and 58MB stripped.
+     */
+    serial64_puts("NOVARIS64: -- a Wine prefix --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 128;
+        const uint64_t EXE_BIAS    = 0x0000555555554000ULL;
+        const uint64_t INTERP_BASE = 0x00007FFFF7000000ULL;
+        vmspace64_t kspace;
+        elf64_info_t exe, interp;
+        const void* image;
+        const void* ld_image;
+        uint64_t len, ld_len, rsp, i;
+        uint64_t enosys_before = syscall64_unimplemented_count();
+        int rc, stack_ok = 1, pid;
+        proc64_t* p;
+
+        static const char* const boot_argv[] = {
+            "/usr/bin/wine", "wineboot", "-u", 0
+        };
+        static const char* const boot_env[] = {
+            "HOME=/root",
+            "USER=root",
+            "WINEPREFIX=/root/.wine",
+            "WINEDEBUG=-all",
+            0
+        };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        syscall64_reset_files();
+        signal64_reset();
+        sched64_init();
+        proc64_init();
+        vmspace64_kernel_space(&kspace);
+
+        if (ramfs64_lookup("/usr/lib/wine/x86_64-windows/wineboot.exe") < 0) {
+            /* Not a failure: the build must not require 64MB of Wine in
+             * the initrd before `make test` passes. */
+            serial64_puts("NOVARIS64: no Wine installation in the initrd - "
+                          "build with WINE64_INSTALL=1\n");
+        } else if (initrd64_open("usr/bin/wine", &image, &len) == INITRD64_OK &&
+                   initrd64_open("lib64/ld-linux-x86-64.so.2",
+                                 &ld_image, &ld_len) == INITRD64_OK) {
+
+            serial64_puts("NOVARIS64: install = ");
+            serial64_putdec(ramfs64_count());
+            serial64_puts(" nodes\n");
+
+            pid = proc64_create();
+            proc64_set_current(pid);
+            p = proc64_current();
+
+            check("a space for wineboot", vmspace64_create(&p->space) != 0);
+
+            /* Wine reads /proc/self/exe and derives its library
+             * directory from it, so this is not decoration: with the
+             * wrong answer it looks for ntdll.so in the wrong place and
+             * stops. */
+            syscall64_set_exe_path("/usr/bin/wine");
+
+            rc = elf64_load_at(image, len, &p->space, EXE_BIAS, &exe);
+            if (rc == ELF64_OK)
+                rc = elf64_load_at(ld_image, ld_len, &p->space, INTERP_BASE,
+                                   &interp);
+            check("the loader and ld.so laid out", rc == ELF64_OK);
+
+            for (i = 0; i < STACK_PAGES; i++) {
+                uint64_t f = pmm64_alloc_frame();
+                if (!f || vmspace64_map(&p->space,
+                                        STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                        PAGE64_PRESENT | PAGE64_WRITE |
+                                        PAGE64_USER) != PAGING64_OK)
+                    stack_ok = 0;
+            }
+            check("a stack for it", stack_ok);
+            uspace64_reset(&p->space, exe.brk_start);
+            rsp = uspace64_build_stack(&p->space, STACK_TOP, STACK_PAGES,
+                                       boot_argv, &exe, INTERP_BASE,
+                                       boot_env);
+
+            {
+                registers64_t first;
+                for (i = 0; i < sizeof(first) / 8; i++)
+                    ((uint64_t*)&first)[i] = 0;
+                sched64_add_frame_for(&first, &p->space, 0, pid);
+                sched64_set_current(0);
+            }
+
+            if (rc == ELF64_OK && stack_ok && rsp) {
+                serial64_puts("NOVARIS64: --- wineboot ---\n");
+                pf_diagnose = 1;
+                syscall64_set_trace(1);
+                vmspace64_switch(&p->space);
+                enter_user_mode64(interp.entry, rsp, 0);
+                vmspace64_switch(&kspace);
+                syscall64_set_trace(0);
+                pf_diagnose = 0;
+                serial64_puts("NOVARIS64: --- end ---\n");
+            }
+
+            /* What actually happened, reported rather than asserted.
+             * This is the first run of this program on this kernel and
+             * the useful output is the distance travelled, not a
+             * pass/fail - an assertion here would only record which
+             * step it died on. */
+            serial64_puts("NOVARIS64: wineboot exit= ");
+            serial64_putdec(syscall64_exit_code());
+            serial64_puts(", enosys ");
+            serial64_putdec(syscall64_unimplemented_count() - enosys_before);
+            serial64_puts(", last ");
+            serial64_putdec(syscall64_unimplemented());
+            serial64_puts(", nodes ");
+            serial64_putdec(ramfs64_count());
+            serial64_putc('\n');
+
+            serial64_puts("NOVARIS64: prefix  = ");
+            serial64_puts(ramfs64_lookup("/root/.wine") >= 0
+                          ? "/root/.wine exists" : "not created");
+            serial64_puts(", system32 ");
+            serial64_puts(ramfs64_lookup(
+                "/root/.wine/drive_c/windows/system32") >= 0
+                          ? "exists" : "absent");
+            serial64_putc('\n');
+        }
+    }
+
     serial64_puts("NOVARIS64: ---- bring-up complete ----\n");
 
     /* --- the input watch (Milestone 70) ------------------------------

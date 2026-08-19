@@ -8157,6 +8157,264 @@ wineserver forks), no rename, no file times, no permissions, no
 reference counting on an unlinked-but-open file, and 901MB of prefix
 against a filesystem that holds everything in the heap.
 
+## Milestone 69 — fork that shares ✅ DONE
+
+The eager clone copied every page of the parent, and its page list
+stopped at `CLONE_MAX_PAGES` — 4096 entries, so **16MB of address
+space**. Wine's wineserver forks, and a process with a prefix mapped is
+far past 16MB before it does.
+
+### Why the direct map is what made this possible
+
+The eager version had to collect the source into a list and replay it
+into the destination, because the recursive page-table addresses only
+ever describe the space that is *loaded*. That is the whole reason it
+had a ceiling.
+
+Milestone 66 made every physical address reachable at
+`PHYSMAP64_BASE + phys`. Walking the tables through the direct map
+instead means both sets are readable and writable at once, neither
+space has to be current, and there is no intermediate list to size. The
+ceiling did not get raised; it stopped existing.
+
+### The three parts
+
+- **Frames carry an owner count**, one byte each, beside the pmm bitmap
+  and reserved with it. Zero extra owners is the default, so nothing
+  that allocated before this had to change, and a frame nobody shared
+  is still freed on the first free.
+- **`PAGE64_COW` marks a shared page, `PAGE64_COW_RW` remembers whether
+  it had been writable.** Two bits, not one, because after the fact the
+  two are indistinguishable — with only the first, every read-only page
+  in a forked child silently becomes writable the moment it is touched.
+- **`CR0.WP` is set.** Without it the write-protect bit in a PTE binds
+  ring 3 only and the kernel writes straight through a read-only
+  mapping. A `read()` into a forked child's buffer would land in the
+  page the *parent* is still using, with no fault and nothing to
+  notice. GRUB leaves it clear and `boot64.s` only ever touched the low
+  16 bits of CR0, so nothing before this had it on.
+
+### Two bugs, neither of which looked like fork
+
+**glibc has no `fork(2)`.** It calls
+`clone(CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID|SIGCHLD)`, and `clone`
+without `CLONE_VM` returned `-ENOSYS` here — the comment on it even said
+"-ENOSYS: fork". So the raw-assembly fork test passed and *every* C
+program's `fork()` failed. A kernel can have a complete `SYS_fork` and
+no fork at all as far as any ordinary program is concerned.
+
+**`sched64_block_current` never saved the blocking thread's `fs_base`.**
+The timer's switch-out does save it, so a thread preempted at least once
+after setting up its TLS carried a correct value by luck; one that
+blocked first woke with whatever its slot was created with — 0 for the
+first task of a process. From ring 3 that is `fs:0x10` reading as zero,
+and the crash lands inside the *next* syscall wrapper
+(`__internal_syscall_cancel`, `mov 0x308(%rbx)` with `rbx` zero) with
+nothing pointing back at the `wait4` that caused it. It was found by
+disassembling the faulting address in the very ELF the guest was
+running, which is a technique worth remembering: the host has the same
+file.
+
+### Measured
+
+An 8MB process forks for **14 frames**, against the 2048+ an eager copy
+charges, and **4109 pages** are copied lazily as the two sides write.
+0 double frees.
+
+`userland/cowfork64.c` deliberately cannot tell the two apart — both
+produce its output exactly. Correctness is what it checks: that the
+child sees the parent's memory, that the child's 8MB of writes do not
+appear in the parent, and that the parent can still write afterwards.
+The *cost* is measured by the kernel across the fork syscall, which is
+the only place the difference is visible.
+
+### Falsified
+
+| broken | result |
+|---|---|
+| fork copies eagerly again | 2 failures — the frame count and the COW count |
+| only the child is made read-only | the parent's buffer comes back overwritten |
+| `block_current` stops saving `fs_base` | the fault returns, in the same place |
+
+## Milestone 70 — a keyboard and a mouse ✅ DONE
+
+Milestone 67 gave this tree a display and said what was missing: *"no
+input at all — no keyboard, no mouse. A display without input is half a
+desktop."* The 32-bit tree has both drivers; neither had been ported.
+
+The decoding is the small half. The interface is the argument, and it is
+the one `/dev/fb0` already made: a driver only the kernel can read is
+not a driver. So these are **`/dev/input/event0` and `event1`**, handing
+back Linux's own `struct input_event` at Linux's own layout, because
+evdev is what Wine sits on top of on Linux. `read(2)` returns whole
+records and never a partial one.
+
+The keyboard needs no setup — the BIOS leaves it streaming. The mouse
+needs the auxiliary port enabled, IRQ12 turned on in the controller's
+config byte, bit 5 cleared so the aux clock runs, and **the cascade line
+unmasked**; a mouse enabled at both ends and silent is what any one of
+those left out produces.
+
+### Two things not to re-learn
+
+**The mouse answers every command with `0xFA`, and `0xFA` has bit 3
+set.** Re-syncing the packet stream on bit 3 alone therefore accepts an
+ACK as a first byte and mis-frames everything after it. The test caught
+this by disagreeing with a comment that claimed otherwise — the comment
+was written first and was wrong.
+
+**Interrupts had been off since the scheduler layer put them back that
+way.** The first version of the watch loop sat in `hlt` forever and
+received nothing at all, while every synthetic assertion passed.
+
+### Which is exactly why inputtest.py exists
+
+Every input assertion in `kmain64.c` feeds the decoder by hand. All of
+them pass on a kernel whose IRQ1 is masked — verified, not assumed:
+with the unmask deleted the kernel still reports **0 failures** across
+all 275 assertions while `tools/inputtest.py` fails all nine of its
+events. The kernel prints `irq1 0, irq12 0` beside them to say so.
+
+`inputtest.py` sends real keystrokes and real mouse movement through the
+QEMU monitor, so they cross the emulated 8042 and raise genuine
+interrupts. Same argument as `fbtest.py` taking a screendump instead of
+asking the kernel what it drew.
+
+One expectation in it looked wrong and was not: a downward `mouse_move`
+arrives as **positive** `REL_Y`. It is inverted twice — the monitor
+speaks screen coordinates and QEMU negates into the PS/2 packet, then
+the driver negates back — landing on evdev's convention, which is the
+number Linux reports for the same gesture. The inversion itself is
+asserted directly in the kernel instead, where a packet with `dy=+3` has
+to come out as `REL_Y=-3`.
+
+## Milestone 71 — towards a Wine prefix ⚠️ PARTLY DONE
+
+**No prefix has been created.** What this milestone did is get Wine from
+"could not load ntdll.so" to running its own ntdll and reserving its
+address space, and it found two real kernel bugs on the way. The
+distance covered is worth recording precisely, because the next session
+starts exactly where this stopped.
+
+### What a prefix costs, measured twice
+
+Milestone 68 measured the prefix a Wine run *produces*: 1049 nodes,
+901MB. This measured what creating one *requires*, which is a different
+and much better-defined question.
+
+Wine builds **602 PE DLLs** and 108 PE executables. `wineboot -u`, run
+against this same tree with `WINEDEBUG=+loaddll`, loads **93 of them**.
+That is 174MB in the build tree and **58MB stripped** — the difference
+between an initrd this kernel can carry and one it cannot. The list is
+`tools/wine_prefix_modules.txt` and `tools/stage_wine.sh` lays it out;
+regenerate it the same way if Wine is updated.
+
+The installation is off by default, because 64MB of initrd on every test
+run is not a trade worth making:
+
+```
+make -f Makefile.amd64 WINE64_INSTALL=1 iso
+```
+
+### Where the unix libraries go, and how that was settled
+
+Not in `lib/wine/x86_64-unix`, which is where an *installed* Wine keeps
+them, but **beside the loader** — a Wine running from its build tree
+reads `/proc/self/exe`, takes the directory, and appends the library
+name. The wrong layout produces exactly one line of output:
+
+```
+wine: could not load ntdll.so: /usr/bin/ntdll.so: cannot open shared
+object file: No such file or directory
+```
+
+which names the path it wanted. Worth remembering as a technique: Wine's
+failures tend to name the thing they could not find.
+
+### The bug that mattered: execve could not run a dynamic program
+
+With ntdll.so found, Wine got further and died at `rip=0x6`. The syscall
+trace said why, once `execve` was made to print its path:
+
+```
+execve "/usr/bin/i386-unix/wine-preloader"  = -ENOENT
+execve "/usr/bin/i386-unix/wine"            = -ENOENT
+execve "/usr/bin/wine-preloader"            = -ENOENT
+execve "/usr/bin/wine"                      → fault at rip=6
+```
+
+Wine's loader re-execs itself, tries four candidates, and the fourth
+exists. So `execve` succeeded and the program died immediately.
+
+`do_execve` called `elf64_load` and entered at `e_entry`. Every program
+it had ever run was static, so that was right. **A PIE that names an
+interpreter asks to be placed at a bias and expects `ld.so` to be mapped
+alongside it and entered instead**; jumping to its own `e_entry` lands
+in unrelocated nonsense, which is what a single-digit RIP is.
+
+It now reads `e_type` from the header — before the load, because the
+bias has to be chosen first — loads the interpreter named in
+`PT_INTERP`, passes its base as `AT_BASE`, and enters *ld.so*. Every
+piece was already in the tree; layer 25 had been doing it by hand for
+the one program that mattered, and `execve` had never been taught.
+
+### The bug that only appeared at 6GB
+
+`pmm64_owns` answered "is this a frame this allocator manages" with
+`frame < frame_count`, and copy-on-write asks it about every page it
+shares — the framebuffer is mapped into processes and must never be
+refcounted or copied, because a private copy of VRAM is a window onto
+nothing.
+
+VRAM sits at `0xFD000000`. With 2GB the bitmap stops below it and the
+question answers *no* by accident. With 6GB it stops above it and the
+same question answers *yes*, so a forked process's framebuffer would
+have been quietly copied away from the screen.
+
+The allocation bitmap cannot answer it: it starts with everything used
+and only clears what the memory map vouched for, so a hole in the map
+and a frame in use are the same bit. There is now a separate record of
+which frames are *memory*, set once from the memory map and never
+cleared — reserving a region takes it out of the allocator, not out of
+existence.
+
+**This is the third time raising QEMU's RAM has found a real bug**
+(Milestone 66's bitmap placement, this one, and the assertion that
+caught it). `make -f Makefile.amd64 test QEMU_RAM=6G` is not optional.
+
+### How far Wine actually gets now
+
+Deep into `ntdll.so`'s own initialisation. It opens `/dev/null`, asks
+for `membarrier`, and makes its address-space reservations —
+`0x10000`, `0x7f000000`, `0x7ffffe000000`, all `MAP_FIXED |
+MAP_NORESERVE` — which are ntdll's virtual memory layout going in. Then
+it calls through a null pointer.
+
+Two things that are *not* the cause, both checked:
+
+- **It is not a missing syscall.** Three are unimplemented in the whole
+  run: `prlimit64` (302), `rseq` (334) and `membarrier` (323). All
+  three are absent on older Linux kernels too and both glibc and Wine
+  handle that.
+- **It is not the PE modules.** Wine never opens a single one — zero
+  reads under `x86_64-windows` — so it dies before it looks for them.
+  The 93 modules are staged and untouched.
+
+So the next thing to find out is what in ntdll's init is being called
+through a null pointer, and that is where the next session starts.
+
+### Verified
+
+15 host/guest differentials and 0 failures at **2G and 6G**, with the
+Wine installation both present and absent.
+
+### Not claimed
+
+No prefix. No `wineboot` completing. No Windows program running under
+Wine. `prefix = not created, system32 absent` is printed by the layer
+itself on every run, and it is printed from a filesystem lookup rather
+than from a variable, so it cannot drift away from the truth.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
@@ -8189,20 +8447,22 @@ over-reading: it was the list of what Wine needs *to start*, and Wine
 does start. What stands between here and a Windows program is the next
 list, and it is shorter than the one above but not smaller:
 
-1. **A Wine prefix, created on this kernel.** Milestone 68 removed every
-   reason it could not be and proved each one; it did not run
-   `wineboot`. This is the next thing to attempt, and the first
-   milestone whose failure mode is interesting rather than predictable.
-2. **Copy-on-write `fork`.** The address space is copied eagerly.
-   wineserver forks, and a 901MB prefix's worth of process does not
-   survive being duplicated byte by byte.
-3. **Keyboard and mouse.** The 64-bit tree has a display (Milestone 67)
-   and no input at all. The 32-bit tree has both and none of it was
-   ported.
+1. **A Wine prefix, created on this kernel.** Attempted in Milestone 71
+   and not achieved. Wine now runs its own ntdll and reserves its
+   address space before calling through a null pointer; it is not a
+   missing syscall (three, all benign) and not the PE modules (it never
+   opens one). That null call is the next thing to find.
+2. ~~**Copy-on-write `fork`.**~~ - done in Milestone 69. An 8MB process
+   forks for 14 frames.
+3. ~~**Keyboard and mouse.**~~ - done in Milestone 70, as
+   `/dev/input/event0` and `event1` carrying Linux's `struct
+   input_event`, and tested with real keystrokes through the QEMU
+   monitor.
 4. **A compositor, double buffering, write-combining.** `gfx.c`, `wm.c`
    and `console.c` have no 64-bit counterpart.
-5. **The other 601 Wine DLLs**, and `tools/install_wine.sh` installing
-   the 28 it already omits.
+5. **The other 509 Wine DLLs.** 93 of the 602 are staged, which is what
+   creating a prefix was measured to need - the rest is what *running
+   things* needs, and that number is not yet measured.
 
 Then, and only then, Chrome's own requirements: a GPU it has a flag to
 do without, and a sandbox it has a flag to do without.

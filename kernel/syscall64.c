@@ -444,7 +444,7 @@ uint64_t syscall64_dispatch(syscall64_args_t* args) {
         args->nr == SYS64_STAT || args->nr == SYS64_UNLINK ||
         args->nr == SYS64_LSTAT || args->nr == SYS64_CHDIR ||
         args->nr == SYS64_MKDIR || args->nr == SYS64_RMDIR ||
-        args->nr == SYS64_READLINK) {
+        args->nr == SYS64_READLINK || args->nr == SYS64_EXECVE) {
         serial64_puts(" \"");
         serial64_puts((const char*)args->a1);
         serial64_puts("\"");
@@ -505,10 +505,14 @@ static uint64_t do_execve(const char* path, const char* const* argv,
     static const char* kenvp[EXECVE_MAX_ARGS + 1];
     const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
     const uint64_t STACK_PAGES = 64;
+    const uint64_t EXE_BIAS    = 0x0000555555554000ULL;
+    const uint64_t INTERP_BASE = 0x00007FFFF7000000ULL;
+    static char  kinterp[PROC64_PATH_MAX];
     const void* image;
     uint64_t len, rsp;
+    uint64_t exe_bias = 0, interp_base = 0;
     vmspace64_t fresh;
-    elf64_info_t info;
+    elf64_info_t info, interp;
     registers64_t entry;
     proc64_t* p = proc64_current();
     int nargv = 0, nenvp = 0;
@@ -544,9 +548,58 @@ static uint64_t do_execve(const char* path, const char* const* argv,
     }
 
     if (!vmspace64_create(&fresh)) return (uint64_t)-12;
-    if (elf64_load(image, len, &fresh, &info) != ELF64_OK) {
+
+    /* A dynamically linked program cannot simply be loaded and jumped
+     * into (Milestone 71).
+     *
+     * Everything execve had run until now was static, so entering at
+     * e_entry was right. A PIE that names an interpreter asks to be
+     * placed somewhere and expects ld.so to be mapped alongside it and
+     * entered *instead*; jumping to its own e_entry lands in relocated
+     * nonsense. What that looks like is a fault at a single-digit RIP,
+     * and it is exactly where Wine's loader died - it re-execs itself
+     * as /usr/bin/wine, which is a PIE.
+     *
+     * e_type is read from the header rather than from a load, because
+     * the bias has to be chosen before the load rather than after it.
+     * ET_DYN is 3. */
+    {
+        uint16_t e_type = (uint16_t)((const uint8_t*)image)[16]
+                        | (uint16_t)(((const uint8_t*)image)[17] << 8);
+        exe_bias = (e_type == 3) ? EXE_BIAS : 0;
+    }
+
+    if (elf64_load_at(image, len, &fresh, exe_bias, &info) != ELF64_OK) {
         vmspace64_destroy(&fresh);
         return (uint64_t)-8;                           /* -ENOEXEC */
+    }
+
+    if (info.has_interp) {
+        const void* iimage;
+        uint64_t ilen;
+        int inode;
+
+        if (!elf64_interp(image, len, kinterp, sizeof(kinterp))) {
+            vmspace64_destroy(&fresh);
+            return (uint64_t)-8;
+        }
+        inode = ramfs64_lookup(kinterp);
+        if (inode < 0) {
+            /* The interpreter is a file like any other, and a missing
+             * one is -ENOENT against the *program*, which is what
+             * Linux reports too. */
+            vmspace64_destroy(&fresh);
+            return (uint64_t)-2;
+        }
+        iimage = ramfs64_data(inode);
+        ilen   = ramfs64_size(inode);
+        if (!iimage || !ilen ||
+            elf64_load_at(iimage, ilen, &fresh, INTERP_BASE, &interp)
+                != ELF64_OK) {
+            vmspace64_destroy(&fresh);
+            return (uint64_t)-8;
+        }
+        interp_base = INTERP_BASE;
     }
 
     for (uint64_t i = 0; i < STACK_PAGES; i++) {
@@ -567,12 +620,17 @@ static uint64_t do_execve(const char* path, const char* const* argv,
     p->mmap_next = USPACE64_MMAP_BASE;
     kstrlcpy(p->exe_path, kpath, PROC64_PATH_MAX);
 
+    /* The exe's own info either way - AT_PHDR and friends describe the
+     * program, not the interpreter - plus where ld.so was put, which is
+     * AT_BASE and how it finds itself. */
     rsp = uspace64_build_stack(&fresh, STACK_TOP, STACK_PAGES,
-                               kargv, &info, 0, kenvp);
+                               kargv, &info, interp_base, kenvp);
 
     for (uint64_t i = 0; i < sizeof(entry) / 8; i++)
         ((uint64_t*)&entry)[i] = 0;
-    entry.rip    = info.entry;
+    /* Into the interpreter when there is one: ld.so relocates the
+     * program and calls its entry point itself. */
+    entry.rip    = interp_base ? interp.entry : info.entry;
     entry.rsp    = rsp;
     entry.cs     = 0x23;
     entry.ss     = 0x1B;
