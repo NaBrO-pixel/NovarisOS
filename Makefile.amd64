@@ -64,6 +64,7 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/idt64.o \
        $(BUILD_DIR)/serial64.o \
        $(BUILD_DIR)/fb64.o \
+       $(BUILD_DIR)/input64.o \
        $(BUILD_DIR)/fbdraw64_blob.o \
        $(BUILD_DIR)/pmm64.o \
        $(BUILD_DIR)/paging64.o \
@@ -470,6 +471,11 @@ test: iso
 	@# wrote, which a framebuffer mapped over ordinary RAM would also
 	@# pass. `screendump` is the far side of the driver.
 	@python3 tools/fbtest.py $(ISO) $(QEMU_RAM) $(BUILD_DIR) || exit 1
+	@# Real keystrokes and real mouse movement, through the emulated
+	@# 8042 and a genuine IRQ. The kernel's own input assertions feed the
+	@# decoder by hand and pass with the interrupt masked; this is the
+	@# half they cannot cover.
+	@python3 tools/inputtest.py $(ISO) $(QEMU_RAM) $(BUILD_DIR) || exit 1
 	@# The same differential for the glibc binary, which is the stronger
 	@# of the two: its output is produced by printf, through stdio,
 	@# after glibc's startup has set up TLS, read the auxv and

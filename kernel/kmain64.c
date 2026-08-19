@@ -23,6 +23,7 @@
 #include "io.h"
 #include "serial64.h"
 #include "fb64.h"
+#include "input64.h"
 #include "gdt64.h"
 #include "idt64.h"
 #include "multiboot.h"
@@ -2813,11 +2814,198 @@ void kernel_main(uint32_t magic, void* mbi) {
               cow_breaks - breaks_before > 1024);
     }
 
+    /* --- layer 31: keyboard and mouse (Milestone 70) ----------------- */
+    /* Milestone 67 gave this tree a display and said plainly what was
+     * still missing: "no input at all - no keyboard, no mouse. A
+     * display without input is half a desktop."
+     *
+     * The decoding is the small half of this. The interface is the
+     * point, and it is the same argument /dev/fb0 made: a driver only
+     * the kernel can read is not a driver. So these are device nodes
+     * that hand back Linux's own struct input_event, because evdev is
+     * what Wine sits on top of on Linux.
+     *
+     * The scancodes below are fed in rather than typed. Every
+     * assertion here is about the decoder, and a decoder tested through
+     * an emulated controller is testing QEMU as much as itself -
+     * tools/inputtest.py does that part, with real keystrokes from the
+     * QEMU monitor, and it is the one that would catch a driver that
+     * decoded perfectly and never received anything. */
+    serial64_puts("NOVARIS64: -- keyboard and mouse --\n");
+    {
+        input64_event_t evs[8];
+        uint64_t got;
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        input64_reset();
+
+        check("the input devices registered", input64_register());
+        check("and /dev/input/event0 is a keyboard",
+              ramfs64_device(ramfs64_lookup("/dev/input/event0"))
+              == RAMFS64_DEV_KBD);
+        check("and /dev/input/event1 is a mouse",
+              ramfs64_device(ramfs64_lookup("/dev/input/event1"))
+              == RAMFS64_DEV_MOUSE);
+        check("nothing is queued before anything happens",
+              input64_queued(INPUT64_KBD) == 0);
+
+        /* 'A': make 0x1E, break 0x9E. Linux's KEY_A is 30, which is
+         * 0x1E - the keycodes for this block *are* the set-1 scancodes,
+         * which is why there is no translation table here. */
+        input64_feed_scancode(0x1E);
+        input64_feed_scancode(0x9E);
+
+        got = input64_read(INPUT64_KBD, evs, sizeof(evs));
+        check("a press and a release arrived, each with its SYN",
+              got == 4 * sizeof(input64_event_t));
+        check("the press is KEY_A down",
+              evs[0].type == EV64_KEY && evs[0].code == 30 &&
+              evs[0].value == 1);
+        check("followed by a SYN_REPORT",
+              evs[1].type == EV64_SYN && evs[1].code == SYN64_REPORT);
+        check("the release is the same key, up",
+              evs[2].type == EV64_KEY && evs[2].code == 30 &&
+              evs[2].value == 0);
+        check("and the queue is empty again",
+              input64_queued(INPUT64_KBD) == 0);
+
+        /* Shift is a key in its own right *and* a modifier. Reporting
+         * only the modifier would lose the keystroke; tracking only the
+         * keystroke would lose the state. */
+        input64_feed_scancode(0x2A);
+        check("holding shift sets the modifier",
+              input64_modifiers() & INPUT64_MOD_SHIFT);
+        input64_feed_scancode(0xAA);
+        check("and releasing it clears the modifier",
+              !(input64_modifiers() & INPUT64_MOD_SHIFT));
+        input64_read(INPUT64_KBD, evs, sizeof(evs));
+
+        /* The mouse. Three bytes: flags, dx, dy. Bit 3 of the flags is
+         * always set on a real packet. */
+        input64_feed_mouse_byte(0x08);      /* no buttons, no sign bits */
+        input64_feed_mouse_byte(5);         /* dx = +5                  */
+        input64_feed_mouse_byte(3);         /* dy = +3                  */
+
+        got = input64_read(INPUT64_MOUSE, evs, sizeof(evs));
+        check("a move produced X, Y and a SYN",
+              got == 3 * sizeof(input64_event_t));
+        check("X is the delta as sent",
+              evs[0].type == EV64_REL && evs[0].code == REL64_X &&
+              evs[0].value == 5);
+        /* The mouse counts Y upwards and the screen counts it down. A
+         * driver that passed this through unchanged would move the
+         * pointer the wrong way, which is the single most obvious bug a
+         * mouse driver can have and the easiest to leave in. */
+        check("Y is inverted, because a screen counts downwards",
+              evs[1].type == EV64_REL && evs[1].code == REL64_Y &&
+              evs[1].value == -3);
+
+        /* A negative delta arrives as a positive byte plus a sign bit,
+         * not as a two's complement byte the reader can just cast. */
+        input64_feed_mouse_byte(0x08 | 0x10);   /* X sign set */
+        input64_feed_mouse_byte(0xFB);          /* -5         */
+        input64_feed_mouse_byte(0);
+        input64_read(INPUT64_MOUSE, evs, sizeof(evs));
+        check("a negative delta is sign-extended from nine bits",
+              evs[0].type == EV64_REL && evs[0].code == REL64_X &&
+              evs[0].value == -5);
+
+        input64_feed_mouse_byte(0x08 | 0x01);   /* left button down */
+        input64_feed_mouse_byte(0);
+        input64_feed_mouse_byte(0);
+        input64_read(INPUT64_MOUSE, evs, sizeof(evs));
+        check("a button press is BTN_LEFT down",
+              evs[0].type == EV64_KEY && evs[0].code == BTN64_LEFT &&
+              evs[0].value == 1);
+
+        /* A first byte without bit 3 is a stream out of phase - an
+         * unread ACK is the usual cause. Shifting it in would leave
+         * every packet after it wrong; dropping it re-syncs. */
+        input64_reset();
+        input64_feed_mouse_byte(0xFA);          /* an ACK, not a packet */
+        input64_feed_mouse_byte(0x08);
+        input64_feed_mouse_byte(7);
+        input64_feed_mouse_byte(0);
+        got = input64_read(INPUT64_MOUSE, evs, sizeof(evs));
+        check("a stray ACK is dropped rather than shifted in",
+              got == 2 * sizeof(input64_event_t) &&
+              evs[0].code == REL64_X && evs[0].value == 7);
+
+        /* Reads are whole records. */
+        input64_reset();
+        input64_feed_scancode(0x1E);
+        check("a read with room for less than one event returns nothing",
+              input64_read(INPUT64_KBD, evs,
+                           sizeof(input64_event_t) - 1) == 0);
+        check("and the event is still queued afterwards",
+              input64_queued(INPUT64_KBD) == 2);
+
+        serial64_puts("NOVARIS64: input   = irq1 ");
+        serial64_putdec(input64_irqs(INPUT64_KBD));
+        serial64_puts(", irq12 ");
+        serial64_putdec(input64_irqs(INPUT64_MOUSE));
+        serial64_putc('\n');
+    }
+
     /* --- verdict ---------------------------------------------------- */
     serial64_puts("NOVARIS64: failures = ");
     serial64_putdec((uint64_t)failures);
     serial64_putc('\n');
     serial64_puts("NOVARIS64: ---- bring-up complete ----\n");
 
-    for (;;) __asm__ __volatile__("hlt");
+    /* --- the input watch (Milestone 70) ------------------------------
+     *
+     * Everything above fed the decoder by hand, which tests the decoder
+     * and nothing else: those assertions all pass on a kernel whose
+     * IRQ1 is masked and whose handler is never called, and the
+     * "irq1 0, irq12 0" line above says exactly that.
+     *
+     * So the driver is installed for real here and whatever arrives is
+     * printed. tools/inputtest.py sends keystrokes and mouse movement
+     * through the QEMU monitor once it sees the line above, and matches
+     * these lines - which is the same argument as fbtest.py taking a
+     * screendump rather than asking the kernel what it drew. An
+     * ordinary `make test` sends nothing, sees nothing, and prints
+     * nothing here.
+     */
+    input64_install();
+
+    /* Interrupts have been off since the scheduler layer put them back
+     * that way, and `hlt` with IF clear is a machine that never wakes.
+     * Nothing above this point needed them; everything below is
+     * interrupts and nothing else. */
+    __asm__ __volatile__("sti");
+
+    serial64_puts("NOVARIS64: ---- input watch ----\n");
+
+    for (;;) {
+        input64_event_t ev;
+
+        __asm__ __volatile__("hlt");
+
+        while (input64_read(INPUT64_KBD, &ev, sizeof(ev)) == sizeof(ev)) {
+            if (ev.type != EV64_KEY) continue;
+            serial64_puts("NOVARIS64: key ");
+            serial64_putdec(ev.code);
+            serial64_puts(ev.value ? " down\n" : " up\n");
+        }
+        while (input64_read(INPUT64_MOUSE, &ev, sizeof(ev)) == sizeof(ev)) {
+            if (ev.type == EV64_REL) {
+                serial64_puts(ev.code == REL64_X ? "NOVARIS64: mouse x "
+                                                 : "NOVARIS64: mouse y ");
+                if (ev.value < 0) {
+                    serial64_putc('-');
+                    serial64_putdec((uint64_t)(-ev.value));
+                } else {
+                    serial64_putdec((uint64_t)ev.value);
+                }
+                serial64_putc('\n');
+            } else if (ev.type == EV64_KEY) {
+                serial64_puts("NOVARIS64: button ");
+                serial64_putdec(ev.code);
+                serial64_puts(ev.value ? " down\n" : " up\n");
+            }
+        }
+    }
 }

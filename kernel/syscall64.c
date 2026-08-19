@@ -24,6 +24,7 @@
 #include "elf64.h"
 #include "initrd64.h"
 #include "pmm64.h"
+#include "input64.h"
 #include "fb64.h"
 
 #define IA32_EFER   0xC0000080u
@@ -1366,8 +1367,24 @@ static uint64_t dispatch(syscall64_args_t* args) {
 
     case SYS64_READ: {
         int64_t n;
+        int dev;
+
         if (a1 < 3) return 0;                          /* stdin: end of file */
         if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+
+        /* An input device is a stream of events, not a file with a
+         * position: there is no offset to advance and nothing to seek
+         * to, and two readers of the same device are not reading the
+         * same bytes. Whole records only, which is evdev's contract -
+         * a reader that got half a struct would resynchronise by
+         * guessing. */
+        dev = ramfs64_device(fds[a1].node);
+        if (dev == RAMFS64_DEV_KBD || dev == RAMFS64_DEV_MOUSE) {
+            return input64_read(dev == RAMFS64_DEV_KBD ? INPUT64_KBD
+                                                       : INPUT64_MOUSE,
+                                (void*)a2, a3);
+        }
+
         n = ramfs64_read(fds[a1].node, fds[a1].pos, (void*)a2, a3);
         if (n > 0) fds[a1].pos += (uint64_t)n;
         return (uint64_t)n;
