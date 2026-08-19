@@ -369,6 +369,7 @@ LIBGCC := $(shell readlink -f /lib/x86_64-linux-gnu/libgcc_s.so.1 2>/dev/null)
 # one. Two candidates because a git worktree sits four levels below the
 # checkout it belongs to, and the build has to work from either.
 # Override with `make -f Makefile.amd64 WINE64_LOADER=/path/to/wine`.
+WINE64_INSTALL ?=
 WINE64_LOADER ?= $(firstword $(wildcard \
     ../wine64-build/loader/wine ../../../../wine64-build/loader/wine))
 WINE64_NTDLL  ?= $(firstword $(wildcard \
@@ -413,6 +414,14 @@ $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
 	    fi; \
 	 else \
 	    echo "  initrd: no Wine loader at $(WINE64_LOADER), skipping"; \
+	 fi
+	@# A whole Wine installation, for the prefix attempt (Milestone 71).
+	@# Off unless asked for: it is 64MB of initrd and every ordinary
+	@# test run would pay for it. Turn it on with
+	@#     make -f Makefile.amd64 WINE64_INSTALL=1 test-wine-prefix
+	@if [ -n "$(WINE64_INSTALL)" ] && [ -x "$(WINE64_LOADER)" ]; then \
+	    bash tools/stage_wine.sh "$(dir $(WINE64_LOADER)).." \
+	        $(INITRD_STAGE) || exit 1; \
 	 fi
 	python3 userland/mkinitrd.py $(INITRD_STAGE) $@
 

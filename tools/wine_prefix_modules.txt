@@ -1,0 +1,108 @@
+# The modules `wineboot -u` loads while creating a prefix, measured
+# rather than guessed.
+#
+# Wine builds 602 PE DLLs and 108 PE executables. Creating a prefix
+# loads 93 of them. The list was produced by running wineboot against
+# this very Wine tree with WINEDEBUG=+loaddll and taking the distinct
+# module names; regenerate it the same way if Wine is updated.
+#
+# Unstripped in the build tree these are 174MB; stripped, 58MB. That is
+# the difference between an initrd this kernel can carry and one it
+# cannot, and it is why tools/stage_wine.sh strips.
+#
+# This is deliberately not "the DLLs Chrome needs" - it is the DLLs
+# *creating a prefix* needs, which is a much smaller and much better
+# defined question, and the one that has to be answered first.
+advapi32.dll
+advpack.dll
+atl100.dll
+avicap32.dll
+bcrypt.dll
+colorcnv.dll
+combase.dll
+comctl32.dll
+comdlg32.dll
+coml2.dll
+compstui.dll
+control.exe
+crypt32.dll
+cryptbase.dll
+cryptdlg.dll
+cryptnet.dll
+cryptui.dll
+dbghelp.dll
+devenum.dll
+dnsapi.dll
+dsound.dll
+explorer.exe
+gdi32.dll
+ieframe.dll
+iexplore.exe
+imm32.dll
+iphlpapi.dll
+kernel32.dll
+kernelbase.dll
+localspl.dll
+mfasfsrcsnk.dll
+mfh264enc.dll
+mfmp4srcsnk.dll
+mfplat.dll
+mp3dmod.dll
+mpr.dll
+msacm32.dll
+msauddecmft.dll
+mscoree.dll
+msdmo.dll
+mshtml.dll
+msisip.dll
+msmpeg2vdec.dll
+msvcrt.dll
+msvdsp.dll
+msvfw32.dll
+msvproc.dll
+newdev.dll
+nsi.dll
+ntdll.dll
+ntoskrnl.exe
+ole32.dll
+oleaut32.dll
+plugplay.exe
+propsys.dll
+qcap.dll
+qedit.dll
+quartz.dll
+resampledmo.dll
+rpcrt4.dll
+rsaenh.dll
+rtworkq.dll
+rundll32.exe
+sechost.dll
+services.exe
+setupapi.dll
+shcore.dll
+shell32.dll
+shlwapi.dll
+spoolss.dll
+start.exe
+svchost.exe
+ucrtbase.dll
+urlmon.dll
+user32.dll
+userenv.dll
+uxtheme.dll
+version.dll
+vidreszr.dll
+wevtsvc.dll
+win32u.dll
+windowscodecs.dll
+wineboot.exe
+winedevice.exe
+winedmo.dll
+winevulkan.dll
+wininet.dll
+winmm.dll
+winprint.dll
+wintrust.dll
+wmadmod.dll
+wmvdecod.dll
+ws2_32.dll
