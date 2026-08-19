@@ -110,6 +110,8 @@ int         ramfs64_parent(int node);
  * what read/mmap/ioctl mean for it is decided by syscall64.c. */
 #define RAMFS64_DEV_NONE 0
 #define RAMFS64_DEV_FB   1        /* /dev/fb0 - the linear framebuffer */
+#define RAMFS64_DEV_KBD  2        /* /dev/input/event0 - the keyboard    */
+#define RAMFS64_DEV_MOUSE 3       /* /dev/input/event1 - the mouse       */
 
 int         ramfs64_set_device(int node, int device);
 int         ramfs64_device(int node);
