@@ -29,9 +29,30 @@
  * measured, see ramfs64.h. */
 #define PROC64_PATH_MAX 1024
 
+/* What a descriptor refers to. Until Milestone 74 there was only one
+ * answer and it did not need saying. */
+#define FD64_FILE  0
+#define FD64_PIPE  1
+
 typedef struct {
-    int      node;
+    int      kind;      /* FD64_FILE or FD64_PIPE */
+    int      node;      /* FD64_FILE: the ramfs node */
     uint64_t pos;
+
+    /* FD64_PIPE: which pipe this descriptor may read from and which it
+     * may write to, -1 for "not this way". A pipe(2) read end has only
+     * rx, its write end only tx, and a socketpair endpoint has both -
+     * pointing at the two pipes the other endpoint has crossed over.
+     * That is the whole of what makes a socketpair bidirectional. */
+    int      rx, tx;
+
+    /* O_NONBLOCK and O_CLOEXEC, as fcntl(2) sets and reads them. Kept
+     * per descriptor rather than per pipe because they are: two
+     * descriptors on the same pipe can disagree about blocking, and
+     * Wine's do. */
+    int      nonblock;
+    int      cloexec;
+
     int      used;
 } proc64_fd_t;
 

@@ -21,6 +21,7 @@
 #include "paging64.h"
 #include "kstring.h"
 #include "proc64.h"
+#include "pipe64.h"
 #include "elf64.h"
 #include "initrd64.h"
 #include "pmm64.h"
@@ -172,6 +173,117 @@ static int64_t abs_path(const char* in, char* out) {
     return 0;
 }
 
+/* --- the descriptor layer (Milestone 74) --------------------------- *
+ *
+ * The address a task blocks on while waiting for a pipe. A third
+ * namespace beside PROC64_WAIT_KEY and PROC64_VFORK_KEY, and for the
+ * same reason: a reader waiting for bytes and a parent waiting for a
+ * child must not wake each other. */
+#define PIPE64_WAIT_KEY(p) (0x3000000000000000ULL + (uint64_t)(p))
+
+/* Declared here because a blocking read has to rebuild its own frame to
+ * be restarted with, and the definition sits with fork further down. */
+static void frame_from_args(const syscall64_args_t* args, uint64_t rax,
+                            registers64_t* out);
+
+/* Lowest free descriptor at or above `from`. Linux promises the lowest,
+ * and it is not a detail: a program that closes 0 and then opens
+ * something expects the new descriptor to *be* 0. dup2 relies on it too. */
+static int fd_alloc(int from) {
+    if (from < 0) from = 0;
+    for (int fd = from; fd < FD_MAX; fd++) if (!fds[fd].used) return fd;
+    return -1;
+}
+
+static void fd_init_pipe(int fd, int rx, int tx, int nonblock, int cloexec) {
+    fds[fd].kind     = FD64_PIPE;
+    fds[fd].node     = -1;
+    fds[fd].pos      = 0;
+    fds[fd].rx       = rx;
+    fds[fd].tx       = tx;
+    fds[fd].nonblock = nonblock;
+    fds[fd].cloexec  = cloexec;
+    fds[fd].used     = 1;
+    pipe64_ref(rx, 1, 0);
+    pipe64_ref(tx, 0, 1);
+}
+
+/* Closing a descriptor, from close(2) and from dup2 replacing one.
+ *
+ * The unref is the whole point. A pipe with no readers left makes the
+ * next write -EPIPE, which is how a server notices its client is gone,
+ * and a pipe with no writers left makes the next read return 0, which is
+ * how a client notices the server is. Forget this and both sides wait
+ * for each other forever - a hang with nothing in the log. */
+static void fd_release(int fd) {
+    if (fd < 0 || fd >= FD_MAX || !fds[fd].used) return;
+    if (fds[fd].kind == FD64_PIPE) {
+        int rx = fds[fd].rx, tx = fds[fd].tx;
+        pipe64_unref(rx, 1, 0);
+        pipe64_unref(tx, 0, 1);
+        /* Anyone parked on either pipe is now waiting on a fact that has
+         * changed - end of file on one side, a dead reader on the
+         * other - and has to be let go to find out. */
+        if (rx >= 0) sched64_wake(PIPE64_WAIT_KEY(rx), SCHED64_MAX_TASKS);
+        if (tx >= 0) sched64_wake(PIPE64_WAIT_KEY(tx), SCHED64_MAX_TASKS);
+    }
+    fds[fd].used = 0;
+    fds[fd].rx   = -1;
+    fds[fd].tx   = -1;
+}
+
+static int64_t do_pipe_write(int fd, const void* buf, uint64_t n) {
+    int64_t w;
+
+    if (fds[fd].tx < 0) return -9;                     /* -EBADF: read end */
+    w = pipe64_write(fds[fd].tx, buf, n);
+
+    /* -EAGAIN here means the ring is full. A blocking write should park
+     * until a reader drains it; this reports it instead, which is
+     * honest and is enough for what runs today - Wine's requests are far
+     * smaller than 64KB, so a full pipe means the peer has stopped
+     * reading rather than that the writer is ahead. Written down rather
+     * than hidden: a blocking write that returns EAGAIN is a divergence
+     * from Linux, and the differential does not assert it. */
+    if (w > 0) sched64_wake(PIPE64_WAIT_KEY(fds[fd].tx), SCHED64_MAX_TASKS);
+    return w;
+}
+
+/* read(2) on a pipe, including the part that waits.
+ *
+ * Restarted rather than resumed, the same way wait4 is: the frame is
+ * rewound over the two bytes of the `syscall` instruction with the
+ * number back in rax, so waking re-runs the call and re-reads the pipe.
+ * There is no other way to return a count that was not known when the
+ * caller blocked. */
+static int64_t do_pipe_read(const syscall64_args_t* args, int fd,
+                            void* buf, uint64_t n) {
+    registers64_t self, next;
+    vmspace64_t next_space;
+    uint64_t next_fs;
+    int64_t r;
+
+    if (fds[fd].rx < 0) return -9;                     /* -EBADF: write end */
+
+    r = pipe64_read(fds[fd].rx, buf, n);
+    if (r != -11) return r;                            /* data, or EOF */
+    if (fds[fd].nonblock) return -11;                  /* -EAGAIN */
+
+    frame_from_args(args, SYS64_READ, &self);
+    self.rip = args->ret_rip - 2;
+
+    if (!sched64_block_current(&self, PIPE64_WAIT_KEY(fds[fd].rx),
+                               SYS64_READ, &next, &next_space, &next_fs)) {
+        /* Nothing else can run, so nobody can ever fill this pipe.
+         * Reporting it beats a machine that stops. */
+        return -11;
+    }
+    vmspace64_switch(&next_space);
+    write_msr(0xC0000100u, next_fs);
+    sched64_resume(&next);                             /* never returns */
+    return 0;
+}
+
 static uint64_t do_open(const char* path, uint64_t flags, uint32_t mode) {
     int node = ramfs64_lookup(path);
     int fd;
@@ -188,9 +300,14 @@ static uint64_t do_open(const char* path, uint64_t flags, uint32_t mode) {
     for (fd = 3; fd < FD_MAX; fd++) if (!fds[fd].used) break;
     if (fd == FD_MAX) return (uint64_t)-24;            /* -EMFILE */
 
-    fds[fd].node = node;
-    fds[fd].pos  = (flags & O_APPEND) ? ramfs64_size(node) : 0;
-    fds[fd].used = 1;
+    fds[fd].kind     = FD64_FILE;
+    fds[fd].node     = node;
+    fds[fd].pos      = (flags & O_APPEND) ? ramfs64_size(node) : 0;
+    fds[fd].rx       = -1;
+    fds[fd].tx       = -1;
+    fds[fd].nonblock = (flags & O_NONBLOCK) ? 1 : 0;
+    fds[fd].cloexec  = (flags & O_CLOEXEC)  ? 1 : 0;
+    fds[fd].used     = 1;
     return (uint64_t)fd;
 }
 
@@ -291,6 +408,7 @@ static uint64_t do_readlink(const char* given, char* buf, uint64_t size) {
 }
 
 static uint64_t forks, execs, vforks;
+static uint64_t pipes_made, socketpairs_made;
 static uint64_t last_fork_frames;
 
 static void frame_from_args(const syscall64_args_t* args, uint64_t rax,
@@ -442,6 +560,8 @@ static uint64_t do_fork(const syscall64_args_t* args) {
 uint64_t syscall64_forks(void) { return forks; }
 uint64_t syscall64_execs(void) { return execs; }
 uint64_t syscall64_vforks(void) { return vforks; }
+uint64_t syscall64_pipes(void) { return pipes_made; }
+uint64_t syscall64_socketpairs(void) { return socketpairs_made; }
 uint64_t syscall64_last_fork_frames(void) { return last_fork_frames; }
 
 /* The calling thread's complete user state, as a frame it could be
@@ -769,6 +889,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
         if (a1 >= 3) {
             int64_t w;
             if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+            if (fds[a1].kind == FD64_PIPE) return (uint64_t)do_pipe_write(a1, buf, n);
             w = ramfs64_write(fds[a1].node, fds[a1].pos, buf, n);
             if (w > 0) fds[a1].pos += (uint64_t)w;
             return (uint64_t)w;
@@ -1363,8 +1484,155 @@ static uint64_t dispatch(syscall64_args_t* args) {
 
     case SYS64_CLOSE:
         if (a1 < 3 || a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
-        fds[a1].used = 0;
+        fd_release(a1);
         return 0;
+
+    /* pipe2(int fds[2], flags). The wineserver's first act, and where
+     * Milestone 73 stopped. glibc's pipe(2) is this with flags 0. */
+    case SYS64_PIPE2: {
+        int* out = (int*)a1;
+        int p, rd, wr;
+
+        if (!out) return (uint64_t)-14;                /* -EFAULT */
+
+        p = pipe64_create();
+        if (p < 0) return (uint64_t)-23;               /* -ENFILE */
+
+        rd = fd_alloc(3);
+        if (rd < 0) { pipe64_unref(p, 0, 0); return (uint64_t)-24; }
+        /* Claimed before the second allocation, or both ends come back
+         * as the same descriptor. */
+        fd_init_pipe(rd, p, -1, (a2 & O_NONBLOCK) != 0, (a2 & O_CLOEXEC) != 0);
+
+        wr = fd_alloc(3);
+        if (wr < 0) { fd_release(rd); return (uint64_t)-24; }
+        fd_init_pipe(wr, -1, p, (a2 & O_NONBLOCK) != 0, (a2 & O_CLOEXEC) != 0);
+
+        out[0] = rd;
+        out[1] = wr;
+        pipes_made++;
+        return 0;
+    }
+
+    /* socketpair(domain, type, protocol, int sv[2]).
+     *
+     * Two pipes, crossed. Only AF_UNIX/SOCK_STREAM is answered, because
+     * that is the only thing a socketpair can be that this kernel could
+     * honestly serve - there is no network stack behind it, and a
+     * SOCK_DGRAM that silently behaved like a stream would lose message
+     * boundaries a caller was relying on.
+     *
+     * This is how every Wine process talks to the wineserver. The type
+     * argument carries SOCK_CLOEXEC and SOCK_NONBLOCK in its high bits,
+     * which are the same values as O_CLOEXEC and O_NONBLOCK. */
+    case SYS64_SOCKETPAIR: {
+        int* sv = (int*)args->a4;
+        int type = (int)(a2 & 0xFF);
+        int p, q, s0, s1;
+
+        if (a1 != 1) return (uint64_t)-97;             /* -EAFNOSUPPORT */
+        if (type != 1) return (uint64_t)-94;           /* -ESOCKTNOSUPPORT */
+        if (!sv) return (uint64_t)-14;
+
+        p = pipe64_create();
+        if (p < 0) return (uint64_t)-23;
+        q = pipe64_create();
+        if (q < 0) { pipe64_unref(p, 0, 0); return (uint64_t)-23; }
+
+        s0 = fd_alloc(3);
+        if (s0 < 0) { pipe64_unref(p,0,0); pipe64_unref(q,0,0);
+                      return (uint64_t)-24; }
+        fd_init_pipe(s0, p, q, (a2 & O_NONBLOCK) != 0, (a2 & O_CLOEXEC) != 0);
+
+        s1 = fd_alloc(3);
+        if (s1 < 0) { fd_release(s0); pipe64_unref(q,0,0);
+                      return (uint64_t)-24; }
+        /* Crossed: what s0 writes, s1 reads. */
+        fd_init_pipe(s1, q, p, (a2 & O_NONBLOCK) != 0, (a2 & O_CLOEXEC) != 0);
+
+        sv[0] = s0;
+        sv[1] = s1;
+        socketpairs_made++;
+        return 0;
+    }
+
+    /* fcntl(fd, cmd, arg).
+     *
+     * Only the commands that are really about the descriptor. The file
+     * locking ones are answered as success without locking anything,
+     * which is a lie of exactly the kind Milestone 72 spent its whole
+     * length removing - so it is confined to the case where it is
+     * harmless and said out loud: there is one process holding the
+     * prefix at a time here, so an advisory lock has nobody to advise. */
+    case SYS64_FCNTL: {
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        switch (a2) {
+        case F_GETFD:
+            return fds[a1].cloexec ? FD_CLOEXEC : 0;
+        case F_SETFD:
+            fds[a1].cloexec = (a3 & FD_CLOEXEC) ? 1 : 0;
+            return 0;
+        case F_GETFL:
+            /* O_RDWR because nothing here tracks the access mode a file
+             * was opened with; the flag callers actually test for is
+             * O_NONBLOCK, which is tracked. */
+            return (uint64_t)(O_RDWR | (fds[a1].nonblock ? O_NONBLOCK : 0));
+        case F_SETFL:
+            fds[a1].nonblock = (a3 & O_NONBLOCK) ? 1 : 0;
+            return 0;
+        case F_DUPFD:
+        case F_DUPFD_CLOEXEC: {
+            int nfd = fd_alloc((int)a3);
+            if (nfd < 0) return (uint64_t)-24;         /* -EMFILE */
+            fds[nfd] = fds[a1];
+            fds[nfd].cloexec = (a2 == F_DUPFD_CLOEXEC);
+            if (fds[nfd].kind == FD64_PIPE) {
+                pipe64_ref(fds[nfd].rx, 1, 0);
+                pipe64_ref(fds[nfd].tx, 0, 1);
+            }
+            return (uint64_t)nfd;
+        }
+        case F_GETLK:
+        case F_SETLK:
+        case F_SETLKW:
+            return 0;
+        default:
+            return (uint64_t)-22;                      /* -EINVAL */
+        }
+    }
+
+    case SYS64_DUP: {
+        int nfd;
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        nfd = fd_alloc(3);
+        if (nfd < 0) return (uint64_t)-24;
+        fds[nfd] = fds[a1];
+        fds[nfd].cloexec = 0;                          /* dup never copies it */
+        if (fds[nfd].kind == FD64_PIPE) {
+            pipe64_ref(fds[nfd].rx, 1, 0);
+            pipe64_ref(fds[nfd].tx, 0, 1);
+        }
+        return (uint64_t)nfd;
+    }
+
+    /* dup2(old, new) and dup3(old, new, flags). The new descriptor is
+     * closed first if it was open, which is the part that matters: this
+     * is how a shell wires a pipe onto stdout, and how Wine hands a
+     * socket to a child at a number it agreed in advance. */
+    case SYS64_DUP2:
+    case SYS64_DUP3: {
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (a2 >= FD_MAX) return (uint64_t)-9;
+        if (a1 == a2) return nr == SYS64_DUP3 ? (uint64_t)-22 : a2;
+        fd_release((int)a2);
+        fds[a2] = fds[a1];
+        fds[a2].cloexec = (nr == SYS64_DUP3 && (a3 & O_CLOEXEC)) ? 1 : 0;
+        if (fds[a2].kind == FD64_PIPE) {
+            pipe64_ref(fds[a2].rx, 1, 0);
+            pipe64_ref(fds[a2].tx, 0, 1);
+        }
+        return a2;
+    }
 
     case SYS64_LSEEK: {
         uint64_t base;
@@ -1571,6 +1839,14 @@ static uint64_t dispatch(syscall64_args_t* args) {
 
         if (a1 < 3) return 0;                          /* stdin: end of file */
         if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+
+        /* A pipe is not a file with a position, so it is answered before
+         * anything asks the filesystem about a node this descriptor does
+         * not have. A read that would block parks the task and is
+         * restarted, which is why this returns through do_pipe_read
+         * rather than inline. */
+        if (fds[a1].kind == FD64_PIPE)
+            return (uint64_t)do_pipe_read(args, a1, (void*)a2, a3);
 
         /* An input device is a stream of events, not a file with a
          * position: there is no offset to advance and nothing to seek

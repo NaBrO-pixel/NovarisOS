@@ -1,6 +1,7 @@
 /* proc64.c - the state a process owns, as opposed to a thread. */
 
 #include "proc64.h"
+#include "pipe64.h"
 #include "kstring.h"
 
 static proc64_t procs[PROC64_MAX];
@@ -56,7 +57,18 @@ int proc64_fork_from(int pid) {
      * the same heap layout, the same idea of what it is. The address
      * space is the caller's job, because copying it can fail after this
      * point and undoing a half-built process is worse than checking. */
-    for (int f = 0; f < PROC64_FD_MAX; f++) child->fds[f] = parent->fds[f];
+    /* Open files at the same offsets - and, for a pipe, a reference of
+     * its own. A fork that copied the descriptor without counting it
+     * would leave the pipe believing one reader had gone the first time
+     * either process closed, so the survivor's next read would report
+     * end of file with the writer still there. */
+    for (int f = 0; f < PROC64_FD_MAX; f++) {
+        child->fds[f] = parent->fds[f];
+        if (parent->fds[f].used && parent->fds[f].kind == FD64_PIPE) {
+            pipe64_ref(parent->fds[f].rx, 1, 0);
+            pipe64_ref(parent->fds[f].tx, 0, 1);
+        }
+    }
     child->brk_base    = parent->brk_base;
     child->brk_current = parent->brk_current;
     child->mmap_next   = parent->mmap_next;
