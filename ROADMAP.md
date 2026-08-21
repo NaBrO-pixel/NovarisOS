@@ -8707,6 +8707,134 @@ of open files.** That is the next milestone, and it is the last piece of
 plumbing before a Windows program has something to run against.
 
 
+## Milestone 74 — the descriptor layer ✅ DONE
+
+`pipe2`, `socketpair` and `fcntl`. Milestone 73 stopped on the first of
+them — the wineserver's own first act is a pipe, and the answer was
+`-ENOSYS`. All three are now used successfully in a full wineboot run.
+
+Until here a descriptor was a ramfs node and an offset, which is all a
+file needs and none of what a connection needs. `proc64_fd_t` now says
+what kind of thing it refers to, and for a pipe it holds a **direction**
+rather than an object: which pipe it may read from and which it may
+write to, either of which may be absent.
+
+That one decision is what makes the rest fall out. A `pipe(2)` read end
+has only `rx`; its write end has only `tx`; and a socketpair endpoint has
+**both, pointing at the two pipes its peer has crossed over**. One
+`read()` and one `write()` serve all three, and the direction is enforced
+by the descriptor rather than by convention — writing to a read end is
+`-EBADF`, which is a thing a test can check and an implementation
+storing one object per pipe would get wrong.
+
+### The ends, which are the part that hangs rather than fails
+
+`kernel/pipe64.c` is a 64KB ring in the kernel heap, and the interesting
+state is not the bytes but the counts. A reader learns the writer has
+gone by `read` returning **0**; a writer learns the reader has gone by
+`write` returning **-EPIPE**. Both are how the two halves of a
+connection discover the other has died.
+
+Get the counting wrong and neither side finds out, so neither returns —
+and that failure is a hang with nothing in the log, not an error. Two
+places had to be right and both are easy to miss:
+
+- **`dup`** and `F_DUPFD`, which make a second writer out of one.
+- **`fork`**, which duplicates every descriptor at once. `proc64.c` takes
+  a reference per inherited pipe; without it, the first process to close
+  looks to the reader like the last one, and a pipe with a live writer
+  reports end of file.
+
+`close` also wakes anything parked on either pipe, because a blocked
+reader is waiting on a fact that has just changed.
+
+A blocking `read` on an empty pipe parks the task and is **restarted**,
+the same way `wait4` is: the frame is rewound over the two bytes of the
+`syscall` instruction with the number back in `rax`, so waking re-runs
+the call and re-reads. There is no other way to return a count that was
+not known when the caller blocked.
+
+### What is deliberately not done
+
+A **blocking write to a full pipe returns `-EAGAIN`** instead of waiting.
+Honest, and enough for what runs today — Wine's requests are far smaller
+than 64KB, so a full pipe means the peer has stopped reading rather than
+that the writer is ahead. It is a divergence from Linux and the
+differential does not assert it.
+
+`fcntl`'s **locking commands return success without locking anything.**
+That is the shape of lie Milestone 72 spent its whole length removing, so
+it is confined to the case where it is harmless and said out loud: one
+process holds the prefix at a time here, so an advisory lock has nobody
+to advise.
+
+`socketpair` answers only `AF_UNIX`/`SOCK_STREAM`. A `SOCK_DGRAM` that
+silently behaved like a stream would lose message boundaries a caller was
+relying on, so it is refused rather than approximated.
+
+### The test, and the falsification
+
+`userland/pipe64.c` — 40 assertions, exit 107 — is mostly about
+direction and ends rather than about bytes, because bytes are the part
+that is hard to get wrong. It asserts that a read end cannot be written
+to, that a pipe is a stream rather than a queue of records, that one of
+two writers closing is *not* end of file, that a socketpair carries
+**both** directions, and that what one endpoint writes does not come
+back to itself.
+
+The kernel counts pipes and socketpairs beside it, and counts how many
+are still open at the end. That last one is the leak a server would hit
+first: accept connections forever and a kernel that never gives a pipe
+back runs out of pipes long before it runs out of memory, and the two
+look nothing alike from outside.
+
+| removed | what failed |
+| --- | --- |
+| the second, crossed pipe in `socketpair` | `sv[0] writes` — the endpoints shared one direction |
+| `fork`'s reference on inherited pipes | `the child's bytes arrive` |
+| `close`'s unref | `and then the reader sees end of file` |
+
+319 assertions, 18 differentials, 0 failures, green at 2G and 6G.
+
+### Where Wine stops now
+
+One step further into the wineserver, and on the other half of the same
+subject. Having made its pipe, it tries to create the **named** socket
+that Wine processes connect to:
+
+```
+fcntl(3, F_SETFD, FD_CLOEXEC)   = 0
+socketpair(AF_UNIX, SOCK_STREAM) = 0
+pipe2(...)                       = 0
+newfstatat("socket")             = -ENOENT
+unlink("socket")                 = -ENOENT
+socket(AF_UNIX, SOCK_STREAM, 0)  = -ENOSYS
+wineserver: socket: Function not implemented
+```
+
+A socketpair is two ends that already know each other. A **listening
+socket is a rendezvous**: a name in the filesystem, a backlog, and an
+`accept` that manufactures a fresh pair per client. The pipe layer is
+what it will be built out of — a connection is exactly the crossed pair
+`socketpair` already makes — but the naming and the queue are new.
+
+| number | name | why it is wanted |
+| --- | --- | --- |
+| 41 | `socket` | where it stops — the server's listening socket |
+| 48 | `shutdown` | half-closing a connection |
+| 112 | `setsid` | the server detaching from its parent |
+| 435 | `clone3` | benign; glibc falls back to `clone` |
+| 302 | `prlimit64` | benign |
+| 334 | `rseq` | benign |
+| 323 | `userfaultfd` | benign |
+
+`socket`, `bind`, `listen`, `accept4` and `connect` over a filesystem
+name are the next milestone. **Wine also passes file descriptors between
+processes with `SCM_RIGHTS` over that socket**, which `sendmsg`/`recvmsg`
+will have to carry, and that is the part worth measuring before
+promising.
+
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
@@ -8751,10 +8879,16 @@ list, and it is shorter than the one above but not smaller:
    staged at the path wineboot spawns, and `mkdir`'s mode is recorded so
    the server's own permission check can pass.
 
-   It now stops **inside** the wineserver, on `pipe2`. What the Windows
-   side waits on is no longer a spawn but a **descriptor layer**:
-   `pipe2`, `socketpair` and `fcntl`, which is how every Wine process
-   talks to the server. No PE module is loaded until that works.
+   ~~It now stops **inside** the wineserver, on `pipe2`~~ - the
+   descriptor layer landed in Milestone 74: `pipe2`, `socketpair` and
+   `fcntl` all work, and Wine uses all three.
+
+   It now stops one step further on, at `socket`. A socketpair is two
+   ends that already know each other; the server needs a **listening
+   socket** - a name in the filesystem, a backlog, and an `accept` that
+   makes a fresh pair per client - plus `SCM_RIGHTS` over it, which is
+   how Wine passes descriptors between processes. No PE module is loaded
+   until a client can connect.
 2. ~~**Copy-on-write `fork`.**~~ - done in Milestone 69. An 8MB process
    forks for 14 frames.
 3. ~~**Keyboard and mouse.**~~ - done in Milestone 70, as

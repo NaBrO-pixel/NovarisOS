@@ -70,6 +70,31 @@
 #define O_CREAT    0x0040
 #define O_TRUNC    0x0200
 #define O_APPEND   0x0400
+#define O_NONBLOCK 0x0800
+#define O_CLOEXEC  0x80000
+
+/* The descriptor layer (Milestone 74). pipe2 and socketpair take the
+ * same two flags, in the same bits, which is why they are up here rather
+ * than beside either one. */
+#define SYS64_PIPE2      293
+#define SYS64_SOCKETPAIR 53
+#define SYS64_FCNTL      72
+#define SYS64_DUP        32
+#define SYS64_DUP2       33
+#define SYS64_DUP3       292
+#define SYS64_POLL       7
+
+/* fcntl(2) commands, Linux's values. */
+#define F_DUPFD          0
+#define F_GETFD          1
+#define F_SETFD          2
+#define F_GETFL          3
+#define F_SETFL          4
+#define F_SETLK          6
+#define F_SETLKW         7
+#define F_GETLK          5
+#define F_DUPFD_CLOEXEC  1030
+#define FD_CLOEXEC       1
 
 /* mmap(2) protection and flags, Linux's values. */
 #define PROT_READ      0x1
@@ -238,5 +263,11 @@ uint64_t syscall64_execs(void);
 /* How many of those forks were vforks - a parent suspended until its
  * child execve'd or exited (Milestone 73). */
 uint64_t syscall64_vforks(void);
+
+/* Pipes and socketpairs created (Milestone 74). A socketpair that was
+ * quietly answered as a plain pipe would pass every read/write
+ * assertion and lose one direction; these are how that is caught. */
+uint64_t syscall64_pipes(void);
+uint64_t syscall64_socketpairs(void);
 
 #endif

@@ -85,6 +85,7 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/fs64_blob.o \
        $(BUILD_DIR)/mmapfile64_blob.o \
        $(BUILD_DIR)/ramfs64.o \
+       $(BUILD_DIR)/pipe64.o \
        $(BUILD_DIR)/proc64.o \
        $(BUILD_DIR)/forkexec64_blob.o \
        $(BUILD_DIR)/tree64_blob.o \
@@ -92,6 +93,7 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/cowfork64_blob.o \
        $(BUILD_DIR)/vmem64_blob.o \
        $(BUILD_DIR)/spawn64_blob.o \
+       $(BUILD_DIR)/pipetest64_blob.o \
        $(BUILD_DIR)/initrd64.o \
        $(BUILD_DIR)/hello64_blob.o \
        $(BUILD_DIR)/glibc64_blob.o \
@@ -257,6 +259,20 @@ $(BUILD_DIR)/spawn64_blob.c: $(BUILD_DIR)/spawn64.elf userland/embed64.py
 	python3 userland/embed64.py $< $@ spawn64_elf
 
 $(BUILD_DIR)/spawn64_blob.o: $(BUILD_DIR)/spawn64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# The descriptor layer (Milestone 74): pipe2, socketpair, fcntl, dup.
+# Named pipetest64 rather than pipe64 in the build because kernel/pipe64.c
+# is the implementation, and two objects called pipe64.o would be one.
+$(BUILD_DIR)/pipetest64.elf: userland/pipe64.c | $(BUILD_DIR)
+	gcc -static -O2 -o $@ $<
+	@file $@ | grep -q "statically linked" \
+	    || (echo "ERROR: $@ is not static"; false)
+
+$(BUILD_DIR)/pipetest64_blob.c: $(BUILD_DIR)/pipetest64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ pipetest64_elf
+
+$(BUILD_DIR)/pipetest64_blob.o: $(BUILD_DIR)/pipetest64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Two threads handing off through a futex, with no spin to fall back on.
@@ -699,6 +715,18 @@ test: iso
 	    || (echo "FAIL: the host run of the spawn binary did not exit 103"; \
 	        exit 1)
 	@echo "PASS: posix_spawn behaves the same, and exits 103, on both"
+	@# The descriptor layer.
+	@timeout 60 ./$(BUILD_DIR)/pipetest64.elf > $(BUILD_DIR)/pipetest64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/pipetest64.host.status
+	@while read -r line; do \
+	    grep -qF "$$line" $(BUILD_DIR)/serial.log \
+	        || (echo "FAIL: the guest never printed: $$line"; exit 1) \
+	        || exit 1; \
+	done < $(BUILD_DIR)/pipetest64.host.txt
+	@[ "`cat $(BUILD_DIR)/pipetest64.host.status`" = "107" ] \
+	    || (echo "FAIL: the host run of the pipe binary did not exit 107"; \
+	        exit 1)
+	@echo "PASS: pipes and socketpairs behave the same, and exit 107, on both"
 
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR) $(ISO)
