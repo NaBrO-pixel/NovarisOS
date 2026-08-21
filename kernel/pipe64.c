@@ -5,12 +5,22 @@
 #include "kstring.h"
 
 typedef struct {
+    fdpass64_t fds[8];
+    int        n;
+} batch64_t;
+
+typedef struct {
     uint8_t* buf;
     uint64_t head;      /* next byte to read  */
     uint64_t tail;      /* next byte to write */
     uint64_t len;       /* bytes in the ring  */
     int      readers;
     int      writers;
+
+    /* Descriptors in flight, oldest first. */
+    batch64_t inflight[PIPE64_INFLIGHT];
+    int       in_head, in_count;
+
     int      used;
 } pipe64_t;
 
@@ -28,6 +38,8 @@ void pipe64_init(void) {
         pipes[i].len     = 0;
         pipes[i].readers = 0;
         pipes[i].writers = 0;
+        pipes[i].in_head = 0;
+        pipes[i].in_count = 0;
         pipes[i].used    = 0;
     }
 }
@@ -50,6 +62,8 @@ int pipe64_create(void) {
     pipes[i].len     = 0;
     pipes[i].readers = 0;
     pipes[i].writers = 0;
+    pipes[i].in_head = 0;
+    pipes[i].in_count = 0;
     pipes[i].used    = 1;
     return i;
 }
@@ -70,11 +84,68 @@ void pipe64_unref(int p, int reader, int writer) {
      * would otherwise run out of pipes rather than out of memory, and
      * the two failures look nothing alike from outside. */
     if (pipes[p].readers == 0 && pipes[p].writers == 0) {
+        /* Descriptors that were sent and never received. Their pipes were
+         * referenced when they went in flight, on behalf of a receiver
+         * that is now not coming, so they are given back here. Miss this
+         * and a message dropped on a closing connection leaks a pipe per
+         * message - invisible until a long-running server stops being
+         * able to open anything. */
+        while (pipes[p].in_count > 0) {
+            batch64_t* b = &pipes[p].inflight[pipes[p].in_head];
+            for (int k = 0; k < b->n; k++) {
+                pipe64_unref(b->fds[k].rx, 1, 0);
+                pipe64_unref(b->fds[k].tx, 0, 1);
+            }
+            pipes[p].in_head = (pipes[p].in_head + 1) % PIPE64_INFLIGHT;
+            pipes[p].in_count--;
+        }
         kfree64(pipes[p].buf);
         pipes[p].buf  = 0;
         pipes[p].used = 0;
         pipes[p].len  = 0;
     }
+}
+
+int pipe64_send_fds(int p, const fdpass64_t* in, int n) {
+    batch64_t* b;
+
+    if (!pipe64_valid(p) || n <= 0) return 0;
+    if (n > (int)(sizeof(b->fds) / sizeof(b->fds[0]))) return 0;
+    if (pipes[p].in_count >= PIPE64_INFLIGHT) return 0;
+
+    b = &pipes[p].inflight[(pipes[p].in_head + pipes[p].in_count)
+                           % PIPE64_INFLIGHT];
+    for (int k = 0; k < n; k++) b->fds[k] = in[k];
+    b->n = n;
+    pipes[p].in_count++;
+    return 1;
+}
+
+int pipe64_recv_fds(int p, fdpass64_t* out, int max) {
+    batch64_t* b;
+    int n;
+
+    if (!pipe64_valid(p) || pipes[p].in_count == 0) return 0;
+
+    b = &pipes[p].inflight[pipes[p].in_head];
+    n = b->n < max ? b->n : max;
+    for (int k = 0; k < n; k++) out[k] = b->fds[k];
+
+    /* Anything the receiver had no room for is dropped, and dropped
+     * properly: Linux closes the surplus rather than leaving it in
+     * flight, because the sender has already given it away. */
+    for (int k = n; k < b->n; k++) {
+        pipe64_unref(b->fds[k].rx, 1, 0);
+        pipe64_unref(b->fds[k].tx, 0, 1);
+    }
+
+    pipes[p].in_head = (pipes[p].in_head + 1) % PIPE64_INFLIGHT;
+    pipes[p].in_count--;
+    return n;
+}
+
+int pipe64_inflight(int p) {
+    return pipe64_valid(p) ? pipes[p].in_count : 0;
 }
 
 uint64_t pipe64_available(int p) {

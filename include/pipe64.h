@@ -27,6 +27,28 @@
 #define PIPE64_MAX 64
 #define PIPE64_BUF 65536
 
+/* Descriptors in flight (Milestone 76).
+ *
+ * SCM_RIGHTS sends a *descriptor*, not a number: the receiver gets the
+ * thing the sender's number referred to, at a number of its own
+ * choosing. So what travels is this - everything a descriptor is, minus
+ * the parts that belong to the process holding it.
+ *
+ * It rides beside the bytes rather than in them. Linux ties a control
+ * message to a point in the stream; this keeps a queue per pipe and
+ * hands the oldest batch to the next recvmsg, which is the same thing
+ * for a protocol that sends one message at a time and reads it whole -
+ * and Wine's is exactly that. A protocol that coalesced would notice
+ * the difference, so it is written down rather than assumed. */
+#define PIPE64_INFLIGHT 16
+
+typedef struct {
+    int      kind;              /* FD64_FILE, FD64_PIPE, FD64_SOCKET */
+    int      node;
+    uint64_t pos;
+    int      rx, tx;
+} fdpass64_t;
+
 void pipe64_init(void);
 
 /* A new pipe with no ends attached yet, or -1 if the table or the heap
@@ -55,6 +77,18 @@ uint64_t pipe64_space(int p);       /* bytes that would fit          */
 int      pipe64_readers(int p);
 int      pipe64_writers(int p);
 int      pipe64_valid(int p);
+
+/* Queue a batch of descriptors behind whatever is already in flight.
+ * Returns 0 if there is no room. The caller has already taken whatever
+ * references the descriptors need; if the pipe dies first, they are
+ * given back by pipe64_unref. */
+int pipe64_send_fds(int p, const fdpass64_t* in, int n);
+
+/* Take the oldest batch, or 0 if there is none. */
+int pipe64_recv_fds(int p, fdpass64_t* out, int max);
+
+/* How many batches are waiting, for the assertions. */
+int pipe64_inflight(int p);
 
 /* Live pipes, for the assertions: a layer that leaks one descriptor per
  * connection is not visible any other way. */

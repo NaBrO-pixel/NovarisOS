@@ -114,6 +114,8 @@ extern const unsigned char pipetest64_elf[];
 extern const unsigned long pipetest64_elf_len;
 extern const unsigned char socktest64_elf[];
 extern const unsigned long socktest64_elf_len;
+extern const unsigned char scm64_elf[];
+extern const unsigned long scm64_elf_len;
 extern const unsigned char cwd64_elf[];
 extern const unsigned long cwd64_elf_len;
 extern const unsigned char fbdraw64_elf[];
@@ -3360,7 +3362,126 @@ void kernel_main(uint32_t magic, void* mbi) {
               sock64_live() == 0 && pipe64_live() == 0);
     }
 
-    /* --- layer 36: a Wine prefix (Milestone 71) ---------------------- */
+    /* --- layer 36: passing a descriptor (Milestone 76) --------------- */
+    /* Where Milestone 75 stopped, and the mechanism the whole Windows
+     * side stands on: every Windows object a Wine process holds is,
+     * underneath, a file descriptor the wineserver sent it over their
+     * socket with SCM_RIGHTS.
+     *
+     * It is the first operation in this tree that touches two
+     * processes' descriptor tables. What travels is the descriptor and
+     * not the number - the sender names one of its own, the receiver
+     * gets the thing it referred to at a number the receiver picks - so
+     * the assertions are about identity rather than arrival. A test that
+     * only checked "a descriptor appeared" would pass on an
+     * implementation that sent the integer. */
+    serial64_puts("NOVARIS64: -- passing a descriptor --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 64;
+        vmspace64_t kspace;
+        elf64_info_t info;
+        uint64_t i, rsp;
+        uint64_t passed_before, sent_before;
+        int rc, stack_ok = 1, pid;
+        proc64_t* p;
+        static const char* const scm_argv[] = { "/scm64", 0 };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        syscall64_reset_files();
+        signal64_reset();
+        sched64_init();
+        proc64_init();
+        pipe64_init();
+        sock64_init();
+        vmspace64_kernel_space(&kspace);
+        passed_before = syscall64_fds_passed();
+        sent_before   = syscall64_sendmsgs();
+
+        pid = proc64_create();
+        proc64_set_current(pid);
+        p = proc64_current();
+
+        check("a space for it", vmspace64_create(&p->space) != 0);
+        rc = elf64_load(scm64_elf, scm64_elf_len, &p->space, &info);
+        check("the descriptor-passing program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&p->space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&p->space, info.brk_start);
+        rsp = uspace64_build_stack(&p->space, STACK_TOP, STACK_PAGES,
+                                   scm_argv, &info, 0, 0);
+
+        {
+            registers64_t first;
+            for (i = 0; i < sizeof(first) / 8; i++)
+                ((uint64_t*)&first)[i] = 0;
+            sched64_add_frame_for(&first, &p->space, 0, pid);
+            sched64_set_current(0);
+        }
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+
+        /* The timer has to be running for this one, and that is not a
+         * detail. Every layer before this waited for an *event* - a
+         * write, an exit, a connection - and something else always
+         * caused it. This program waits for *time*: it sleeps so that
+         * its child reaches recvmsg and blocks there before anything is
+         * sent, which is the only way to exercise a receive that has to
+         * wait. A deadline cannot be reached with IRQ0 masked, because
+         * nothing advances the counter it is measured against - the
+         * sleep would not be slow, it would never end.
+         *
+         * Ticks land only in ring 3: the syscall path clears IF on the
+         * way in, so a task is never preempted inside the kernel, which
+         * is what makes one kernel stack safe. Same arrangement as the
+         * preemption layer, and masked again afterwards so no tick
+         * arrives during the assertions below. */
+        register_interrupt_handler64(32, sched_timer_handler);
+        idt64_irq_set_mask(0, 0);
+
+        vmspace64_switch(&p->space);
+        enter_user_mode64(info.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+
+        idt64_irq_set_mask(0, 1);
+        pf_diagnose = 0;
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("descriptors passed as Linux's do",
+              syscall64_exit_code() == 113);
+
+        /* Two descriptors, over three sendmsgs - the first carries only
+         * bytes. Counted because a sendmsg that delivered the payload
+         * and quietly dropped the control data would satisfy every
+         * assertion the program makes about the *bytes*, and the
+         * program's own checks would then fail somewhere further along
+         * looking like a broken file rather than a lost descriptor. */
+        serial64_puts("NOVARIS64: passed  = ");
+        serial64_putdec(syscall64_fds_passed() - passed_before);
+        serial64_puts(" descriptors over ");
+        serial64_putdec(syscall64_sendmsgs() - sent_before);
+        serial64_puts(" sendmsgs\n");
+        check("two descriptors were carried, over three messages",
+              syscall64_fds_passed() - passed_before == 2 &&
+              syscall64_sendmsgs() - sent_before == 3);
+
+        serial64_puts("NOVARIS64: live    = ");
+        serial64_putdec(pipe64_live());
+        serial64_puts(" pipes still open\n");
+        check("and nothing leaked", pipe64_live() == 0);
+    }
+
+    /* --- layer 37: a Wine prefix (Milestone 71) ---------------------- */
     /* Milestone 68 removed every reason a prefix could not exist here -
      * the node ceiling, the name and path ceilings, the missing links,
      * the missing working directory - and proved each one separately.
@@ -3468,9 +3589,20 @@ void kernel_main(uint32_t magic, void* mbi) {
                 serial64_puts("NOVARIS64: --- wineboot ---\n");
                 pf_diagnose = 1;
                 syscall64_set_trace(1);
+
+                /* The timer, for the same reason as the layer above and
+                 * with a sharper edge: the wineserver's main loop is
+                 * poll(fds, n, 30000), and a poll timeout is a deadline.
+                 * With IRQ0 masked it is not a thirty-second wait, it is
+                 * a permanent one. */
+                register_interrupt_handler64(32, sched_timer_handler);
+                idt64_irq_set_mask(0, 0);
+
                 vmspace64_switch(&p->space);
                 enter_user_mode64(interp.entry, rsp, 0);
                 vmspace64_switch(&kspace);
+
+                idt64_irq_set_mask(0, 1);
                 syscall64_set_trace(0);
                 pf_diagnose = 0;
                 serial64_puts("NOVARIS64: --- end ---\n");
