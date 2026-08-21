@@ -8986,6 +8986,159 @@ on one process's descriptors.
 | 302, 334, 323 | `prlimit64`, `rseq`, `userfaultfd` | benign |
 
 
+## Milestone 76 — passing a descriptor ✅ DONE
+
+`sendmsg` and `recvmsg`, and the `SCM_RIGHTS` control data that carries
+file descriptors between processes. **Wine's client and server now speak
+their protocol**: the handshake completes, the version matches, and the
+wineserver goes on to serve requests and write the registry.
+
+This is Wine's handle mechanism. Every Windows object a Wine process
+holds is, underneath, a descriptor the wineserver sent it over their
+socket — so it is not one more syscall, it is the thing the whole
+Windows side stands on.
+
+### What travels
+
+The descriptor, not the number. The sender names one of its own; the
+receiver gets the thing that number referred to, at a number the
+receiver picks. That is the first operation in this tree touching **two
+processes' descriptor tables**, and the only reason it can be written at
+all is that a descriptor here is a small record — a kind, a node or a
+pair of pipes — rather than a pointer into its owner.
+
+It rides beside the bytes rather than in them: `pipe64` keeps a queue of
+in-flight batches per pipe and hands the oldest to the next `recvmsg`.
+Linux ties control data to a point in the stream; this is the same thing
+for a protocol that sends one message and reads it whole, which Wine's
+is. A protocol that coalesced would notice, so it is written down.
+
+**The reference is taken on send, not on arrival.** Wine closes its copy
+the instant `sendmsg` returns — `send_client_fd` does exactly that — so
+a reference taken when the message is received would be taken on a pipe
+that had already been given back.
+
+### Three bugs, and the best one was a restart
+
+**A process that exits kept its descriptors.** Linux closes them; nothing
+here did, which stayed invisible for as long as every test closed what
+it opened. It stops being invisible the moment a process holds one *end*
+of something: a child that exits holding a socket leaves the pipe
+believing it still has a reader, so the peer's next read waits for bytes
+from a process that no longer exists. A leak in the table and a hang at
+the other end turn out to be the same bug seen from two places. Found by
+the layer's own "nothing leaked" count, not by the program.
+
+**`do_pipe_read` hardcoded `SYS64_READ` as its restart number.** That was
+correct while `read` was its only caller and then failed in the least
+obvious way available. `recvmsg` reads through the same function; when
+it blocked, the restart rewound the frame with **read's** number in
+`rax`, so the call came back as
+
+```
+read(fd, &msghdr, flags)
+```
+
+— the same arguments under a different name. The payload landed in the
+message *header* instead of the buffer the header pointed at, and Wine
+reported
+
+```
+wine client error:0: version mismatch 4096/930.
+```
+
+4096 is not a version. It is what you get when four bytes are written
+over a `struct msghdr`. `sched64.c`'s own comment on `wake_rax` had said
+this in advance: a syscall that restarts needs its own number back
+there, *"or the re-executed `syscall` invokes whatever call 0 happens to
+be"*. The number is a parameter now.
+
+The test did not catch it at first, and that is the more useful half. A
+`recvmsg` that finds its data already waiting never blocks, so the
+restart path only runs when the receiver gets there first — and the test
+passed for as long as the send happened to win the race. It now sleeps
+before sending, so the receiver is always blocked when the message
+arrives. **A test that only sometimes exercises a path is a test that
+sometimes passes.**
+
+### The one that was not a bug: the clock has to be running
+
+`nanosleep` and `poll` are the first things in this tree that wait for
+*time* rather than for an event. Everything before them — a write, an
+exit, a connection — was ended by something else doing something.
+
+Two facts collide there. Syscalls run with **interrupts off** (`FMASK`
+clears IF, deliberately: there is one kernel stack, so a timer that
+preempted a syscall would hand that stack to somebody else). And every
+layer in `kmain64` runs with **IRQ0 masked** except the ones that
+explicitly want preemption.
+
+So a deadline cannot be reached from inside a syscall, and cannot be
+reached at all in a layer whose timer is masked. A first `nanosleep`
+that spun on the tick counter was not slow, it was permanent. Waiting is
+therefore written as *look, and if the answer is "not yet", hand the CPU
+to somebody else and restart the call* — and the two layers whose
+programs wait on time now unmask IRQ0 for the duration, exactly as the
+preemption layer does, with ticks landing only in ring 3.
+
+That applies to the Wine layer too, and not academically: the
+wineserver's main loop is `poll(fds, n, 30000)`. With IRQ0 masked that
+is not a thirty-second wait, it is a permanent one.
+
+### The test, and the falsification
+
+`userland/scm64.c` — 17 assertions, exit 113 — asserts identity rather
+than arrival. A test that only checked "a descriptor appeared" would
+pass on an implementation that sent the integer. So: the received
+descriptor is a *different number*, in a *different process*, that is
+the *same open file* — reading continues from where the sender's
+position had got to, and writes through it land in the real file after
+the sender has closed its own copy. Then the same for a pipe end, which
+is what Wine actually passes.
+
+| removed | what failed |
+| --- | --- |
+| `sendmsg` parsing the control data | `the child got a working descriptor` |
+| the reference taken on send | `the parent writes to its own end` — the sender's close had destroyed it |
+| the restart number, back to `SYS64_READ` | `the child got a working descriptor` |
+| `close_all_files` on exit | `and nothing leaked` |
+
+331 assertions, 20 differentials, 0 failures, green at 2G and 6G.
+
+### Where Wine stops now
+
+Inside the conversation, with both sides talking:
+
+```
+socket/bind/listen/connect/accept        the rendezvous (M75)
+sendmsg → 4 bytes + SCM_RIGHTS           the version handshake
+                                          version matches
+...                                       the server serves requests
+write(fd, ..., 125)                       the registry
+rename("reg30000.tmp", "system.reg")     = -ENOSYS
+```
+
+The wineserver is **running and serving**. It writes the registry to a
+temporary file and cannot put it in place, because `rename` does not
+exist — so `wineboot -u` never finishes and the run ends in the server's
+poll loop.
+
+| number | name | why it is wanted |
+| --- | --- | --- |
+| 82 | `rename` | where it stops — the registry save |
+| 77 | `ftruncate` | the server's shared memory |
+| 131 | `sigaltstack` | Wine's exception handling |
+| 138 | `fstatfs` | which filesystem a file is on |
+| 204 | `sched_getaffinity` | how many processors |
+| 141, 213, 302, 323, 334, 435 | `setpriority`, `epoll_create`, `prlimit64`, `userfaultfd`, `rseq`, `clone3` | benign; Wine falls back |
+
+`rename` and `ftruncate` are ordinary filesystem work and the shortest
+remaining step. What is worth saying is what is no longer in the way:
+**the transport is finished.** A Wine process can find the server, talk
+to it, and be handed handles by it, which is everything the Windows side
+needed from the Unix side to begin.
+
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
@@ -9038,11 +9191,15 @@ list, and it is shorter than the one above but not smaller:
    socket landed in Milestone 75, along with `poll`. **A Wine process
    connects to the wineserver and the server accepts it.**
 
-   What remains between here and a Windows program running is
-   `sendmsg`/`recvmsg` with **`SCM_RIGHTS`**: Wine's handle mechanism is
-   passing file *descriptors* between processes over that socket. It is
-   the first thing in this tree that has to operate on two processes'
-   descriptor tables at once. No PE module is loaded until it works.
+   ~~What remains between here and a Windows program running is
+   `sendmsg`/`recvmsg` with **`SCM_RIGHTS`**~~ - done in Milestone 76.
+   **The transport is finished**: a Wine process finds the server, talks
+   to it, and is handed handles by it. The version handshake matches and
+   the wineserver serves requests.
+
+   It now stops on `rename`, saving the registry - ordinary filesystem
+   work rather than plumbing. `rename` and `ftruncate` are the shortest
+   remaining step before `wineboot -u` can finish.
 2. ~~**Copy-on-write `fork`.**~~ - done in Milestone 69. An 8MB process
    forks for 14 frames.
 3. ~~**Keyboard and mouse.**~~ - done in Milestone 70, as

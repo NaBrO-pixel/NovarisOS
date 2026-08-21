@@ -97,6 +97,7 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/spawn64_blob.o \
        $(BUILD_DIR)/pipetest64_blob.o \
        $(BUILD_DIR)/socktest64_blob.o \
+       $(BUILD_DIR)/scm64_blob.o \
        $(BUILD_DIR)/initrd64.o \
        $(BUILD_DIR)/hello64_blob.o \
        $(BUILD_DIR)/glibc64_blob.o \
@@ -289,6 +290,19 @@ $(BUILD_DIR)/socktest64_blob.c: $(BUILD_DIR)/socktest64.elf userland/embed64.py
 	python3 userland/embed64.py $< $@ socktest64_elf
 
 $(BUILD_DIR)/socktest64_blob.o: $(BUILD_DIR)/socktest64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Passing a descriptor to another process (Milestone 76) - Wine's handle
+# mechanism.
+$(BUILD_DIR)/scm64.elf: userland/scm64.c | $(BUILD_DIR)
+	gcc -static -O2 -o $@ $<
+	@file $@ | grep -q "statically linked" \
+	    || (echo "ERROR: $@ is not static"; false)
+
+$(BUILD_DIR)/scm64_blob.c: $(BUILD_DIR)/scm64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ scm64_elf
+
+$(BUILD_DIR)/scm64_blob.o: $(BUILD_DIR)/scm64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Two threads handing off through a futex, with no spin to fall back on.
@@ -758,6 +772,21 @@ test: iso
 	    || (echo "FAIL: the host run of the socket binary did not exit 109"; \
 	        exit 1)
 	@echo "PASS: named sockets behave the same, and exit 109, on both"
+	@# Passing a descriptor. The host run leaves a scratch file behind
+	@# only if it fails, so it is removed either way.
+	@rm -f /tmp/scm64-file
+	@timeout 60 ./$(BUILD_DIR)/scm64.elf > $(BUILD_DIR)/scm64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/scm64.host.status
+	@rm -f /tmp/scm64-file
+	@while read -r line; do \
+	    grep -qF "$$line" $(BUILD_DIR)/serial.log \
+	        || (echo "FAIL: the guest never printed: $$line"; exit 1) \
+	        || exit 1; \
+	done < $(BUILD_DIR)/scm64.host.txt
+	@[ "`cat $(BUILD_DIR)/scm64.host.status`" = "113" ] \
+	    || (echo "FAIL: the host run of the scm binary did not exit 113"; \
+	        exit 1)
+	@echo "PASS: descriptors pass between processes the same, and exit 113, on both"
 
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR) $(ISO)

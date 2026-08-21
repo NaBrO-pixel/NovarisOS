@@ -97,6 +97,40 @@
 #define SYS64_SETSOCKOPT  54
 #define SYS64_GETSOCKOPT  55
 #define SYS64_ACCEPT4     288
+#define SYS64_SENDMSG     46
+#define SYS64_RECVMSG     47
+
+/* sendmsg/recvmsg, and the control data that carries descriptors.
+ * The layouts are Linux's for x86-64 and the offsets are load-bearing:
+ * this is the structure Wine's server protocol is written against. */
+typedef struct { void* iov_base; uint64_t iov_len; } iovec64_t;
+
+typedef struct {
+    void*      msg_name;
+    uint32_t   msg_namelen;
+    uint32_t   _pad1;
+    iovec64_t* msg_iov;
+    uint64_t   msg_iovlen;
+    void*      msg_control;
+    uint64_t   msg_controllen;
+    int32_t    msg_flags;
+    uint32_t   _pad2;
+} msghdr64_t;
+
+typedef struct {
+    uint64_t cmsg_len;
+    int32_t  cmsg_level;
+    int32_t  cmsg_type;
+} cmsghdr64_t;
+
+/* Control data is padded to a pointer, and the padding is part of the
+ * layout rather than an implementation detail - CMSG_NXTHDR steps by it. */
+#define CMSG64_ALIGN(n) (((n) + 7ull) & ~7ull)
+
+#define SOL_SOCKET_        1
+#define SCM_RIGHTS_        1
+#define MSG_CTRUNC_        0x08
+#define MSG_CMSG_CLOEXEC_  0x40000000
 #define SYS64_CHMOD       90
 #define SYS64_FCHMOD      91
 #define SYS64_SETSID      112
@@ -313,5 +347,12 @@ uint64_t syscall64_vforks(void);
 uint64_t syscall64_pipes(void);
 uint64_t syscall64_socketpairs(void);
 uint64_t syscall64_sockets(void);
+
+/* The server protocol, counted (Milestone 76). fds_passed is the one
+ * that matters: a sendmsg that carried the bytes and dropped the
+ * descriptor would look like a working socket. */
+uint64_t syscall64_sendmsgs(void);
+uint64_t syscall64_recvmsgs(void);
+uint64_t syscall64_fds_passed(void);
 
 #endif
