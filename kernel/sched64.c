@@ -263,6 +263,45 @@ int sched64_block_current(const registers64_t* regs, uint64_t addr,
     return 1;
 }
 
+/* Give somebody else a turn, and stay runnable.
+ *
+ * This is not block_current with the flag left clear: a blocked task is
+ * skipped by next_task and needs waking, and what a poll or a sleep
+ * wants is the opposite - to be picked again on the next pass without
+ * anybody having to remember it.
+ *
+ * It exists because syscalls run with interrupts *off* here. FMASK
+ * clears IF on entry, deliberately: this kernel has one kernel stack, so
+ * a timer that preempted a task in the middle of a syscall would hand
+ * that stack to somebody else and the first syscall would resume onto
+ * whatever the second left behind. The consequence is that a syscall
+ * cannot wait for time to pass - the tick that would end the wait cannot
+ * arrive while it is waiting - so anything that waits has to leave, and
+ * this is how.
+ *
+ * Returns 0 when there is nobody else to run, which the caller must
+ * handle by returning to ring 3 rather than looping: the timer only
+ * advances while a task is out there. */
+int sched64_yield_current(const registers64_t* regs, registers64_t* out_regs,
+                          vmspace64_t* out_space, uint64_t* out_fs_base) {
+    int next;
+
+    if (current < 0 || !tasks[current].used) return 0;
+
+    tasks[current].fs_base = read_fs_base();
+    tasks[current].regs    = *regs;
+
+    next = next_task(current);
+    if (next == current) return 0;
+
+    current = next;
+    if (out_regs)    *out_regs    = tasks[next].regs;
+    if (out_space)   *out_space   = tasks[next].space;
+    if (out_fs_base) *out_fs_base = tasks[next].fs_base;
+    proc64_set_current(tasks[next].pid);
+    return 1;
+}
+
 int sched64_wake(uint64_t addr, int max) {
     int woken = 0;
 

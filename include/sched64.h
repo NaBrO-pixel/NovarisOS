@@ -85,6 +85,12 @@ int sched64_block_current(const registers64_t* regs, uint64_t addr,
 /* Wakes at most `max` threads blocked on `addr`; returns how many.
  * A woken thread's saved rax becomes 0, which is what futex(2) returns
  * to a waiter that was woken rather than timed out. */
+/* Hand the CPU to another runnable task without blocking. Returns 0 if
+ * this is the only one - see the note in sched64.c about why a syscall
+ * that waits has to return to ring 3 rather than spin. */
+int sched64_yield_current(const registers64_t* regs, registers64_t* out_regs,
+                          vmspace64_t* out_space, uint64_t* out_fs_base);
+
 int sched64_wake(uint64_t addr, int max);
 
 /* Enters a saved thread directly. Never returns. Implemented in

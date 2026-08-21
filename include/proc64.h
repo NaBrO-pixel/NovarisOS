@@ -31,8 +31,9 @@
 
 /* What a descriptor refers to. Until Milestone 74 there was only one
  * answer and it did not need saying. */
-#define FD64_FILE  0
-#define FD64_PIPE  1
+#define FD64_FILE   0
+#define FD64_PIPE   1
+#define FD64_SOCKET 2
 
 typedef struct {
     int      kind;      /* FD64_FILE or FD64_PIPE */
@@ -45,6 +46,13 @@ typedef struct {
      * pointing at the two pipes the other endpoint has crossed over.
      * That is the whole of what makes a socketpair bidirectional. */
     int      rx, tx;
+
+    /* FD64_SOCKET: which socket in sock64.c, or -1. A socket keeps this
+     * after it is connected, because shutdown, getsockname and
+     * setsockopt are still asked about it - but once connected it also
+     * has rx and tx, and from read(2)'s point of view it is a pipe like
+     * any other. */
+    int      sock;
 
     /* O_NONBLOCK and O_CLOEXEC, as fcntl(2) sets and reads them. Kept
      * per descriptor rather than per pipe because they are: two

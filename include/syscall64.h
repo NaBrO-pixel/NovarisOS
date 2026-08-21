@@ -84,6 +84,49 @@
 #define SYS64_DUP3       292
 #define SYS64_POLL       7
 
+/* The listening socket (Milestone 75). */
+#define SYS64_SOCKET      41
+#define SYS64_CONNECT     42
+#define SYS64_ACCEPT      43
+#define SYS64_SENDTO      44
+#define SYS64_RECVFROM    45
+#define SYS64_SHUTDOWN    48
+#define SYS64_BIND        49
+#define SYS64_LISTEN      50
+#define SYS64_GETSOCKNAME 51
+#define SYS64_SETSOCKOPT  54
+#define SYS64_GETSOCKOPT  55
+#define SYS64_ACCEPT4     288
+#define SYS64_CHMOD       90
+#define SYS64_FCHMOD      91
+#define SYS64_SETSID      112
+#define SYS64_UMASK       95
+
+/* Time. The epoch is when the timer started, not 1970 - see clock64.h. */
+#define SYS64_GETTIMEOFDAY   96
+#define SYS64_NANOSLEEP      35
+#define SYS64_CLOCK_GETTIME  228
+#define SYS64_CLOCK_GETRES   229
+#define SYS64_CLOCK_NANOSLEEP 230
+
+/* poll(2) events, Linux's values. Only these three mean anything here. */
+#define POLL64_IN    0x001
+#define POLL64_OUT   0x004
+#define POLL64_HUP   0x010
+#define POLL64_NVAL  0x020
+
+/* socket(2) domains and types, Linux's values. */
+#define AF_UNIX_        1
+#define SOCK_STREAM_    1
+
+/* sockaddr_un, which is the only address family here. The path is
+ * NUL-terminated inside a fixed 108-byte field; the length the caller
+ * passes covers the family and however much of the path it used. */
+typedef struct {
+    uint16_t sun_family;
+    char     sun_path[108];
+} sockaddr_un64_t;
+
 /* fcntl(2) commands, Linux's values. */
 #define F_DUPFD          0
 #define F_GETFD          1
@@ -269,5 +312,6 @@ uint64_t syscall64_vforks(void);
  * assertion and lose one direction; these are how that is caught. */
 uint64_t syscall64_pipes(void);
 uint64_t syscall64_socketpairs(void);
+uint64_t syscall64_sockets(void);
 
 #endif
