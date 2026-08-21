@@ -17,6 +17,22 @@
  * it at 0x400000) and of the initial stack near the top of the low half. */
 #define USPACE64_MMAP_BASE 0x0000100000000000ULL
 
+/* The end of the user half, which is where four-level paging puts it:
+ * addresses from 0x0000800000000000 up are not canonical, and the
+ * canonical addresses above them are the kernel's. Nothing may be mapped
+ * at or beyond this, and mmap has to say so rather than oblige.
+ *
+ * This is Linux's TASK_SIZE and it is load-bearing, not hygiene. Wine
+ * measures the address space instead of assuming it: it mmaps one page
+ * at 1<<63 and halves the address until the kernel accepts it, then
+ * takes twice the first address that worked as the limit. A kernel that
+ * maps a page at 1<<63 answers that question with 0xffffffffffff0000,
+ * and Wine sizes its page-protection table from it - a 32GB allocation
+ * where Linux asks for 2.2MB, refused with ENOMEM, and virtual_init
+ * dies on its own assert. With the limit enforced the probe stops at
+ * 0x400000000000 exactly as it does on Linux. */
+#define USPACE64_LIMIT     0x0000800000000000ULL
+
 void uspace64_reset(vmspace64_t* space, uint64_t brk_start);
 
 /* brk(0) reports the break; brk(addr) moves it and returns where it

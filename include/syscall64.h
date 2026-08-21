@@ -79,6 +79,12 @@
 #define MAP_PRIVATE    0x02
 #define MAP_FIXED      0x10
 #define MAP_ANONYMOUS  0x20
+/* "Exactly here, but only if it is free." Linux fails these with EEXIST
+ * rather than replacing what is already mapped, and the flag implies
+ * fixed placement on its own - it does not come with MAP_FIXED. Wine
+ * reserves its address space with it and relies on the refusal: see
+ * uspace64_mmap. */
+#define MAP_FIXED_NOREPLACE 0x100000
 
 /* lseek(2) whence */
 #define SEEK_SET_  0
@@ -101,6 +107,10 @@
 #define SYS64_WAIT4           61
 #define SYS64_GETPID          39
 #define SYS64_GETPPID         110
+#define SYS64_GETUID          102
+#define SYS64_GETGID          104
+#define SYS64_GETEUID         107
+#define SYS64_GETEGID         108
 #define SYS64_CLONE           56
 #define SYS64_GETTID          186
 #define SYS64_ARCH_PRCTL      158

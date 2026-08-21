@@ -790,10 +790,18 @@ static uint64_t dispatch(syscall64_args_t* args) {
         return uspace64_munmap(a1, a2);
 
     case SYS64_MPROTECT:
-        /* Accepted and ignored. Every mapping this kernel makes is
-         * already readable and writable by the process that owns it, so
-         * the only thing an honest implementation would add here is
-         * *removing* permissions - and nothing yet depends on that. */
+        /* This used to be accepted and ignored, on the reasoning that
+         * every mapping is already readable and writable so the only
+         * thing left to implement was taking permissions away. That was
+         * wrong in both directions, and Wine found the other one:
+         * mappings made read-only - a loader's file mapping, or a page
+         * left shared by fork - are made writable again through here,
+         * and answering "done" without doing it turns the next store
+         * into an unexplained fault a long way from this call.
+         *
+         * uspace64_protect says what it does and does not honour. */
+        if (a1 & (PAGE64_SIZE - 1)) return (uint64_t)-22;   /* -EINVAL */
+        uspace64_protect(a1, a2, a3);
         return 0;
 
     /* arch_prctl(ARCH_SET_FS, addr) is how a thread pointer is set on
@@ -941,6 +949,27 @@ static uint64_t dispatch(syscall64_args_t* args) {
         proc64_t* p = proc64_current();
         return p ? (uint64_t)p->parent : 0;
     }
+
+    /* Who the process is. There is one user here and it is root, which
+     * is also the owner do_stat reports for every file - and the two
+     * answers have to agree, because that comparison is how Wine decides
+     * whether it may create its prefix:
+     *
+     *     if (!stat( config_dir, &st ) && st.st_uid != getuid())
+     *         fatal_error( "'%s' is not owned by you, refusing to
+     *                       create a configuration directory there" );
+     *
+     * These are the syscalls Linux specifies as never failing, so glibc
+     * does not check them and hands back whatever the kernel returned.
+     * Left unimplemented, getuid() returned -ENOSYS as a uid, which is
+     * not 0, and wineboot refused to build a prefix in a directory it
+     * owned. A refusal, reported clearly, from a missing four-line
+     * syscall. */
+    case SYS64_GETUID:
+    case SYS64_GETEUID:
+    case SYS64_GETGID:
+    case SYS64_GETEGID:
+        return 0;
 
     case SYS64_GETTID:
         return (uint64_t)sched64_current() + 1;
