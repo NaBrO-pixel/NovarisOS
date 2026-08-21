@@ -103,6 +103,8 @@ extern const unsigned char tree64_elf[];
 extern const unsigned long tree64_elf_len;
 extern const unsigned char cowfork64_elf[];
 extern const unsigned long cowfork64_elf_len;
+extern const unsigned char vmem64_elf[];
+extern const unsigned long vmem64_elf_len;
 extern const unsigned char cwd64_elf[];
 extern const unsigned long cwd64_elf_len;
 extern const unsigned char fbdraw64_elf[];
@@ -2952,7 +2954,91 @@ void kernel_main(uint32_t magic, void* mbi) {
     serial64_puts("NOVARIS64: failures = ");
     serial64_putdec((uint64_t)failures);
     serial64_putc('\n');
-    /* --- layer 32: a Wine prefix (Milestone 71) ---------------------- */
+    /* --- layer 32: the address space, as a program sees it (M72) ----- */
+    /* Three answers this kernel used to give confidently and wrongly,
+     * each of which Wine depends on and none of which any earlier layer
+     * asked for. The program is the assertion; what is worth saying here
+     * is why they were invisible for so long.
+     *
+     * Every one of them is a syscall that reported success. A refused
+     * MAP_FIXED_NOREPLACE was granted, and the pages already in the
+     * range were zeroed by the same code that makes a fresh mapping read
+     * as zeros - so the corruption arrived through the mechanism that is
+     * normally correct. An mmap above the user half was granted, because
+     * nothing had ever asked for one. And mprotect returned 0 without
+     * touching a page table, which is invisible until something needs a
+     * page back that it made read-only.
+     *
+     * None of them faults where it happens. The first shows up as a jump
+     * to address 0 some time later, when a `ret` pops a zeroed return
+     * address; the second as a 32GB allocation failing; the third as a
+     * write fault on memory the program just asked to be made writable.
+     * That distance is the reason this layer exists rather than a
+     * comment saying the calls are handled. */
+    serial64_puts("NOVARIS64: -- the address space --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 64;
+        vmspace64_t kspace;
+        elf64_info_t info;
+        uint64_t i, rsp;
+        int rc, stack_ok = 1, pid;
+        proc64_t* p;
+        static const char* const vmem_argv[] = { "/vmem64", 0 };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        signal64_reset();
+        sched64_init();
+        proc64_init();
+        vmspace64_kernel_space(&kspace);
+
+        pid = proc64_create();
+        proc64_set_current(pid);
+        p = proc64_current();
+
+        check("a space for it", vmspace64_create(&p->space) != 0);
+        rc = elf64_load(vmem64_elf, vmem64_elf_len, &p->space, &info);
+        check("the address-space program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&p->space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&p->space, info.brk_start);
+        rsp = uspace64_build_stack(&p->space, STACK_TOP, STACK_PAGES,
+                                   vmem_argv, &info, 0, 0);
+
+        {
+            registers64_t first;
+            for (i = 0; i < sizeof(first) / 8; i++)
+                ((uint64_t*)&first)[i] = 0;
+            sched64_add_frame_for(&first, &p->space, 0, pid);
+            sched64_set_current(0);
+        }
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        /* Off, and deliberately: this program's whole method is to write
+         * to a page it has just made read-only and be sent SIGSEGV for
+         * it. With the diagnostic on, the first such write is reported
+         * as a kernel-level fault and the program is killed - which is
+         * right for every other layer here and wrong for this one. */
+        pf_diagnose = 0;
+        vmspace64_switch(&p->space);
+        enter_user_mode64(info.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("the address space behaved as Linux's does",
+              syscall64_exit_code() == 101);
+    }
+
+    /* --- layer 33: a Wine prefix (Milestone 71) ---------------------- */
     /* Milestone 68 removed every reason a prefix could not exist here -
      * the node ceiling, the name and path ceilings, the missing links,
      * the missing working directory - and proved each one separately.

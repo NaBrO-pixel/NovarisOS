@@ -90,6 +90,7 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/tree64_blob.o \
        $(BUILD_DIR)/cwd64_blob.o \
        $(BUILD_DIR)/cowfork64_blob.o \
+       $(BUILD_DIR)/vmem64_blob.o \
        $(BUILD_DIR)/initrd64.o \
        $(BUILD_DIR)/hello64_blob.o \
        $(BUILD_DIR)/glibc64_blob.o \
@@ -226,6 +227,21 @@ $(BUILD_DIR)/cowfork64_blob.c: $(BUILD_DIR)/cowfork64.elf userland/embed64.py
 	python3 userland/embed64.py $< $@ cowfork64_elf
 
 $(BUILD_DIR)/cowfork64_blob.o: $(BUILD_DIR)/cowfork64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# What a program is allowed to be told about its own address space
+# (Milestone 72): MAP_FIXED_NOREPLACE, the end of the user half, and an
+# mprotect that does something. Static, like every other differential
+# here, so that the guest run needs no loader.
+$(BUILD_DIR)/vmem64.elf: userland/vmem64.c | $(BUILD_DIR)
+	gcc -static -O2 -o $@ $<
+	@file $@ | grep -q "statically linked" \
+	    || (echo "ERROR: $@ is not static"; false)
+
+$(BUILD_DIR)/vmem64_blob.c: $(BUILD_DIR)/vmem64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ vmem64_elf
+
+$(BUILD_DIR)/vmem64_blob.o: $(BUILD_DIR)/vmem64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Two threads handing off through a futex, with no spin to fall back on.
@@ -637,6 +653,22 @@ test: iso
 	    || (echo "FAIL: the host run of the cow binary did not exit 97"; \
 	        exit 1)
 	@echo "PASS: fork shares and separates the same, and exits 97, on both"
+	@# The address space. Line by line like the rest, and the line that
+	@# matters most is `limit ...`: it is not an assertion the program
+	@# makes but a number it measures the same way Wine does, so the
+	@# comparison is against what Linux answered rather than against
+	@# what this kernel hoped.
+	@timeout 60 ./$(BUILD_DIR)/vmem64.elf > $(BUILD_DIR)/vmem64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/vmem64.host.status
+	@while read -r line; do \
+	    grep -qF "$$line" $(BUILD_DIR)/serial.log \
+	        || (echo "FAIL: the guest never printed: $$line"; exit 1) \
+	        || exit 1; \
+	done < $(BUILD_DIR)/vmem64.host.txt
+	@[ "`cat $(BUILD_DIR)/vmem64.host.status`" = "101" ] \
+	    || (echo "FAIL: the host run of the vmem binary did not exit 101"; \
+	        exit 1)
+	@echo "PASS: the address space behaves the same, and exits 101, on both"
 
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR) $(ISO)

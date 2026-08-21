@@ -5,6 +5,7 @@
 #include "pmm64.h"
 #include "kstring.h"
 #include "proc64.h"
+#include "vmspace64.h"
 
 #define KERNEL_VMA  0xFFFFFFFF80000000ULL
 
@@ -47,6 +48,26 @@ void uspace64_reset(vmspace64_t* space, uint64_t brk_start) {
     p->brk_current = brk_start;
     p->mmap_next   = USPACE64_MMAP_BASE;
     pages_allocated = 0;
+}
+
+/* Does [start, start+length) lie wholly inside the user half? Written
+ * as a subtraction rather than start+length so that a length large
+ * enough to wrap is refused instead of wrapping into a range that looks
+ * fine - which is the shape a caller probing for the limit produces. */
+static int fits_in_user_half(uint64_t start, uint64_t length) {
+    if (start >= USPACE64_LIMIT) return 0;
+    return length <= USPACE64_LIMIT - start;
+}
+
+/* Is every page in [start, end) unmapped? Asked before a mapping that
+ * must not disturb anything already there - which means asking about
+ * the whole range and not just a page of it. */
+static int range_free(uint64_t start, uint64_t end) {
+    for (uint64_t va = start; va < end; va += PAGE64_SIZE) {
+        uint64_t frame;
+        if (paging64_translate(va, &frame) == PAGING64_OK) return 0;
+    }
+    return 1;
 }
 
 /* Maps [start, end) as anonymous zeroed user memory. Returns 0 on
@@ -120,6 +141,7 @@ uint64_t uspace64_brk(uint64_t addr) {
 }
 
 #define MAP_FIXED 0x10
+#define MAP_FIXED_NOREPLACE 0x100000
 
 uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                        uint64_t flags) {
@@ -137,19 +159,48 @@ uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
      * Pages already mapped in the range are kept rather than replaced -
      * the caller is overwriting a reservation it made itself, and the
      * contents are about to be written anyway. */
-    if (flags & MAP_FIXED) {
+    if (flags & MAP_FIXED_NOREPLACE) {
+        /* Exactly here, and only if the whole range is free. Linux
+         * fails this with EEXIST and changes nothing, and the caller is
+         * entitled to treat the refusal as information.
+         *
+         * This is the flag Wine reserves its address space with, and
+         * getting it wrong is not a lost reservation, it is memory
+         * corruption at a distance. Wine asks to reserve
+         * 0x7ffffe000000..0x7fffffff0000 PROT_NONE; that range contains
+         * this kernel's user stack, so on Linux the call fails and
+         * reserve_area halves the range and recurses around the stack.
+         * Without the check the range was mapped anyway and map_anon
+         * zeroed every page already in it - all 128 pages of Wine's own
+         * stack, saved return addresses included. Nothing faulted at the
+         * time: execution ran on until the first `ret` popped a zeroed
+         * return address and jumped to 0. Milestone 71 recorded that as
+         * "calls through a null pointer" and it was this.
+         *
+         * Note there is no MAP_FIXED here to test: the flag implies
+         * fixed placement by itself, which is why the hint path below
+         * used to take these calls and honour a 32MB request after
+         * probing a single page of it. */
         start = addr & ~(PAGE64_SIZE - 1);
+        if (!fits_in_user_half(start, length)) return (uint64_t)-12; /* -ENOMEM */
+        end   = start + length;
+        if (!range_free(start, end)) return (uint64_t)-17;   /* -EEXIST */
+    } else if (flags & MAP_FIXED) {
+        start = addr & ~(PAGE64_SIZE - 1);
+        if (!fits_in_user_half(start, length)) return (uint64_t)-12; /* -ENOMEM */
+        end   = start + length;
     } else {
-        /* A hint is honoured only when it is free; anything else comes
-         * out of the bump region. */
+        /* A hint is honoured only when it fits and is free; anything
+         * else comes out of the bump region. The whole range has to be
+         * free, not just its first page - a hint that fits everywhere
+         * except its last page is not a hint that fits. */
         start = addr ? (addr & ~(PAGE64_SIZE - 1)) : cur()->mmap_next;
-        if (addr) {
-            uint64_t probe;
-            if (paging64_translate(start, &probe) == PAGING64_OK)
-                start = cur()->mmap_next;
-        }
+        if (addr && !(fits_in_user_half(start, length) &&
+                      range_free(start, start + length)))
+            start = cur()->mmap_next;
+        if (!fits_in_user_half(start, length)) return (uint64_t)-12;
+        end = start + length;
     }
-    end = start + length;
 
     pflags = PAGE64_PRESENT | PAGE64_USER;
     if (prot & 0x2) pflags |= PAGE64_WRITE;        /* PROT_WRITE */
@@ -200,18 +251,30 @@ uint64_t uspace64_map_phys(uint64_t length, uint64_t phys, uint64_t prot) {
     return start;
 }
 
+/* mprotect(2), for the one distinction this kernel's page tables draw:
+ * whether the process may write.
+ *
+ * PROT_NONE is mapped onto "readable but not writable" rather than onto
+ * an absent page, and that is a deliberate limit rather than an
+ * oversight. A PROT_NONE range is still a range somebody has taken, and
+ * the only record this kernel keeps of who has taken what is the page
+ * tables themselves - so unmapping it would make Wine's own PROT_NONE
+ * address-space reservations read as free, and the very next
+ * MAP_FIXED_NOREPLACE would be told it could have them. Reads that
+ * ought to fault therefore succeed. PROT_EXEC is likewise not
+ * distinguished, because nothing here sets NX.
+ *
+ * What this must not do is get PROT_WRITE wrong, which is what it was
+ * doing by not existing: the mprotect case in syscall64.c returned 0
+ * without touching anything, so Wine's mprotect of its own PE image from
+ * read-only to read-write was answered "done" and the first write to it
+ * faulted with nobody to blame. */
 void uspace64_protect(uint64_t addr, uint64_t length, uint64_t prot) {
     uint64_t start = addr & ~(PAGE64_SIZE - 1);
     uint64_t end = start + ((length + PAGE64_SIZE - 1) & ~(PAGE64_SIZE - 1));
-    uint64_t flags = PAGE64_PRESENT | PAGE64_USER;
 
-    if (prot & 0x2) flags |= PAGE64_WRITE;             /* PROT_WRITE */
-
-    for (uint64_t va = start; va < end; va += PAGE64_SIZE) {
-        uint64_t frame;
-        if (paging64_translate(va, &frame) != PAGING64_OK) continue;
-        paging64_map(va, frame & ~(PAGE64_SIZE - 1), flags);
-    }
+    for (uint64_t va = start; va < end; va += PAGE64_SIZE)
+        vmspace64_set_writable(va, (prot & 0x2) != 0);   /* PROT_WRITE */
 }
 
 uint64_t uspace64_munmap(uint64_t addr, uint64_t length) {

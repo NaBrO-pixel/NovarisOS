@@ -70,6 +70,19 @@ int  vmspace64_clone_cow(uint64_t src_pml4, vmspace64_t* dst);
  * copy-on-write page, which means the fault was a real one. */
 int  vmspace64_break_cow(uint64_t va);
 
+/* Changes whether one already-mapped page of the current space may be
+ * written. Returns 0 if nothing is mapped at `va`, which mprotect(2)
+ * treats as "nothing to do" rather than an error.
+ *
+ * It lives here rather than in uspace64.c because a shared page cannot
+ * simply be made writable: doing that would hand the same frame to a
+ * parent and a child that fork separated. On a copy-on-write page the
+ * write bit stays clear whatever the caller asked for, and the request
+ * is recorded in PAGE64_COW_RW - which is precisely the bit break_cow
+ * consults to tell a page it should copy from a page that is genuinely
+ * read-only. */
+int  vmspace64_set_writable(uint64_t va, int writable);
+
 void vmspace64_switch(const vmspace64_t* vs);
 
 /* The space the CPU is in, as a physical PML4 address (CR3 without its
