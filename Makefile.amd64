@@ -91,6 +91,7 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/cwd64_blob.o \
        $(BUILD_DIR)/cowfork64_blob.o \
        $(BUILD_DIR)/vmem64_blob.o \
+       $(BUILD_DIR)/spawn64_blob.o \
        $(BUILD_DIR)/initrd64.o \
        $(BUILD_DIR)/hello64_blob.o \
        $(BUILD_DIR)/glibc64_blob.o \
@@ -242,6 +243,20 @@ $(BUILD_DIR)/vmem64_blob.c: $(BUILD_DIR)/vmem64.elf userland/embed64.py
 	python3 userland/embed64.py $< $@ vmem64_elf
 
 $(BUILD_DIR)/vmem64_blob.o: $(BUILD_DIR)/vmem64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# posix_spawn, which is clone(CLONE_VM|CLONE_VFORK) and is how Wine
+# starts the wineserver (Milestone 73). It execs forkchild64, which the
+# initrd already stages at /tmp/forkchild64 for the fork/exec test.
+$(BUILD_DIR)/spawn64.elf: userland/spawn64.c | $(BUILD_DIR)
+	gcc -static -O2 -o $@ $<
+	@file $@ | grep -q "statically linked" \
+	    || (echo "ERROR: $@ is not static"; false)
+
+$(BUILD_DIR)/spawn64_blob.c: $(BUILD_DIR)/spawn64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ spawn64_elf
+
+$(BUILD_DIR)/spawn64_blob.o: $(BUILD_DIR)/spawn64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Two threads handing off through a futex, with no spin to fall back on.
@@ -669,6 +684,21 @@ test: iso
 	    || (echo "FAIL: the host run of the vmem binary did not exit 101"; \
 	        exit 1)
 	@echo "PASS: the address space behaves the same, and exits 101, on both"
+	@# posix_spawn. Needs the child staged where both sides look for it,
+	@# the same way the fork/exec differential does.
+	@cp $(BUILD_DIR)/forkchild64.elf /tmp/forkchild64
+	@timeout 60 ./$(BUILD_DIR)/spawn64.elf > $(BUILD_DIR)/spawn64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/spawn64.host.status
+	@rm -f /tmp/forkchild64
+	@while read -r line; do \
+	    grep -qF "$$line" $(BUILD_DIR)/serial.log \
+	        || (echo "FAIL: the guest never printed: $$line"; exit 1) \
+	        || exit 1; \
+	done < $(BUILD_DIR)/spawn64.host.txt
+	@[ "`cat $(BUILD_DIR)/spawn64.host.status`" = "103" ] \
+	    || (echo "FAIL: the host run of the spawn binary did not exit 103"; \
+	        exit 1)
+	@echo "PASS: posix_spawn behaves the same, and exits 103, on both"
 
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR) $(ISO)

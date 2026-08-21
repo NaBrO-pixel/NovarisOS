@@ -172,7 +172,7 @@ static int64_t abs_path(const char* in, char* out) {
     return 0;
 }
 
-static uint64_t do_open(const char* path, uint64_t flags) {
+static uint64_t do_open(const char* path, uint64_t flags, uint32_t mode) {
     int node = ramfs64_lookup(path);
     int fd;
 
@@ -180,6 +180,7 @@ static uint64_t do_open(const char* path, uint64_t flags) {
         if (!(flags & O_CREAT)) return (uint64_t)-2;   /* -ENOENT */
         node = ramfs64_create(path, 0);
         if (node < 0) return (uint64_t)-28;            /* -ENOSPC */
+        ramfs64_set_mode(node, mode);
     } else if (flags & O_TRUNC) {
         ramfs64_truncate(node);
     }
@@ -230,9 +231,13 @@ static uint64_t do_stat(const char* path, void* out, int follow) {
      * that reported a symlink as an ordinary file would send `cp -r`
      * and Wine's prefix updater into the target instead of copying the
      * link. */
-    *(uint32_t*)(st + 24) = ramfs64_is_dir(node)  ? 0040755u
+    /* The type bits are the kernel's; the permission bits are whatever
+     * the file was created with, which mkdir and open now record rather
+     * than this inventing them. A symlink's own mode is not meaningful
+     * and Linux reports 0777 for it. */
+    *(uint32_t*)(st + 24) = ramfs64_is_dir(node)  ? 0040000u | ramfs64_mode(node)
                           : ramfs64_is_link(node) ? 0120777u
-                                                  : 0100644u;
+                                                  : 0100000u | ramfs64_mode(node);
     *(uint64_t*)(st + 48) = ramfs64_size(node);
     *(uint64_t*)(st + 56) = 4096;
     return 0;
@@ -285,7 +290,7 @@ static uint64_t do_readlink(const char* given, char* buf, uint64_t size) {
     return n;
 }
 
-static uint64_t forks, execs;
+static uint64_t forks, execs, vforks;
 static uint64_t last_fork_frames;
 
 static void frame_from_args(const syscall64_args_t* args, uint64_t rax,
@@ -301,7 +306,36 @@ static void frame_from_args(const syscall64_args_t* args, uint64_t rax,
  * happens before anything is committed. A half-built process is worse
  * than a failed fork.
  */
-static uint64_t do_fork(const syscall64_args_t* args) {
+/* Wakes a parent suspended in vfork. Called from execve and from exit -
+ * the two ways a vfork child stops being the thing its parent is waiting
+ * on - and harmless on a process that was not vforked. */
+static void vfork_release(proc64_t* child) {
+    if (!child || !child->vfork_parent) return;
+    child->vfork_parent = 0;
+    sched64_wake(PROC64_VFORK_KEY(child->pid), SCHED64_MAX_TASKS);
+}
+
+/* fork, and the two shapes of clone that are really fork.
+ *
+ * `child_stack` is 0 for a plain fork - the child resumes on its own
+ * copy of the parent's stack - and an address for a clone that supplied
+ * one, which is how glibc's posix_spawn hands its child a scratch stack.
+ *
+ * `vfork` suspends the caller until the child execve's or exits. Linux
+ * does that by sharing the address space outright, so the child's writes
+ * are the parent's. This copies instead - the same choice the 32-bit
+ * tree made, and the same honest consequence: a vfork child here can
+ * report back through its exit status but not through memory. What it
+ * preserves is the part a spawn depends on, which is that the parent
+ * does not resume, and therefore does not free the stack the child is
+ * standing on, until the child is gone.
+ *
+ * The copy is cheap here in a way it is not on the 32-bit side, because
+ * fork has been copy-on-write since Milestone 69 - a vfork pays for page
+ * tables and for whatever the child touches before it execs, which for
+ * posix_spawn is a few pages of glibc. */
+static uint64_t do_fork_common(const syscall64_args_t* args,
+                               uint64_t child_stack, int vfork) {
     registers64_t child;
     int child_pid;
     proc64_t* cp;
@@ -336,6 +370,13 @@ static uint64_t do_fork(const syscall64_args_t* args) {
      * apart. */
     frame_from_args(args, 0, &child);
 
+    /* A clone that supplied a stack runs the child there instead of on
+     * its copy of the parent's. The copy is still made - the child needs
+     * everything else the parent had - but its first instruction runs on
+     * the stack it was given, which is where glibc's clone stub expects
+     * to find the function it is about to call. */
+    if (child_stack) child.rsp = child_stack;
+
     /* The child inherits the parent's thread pointer.
      *
      * Passing 0 here - "a task that has never run has no TLS yet" - is
@@ -356,11 +397,51 @@ static uint64_t do_fork(const syscall64_args_t* args) {
         uint64_t now = pmm64_free_frames();
         last_fork_frames = free_before > now ? free_before - now : 0;
     }
+
+    if (vfork) {
+        registers64_t self, next;
+        vmspace64_t next_space;
+        uint64_t next_fs;
+
+        cp->vfork_parent = proc64_current_pid();
+        vforks++;
+
+        /* Parked on the child's key until it execs or exits. Unlike
+         * wait4 this is not restarted: the answer is already known, so
+         * the frame is built with the child's pid in rax and the parent
+         * simply carries on from the instruction after its `syscall`
+         * when it is woken.
+         *
+         * If nothing else is runnable the block fails, and the caller
+         * gets that same pid without ever having waited - which cannot
+         * happen here, because the child was made runnable above, and
+         * which is the right answer anyway. */
+        frame_from_args(args, (uint64_t)child_pid, &self);
+        /* The third argument is what rax holds when the task is woken,
+         * not the syscall number: wait4 passes its own number there
+         * because it is *restarted*, and this is not. Passing SYS64_CLONE
+         * here made the parent's clone() return 56, and posix_spawn
+         * reported 56 as the child's pid - a plausible number that
+         * nothing could then wait for. */
+        if (sched64_block_current(&self, PROC64_VFORK_KEY(child_pid),
+                                  (uint64_t)child_pid, &next, &next_space,
+                                  &next_fs)) {
+            vmspace64_switch(&next_space);
+            write_msr(0xC0000100u, next_fs);
+            sched64_resume(&next);                     /* never returns */
+        }
+    }
+
     return (uint64_t)child_pid;
+}
+
+static uint64_t do_fork(const syscall64_args_t* args) {
+    return do_fork_common(args, 0, 0);
 }
 
 uint64_t syscall64_forks(void) { return forks; }
 uint64_t syscall64_execs(void) { return execs; }
+uint64_t syscall64_vforks(void) { return vforks; }
 uint64_t syscall64_last_fork_frames(void) { return last_fork_frames; }
 
 /* The calling thread's complete user state, as a frame it could be
@@ -616,6 +697,14 @@ static uint64_t do_execve(const char* path, const char* const* argv,
      * nothing left to return an error to. */
     p->space = fresh;
     proc64_set_current(p->pid);
+
+    /* A parent suspended in vfork is waiting for exactly this moment -
+     * not for the child to exit. The child has stopped standing on
+     * anything the parent owns, so the parent may run again, and a
+     * posix_spawn that waited for its child to *finish* would be a
+     * fork/exec/wait rather than a spawn: wineboot starts the wineserver
+     * and then talks to it. */
+    vfork_release(p);
     p->brk_base = p->brk_current = info.brk_start;
     p->mmap_next = USPACE64_MMAP_BASE;
     kstrlcpy(p->exe_path, kpath, PROC64_PATH_MAX);
@@ -847,6 +936,18 @@ static uint64_t dispatch(syscall64_args_t* args) {
          * was: the raw-assembly fork test passed and every glibc
          * program's fork() failed. */
         if (!(a1 & CLONE_VM)) return do_fork(args);
+
+        /* CLONE_VM with CLONE_VFORK is not a thread, it is a spawn.
+         * glibc's posix_spawn issues exactly this, and it is how Wine
+         * starts the wineserver - so answering it the way the thread
+         * path below does produces a tid that wait4 cannot find, and a
+         * parent that gives up with -ECHILD. That is precisely where
+         * Milestone 72 left wineboot.
+         *
+         * The child needs a pid of its own and a parent that stays out
+         * of its way, which is a fork, and the stack it was handed. */
+        if (a1 & CLONE_VFORK) return do_fork_common(args, a2, 1);
+
         if (!a2)                 return (uint64_t)-22;  /* -EINVAL       */
 
         space = sched64_current_space();
@@ -1161,7 +1262,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
         char path[PROC64_PATH_MAX];
         int64_t e = abs_path((const char*)a1, path);
         if (e) return (uint64_t)e;
-        return do_open(path, a2);
+        return do_open(path, a2, (uint32_t)a3);
     }
 
     case SYS64_OPENAT: {
@@ -1183,7 +1284,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
 
         e = abs_path(given, path);
         if (e) return (uint64_t)e;
-        return do_open(path, a3);
+        return do_open(path, a3, (uint32_t)args->a4);
     }
 
     /* chdir(path). Wine's first act on a prefix is to chdir into it, and
@@ -1416,8 +1517,15 @@ static uint64_t dispatch(syscall64_args_t* args) {
     case SYS64_MKDIR: {
         char path[PROC64_PATH_MAX];
         int64_t e = abs_path((const char*)a1, path);
+        int node;
         if (e) return (uint64_t)e;
-        return ramfs64_create(path, 1) >= 0 ? 0 : (uint64_t)-28;
+        node = ramfs64_create(path, 1);
+        if (node < 0) return (uint64_t)-28;
+        /* The mode argument, which used to be discarded. The wineserver
+         * creates its socket directory 0700 and refuses to start if
+         * stat says otherwise. */
+        ramfs64_set_mode(node, (uint32_t)a2);
+        return 0;
     }
 
     case SYS64_MKDIRAT: {
@@ -1427,7 +1535,12 @@ static uint64_t dispatch(syscall64_args_t* args) {
             && ((const char*)a2)[0] != '/') return (uint64_t)-9;
         e = abs_path((const char*)a2, path);
         if (e) return (uint64_t)e;
-        return ramfs64_create(path, 1) >= 0 ? 0 : (uint64_t)-28;
+        {
+            int node = ramfs64_create(path, 1);
+            if (node < 0) return (uint64_t)-28;
+            ramfs64_set_mode(node, (uint32_t)a3);
+            return 0;
+        }
     }
 
     case SYS64_UNLINK: {
@@ -1503,6 +1616,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
         /* The last thread. Falling through leaves ring 3 the way
          * exit_group does, which is correct - the process is over. */
         exit_code = a1;
+        vfork_release(proc64_current());
         proc64_exit(proc64_current_pid(), (int)a1);
         return a1;
     }
@@ -1516,6 +1630,11 @@ static uint64_t dispatch(syscall64_args_t* args) {
         {
             proc64_t* me = proc64_current();
             int parent = me ? me->parent : 0;
+            /* The other way a vfork child stops being what its parent is
+             * waiting for: it never execs, it just dies. Released before
+             * the exit is recorded, so a parent that goes straight from
+             * vfork to wait4 finds the child already reapable. */
+            vfork_release(me);
             proc64_exit(proc64_current_pid(), (int)a1);
             /* A parent blocked in wait4 is waiting on exactly this. */
             if (parent) sched64_wake(PROC64_WAIT_KEY(parent),
