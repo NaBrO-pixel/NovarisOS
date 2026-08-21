@@ -42,6 +42,7 @@
 #include "signal64.h"
 #include "ramfs64.h"
 #include "proc64.h"
+#include "pipe64.h"
 
 static int failures = 0;
 
@@ -107,6 +108,8 @@ extern const unsigned char vmem64_elf[];
 extern const unsigned long vmem64_elf_len;
 extern const unsigned char spawn64_elf[];
 extern const unsigned long spawn64_elf_len;
+extern const unsigned char pipetest64_elf[];
+extern const unsigned long pipetest64_elf_len;
 extern const unsigned char cwd64_elf[];
 extern const unsigned long cwd64_elf_len;
 extern const unsigned char fbdraw64_elf[];
@@ -383,6 +386,7 @@ void kernel_main(uint32_t magic, void* mbi) {
          * syscall arriving with no process is a null dereference in the
          * kernel rather than a missing feature. */
         proc64_init();
+        pipe64_init();
         proc64_set_current(proc64_create());
 
         check("the frame allocator came up", pmm64_ready());
@@ -2274,6 +2278,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         signal64_reset();
         sched64_init();
         proc64_init();
+        pipe64_init();
         vmspace64_kernel_space(&kspace);
 
         check("the child program is in the filesystem",
@@ -2364,6 +2369,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         signal64_reset();
         sched64_init();
         proc64_init();
+        pipe64_init();
         vmspace64_kernel_space(&kspace);
 
         /* The seed had to build directories on the way down, which the
@@ -2451,6 +2457,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         ramfs64_init();
         ramfs64_seed_from_initrd();
         proc64_init();
+        pipe64_init();
         proc64_set_current(proc64_create());
         vmspace64_kernel_space(&kspace);
 
@@ -2550,6 +2557,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         signal64_reset();
         sched64_init();
         proc64_init();
+        pipe64_init();
         vmspace64_kernel_space(&kspace);
 
         /* Three the kernel can settle before the program runs, because
@@ -2727,6 +2735,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         signal64_reset();
         sched64_init();
         proc64_init();
+        pipe64_init();
         vmspace64_kernel_space(&kspace);
 
         /* The refcount table, before anything shares anything. */
@@ -2993,6 +3002,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         signal64_reset();
         sched64_init();
         proc64_init();
+        pipe64_init();
         vmspace64_kernel_space(&kspace);
 
         pid = proc64_create();
@@ -3071,6 +3081,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         signal64_reset();
         sched64_init();
         proc64_init();
+        pipe64_init();
         vmspace64_kernel_space(&kspace);
         vforks_before = syscall64_vforks();
 
@@ -3126,7 +3137,113 @@ void kernel_main(uint32_t magic, void* mbi) {
               syscall64_vforks() - vforks_before == 2);
     }
 
-    /* --- layer 34: a Wine prefix (Milestone 71) ---------------------- */
+    /* --- layer 34: the descriptor layer (Milestone 74) --------------- */
+    /* Where Milestone 73 stopped: the wineserver's first act is a pipe,
+     * and the answer was -ENOSYS.
+     *
+     * The pipe is not really the point, though. What every Wine process
+     * needs is the socketpair it talks to the server over, and that is
+     * the thing this is easy to get quietly wrong on - a socketpair is
+     * two pipes crossed, and one pipe answered in its place passes every
+     * obvious read/write assertion while silently losing a direction.
+     * The program below asserts both directions and, separately, that
+     * what one endpoint writes does *not* come back to itself.
+     *
+     * The other half is the ends. A pipe's reader learns the writer has
+     * gone by reading 0, and a writer learns the reader has gone by
+     * getting -EPIPE; get the reference counting wrong - across dup, and
+     * across fork, which duplicates every descriptor - and neither side
+     * ever finds out. That failure is a hang, not an error. */
+    serial64_puts("NOVARIS64: -- pipes and socketpairs --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 64;
+        vmspace64_t kspace;
+        elf64_info_t info;
+        uint64_t i, rsp;
+        uint64_t pipes_before, pairs_before;
+        int rc, stack_ok = 1, pid;
+        proc64_t* p;
+        static const char* const pipe_argv[] = { "/pipetest64", 0 };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        syscall64_reset_files();
+        signal64_reset();
+        sched64_init();
+        proc64_init();
+        pipe64_init();
+        vmspace64_kernel_space(&kspace);
+        pipes_before = syscall64_pipes();
+        pairs_before = syscall64_socketpairs();
+
+        pid = proc64_create();
+        proc64_set_current(pid);
+        p = proc64_current();
+
+        check("a space for it", vmspace64_create(&p->space) != 0);
+        rc = elf64_load(pipetest64_elf, pipetest64_elf_len, &p->space, &info);
+        check("the pipe program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&p->space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&p->space, info.brk_start);
+        rsp = uspace64_build_stack(&p->space, STACK_TOP, STACK_PAGES,
+                                   pipe_argv, &info, 0, 0);
+
+        {
+            registers64_t first;
+            for (i = 0; i < sizeof(first) / 8; i++)
+                ((uint64_t*)&first)[i] = 0;
+            sched64_add_frame_for(&first, &p->space, 0, pid);
+            sched64_set_current(0);
+        }
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        vmspace64_switch(&p->space);
+        enter_user_mode64(info.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+        pf_diagnose = 0;
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("descriptors behaved as Linux's do",
+              syscall64_exit_code() == 107);
+
+        /* A socketpair answered as a plain pipe would satisfy the
+         * program's first direction and fail its second, so the
+         * assertion above does catch that - but only because the
+         * program looks. These two say the kernel took the route it was
+         * meant to, rather than a route that happened to work. */
+        serial64_puts("NOVARIS64: fds     = ");
+        serial64_putdec(syscall64_pipes() - pipes_before);
+        serial64_puts(" pipes, ");
+        serial64_putdec(syscall64_socketpairs() - pairs_before);
+        serial64_puts(" socketpairs\n");
+        check("three pipes and one socketpair were made",
+              syscall64_pipes() - pipes_before == 3 &&
+              syscall64_socketpairs() - pairs_before == 1);
+
+        /* And every one of them was given back. This is the leak the
+         * reference counting exists to prevent: a server that accepted
+         * connections forever would otherwise run out of pipes long
+         * before it ran out of memory, and the two look nothing alike
+         * from outside. The program closed both ends of everything and
+         * its child exited, so nothing should be left. */
+        serial64_puts("NOVARIS64: live    = ");
+        serial64_putdec(pipe64_live());
+        serial64_puts(" pipes still open\n");
+        check("and none of them leaked", pipe64_live() == 0);
+    }
+
+    /* --- layer 35: a Wine prefix (Milestone 71) ---------------------- */
     /* Milestone 68 removed every reason a prefix could not exist here -
      * the node ceiling, the name and path ceilings, the missing links,
      * the missing working directory - and proved each one separately.
@@ -3173,6 +3290,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         signal64_reset();
         sched64_init();
         proc64_init();
+        pipe64_init();
         vmspace64_kernel_space(&kspace);
 
         if (ramfs64_lookup("/usr/lib/wine/x86_64-windows/wineboot.exe") < 0) {
