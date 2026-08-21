@@ -8573,6 +8573,140 @@ matters: `clone3` (435), `fcntl` (72), `prlimit64` (302), `rseq` (334),
 `userfaultfd` (323).
 
 
+## Milestone 73 — the wineserver starts ✅ DONE
+
+Milestone 72 built a prefix and then could not start the wineserver.
+It starts now: wineboot spawns it, it execs, it passes its own
+ownership and permission checks, it creates its socket directory and
+chdirs into it. It does not finish — it wants `pipe2` — but the thing
+that runs everything on the Windows side is running.
+
+Three fixes, and the first is the one that mattered.
+
+### 1. `clone(CLONE_VM|CLONE_VFORK)` was answered as a thread
+
+`posix_spawn` is how Wine starts the wineserver, and on x86-64 glibc
+implements it as
+
+```
+clone3(...)                          → -ENOSYS, glibc falls back
+clone(CLONE_VM|CLONE_VFORK|SIGCHLD, child_stack)
+```
+
+which is neither of the two shapes `clone` knew. It has `CLONE_VM`, so
+it went down the thread path and came back with a **tid**. The caller
+then asked `wait4` for that tid and was told `-ECHILD`, because a thread
+is not a child, and wineboot gave up.
+
+A spawn needs a process, so `CLONE_VFORK` now goes to fork — which has
+been copy-on-write since Milestone 69 — with two additions. The child
+runs on the stack it was handed rather than on its copy of the parent's,
+because that is where glibc's clone stub expects to find the function it
+is about to call. And the parent is **suspended** until the child
+execve's or exits, which is what vfork means and is not decoration here:
+`posix_spawn` frees the child's stack when it returns.
+
+Linux implements that suspension by sharing the address space outright,
+so a vfork child's writes are its parent's. This copies instead — the
+same choice the 32-bit tree made in its own vfork, and the same honest
+consequence: **a vfork child here can report back through its exit
+status but not through memory.** What that costs is the failure path.
+On Linux a child whose exec fails writes the errno into shared memory
+and `posix_spawn` itself returns ENOENT; here the report never arrives,
+`posix_spawn` returns success, and the failure surfaces as the child's
+exit status of 127. `userland/spawn64.c` says so and deliberately does
+not assert the Linux behaviour.
+
+One bug worth not re-learning. `sched64_block_current`'s third argument
+is **`wake_rax`** — what the task's `rax` holds when it is woken — not
+the syscall number. `wait4` passes its own number there because it is
+*restarted*; a vfork is not. Passing `SYS64_CLONE` made the parent's
+`clone()` return **56**, so `posix_spawn` reported 56 as the child's
+pid: a plausible small number that nothing could then wait for. The
+symptom was identical to having no vfork at all.
+
+### 2. The wineserver was never staged
+
+`execve("/usr/bin/../../bin/wineserver")` → `-ENOENT`, and wineboot
+exited 127. `tools/stage_wine.sh` copied the loader, the unix halves and
+93 PE modules, and not the server. The path is not a guess: it is the
+string `execve` was handed, and it resolves to `/bin/wineserver` —
+Wine takes the directory of its own `/proc/self/exe`, which is
+`/usr/bin`, and appends `../../bin/wineserver`.
+
+### 3. `mkdir`'s mode was discarded and `stat` invented one
+
+With the server running, it died on:
+
+```
+wineserver: /tmp/.wine-0 must not be accessible by other users
+```
+
+from `server/request.c`, which is `if (st->st_mode & 077) fatal_error(...)`.
+The server creates that directory `0700`. `ramfs64` did not record the
+mode `mkdir` was given, and `do_stat` reported a fixed `0755` for every
+directory and `0644` for every file — so the low six bits were always
+set and the check could never pass.
+
+Nodes now carry the mode they were created with, `mkdir`, `mkdirat` and
+`open(O_CREAT)` record it, and `stat` reports it beside the type bits. A
+node created without a mode keeps exactly what `do_stat` used to invent,
+so nothing that was not asking about permissions changed.
+
+### The test, and the falsification
+
+`userland/spawn64.c` — 13 assertions, exit 103 — spawns
+`/tmp/forkchild64` twice, waits for each, and checks it exited 24, which
+is only true if the clone made a process, execve replaced it, and wait4
+found it. It also makes a directory `0700` and reads the mode back,
+because that assertion belongs with the spawn: the mode bug looked like
+a spawn failure and was not.
+
+The kernel counts vforks beside it, and that is not redundant. Routing
+`CLONE_VFORK` to the ordinary fork path produces a perfectly waitable
+child and **passes every assertion in the program** — while leaving the
+parent free to run, and to free the stack its child is standing on. Only
+`vforks == 2` catches it:
+
+| removed | what failed |
+| --- | --- |
+| the `CLONE_VFORK` dispatch | `the spawned child was waited for` |
+| the parent's suspension | `each spawn suspended its parent` (the program passed) |
+| the stored mode | `and stat says 0700, not something invented` |
+
+313 assertions, 17 differentials, 0 failures, green at 2G and 6G.
+
+### Where Wine stops now
+
+Inside the wineserver, on its own first pipe:
+
+```
+mkdir  /tmp/.wine-0                       0700, and stat now agrees
+mkdir  /tmp/.wine-0/server-1-90           created, chdir'd into
+openat "."                                → fd 5
+pipe2(...)                                → -ENOSYS
+wineserver: pipe: Function not implemented
+```
+
+Seven syscalls are unimplemented in a full run, and the first three are
+now the whole of the Windows side:
+
+| number | name | why it is wanted |
+| --- | --- | --- |
+| 293 | `pipe2` | the server's own signal/shutdown pipe — where it stops |
+| 53 | `socketpair` | how every Wine process talks to the server |
+| 72 | `fcntl` | descriptor flags around both of those |
+| 435 | `clone3` | benign; glibc falls back to `clone` |
+| 302 | `prlimit64` | benign |
+| 334 | `rseq` | benign |
+| 323 | `userfaultfd` | benign |
+
+**A wineserver that runs is a wineserver processes can connect to, and
+that needs `socketpair` and a descriptor layer that is more than a table
+of open files.** That is the next milestone, and it is the last piece of
+plumbing before a Windows program has something to run against.
+
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
@@ -8611,12 +8745,16 @@ list, and it is shorter than the one above but not smaller:
    `mmap` that granted a `MAP_FIXED_NOREPLACE` it should have refused
    and zeroed Wine's own stack; the jump to 0 was a later `ret`.
 
-   The prefix is created, not finished: wineboot then tries to start the
-   **wineserver** and cannot, because `clone` with
-   `CLONE_VM|CLONE_VFORK` returns a tid but no waitable child.
-   **vfork is the next thing to build**, and it is what the whole
-   Windows side now waits on - there is no prefix content, and no PE
-   module is loaded, until a wineserver runs.
+   The prefix is created, not finished. ~~wineboot then tries to start
+   the **wineserver** and cannot~~ - the wineserver starts in Milestone
+   73: `CLONE_VFORK` is a fork with the parent suspended, the server is
+   staged at the path wineboot spawns, and `mkdir`'s mode is recorded so
+   the server's own permission check can pass.
+
+   It now stops **inside** the wineserver, on `pipe2`. What the Windows
+   side waits on is no longer a spawn but a **descriptor layer**:
+   `pipe2`, `socketpair` and `fcntl`, which is how every Wine process
+   talks to the server. No PE module is loaded until that works.
 2. ~~**Copy-on-write `fork`.**~~ - done in Milestone 69. An 8MB process
    forks for 14 frames.
 3. ~~**Keyboard and mouse.**~~ - done in Milestone 70, as

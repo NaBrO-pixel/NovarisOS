@@ -103,6 +103,11 @@ int ramfs64_path(int node, char* out, uint64_t size);
 const char* ramfs64_name(int node);
 const void* ramfs64_data(int node);
 uint64_t    ramfs64_size(int node);
+/* The permission bits a node was created with. Stored rather than
+ * invented, because the wineserver creates its socket directory 0700 and
+ * refuses to run if stat reports anything looser. */
+uint32_t    ramfs64_mode(int node);
+void        ramfs64_set_mode(int node, uint32_t mode);
 int         ramfs64_is_dir(int node);
 int         ramfs64_parent(int node);
 

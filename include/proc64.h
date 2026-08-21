@@ -42,6 +42,15 @@ typedef struct {
     int         exited;
     int         exit_status;
 
+    /* The pid of a parent suspended in vfork waiting for this process,
+     * or 0. glibc's posix_spawn is clone(CLONE_VM|CLONE_VFORK) and Wine
+     * reaches the wineserver through it, so "the parent does not run
+     * until the child has become something else" is not an optimisation
+     * here - it is the difference between starting a server and freeing
+     * the stack the child is standing on. Cleared by whichever of execve
+     * or exit happens first. */
+    int         vfork_parent;
+
     vmspace64_t space;
 
     /* The heap and the mmap bump pointer: per process, because a fork
@@ -94,6 +103,13 @@ int       proc64_has_children(int pid);
  * user pointers stop well below this - so it cannot collide with a
  * futex a program is using. */
 #define PROC64_WAIT_KEY(pid) (0x1000000000000000ULL + (uint64_t)(pid))
+
+/* And the address a parent blocks on while its vfork child runs. A
+ * different key from the one above because the two waits end on
+ * different events: wait4 ends when a child exits, vfork ends when the
+ * child execve's - which is usually the moment the child starts being
+ * interesting rather than the moment it stops. */
+#define PROC64_VFORK_KEY(pid) (0x2000000000000000ULL + (uint64_t)(pid))
 
 uint64_t  proc64_count(void);
 

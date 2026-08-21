@@ -133,6 +133,7 @@
 
 /* clone() flag bits, Linux's values. Only these are acted on. */
 #define CLONE_VM      0x00000100
+#define CLONE_VFORK   0x00004000
 #define CLONE_THREAD  0x00010000
 #define CLONE_SETTLS  0x00080000
 
@@ -233,5 +234,9 @@ uint64_t syscall64_forks(void);
  * a shared clone from a copied one (Milestone 69). */
 uint64_t syscall64_last_fork_frames(void);
 uint64_t syscall64_execs(void);
+
+/* How many of those forks were vforks - a parent suspended until its
+ * child execve'd or exited (Milestone 73). */
+uint64_t syscall64_vforks(void);
 
 #endif

@@ -13,6 +13,16 @@ typedef struct {
     uint64_t capacity;
     int      is_dir;
     int      is_link;
+
+    /* The permission bits, as mkdir(2) and open(2) were given them.
+     *
+     * These used to be invented by do_stat - 0755 for a directory and
+     * 0644 for a file, whatever the caller had asked for - and that is
+     * fine until something reads them back and cares. The wineserver
+     * does: it creates its socket directory 0700 and then refuses to
+     * start if stat says anyone else can reach it, which a fixed 0755
+     * always says. */
+    uint32_t mode;
     int      device;                   /* RAMFS64_DEV_*; 0 = an ordinary file */
     int      used;
 
@@ -55,6 +65,9 @@ static int alloc_node(const char* name, int parent, int is_dir) {
     nodes[i].capacity     = 0;
     nodes[i].is_dir       = is_dir;
     nodes[i].is_link      = 0;
+    /* What do_stat used to invent, so a caller that passes no mode is
+     * left exactly where it was. */
+    nodes[i].mode         = is_dir ? 0755u : 0644u;
     nodes[i].device       = RAMFS64_DEV_NONE;
     nodes[i].used         = 1;
     nodes[i].first_child  = -1;
@@ -499,6 +512,14 @@ const void* ramfs64_data(int node) {
 uint64_t ramfs64_size(int node) {
     if (!valid(node)) return 0;
     return nodes[node].size;
+}
+
+uint32_t ramfs64_mode(int node) {
+    return valid(node) ? nodes[node].mode : 0;
+}
+
+void ramfs64_set_mode(int node, uint32_t mode) {
+    if (valid(node)) nodes[node].mode = mode & 07777u;
 }
 
 int ramfs64_is_dir(int node) {
