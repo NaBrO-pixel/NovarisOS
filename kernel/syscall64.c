@@ -22,6 +22,8 @@
 #include "kstring.h"
 #include "proc64.h"
 #include "pipe64.h"
+#include "sock64.h"
+#include "clock64.h"
 #include "elf64.h"
 #include "initrd64.h"
 #include "pmm64.h"
@@ -201,11 +203,39 @@ static void fd_init_pipe(int fd, int rx, int tx, int nonblock, int cloexec) {
     fds[fd].pos      = 0;
     fds[fd].rx       = rx;
     fds[fd].tx       = tx;
+    fds[fd].sock     = -1;
     fds[fd].nonblock = nonblock;
     fds[fd].cloexec  = cloexec;
     fds[fd].used     = 1;
     pipe64_ref(rx, 1, 0);
     pipe64_ref(tx, 0, 1);
+}
+
+/* A descriptor whose two ends were handed over already referenced - by
+ * connect, on behalf of a server, or by accept taking them off the
+ * queue. Distinct from fd_init_pipe precisely because it must NOT take
+ * a reference: the one connect already took is the one being moved in
+ * here, and taking another would leave every accepted connection
+ * holding a count nobody ever drops. */
+static void fd_adopt_pipe(int fd, int rx, int tx, int sock,
+                          int nonblock, int cloexec) {
+    fds[fd].kind     = sock >= 0 ? FD64_SOCKET : FD64_PIPE;
+    fds[fd].node     = -1;
+    fds[fd].pos      = 0;
+    fds[fd].rx       = rx;
+    fds[fd].tx       = tx;
+    fds[fd].sock     = sock;
+    fds[fd].nonblock = nonblock;
+    fds[fd].cloexec  = cloexec;
+    fds[fd].used     = 1;
+}
+
+/* Is this descriptor a byte stream - a pipe, or a socket that has been
+ * connected? read and write ask, because from their point of view the
+ * three things the descriptor layer makes are the same thing. */
+static int fd_is_stream(int fd) {
+    return fds[fd].kind == FD64_PIPE ||
+           (fds[fd].kind == FD64_SOCKET && (fds[fd].rx >= 0 || fds[fd].tx >= 0));
 }
 
 /* Closing a descriptor, from close(2) and from dup2 replacing one.
@@ -217,7 +247,20 @@ static void fd_init_pipe(int fd, int rx, int tx, int nonblock, int cloexec) {
  * for each other forever - a hang with nothing in the log. */
 static void fd_release(int fd) {
     if (fd < 0 || fd >= FD_MAX || !fds[fd].used) return;
-    if (fds[fd].kind == FD64_PIPE) {
+
+    /* A listening socket goes first, and it matters that it does: its
+     * queue may still hold connections nobody accepted, whose pipes were
+     * referenced by connect on behalf of a server that is now not
+     * coming. sock64_destroy gives those back, which is what makes the
+     * caller at the other end see end of file rather than wait forever
+     * for a reply. */
+    if (fds[fd].kind == FD64_SOCKET && fds[fd].sock >= 0) {
+        int s = fds[fd].sock;
+        sched64_wake(sock64_wait_key(s), SCHED64_MAX_TASKS);
+        sock64_destroy(s);
+        fds[fd].sock = -1;
+    }
+    if (fd_is_stream(fd)) {
         int rx = fds[fd].rx, tx = fds[fd].tx;
         pipe64_unref(rx, 1, 0);
         pipe64_unref(tx, 0, 1);
@@ -230,6 +273,69 @@ static void fd_release(int fd) {
     fds[fd].used = 0;
     fds[fd].rx   = -1;
     fds[fd].tx   = -1;
+}
+
+/* Leave, and come back to the same call.
+ *
+ * Used by the two syscalls that have to wait for time rather than for an
+ * event - nanosleep and poll. The frame is rewound over the two bytes of
+ * `syscall` with the number back in rax, so returning to ring 3
+ * re-executes the call.
+ *
+ * The deadline is kept here, per task, rather than in the caller's
+ * registers. Carrying it in a callee-saved register would have been
+ * tidier to write and wrong: the entry stub restores r12-r15 from this
+ * frame when the call finally returns, so a deadline parked in one of
+ * them is handed back to the caller in place of the value it had before
+ * the call. Callee-saved means the caller is entitled to it.
+ *
+ * Then it hands the CPU to another task if there is one. If there is
+ * not, it still returns to ring 3 - and that is the point rather than a
+ * fallback: interrupts are off inside a syscall, so the timer only
+ * advances out there, and a deadline can only be reached by going and
+ * coming back.
+ *
+ * A deadline of 0 means "no timeout", which poll(-1) asks for. */
+static uint64_t wait_deadline[SCHED64_MAX_TASKS];
+static int      wait_pending[SCHED64_MAX_TASKS];
+
+static int wait_slot(void) {
+    int t = sched64_current();
+    return (t >= 0 && t < SCHED64_MAX_TASKS) ? t : 0;
+}
+
+/* Is this call a restart of one that already began waiting, and if so
+ * has its deadline passed? Returns 1 when the caller should give up. */
+static int wait_expired(void) {
+    int t = wait_slot();
+    if (!wait_pending[t]) return 0;
+    if (wait_deadline[t] == 0) return 0;               /* no timeout */
+    return clock64_ticks() >= wait_deadline[t];
+}
+
+static int wait_started(void) { return wait_pending[wait_slot()]; }
+static void wait_done(void)   { wait_pending[wait_slot()] = 0; }
+
+static uint64_t wait_restart(const syscall64_args_t* args, uint64_t nr,
+                             uint64_t deadline) {
+    registers64_t self, next;
+    vmspace64_t next_space;
+    uint64_t next_fs;
+    int t = wait_slot();
+
+    wait_deadline[t] = deadline;
+    wait_pending[t]  = 1;
+
+    frame_from_args(args, nr, &self);
+    self.rip = args->ret_rip - 2;
+
+    if (sched64_yield_current(&self, &next, &next_space, &next_fs)) {
+        vmspace64_switch(&next_space);
+        write_msr(0xC0000100u, next_fs);
+        sched64_resume(&next);                         /* never returns */
+    }
+    sched64_resume(&self);                             /* never returns */
+    return 0;
 }
 
 static int64_t do_pipe_write(int fd, const void* buf, uint64_t n) {
@@ -305,6 +411,7 @@ static uint64_t do_open(const char* path, uint64_t flags, uint32_t mode) {
     fds[fd].pos      = (flags & O_APPEND) ? ramfs64_size(node) : 0;
     fds[fd].rx       = -1;
     fds[fd].tx       = -1;
+    fds[fd].sock     = -1;
     fds[fd].nonblock = (flags & O_NONBLOCK) ? 1 : 0;
     fds[fd].cloexec  = (flags & O_CLOEXEC)  ? 1 : 0;
     fds[fd].used     = 1;
@@ -352,9 +459,14 @@ static uint64_t do_stat(const char* path, void* out, int follow) {
      * the file was created with, which mkdir and open now record rather
      * than this inventing them. A symlink's own mode is not meaningful
      * and Linux reports 0777 for it. */
-    *(uint32_t*)(st + 24) = ramfs64_is_dir(node)  ? 0040000u | ramfs64_mode(node)
-                          : ramfs64_is_link(node) ? 0120777u
-                                                  : 0100000u | ramfs64_mode(node);
+    /* S_IFSOCK is not decoration either: Wine's client lstats the
+     * server's socket and refuses to connect - "'%s/%s' is not a
+     * socket" - unless the type bits say so. */
+    *(uint32_t*)(st + 24) =
+          ramfs64_is_dir(node)                     ? 0040000u | ramfs64_mode(node)
+        : ramfs64_is_link(node)                    ? 0120777u
+        : ramfs64_device(node) == RAMFS64_DEV_SOCK ? 0140000u | ramfs64_mode(node)
+                                                   : 0100000u | ramfs64_mode(node);
     *(uint64_t*)(st + 48) = ramfs64_size(node);
     *(uint64_t*)(st + 56) = 4096;
     return 0;
@@ -408,7 +520,7 @@ static uint64_t do_readlink(const char* given, char* buf, uint64_t size) {
 }
 
 static uint64_t forks, execs, vforks;
-static uint64_t pipes_made, socketpairs_made;
+static uint64_t pipes_made, socketpairs_made, sockets_made;
 static uint64_t last_fork_frames;
 
 static void frame_from_args(const syscall64_args_t* args, uint64_t rax,
@@ -562,6 +674,7 @@ uint64_t syscall64_execs(void) { return execs; }
 uint64_t syscall64_vforks(void) { return vforks; }
 uint64_t syscall64_pipes(void) { return pipes_made; }
 uint64_t syscall64_socketpairs(void) { return socketpairs_made; }
+uint64_t syscall64_sockets(void) { return sockets_made; }
 uint64_t syscall64_last_fork_frames(void) { return last_fork_frames; }
 
 /* The calling thread's complete user state, as a frame it could be
@@ -889,7 +1002,12 @@ static uint64_t dispatch(syscall64_args_t* args) {
         if (a1 >= 3) {
             int64_t w;
             if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
-            if (fds[a1].kind == FD64_PIPE) return (uint64_t)do_pipe_write(a1, buf, n);
+            if (fd_is_stream(a1)) return (uint64_t)do_pipe_write(a1, buf, n);
+            if (fds[a1].kind == FD64_SOCKET) return (uint64_t)-107;  /* -ENOTCONN */
+            /* /dev/null takes everything and keeps none of it. Wine
+             * opens it before anything else, to guarantee that the
+             * three standard descriptors are open. */
+            if (ramfs64_device(fds[a1].node) == RAMFS64_DEV_NULL) return n;
             w = ramfs64_write(fds[a1].node, fds[a1].pos, buf, n);
             if (w > 0) fds[a1].pos += (uint64_t)w;
             return (uint64_t)w;
@@ -1514,6 +1632,384 @@ static uint64_t dispatch(syscall64_args_t* args) {
         return 0;
     }
 
+    /* --- the listening socket (Milestone 75) ---------------------- *
+     *
+     * A socketpair is two ends handed to somebody who already holds
+     * both. These five calls are the other arrangement: a name in the
+     * filesystem that two processes which have never met can find, a
+     * queue of callers waiting at it, and an accept that makes a fresh
+     * crossed pair per caller. Once the pair exists it is the descriptor
+     * layer from Milestone 74 and nothing here is involved again. */
+    case SYS64_SOCKET: {
+        int s, fd;
+
+        if (a1 != AF_UNIX_) return (uint64_t)-97;      /* -EAFNOSUPPORT */
+        if ((int)(a2 & 0xFF) != SOCK_STREAM_) return (uint64_t)-94;
+
+        s = sock64_create();
+        if (s < 0) return (uint64_t)-23;               /* -ENFILE */
+        fd = fd_alloc(3);
+        if (fd < 0) { sock64_destroy(s); return (uint64_t)-24; }
+
+        fd_adopt_pipe(fd, -1, -1, s,
+                      (a2 & O_NONBLOCK) != 0, (a2 & O_CLOEXEC) != 0);
+        sockets_made++;
+        return (uint64_t)fd;
+    }
+
+    /* bind(fd, addr, addrlen). The name becomes a node in the
+     * filesystem, and it is the node rather than the text that
+     * identifies the socket - so a client that reaches it by a different
+     * but equivalent path finds the same listener. */
+    case SYS64_BIND: {
+        const sockaddr_un64_t* addr = (const sockaddr_un64_t*)a2;
+        char path[PROC64_PATH_MAX];
+        int64_t e;
+        int node;
+
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind != FD64_SOCKET || fds[a1].sock < 0)
+            return (uint64_t)-88;                      /* -ENOTSOCK */
+        if (!addr || addr->sun_family != AF_UNIX_) return (uint64_t)-22;
+
+        e = abs_path(addr->sun_path, path);
+        if (e) return (uint64_t)e;
+
+        /* Already there. Wine unlinks a stale socket before binding and
+         * treats -EADDRINUSE as "somebody else got the lock", so this
+         * has to be the error rather than a silent replacement. */
+        if (ramfs64_lookup_nofollow(path) >= 0) return (uint64_t)-98;
+
+        node = ramfs64_create(path, 0);
+        if (node < 0) return (uint64_t)-28;            /* -ENOSPC */
+        ramfs64_set_device(node, RAMFS64_DEV_SOCK);
+        ramfs64_set_mode(node, 0755);
+
+        return (uint64_t)sock64_bind(fds[a1].sock, node);
+    }
+
+    case SYS64_LISTEN:
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind != FD64_SOCKET || fds[a1].sock < 0)
+            return (uint64_t)-88;
+        return (uint64_t)sock64_listen(fds[a1].sock, (int)a2);
+
+    /* connect(fd, addr, addrlen).
+     *
+     * Completes immediately or not at all: the pair is made here and the
+     * far half left on the listener's queue, so there is no state in
+     * which a connection is half open. Linux can return -EINPROGRESS on
+     * a non-blocking socket; nothing here ever does, which is a
+     * simplification rather than a lie - the connection really is
+     * established when this returns 0. */
+    case SYS64_CONNECT: {
+        const sockaddr_un64_t* addr = (const sockaddr_un64_t*)a2;
+        char path[PROC64_PATH_MAX];
+        int64_t e;
+        int node, listener, rx = -1, tx = -1, rc;
+
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind != FD64_SOCKET || fds[a1].sock < 0)
+            return (uint64_t)-88;
+        if (!addr || addr->sun_family != AF_UNIX_) return (uint64_t)-22;
+
+        e = abs_path(addr->sun_path, path);
+        if (e) return (uint64_t)e;
+
+        node = ramfs64_lookup_nofollow(path);
+        if (node < 0) return (uint64_t)-2;             /* -ENOENT */
+        if (ramfs64_device(node) != RAMFS64_DEV_SOCK)
+            return (uint64_t)-111;                     /* -ECONNREFUSED */
+
+        listener = sock64_listener_for_node(node);
+        if (listener < 0) return (uint64_t)-111;
+
+        rc = sock64_connect(fds[a1].sock, listener, &rx, &tx);
+        if (rc != 0) return (uint64_t)(int64_t)rc;
+
+        /* The caller's descriptor stops being a bare socket and becomes
+         * a connection. The references were taken by sock64_connect. */
+        fds[a1].rx = rx;
+        fds[a1].tx = tx;
+
+        /* A server parked in accept is waiting on exactly this. */
+        sched64_wake(sock64_wait_key(listener), SCHED64_MAX_TASKS);
+        return 0;
+    }
+
+    /* accept4(fd, addr, addrlen, flags), and accept(2) which is the same
+     * call with no flags. Blocks when the queue is empty, and is
+     * restarted rather than resumed for the same reason a pipe read is:
+     * the descriptor it must return was not known when the caller
+     * blocked. */
+    case SYS64_ACCEPT:
+    case SYS64_ACCEPT4: {
+        int rx = -1, tx = -1, nfd, rc, flags;
+        registers64_t self, next;
+        vmspace64_t next_space;
+        uint64_t next_fs;
+
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind != FD64_SOCKET || fds[a1].sock < 0)
+            return (uint64_t)-88;
+
+        flags = (nr == SYS64_ACCEPT4) ? (int)args->a4 : 0;
+        rc = sock64_accept(fds[a1].sock, &rx, &tx);
+
+        if (rc == -11) {                               /* -EAGAIN */
+            if (fds[a1].nonblock) return (uint64_t)-11;
+
+            frame_from_args(args, nr, &self);
+            self.rip = args->ret_rip - 2;
+            if (!sched64_block_current(&self, sock64_wait_key(fds[a1].sock),
+                                       nr, &next, &next_space, &next_fs))
+                return (uint64_t)-11;
+            vmspace64_switch(&next_space);
+            write_msr(0xC0000100u, next_fs);
+            sched64_resume(&next);                     /* never returns */
+        }
+        if (rc != 0) return (uint64_t)(int64_t)rc;
+
+        nfd = fd_alloc(3);
+        if (nfd < 0) {
+            /* Nowhere to put it. The connection is already made, so the
+             * ends have to be released rather than dropped - the caller
+             * at the far side is entitled to find out. */
+            pipe64_unref(rx, 1, 0);
+            pipe64_unref(tx, 0, 1);
+            return (uint64_t)-24;                      /* -EMFILE */
+        }
+        /* A connected socket rather than a plain pipe, because
+         * setsockopt and shutdown are still asked about it. Adopted, not
+         * referenced: sock64_connect already counted these. */
+        fd_adopt_pipe(nfd, rx, tx, -1,
+                      (flags & O_NONBLOCK) != 0, (flags & O_CLOEXEC) != 0);
+        fds[nfd].kind = FD64_SOCKET;
+
+        /* The peer of a Unix socket has no address to report, and Linux
+         * says so by setting the returned length to the family alone. */
+        if (a3) *(uint32_t*)a3 = 2;
+        return (uint64_t)nfd;
+    }
+
+    /* shutdown(fd, how). 0 = no more reading, 1 = no more writing,
+     * 2 = both. Dropping the end is the whole of it: a writer whose
+     * reader has shut down gets -EPIPE, which is how the far side finds
+     * out, and that is the machinery Milestone 74 already built. */
+    case SYS64_SHUTDOWN: {
+        int rx, tx;
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (!fd_is_stream(a1)) return (uint64_t)-88;
+
+        rx = fds[a1].rx;
+        tx = fds[a1].tx;
+        if (a2 == 0 || a2 == 2) {
+            if (rx >= 0) { pipe64_unref(rx, 1, 0); fds[a1].rx = -1;
+                           sched64_wake(PIPE64_WAIT_KEY(rx), SCHED64_MAX_TASKS); }
+        }
+        if (a2 == 1 || a2 == 2) {
+            if (tx >= 0) { pipe64_unref(tx, 0, 1); fds[a1].tx = -1;
+                           sched64_wake(PIPE64_WAIT_KEY(tx), SCHED64_MAX_TASKS); }
+        }
+        return 0;
+    }
+
+    /* Socket options. Accepted and not acted on, and the reason this is
+     * not the kind of lie Milestone 72 removed is that none of them
+     * describes behaviour this kernel could get wrong: SO_PASSCRED asks
+     * for credentials nobody checks, SO_REUSEADDR is about a binding
+     * conflict that cannot arise with one machine and one prefix, and
+     * the buffer sizes are advice about a 64KB ring. What would be a lie
+     * is reporting a value that was never stored, so GETSOCKOPT reports
+     * zero rather than inventing one. */
+    case SYS64_SETSOCKOPT:
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        return 0;
+
+    case SYS64_GETSOCKOPT:
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (args->a4 && args->a5) {
+            *(int*)args->a4 = 0;
+            *(uint32_t*)args->a5 = sizeof(int);
+        }
+        return 0;
+
+    case SYS64_GETSOCKNAME: {
+        sockaddr_un64_t* addr = (sockaddr_un64_t*)a2;
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind != FD64_SOCKET) return (uint64_t)-88;
+        if (!addr) return (uint64_t)-14;
+        addr->sun_family = AF_UNIX_;
+        addr->sun_path[0] = 0;
+        if (a3) *(uint32_t*)a3 = 2;
+        return 0;
+    }
+
+    /* chmod(path, mode) and fchmod(fd, mode). Wine chmods its socket to
+     * 0600 immediately after binding, having refused to start over the
+     * same bits earlier - see Milestone 73. */
+    case SYS64_CHMOD: {
+        char path[PROC64_PATH_MAX];
+        int64_t e = abs_path((const char*)a1, path);
+        int node;
+        if (e) return (uint64_t)e;
+        node = ramfs64_lookup(path);
+        if (node < 0) return (uint64_t)-2;
+        ramfs64_set_mode(node, (uint32_t)a2);
+        return 0;
+    }
+
+    case SYS64_FCHMOD:
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind != FD64_FILE) return (uint64_t)-9;
+        ramfs64_set_mode(fds[a1].node, (uint32_t)a2);
+        return 0;
+
+    /* setsid(2). The wineserver calls it to detach from the process
+     * group it was spawned in, so that a signal to the shell does not
+     * take the server with it. There are no sessions here and nothing
+     * sends such a signal, so the honest implementation is to report the
+     * caller's own pid - which is what a real setsid returns, because a
+     * new session's id is the pid of the process that made it. */
+    case SYS64_SETSID:
+        return (uint64_t)proc64_current_pid();
+
+    case SYS64_UMASK:
+        return 0;
+
+    /* --- time ------------------------------------------------------- *
+     *
+     * The epoch here is when the timer was installed, not 1970, and
+     * that is written down rather than hidden: nothing reads an RTC, so
+     * a plausible-looking date would be a fabrication, and a file
+     * stamped with a fabricated date is worse than one stamped with an
+     * obviously small number. What the wineserver needs is that time
+     * advances and that two readings subtract correctly. */
+    case SYS64_CLOCK_GETTIME: {
+        struct { uint64_t sec, nsec; }* ts = (void*)a2;
+        if (!ts) return (uint64_t)-14;
+        clock64_now(&ts->sec, &ts->nsec);
+        return 0;
+    }
+
+    case SYS64_GETTIMEOFDAY: {
+        struct { uint64_t sec, usec; }* tv = (void*)a1;
+        if (tv) {
+            uint64_t s, ns;
+            clock64_now(&s, &ns);
+            tv->sec  = s;
+            tv->usec = ns / 1000;
+        }
+        return 0;
+    }
+
+    case SYS64_CLOCK_GETRES: {
+        struct { uint64_t sec, nsec; }* ts = (void*)a2;
+        if (ts) { ts->sec = 0; ts->nsec = 1000000000ull / CLOCK64_HZ; }
+        return 0;
+    }
+
+    /* nanosleep(req, rem), and poll(2), which wait the same way.
+     *
+     * Neither can wait inside the kernel. Syscalls run with interrupts
+     * off - see sched64_yield_current - so the tick that would end the
+     * wait cannot arrive while the waiter is holding the CPU. So both
+     * are written as: look, and if the answer is "not yet", hand the
+     * CPU to somebody else and *restart the call*. The frame is rewound
+     * over the two bytes of `syscall` with the number back in rax, the
+     * same restart wait4 and a blocking pipe read use.
+     *
+     * When there is nobody else to run, the restart still happens - the
+     * task returns to ring 3 and re-enters immediately, which is a busy
+     * loop, but a busy loop with interrupts enabled between the
+     * iterations. That is the whole point: the timer advances there and
+     * nowhere else, so a deadline that is checked here can only be
+     * reached by going out and coming back. */
+    case SYS64_NANOSLEEP:
+    case SYS64_CLOCK_NANOSLEEP: {
+        const struct { uint64_t sec, nsec; }* req =
+            (const void*)(nr == SYS64_NANOSLEEP ? a1 : args->a3);
+        uint64_t want;
+
+        if (wait_started()) {
+            if (!wait_expired()) return wait_restart(args, nr,
+                                                     wait_deadline[wait_slot()]);
+            wait_done();
+            if (nr == SYS64_NANOSLEEP && a2) {
+                struct { uint64_t sec, nsec; }* rem = (void*)a2;
+                rem->sec = rem->nsec = 0;
+            }
+            return 0;
+        }
+
+        if (!req) return (uint64_t)-14;
+        want = req->sec * CLOCK64_HZ + req->nsec / (1000000000ull / CLOCK64_HZ);
+        if (want == 0) return 0;
+        return wait_restart(args, nr, clock64_ticks() + want);
+    }
+
+    /* poll(fds, nfds, timeout_ms).
+     *
+     * The wineserver's main loop. It configures epoll first, gets
+     * -ENOSYS, and falls back to this - which is the older interface and
+     * the easier one to answer honestly, because it asks the question
+     * fresh every time instead of keeping a set in the kernel.
+     *
+     * Only the three events that mean anything here: readable, writable,
+     * and hung up. POLLIN on a stream is "there is a byte, or there will
+     * never be one again" - end of file has to report readable, or a
+     * server waiting on a client that has gone never notices. */
+    case SYS64_POLL: {
+        struct pollfd64 { int fd; short events; short revents; }* pfds =
+            (void*)a1;
+        uint64_t n = a2;
+        int64_t  timeout = (int64_t)(int32_t)a3;
+        uint64_t ready = 0;
+
+        if (n > FD_MAX * 2) return (uint64_t)-22;      /* -EINVAL */
+
+        for (uint64_t i = 0; i < n; i++) {
+            int fd = pfds[i].fd;
+            short want = pfds[i].events, got = 0;
+
+            pfds[i].revents = 0;
+            if (fd < 0) continue;
+            if (fd >= FD_MAX || !fds[fd].used) { pfds[i].revents = POLL64_NVAL;
+                                                 ready++; continue; }
+
+            if (fds[fd].kind == FD64_SOCKET && fds[fd].sock >= 0 &&
+                sock64_state(fds[fd].sock) == SOCK64_LISTENING) {
+                /* A listening socket is readable when somebody is
+                 * waiting to be accepted. That is the event the whole
+                 * server loop turns on. */
+                if (sock64_pending(fds[fd].sock)) got |= POLL64_IN;
+            } else if (fd_is_stream(fd)) {
+                int rx = fds[fd].rx, tx = fds[fd].tx;
+                if (rx >= 0 && (pipe64_available(rx) > 0 ||
+                                pipe64_writers(rx) == 0)) got |= POLL64_IN;
+                if (tx >= 0 && pipe64_space(tx) > 0)      got |= POLL64_OUT;
+                if (tx >= 0 && pipe64_readers(tx) == 0)   got |= POLL64_HUP;
+            } else {
+                /* A file is always ready, which is what Linux says too. */
+                got |= POLL64_IN | POLL64_OUT;
+            }
+
+            got &= (short)(want | POLL64_HUP | POLL64_NVAL);
+            if (got) { pfds[i].revents = got; ready++; }
+        }
+
+        if (ready) { wait_done(); return ready; }
+        if (timeout == 0) return 0;
+
+        if (wait_started()) {
+            if (wait_expired()) { wait_done(); return 0; }
+            return wait_restart(args, nr, wait_deadline[wait_slot()]);
+        }
+        return wait_restart(args, nr,
+                            timeout < 0 ? 0    /* forever */
+                                        : clock64_ticks() + (uint64_t)timeout);
+    }
+
     /* socketpair(domain, type, protocol, int sv[2]).
      *
      * Two pipes, crossed. Only AF_UNIX/SOCK_STREAM is answered, because
@@ -1845,8 +2341,9 @@ static uint64_t dispatch(syscall64_args_t* args) {
          * not have. A read that would block parks the task and is
          * restarted, which is why this returns through do_pipe_read
          * rather than inline. */
-        if (fds[a1].kind == FD64_PIPE)
+        if (fd_is_stream(a1))
             return (uint64_t)do_pipe_read(args, a1, (void*)a2, a3);
+        if (fds[a1].kind == FD64_SOCKET) return (uint64_t)-107;   /* -ENOTCONN */
 
         /* An input device is a stream of events, not a file with a
          * position: there is no offset to advance and nothing to seek
@@ -1855,6 +2352,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
          * a reader that got half a struct would resynchronise by
          * guessing. */
         dev = ramfs64_device(fds[a1].node);
+        if (dev == RAMFS64_DEV_NULL) return 0;         /* end of file */
         if (dev == RAMFS64_DEV_KBD || dev == RAMFS64_DEV_MOUSE) {
             return input64_read(dev == RAMFS64_DEV_KBD ? INPUT64_KBD
                                                        : INPUT64_MOUSE,

@@ -117,6 +117,8 @@ int         ramfs64_parent(int node);
 #define RAMFS64_DEV_FB   1        /* /dev/fb0 - the linear framebuffer */
 #define RAMFS64_DEV_KBD  2        /* /dev/input/event0 - the keyboard    */
 #define RAMFS64_DEV_MOUSE 3       /* /dev/input/event1 - the mouse       */
+#define RAMFS64_DEV_SOCK  4       /* a bound Unix-domain socket          */
+#define RAMFS64_DEV_NULL  5       /* /dev/null                           */
 
 int         ramfs64_set_device(int node, int device);
 int         ramfs64_device(int node);

@@ -43,6 +43,8 @@
 #include "ramfs64.h"
 #include "proc64.h"
 #include "pipe64.h"
+#include "sock64.h"
+#include "clock64.h"
 
 static int failures = 0;
 
@@ -110,6 +112,8 @@ extern const unsigned char spawn64_elf[];
 extern const unsigned long spawn64_elf_len;
 extern const unsigned char pipetest64_elf[];
 extern const unsigned long pipetest64_elf_len;
+extern const unsigned char socktest64_elf[];
+extern const unsigned long socktest64_elf_len;
 extern const unsigned char cwd64_elf[];
 extern const unsigned long cwd64_elf_len;
 extern const unsigned char fbdraw64_elf[];
@@ -152,11 +156,13 @@ static volatile uint64_t timer_ticks;
 static void timer_handler(registers64_t* r) {
     (void)r;
     timer_ticks++;
+    clock64_tick();
 }
 
 /* The same interrupt, once there is something to schedule. */
 static void sched_timer_handler(registers64_t* r) {
     timer_ticks++;
+    clock64_tick();
     sched64_tick(r);
 }
 
@@ -387,6 +393,7 @@ void kernel_main(uint32_t magic, void* mbi) {
          * kernel rather than a missing feature. */
         proc64_init();
         pipe64_init();
+        sock64_init();
         proc64_set_current(proc64_create());
 
         check("the frame allocator came up", pmm64_ready());
@@ -2279,6 +2286,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         sched64_init();
         proc64_init();
         pipe64_init();
+        sock64_init();
         vmspace64_kernel_space(&kspace);
 
         check("the child program is in the filesystem",
@@ -2370,6 +2378,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         sched64_init();
         proc64_init();
         pipe64_init();
+        sock64_init();
         vmspace64_kernel_space(&kspace);
 
         /* The seed had to build directories on the way down, which the
@@ -2458,6 +2467,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         ramfs64_seed_from_initrd();
         proc64_init();
         pipe64_init();
+        sock64_init();
         proc64_set_current(proc64_create());
         vmspace64_kernel_space(&kspace);
 
@@ -2558,6 +2568,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         sched64_init();
         proc64_init();
         pipe64_init();
+        sock64_init();
         vmspace64_kernel_space(&kspace);
 
         /* Three the kernel can settle before the program runs, because
@@ -2736,6 +2747,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         sched64_init();
         proc64_init();
         pipe64_init();
+        sock64_init();
         vmspace64_kernel_space(&kspace);
 
         /* The refcount table, before anything shares anything. */
@@ -3003,6 +3015,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         sched64_init();
         proc64_init();
         pipe64_init();
+        sock64_init();
         vmspace64_kernel_space(&kspace);
 
         pid = proc64_create();
@@ -3082,6 +3095,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         sched64_init();
         proc64_init();
         pipe64_init();
+        sock64_init();
         vmspace64_kernel_space(&kspace);
         vforks_before = syscall64_vforks();
 
@@ -3173,6 +3187,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         sched64_init();
         proc64_init();
         pipe64_init();
+        sock64_init();
         vmspace64_kernel_space(&kspace);
         pipes_before = syscall64_pipes();
         pairs_before = syscall64_socketpairs();
@@ -3243,7 +3258,109 @@ void kernel_main(uint32_t magic, void* mbi) {
         check("and none of them leaked", pipe64_live() == 0);
     }
 
-    /* --- layer 35: a Wine prefix (Milestone 71) ---------------------- */
+    /* --- layer 35: a socket with a name (Milestone 75) --------------- */
+    /* Where Milestone 74 stopped, one call past the pipe: the wineserver
+     * makes a *named* socket in its own directory and every Wine process
+     * connects to it by that name.
+     *
+     * The difference from a socketpair is the whole of this layer. A
+     * socketpair's two ends go to somebody who already holds both, so
+     * there is no question of who is talking to whom. A rendezvous has
+     * to answer that, and the way to get it wrong is to answer it once:
+     * a server that handed every caller the same pair would pass a
+     * single-client test perfectly and mix two clients' traffic the
+     * moment there were two. The program below connects twice and
+     * asserts that what one client sends does *not* arrive on the other
+     * connection. */
+    serial64_puts("NOVARIS64: -- a socket with a name --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 64;
+        vmspace64_t kspace;
+        elf64_info_t info;
+        uint64_t i, rsp;
+        uint64_t socks_before, accepted_before;
+        int rc, stack_ok = 1, pid;
+        proc64_t* p;
+        static const char* const sock_argv[] = { "/socktest64", 0 };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        syscall64_reset_files();
+        signal64_reset();
+        sched64_init();
+        proc64_init();
+        pipe64_init();
+        sock64_init();
+        vmspace64_kernel_space(&kspace);
+        socks_before    = syscall64_sockets();
+        accepted_before = sock64_accepted();
+
+        pid = proc64_create();
+        proc64_set_current(pid);
+        p = proc64_current();
+
+        check("a space for it", vmspace64_create(&p->space) != 0);
+        rc = elf64_load(socktest64_elf, socktest64_elf_len, &p->space, &info);
+        check("the socket program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&p->space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&p->space, info.brk_start);
+        rsp = uspace64_build_stack(&p->space, STACK_TOP, STACK_PAGES,
+                                   sock_argv, &info, 0, 0);
+
+        {
+            registers64_t first;
+            for (i = 0; i < sizeof(first) / 8; i++)
+                ((uint64_t*)&first)[i] = 0;
+            sched64_add_frame_for(&first, &p->space, 0, pid);
+            sched64_set_current(0);
+        }
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        vmspace64_switch(&p->space);
+        enter_user_mode64(info.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+        pf_diagnose = 0;
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("named sockets behaved as Linux's do",
+              syscall64_exit_code() == 109);
+
+        serial64_puts("NOVARIS64: sockets = ");
+        serial64_putdec(syscall64_sockets() - socks_before);
+        serial64_puts(" made, ");
+        serial64_putdec(sock64_accepted() - accepted_before);
+        serial64_puts(" connections accepted\n");
+        /* Five: the first client, the second, the two that queued up
+         * before either was accepted, and the forked child's. */
+        check("five connections were accepted",
+              sock64_accepted() - accepted_before == 5);
+
+        /* Every socket and every pipe given back. This is the leak that
+         * matters most in exactly this layer: a server accepts for as
+         * long as it runs, so a connection that costs a pipe nobody
+         * returns is a server with a lifetime rather than a service.
+         * The program closed everything and its child exited. */
+        serial64_puts("NOVARIS64: live    = ");
+        serial64_putdec(sock64_live());
+        serial64_puts(" sockets, ");
+        serial64_putdec(pipe64_live());
+        serial64_puts(" pipes still open\n");
+        check("and nothing leaked",
+              sock64_live() == 0 && pipe64_live() == 0);
+    }
+
+    /* --- layer 36: a Wine prefix (Milestone 71) ---------------------- */
     /* Milestone 68 removed every reason a prefix could not exist here -
      * the node ceiling, the name and path ceilings, the missing links,
      * the missing working directory - and proved each one separately.
@@ -3291,6 +3408,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         sched64_init();
         proc64_init();
         pipe64_init();
+        sock64_init();
         vmspace64_kernel_space(&kspace);
 
         if (ramfs64_lookup("/usr/lib/wine/x86_64-windows/wineboot.exe") < 0) {
