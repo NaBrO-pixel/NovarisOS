@@ -259,6 +259,21 @@ void ramfs64_init(void) {
     ramfs64_mkdirp("/root");
     ramfs64_mkdirp("/etc");
 
+    /* /dev/null, for the same reason and with a sharper edge. Wine opens
+     * it before it does anything else, to guarantee that descriptors 0,
+     * 1 and 2 are all open - it dups the result until it is above 2 -
+     * and a program whose stdin is closed rather than empty behaves
+     * differently in ways that surface a long way from here. */
+    {
+        int n;
+        ramfs64_mkdirp("/dev");
+        n = ramfs64_create("/dev/null", 0);
+        if (n >= 0) {
+            ramfs64_set_device(n, RAMFS64_DEV_NULL);
+            ramfs64_set_mode(n, 0666);
+        }
+    }
+
     {
         static const char passwd[] = "root:x:0:0:root:/root:/bin/sh\n";
         static const char nsswitch[] =

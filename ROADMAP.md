@@ -8835,6 +8835,157 @@ will have to carry, and that is the part worth measuring before
 promising.
 
 
+## Milestone 75 — a socket with a name ✅ DONE
+
+`socket`, `bind`, `listen`, `connect`, `accept` — and `poll`, which
+turned out to be the interesting one. **A Wine process now connects to
+the wineserver and the server accepts it.**
+
+Milestone 74 built the connection and stopped one call short of the
+thing that needs it. A socketpair's two ends go to somebody who already
+holds both, so there is no question of who is talking to whom. The
+wineserver's socket has to answer that question for processes that have
+never met: a name in the filesystem, a queue of callers waiting at it,
+and an accept that manufactures a fresh crossed pair per caller.
+
+`kernel/sock64.c` is only that part. Once a connection exists it **is**
+two pipes crossed — the same shape `socketpair` already made — and the
+descriptor layer carries it with no further involvement from here. The
+whole file is the rendezvous.
+
+### Three things that were not the socket
+
+Two of the three failures on the way were not in this code at all, which
+is worth recording because both presented as socket problems.
+
+**`l_intl.nls` was not staged.** The server bound its socket, listened,
+set up its signal handlers, and then died with `failed to load
+l_intl.nls` — looking in `/usr/share/wine/nls`, which `stage_wine.sh`
+had never copied. 77 files, 8KB. What made it misleading is the order:
+the server had already registered `socket_cleanup` with `atexit`, so on
+the way out it **unlinked its own socket**, and the client that followed
+reported
+
+```
+a wine server seems to be running, but I cannot connect to it.
+```
+
+Two misleading messages from one missing 8KB directory, neither of them
+naming it.
+
+**There was no `/dev/null`.** Wine opens it before anything else and
+dups the result until it is above 2, to guarantee the three standard
+descriptors are open. It is now a node in the seeded filesystem: reads
+report end of file, writes are discarded.
+
+**There was no clock.** The PIT has been running at ~1kHz since the
+scheduler layer and its handler counted ticks; `clock64.c` gives that
+counter a name and converts it into Linux's units for `clock_gettime`,
+`gettimeofday` and `clock_getres`. The epoch is when the timer started,
+**not 1970**, and that is deliberate rather than unfinished: nothing
+reads an RTC, so a plausible-looking date would be a fabrication, and a
+file stamped with a fabricated date is worse than one stamped with an
+obviously small number. What the server needs is that time advances and
+that two readings subtract, and both are true.
+
+### The one that was structural: waiting
+
+The wineserver's main loop configures `epoll`, gets `-ENOSYS`, and falls
+back to `poll`. Answering it exposed something this kernel had never had
+to face.
+
+**Syscalls run with interrupts off.** `FMASK` clears IF on entry, and
+deliberately: there is one kernel stack here, so a timer that preempted
+a task in the middle of a syscall would hand that stack to somebody else
+and the first syscall would resume onto whatever the second left behind.
+
+The consequence is that **a syscall cannot wait for time to pass** — the
+tick that would end the wait cannot arrive while the waiter is holding
+the CPU. A first attempt at `nanosleep` spun on the tick counter, which
+is not slow, it is a permanent hang. Every wait for a *deadline* is
+therefore written as: look, and if the answer is "not yet", hand the CPU
+to somebody else and **restart the call**, rewinding the frame over the
+two bytes of `syscall` with the number back in `rax` — the same restart
+`wait4` and a blocking pipe read already used. When there is nobody else
+to run it still returns to ring 3, and that is the point rather than a
+fallback: the timer only advances out there.
+
+`sched64_yield_current` is new and is not `block_current` with the flag
+left clear — a blocked task is skipped by `next_task` and needs waking,
+and what a poll wants is to be picked again on the next pass with nobody
+having to remember it.
+
+The deadline is kept **per task in the kernel**, not in a callee-saved
+register. Carrying it in `r12` was tidier to write and wrong: the entry
+stub restores `r12`-`r15` from the frame when the call finally returns,
+so a deadline parked in one of them is handed back to the caller in
+place of the value it had before the call.
+
+`poll` reports readable, writable and hung up, and the one that is easy
+to get wrong is `POLLIN` on a stream: it means "there is a byte, **or
+there will never be one again**". End of file has to report readable, or
+a server waiting on a client that has gone never notices.
+
+### The test, and the falsification
+
+`userland/sock64.c` — 38 assertions, exit 109 — is about the queue and
+the pairing rather than about bytes, which Milestone 74 covered. The
+assertion that matters most is that **two connections do not get each
+other's traffic**: a rendezvous that handed every caller the same pair
+would pass a single-client test perfectly. It also connects two clients
+*before* accepting either, and checks that each accepted descriptor is
+joined to the client that queued it rather than to whichever arrived
+last.
+
+| removed | what failed |
+| --- | --- |
+| crossing the two pipes in `connect` | the run **deadlocked** — both sides waiting to be written to, which is the failure mode this whole layer is written to avoid |
+| `bind` marking the node a socket | `and stat says it is a socket`, then every connect |
+| `accept` adopting rather than re-referencing | `and nothing leaked` |
+
+The second column of the first row is the point. An uncrossed pair does
+not return an error; it stops. That is why the differential is bounded
+by the harness's timeout and why the kernel counts what is still open.
+
+325 assertions, 19 differentials, 0 failures, green at 2G and 6G.
+
+### Where Wine stops now
+
+Past the introduction and into the conversation:
+
+```
+socket(AF_UNIX, SOCK_STREAM) = 9      the server
+bind(9, "socket")            = 0
+listen(9, 5)                 = 0
+poll([9], 1, 30000)                   the server waits
+socket(AF_UNIX, SOCK_STREAM) = 4      the client
+connect(4, "socket")         = 0      connected
+recvmsg(4, ...)              = -ENOSYS
+poll → accept(9)             = 21     accepted
+sendmsg(21, ...)             = -ENOSYS
+Protocol error: process 0020: sendmsg: Function not implemented
+```
+
+**`sendmsg` and `recvmsg` with `SCM_RIGHTS`** — which is how Wine passes
+file *descriptors* between processes, and is the whole of its handle
+mechanism. That is the next milestone and it is not a formality: a
+descriptor sent over a socket has to be resolved in the sender's table,
+carried as a kernel object, and installed in the receiver's at a number
+the receiver picks. Every other syscall in this tree so far has operated
+on one process's descriptors.
+
+| number | name | why it is wanted |
+| --- | --- | --- |
+| 46 | `sendmsg` | where it stops — the server protocol |
+| 47 | `recvmsg` | the other half, with `SCM_RIGHTS` |
+| 77 | `ftruncate` | the server's shared memory |
+| 138 | `fstatfs` | Wine asking what filesystem it is on |
+| 141 | `setpriority` | benign |
+| 213 | `epoll_create` | benign — Wine falls back to `poll`, which works |
+| 435 | `clone3` | benign; glibc falls back to `clone` |
+| 302, 334, 323 | `prlimit64`, `rseq`, `userfaultfd` | benign |
+
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
@@ -8883,12 +9034,15 @@ list, and it is shorter than the one above but not smaller:
    descriptor layer landed in Milestone 74: `pipe2`, `socketpair` and
    `fcntl` all work, and Wine uses all three.
 
-   It now stops one step further on, at `socket`. A socketpair is two
-   ends that already know each other; the server needs a **listening
-   socket** - a name in the filesystem, a backlog, and an `accept` that
-   makes a fresh pair per client - plus `SCM_RIGHTS` over it, which is
-   how Wine passes descriptors between processes. No PE module is loaded
-   until a client can connect.
+   ~~It now stops one step further on, at `socket`~~ - the listening
+   socket landed in Milestone 75, along with `poll`. **A Wine process
+   connects to the wineserver and the server accepts it.**
+
+   What remains between here and a Windows program running is
+   `sendmsg`/`recvmsg` with **`SCM_RIGHTS`**: Wine's handle mechanism is
+   passing file *descriptors* between processes over that socket. It is
+   the first thing in this tree that has to operate on two processes'
+   descriptor tables at once. No PE module is loaded until it works.
 2. ~~**Copy-on-write `fork`.**~~ - done in Milestone 69. An 8MB process
    forks for 14 frames.
 3. ~~**Keyboard and mouse.**~~ - done in Milestone 70, as

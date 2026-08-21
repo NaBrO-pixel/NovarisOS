@@ -69,6 +69,21 @@ while IFS= read -r so; do
     cp "$so" "$UNIX/$(basename "$so")" 2>/dev/null && found_unix=$((found_unix+1))
 done < <(find "$TREE/dlls" -name "*.so" -type f)
 
+# The NLS tables. 77 files and 8KB in total, and not optional: the
+# wineserver loads l_intl.nls before it will serve anything and dies
+# with "failed to load l_intl.nls" without it - after binding its
+# socket, so its atexit handler unlinks the socket on the way out and
+# the client that follows reports "a wine server seems to be running,
+# but I cannot connect to it". Two misleading messages from one missing
+# 8KB directory.
+if [ -d "$TREE/nls" ]; then
+    mkdir -p "$DEST/usr/share/wine/nls" || exit 1
+    cp "$TREE"/nls/*.nls "$DEST/usr/share/wine/nls/" 2>/dev/null
+    echo "stage_wine: $(ls "$DEST/usr/share/wine/nls" | wc -l) NLS tables"
+else
+    echo "stage_wine: no nls directory at $TREE/nls" >&2
+fi
+
 # The PE halves, from the measured list.
 found_pe=0
 missing=""
