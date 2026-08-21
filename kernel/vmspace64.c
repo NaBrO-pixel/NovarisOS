@@ -283,6 +283,32 @@ int vmspace64_clone_cow(uint64_t src_pml4, vmspace64_t* dst) {
 /* A write to a shared page. Returns 1 if it dealt with it, 0 if this was
  * not a copy-on-write fault at all and the caller should treat it as the
  * real fault it is. */
+int vmspace64_set_writable(uint64_t va, int writable) {
+    uint64_t pml4 = read_cr3() & ADDR_MASK;
+    uint64_t* pte = pte_for(pml4, va & ~(PAGE64_SIZE - 1), 0);
+    uint64_t e;
+
+    if (!pte) return 0;
+    e = *pte;
+    if (!(e & PAGE64_PRESENT)) return 0;
+
+    if (e & PAGE64_COW) {
+        /* Shared. The write bit must stay clear so that the next write
+         * still traps into break_cow and gets a copy of its own; what
+         * changes is only whether break_cow will then oblige. */
+        if (writable) e |= PAGE64_COW_RW;
+        else          e &= ~PAGE64_COW_RW;
+        e &= ~PAGE64_WRITE;
+    } else {
+        if (writable) e |= PAGE64_WRITE;
+        else          e &= ~PAGE64_WRITE;
+    }
+
+    *pte = e;
+    __asm__ __volatile__("invlpg (%0)" :: "r"(va) : "memory");
+    return 1;
+}
+
 int vmspace64_break_cow(uint64_t va) {
     uint64_t pml4 = read_cr3() & ADDR_MASK;
     uint64_t* pte = pte_for(pml4, va & ~(PAGE64_SIZE - 1), 0);

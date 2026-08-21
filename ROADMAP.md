@@ -8415,6 +8415,164 @@ Wine. `prefix = not created, system32 absent` is printed by the layer
 itself on every run, and it is printed from a filesystem lookup rather
 than from a variable, so it cannot drift away from the truth.
 
+## Milestone 72 — the prefix, and three syscalls that lied ✅ DONE
+
+**A Wine prefix now exists on this kernel.** `wineboot -u` creates
+`/root/.wine`, `chdir`s into it, makes `dosdevices` and `drive_c`, and
+links them together — the thing Milestone 71 said plainly had never
+happened. It does not finish: it stops trying to launch the wineserver,
+which is a different and later problem, recorded at the end.
+
+Nothing here is a new feature. All four fixes are the same shape — a
+syscall that reported success without doing what it said — and that is
+the shape this tree keeps producing. What is worth recording is that
+none of them faulted anywhere near where they were wrong.
+
+### 1. `MAP_FIXED_NOREPLACE` was granted instead of refused
+
+This is Milestone 71's "calls through a null pointer", and it was never
+a null pointer.
+
+Wine reserves its address space without a preloader by asking for three
+ranges `PROT_NONE`, the last being
+`0x7ffffe000000..0x7fffffff0000`. This kernel puts the user stack at
+`0x7fffffff0000` and 128 pages below it — **inside that range**. On
+Linux the call therefore fails, and `reserve_area` is written for that:
+it halves the range and recurses, reserving what it can around the
+obstacle.
+
+The flag is `MAP_FIXED_NOREPLACE` (0x100000) and it **does not come with
+`MAP_FIXED`** — it implies fixed placement on its own. So the request
+missed the `MAP_FIXED` branch entirely and fell into the *hint* path,
+which probed a single page, found it free, and mapped all 32MB. Then
+`map_anon` did the thing it exists to do: a page already mapped in the
+range is kept but **zeroed**, because an anonymous mapping must read as
+zeros.
+
+So Wine zeroed all 128 pages of its own stack. Nothing faulted. Every
+saved return address and every saved register on that stack was now 0,
+and execution carried on until the first `ret` popped a zero and jumped
+to address 0. The fault was reported at `rip=0 cr2=0` with `rdi`/`rsi`
+still holding the arguments of the mmap that had caused it, four calls
+earlier.
+
+`mmap` now honours the flag: the **whole** range must be free, and a
+refusal returns `-EEXIST` having changed nothing. The plain-hint path
+was checking one page for the same reason and now checks the range too.
+
+### 2. An `mmap` above the user half was granted
+
+Wine does not assume how big the address space is, it measures it
+(`get_host_addr_space_limit`): mmap one page at `1<<63`, halve the
+address until the kernel accepts it, and call twice the first address
+that worked the limit.
+
+This kernel accepted `0x8000000000000000` on the first try — a
+non-canonical address in the kernel's half — so Wine concluded the user
+address space ended at `0xffffffffffff0000` and sized its page
+protection table from it:
+
+```
+pages_vprot_size = (limit >> 12 >> 20) + 1;
+size = 2 * view_block_size + pages_vprot_size * sizeof(*pages_vprot);
+```
+
+which is **32GB**, where Linux asks for 2.2MB. That allocation failed
+and `virtual_init` died on its own `assert`. The 32GB was a symptom;
+the missing bounds check was the bug.
+
+`USPACE64_LIMIT` is now `0x0000800000000000` and `mmap` refuses anything
+that does not fit wholly below it, with the length checked as a
+subtraction so a wrapping request is refused rather than wrapping into a
+range that looks fine. The probe now stops at `0x400000000000` and
+reports `0x7fffffff0000`, which is what Linux reports — asserted by
+comparing the two.
+
+### 3. `mprotect` was accepted and ignored
+
+The old comment reasoned that every mapping is already readable and
+writable, so the only thing left to implement was *removing*
+permissions, and nothing needed that yet. It was wrong in the other
+direction: pages get made read-only — by a loader's file mapping, or by
+`fork` leaving them shared — and `mprotect` is how they are made
+writable again. Returning 0 without touching a page table turns the
+next store into an unexplained fault a long way from the call.
+
+`uspace64_protect` now does it, and it is careful about one case: a
+copy-on-write page must **not** simply have its write bit set, or a
+parent and child that `fork` separated would share a writable frame.
+The write bit stays clear and the request is recorded in
+`PAGE64_COW_RW`, which is exactly the bit `break_cow` already consults
+to tell a page it should copy from a page that is genuinely read-only.
+That lives in `vmspace64_set_writable`, next to the COW code rather than
+in `uspace64.c`.
+
+What it still does not do is honour `PROT_NONE` or `PROT_EXEC`, and that
+is a stated limit rather than an oversight. The only record this kernel
+keeps of which ranges are taken is the page tables themselves, so
+unmapping a `PROT_NONE` range would make Wine's own reservations read as
+free and the next `MAP_FIXED_NOREPLACE` would be offered them. Reads
+that ought to fault therefore succeed.
+
+### 4. `getuid` was missing, and wineboot refused a directory it owned
+
+```
+wine: '/root' is not owned by you, refusing to create a configuration
+directory there
+```
+
+from `setup_config_dir`, which does `if (!stat(config_dir, &st) &&
+st.st_uid != getuid()) fatal_error(...)`. `do_stat` reports every file
+as owned by uid 0. `getuid` was unimplemented, and it is one of the
+syscalls Linux specifies as never failing, so glibc does not check it
+and handed `-ENOSYS` back as a uid. `getuid`, `geteuid`, `getgid` and
+`getegid` now return 0 and agree with what `stat` says.
+
+### The test, and the falsification
+
+`userland/vmem64.c` is a host/guest differential — 15 assertions, exit
+101 — and it is deliberately not this tree's opinion about what should
+happen: every expected answer is what Linux does, including the measured
+address-space limit, which it computes with Wine's own probe copied out
+of `virtual.c`. It asserts that a refused `MAP_FIXED_NOREPLACE` leaves
+the memory it was refused byte-for-byte intact, which is the assertion
+the stack corruption reduces to, and it checks a range overlapping by a
+single page, which is the case a one-page probe gets wrong.
+
+Each mechanism was removed in turn and the test failed on the assertion
+for that mechanism and no other:
+
+| removed | what failed |
+| --- | --- |
+| the `range_free` check | `MAP_FIXED_NOREPLACE over a mapped range is refused` |
+| `USPACE64_LIMIT` | `a fixed mapping at 1<<63 is refused`, and `limit` diverged |
+| real `mprotect` | `and the page really is read-only now` |
+
+308 assertions, 16 differentials, 0 failures, green at 2G and 6G.
+
+### Where Wine stops now
+
+Much later, and for a reason that is a feature rather than a lie. Having
+built the prefix it tries to start the **wineserver**:
+
+```
+clone3(...)                        = -ENOSYS      (glibc falls back)
+clone(CLONE_VM|CLONE_VFORK|SIGCHLD) = 2
+wait4(2, ...)                      = -ECHILD
+exit_group(1)
+```
+
+That is `posix_spawn`'s vfork path. `clone` returns a tid but no process
+the parent can wait for, so `wait4` says there is no such child. **vfork
+— a child that shares its parent's address space until it `execve`s,
+with the parent suspended — is the next thing to build**, and the
+wineserver is what needs it.
+
+Five syscalls are still unimplemented in a full run, and only the first
+matters: `clone3` (435), `fcntl` (72), `prlimit64` (302), `rseq` (334),
+`userfaultfd` (323).
+
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
@@ -8447,11 +8605,18 @@ over-reading: it was the list of what Wine needs *to start*, and Wine
 does start. What stands between here and a Windows program is the next
 list, and it is shorter than the one above but not smaller:
 
-1. **A Wine prefix, created on this kernel.** Attempted in Milestone 71
-   and not achieved. Wine now runs its own ntdll and reserves its
-   address space before calling through a null pointer; it is not a
-   missing syscall (three, all benign) and not the PE modules (it never
-   opens one). That null call is the next thing to find.
+1. ~~**A Wine prefix, created on this kernel.**~~ - done in Milestone
+   72. `wineboot -u` creates `/root/.wine`, `dosdevices` and `drive_c`
+   and links them. Milestone 71's "calls through a null pointer" was an
+   `mmap` that granted a `MAP_FIXED_NOREPLACE` it should have refused
+   and zeroed Wine's own stack; the jump to 0 was a later `ret`.
+
+   The prefix is created, not finished: wineboot then tries to start the
+   **wineserver** and cannot, because `clone` with
+   `CLONE_VM|CLONE_VFORK` returns a tid but no waitable child.
+   **vfork is the next thing to build**, and it is what the whole
+   Windows side now waits on - there is no prefix content, and no PE
+   module is loaded, until a wineserver runs.
 2. ~~**Copy-on-write `fork`.**~~ - done in Milestone 69. An 8MB process
    forks for 14 frames.
 3. ~~**Keyboard and mouse.**~~ - done in Milestone 70, as
