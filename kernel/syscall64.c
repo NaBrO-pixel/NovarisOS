@@ -338,6 +338,21 @@ static uint64_t wait_restart(const syscall64_args_t* args, uint64_t nr,
     return 0;
 }
 
+/* Everything this process still had open, given back.
+ *
+ * Linux closes a process's descriptors when it exits, and until
+ * Milestone 76 nothing here did - which was invisible for as long as
+ * every test closed what it opened. It stops being invisible the moment
+ * a process holds one end of something: a child that exits while
+ * holding a socket leaves the pipe believing it still has a reader, so
+ * the peer's next read waits for bytes from a process that no longer
+ * exists. A leak in the table and a hang at the other end are the same
+ * bug seen from two places. */
+static void close_all_files(void) {
+    if (!proc64_current()) return;
+    for (int fd = 0; fd < FD_MAX; fd++) fd_release(fd);
+}
+
 static int64_t do_pipe_write(int fd, const void* buf, uint64_t n) {
     int64_t w;
 
@@ -361,9 +376,20 @@ static int64_t do_pipe_write(int fd, const void* buf, uint64_t n) {
  * rewound over the two bytes of the `syscall` instruction with the
  * number back in rax, so waking re-runs the call and re-reads the pipe.
  * There is no other way to return a count that was not known when the
- * caller blocked. */
-static int64_t do_pipe_read(const syscall64_args_t* args, int fd,
-                            void* buf, uint64_t n) {
+ * caller blocked.
+ *
+ * `nr` is which call to restart *as*, and it is a parameter rather than
+ * SYS64_READ because recvmsg reads through here too. Hardcoding read's
+ * number worked for as long as read was the only caller and then failed
+ * in the least obvious way available: a recvmsg that blocked came back
+ * as `read(fd, &msghdr, flags)` - the same arguments, a different call -
+ * so the payload landed in the message header instead of the buffer the
+ * header pointed at, and Wine reported a protocol version of 4096.
+ * sched64.c's own comment on wake_rax says exactly this: a syscall that
+ * restarts needs its own number back there, "or the re-executed
+ * `syscall` invokes whatever call 0 happens to be". */
+static int64_t do_pipe_read(const syscall64_args_t* args, uint64_t nr,
+                            int fd, void* buf, uint64_t n) {
     registers64_t self, next;
     vmspace64_t next_space;
     uint64_t next_fs;
@@ -375,11 +401,11 @@ static int64_t do_pipe_read(const syscall64_args_t* args, int fd,
     if (r != -11) return r;                            /* data, or EOF */
     if (fds[fd].nonblock) return -11;                  /* -EAGAIN */
 
-    frame_from_args(args, SYS64_READ, &self);
+    frame_from_args(args, nr, &self);
     self.rip = args->ret_rip - 2;
 
     if (!sched64_block_current(&self, PIPE64_WAIT_KEY(fds[fd].rx),
-                               SYS64_READ, &next, &next_space, &next_fs)) {
+                               nr, &next, &next_space, &next_fs)) {
         /* Nothing else can run, so nobody can ever fill this pipe.
          * Reporting it beats a machine that stops. */
         return -11;
@@ -521,6 +547,7 @@ static uint64_t do_readlink(const char* given, char* buf, uint64_t size) {
 
 static uint64_t forks, execs, vforks;
 static uint64_t pipes_made, socketpairs_made, sockets_made;
+static uint64_t sendmsgs, recvmsgs, fds_passed;
 static uint64_t last_fork_frames;
 
 static void frame_from_args(const syscall64_args_t* args, uint64_t rax,
@@ -675,6 +702,9 @@ uint64_t syscall64_vforks(void) { return vforks; }
 uint64_t syscall64_pipes(void) { return pipes_made; }
 uint64_t syscall64_socketpairs(void) { return socketpairs_made; }
 uint64_t syscall64_sockets(void) { return sockets_made; }
+uint64_t syscall64_sendmsgs(void) { return sendmsgs; }
+uint64_t syscall64_recvmsgs(void) { return recvmsgs; }
+uint64_t syscall64_fds_passed(void) { return fds_passed; }
 uint64_t syscall64_last_fork_frames(void) { return last_fork_frames; }
 
 /* The calling thread's complete user state, as a frame it could be
@@ -1792,6 +1822,184 @@ static uint64_t dispatch(syscall64_args_t* args) {
         return (uint64_t)nfd;
     }
 
+    /* --- sendmsg and recvmsg, and the descriptors they carry --------- *
+     *
+     * SCM_RIGHTS is how Wine passes handles. Every Windows object a
+     * process holds is, underneath, a file descriptor the wineserver
+     * handed it over this socket - so this is not one more syscall, it
+     * is the mechanism the whole Windows side is built on.
+     *
+     * What travels is the descriptor, not the number. The sender names
+     * one of its own; the receiver gets the thing that number referred
+     * to, at a number the receiver picks. That is the first operation in
+     * this tree that touches two processes' descriptor tables, and the
+     * reason it can be written at all is that a descriptor here is a
+     * small record - a kind, a node or a pair of pipes - rather than a
+     * pointer into the owner. */
+    case SYS64_SENDMSG: {
+        const msghdr64_t* msg = (const msghdr64_t*)a2;
+        fdpass64_t carried[8];
+        int ncarried = 0;
+        int64_t total = 0;
+
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (!fd_is_stream(a1)) return (uint64_t)-88;   /* -ENOTSOCK */
+        if (!msg) return (uint64_t)-14;
+        if (fds[a1].tx < 0) return (uint64_t)-9;
+
+        /* The control data first, because a failure here must not send
+         * half a message: the descriptors and the bytes they describe
+         * have to arrive together or not at all. */
+        if (msg->msg_control && msg->msg_controllen >= sizeof(cmsghdr64_t)) {
+            const uint8_t* base = (const uint8_t*)msg->msg_control;
+            uint64_t off = 0;
+
+            while (off + sizeof(cmsghdr64_t) <= msg->msg_controllen) {
+                const cmsghdr64_t* c = (const cmsghdr64_t*)(base + off);
+                if (c->cmsg_len < sizeof(cmsghdr64_t)) break;
+                if (c->cmsg_level == SOL_SOCKET_ && c->cmsg_type == SCM_RIGHTS_) {
+                    const int* sent = (const int*)(base + off + CMSG64_ALIGN(sizeof(cmsghdr64_t)));
+                    uint64_t bytes = c->cmsg_len - CMSG64_ALIGN(sizeof(cmsghdr64_t));
+                    int n = (int)(bytes / sizeof(int));
+
+                    if (n > (int)(sizeof(carried)/sizeof(carried[0])))
+                        return (uint64_t)-22;
+                    for (int k = 0; k < n; k++) {
+                        int sfd = sent[k];
+                        if (sfd < 0 || sfd >= FD_MAX || !fds[sfd].used)
+                            return (uint64_t)-9;       /* -EBADF */
+                        /* A listening or unconnected socket carries
+                         * state this record cannot describe, and Wine
+                         * never sends one. Refused rather than sent as
+                         * something subtly different. */
+                        if (fds[sfd].kind == FD64_SOCKET && fds[sfd].sock >= 0)
+                            return (uint64_t)-22;      /* -EINVAL */
+
+                        carried[ncarried].kind = fds[sfd].kind;
+                        carried[ncarried].node = fds[sfd].node;
+                        carried[ncarried].pos  = fds[sfd].pos;
+                        carried[ncarried].rx   = fds[sfd].rx;
+                        carried[ncarried].tx   = fds[sfd].tx;
+                        /* Referenced for the receiver now. The sender is
+                         * free to close its own copy the moment this
+                         * returns - and does - so a reference taken only
+                         * on arrival would be taken on a pipe that had
+                         * already been given back. */
+                        pipe64_ref(fds[sfd].rx, 1, 0);
+                        pipe64_ref(fds[sfd].tx, 0, 1);
+                        ncarried++;
+                    }
+                }
+                if (c->cmsg_len == 0) break;
+                off += CMSG64_ALIGN(c->cmsg_len);
+            }
+        }
+
+        if (ncarried && !pipe64_send_fds(fds[a1].tx, carried, ncarried)) {
+            for (int k = 0; k < ncarried; k++) {
+                pipe64_unref(carried[k].rx, 1, 0);
+                pipe64_unref(carried[k].tx, 0, 1);
+            }
+            return (uint64_t)-11;                      /* -EAGAIN */
+        }
+
+        for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
+            const iovec64_t* v = &msg->msg_iov[i];
+            int64_t w;
+            if (!v->iov_len) continue;
+            w = do_pipe_write((int)a1, v->iov_base, v->iov_len);
+            if (w < 0) return (uint64_t)w;
+            total += w;
+            if ((uint64_t)w < v->iov_len) break;        /* a short write */
+        }
+        sendmsgs++;
+        return (uint64_t)total;
+    }
+
+    case SYS64_RECVMSG: {
+        msghdr64_t* msg = (msghdr64_t*)a2;
+        fdpass64_t got[8];
+        int ngot, installed = 0;
+        int64_t total = 0;
+
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (!fd_is_stream(a1)) return (uint64_t)-88;
+        if (!msg) return (uint64_t)-14;
+        if (fds[a1].rx < 0) return (uint64_t)-9;
+
+        /* The bytes first, and through the same path an ordinary read
+         * takes - so an empty connection blocks and is restarted here
+         * exactly as it is there, rather than having a second, subtly
+         * different waiting rule. */
+        for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
+            const iovec64_t* v = &msg->msg_iov[i];
+            int64_t r;
+            if (!v->iov_len) continue;
+            r = do_pipe_read(args, nr, (int)a1, v->iov_base, v->iov_len);
+            if (r < 0) return (uint64_t)r;
+            total += r;
+            if (r == 0) break;                          /* end of file */
+            if ((uint64_t)r < v->iov_len) break;
+        }
+
+        msg->msg_flags = 0;
+        msg->msg_namelen = 0;
+
+        ngot = pipe64_recv_fds(fds[a1].rx, got, 8);
+        if (ngot > 0 && msg->msg_control) {
+            uint8_t* base = (uint8_t*)msg->msg_control;
+            cmsghdr64_t* c = (cmsghdr64_t*)base;
+            int* out = (int*)(base + CMSG64_ALIGN(sizeof(cmsghdr64_t)));
+            uint64_t need = CMSG64_ALIGN(sizeof(cmsghdr64_t))
+                          + (uint64_t)ngot * sizeof(int);
+
+            if (msg->msg_controllen < need) {
+                /* No room. The descriptors are already the receiver's -
+                 * the sender gave them away - so they are closed rather
+                 * than lost, and MSG_CTRUNC says what happened. */
+                for (int k = 0; k < ngot; k++) {
+                    pipe64_unref(got[k].rx, 1, 0);
+                    pipe64_unref(got[k].tx, 0, 1);
+                }
+                msg->msg_flags = MSG_CTRUNC_;
+                msg->msg_controllen = 0;
+            } else {
+                for (int k = 0; k < ngot; k++) {
+                    int nfd = fd_alloc(3);
+                    if (nfd < 0) {
+                        pipe64_unref(got[k].rx, 1, 0);
+                        pipe64_unref(got[k].tx, 0, 1);
+                        msg->msg_flags = MSG_CTRUNC_;
+                        continue;
+                    }
+                    /* Adopted: the reference sendmsg took on this
+                     * receiver's behalf is the one being installed. */
+                    fds[nfd].kind     = got[k].kind;
+                    fds[nfd].node     = got[k].node;
+                    fds[nfd].pos      = got[k].pos;
+                    fds[nfd].rx       = got[k].rx;
+                    fds[nfd].tx       = got[k].tx;
+                    fds[nfd].sock     = -1;
+                    fds[nfd].nonblock = 0;
+                    fds[nfd].cloexec  = (a3 & MSG_CMSG_CLOEXEC_) ? 1 : 0;
+                    fds[nfd].used     = 1;
+                    out[installed++]  = nfd;
+                }
+                c->cmsg_len   = CMSG64_ALIGN(sizeof(cmsghdr64_t))
+                              + (uint64_t)installed * sizeof(int);
+                c->cmsg_level = SOL_SOCKET_;
+                c->cmsg_type  = SCM_RIGHTS_;
+                msg->msg_controllen = installed ? c->cmsg_len : 0;
+            }
+        } else {
+            msg->msg_controllen = 0;
+        }
+
+        recvmsgs++;
+        fds_passed += (uint64_t)installed;
+        return (uint64_t)total;
+    }
+
     /* shutdown(fd, how). 0 = no more reading, 1 = no more writing,
      * 2 = both. Dropping the end is the whole of it: a writer whose
      * reader has shut down gets -EPIPE, which is how the far side finds
@@ -2342,7 +2550,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
          * restarted, which is why this returns through do_pipe_read
          * rather than inline. */
         if (fd_is_stream(a1))
-            return (uint64_t)do_pipe_read(args, a1, (void*)a2, a3);
+            return (uint64_t)do_pipe_read(args, nr, a1, (void*)a2, a3);
         if (fds[a1].kind == FD64_SOCKET) return (uint64_t)-107;   /* -ENOTCONN */
 
         /* An input device is a stream of events, not a file with a
@@ -2391,6 +2599,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
          * exit_group does, which is correct - the process is over. */
         exit_code = a1;
         vfork_release(proc64_current());
+        close_all_files();
         proc64_exit(proc64_current_pid(), (int)a1);
         return a1;
     }
@@ -2409,6 +2618,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
              * the exit is recorded, so a parent that goes straight from
              * vfork to wait4 finds the child already reapable. */
             vfork_release(me);
+            close_all_files();
             proc64_exit(proc64_current_pid(), (int)a1);
             /* A parent blocked in wait4 is waiting on exactly this. */
             if (parent) sched64_wake(PROC64_WAIT_KEY(parent),
