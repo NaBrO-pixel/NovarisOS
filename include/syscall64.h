@@ -206,6 +206,7 @@ typedef struct {
 #define SYS64_RT_SIGRETURN    15
 #define SYS64_IOCTL           16
 #define SYS64_WRITEV          20
+#define SYS64_READV           19
 #define SYS64_UNAME           63
 #define SYS64_READLINK        89
 #define SYS64_FORK            57
@@ -359,6 +360,11 @@ uint64_t syscall64_sendmsgs(void);
 uint64_t syscall64_recvmsgs(void);
 uint64_t syscall64_fds_passed(void);
 uint64_t syscall64_renames(void);
+
+/* Writable shared file mappings made (Milestone 78). A MAP_SHARED that
+ * quietly handed back a private copy would satisfy every read and write
+ * a single process could make. */
+uint64_t syscall64_shared_maps(void);
 
 /* Ends a run when this process exits rather than when the last one
  * does, so a layer can run a program that leaves a daemon behind. -1

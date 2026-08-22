@@ -4,6 +4,8 @@
 #include "kheap64.h"
 #include "kstring.h"
 #include "initrd64.h"
+#include "paging64.h"
+#include "pmm64.h"
 
 typedef struct {
     char     name[RAMFS64_NAME_MAX];   /* one component, not a path */
@@ -23,6 +25,35 @@ typedef struct {
      * start if stat says anyone else can reach it, which a fixed 0755
      * always says. */
     uint32_t mode;
+
+    /* Physical frames backing this file, once anything has mapped it
+     * MAP_SHARED, and 0 before that (Milestone 78).
+     *
+     * A file is a heap allocation, which is fine for reading and writing
+     * and useless for sharing: two processes cannot map the same
+     * unaligned pointer and see each other's stores. The wineserver's
+     * session data has to be exactly that - it hands each client a
+     * descriptor and every one of them maps it read-write - so the first
+     * shared mapping moves the contents into frames and the frames
+     * become the file. `data` is released at that point, because two
+     * copies of a file's bytes is not a cache, it is a bug waiting for
+     * somebody to write to the wrong one. */
+    uint64_t* frames;
+    uint64_t  nframes;
+
+    /* How many descriptors are open on this node, and whether its name
+     * has been taken away (Milestone 78).
+     *
+     * On Linux a file unlinked while open goes on existing until the
+     * last descriptor closes, and that is not a corner: it is how a
+     * program gets anonymous shared memory out of a filesystem - create,
+     * size, unlink, map, and the only thing left referring to it is the
+     * descriptor. Wine does exactly that for every shared mapping it
+     * makes. This used to free the node on unlink and say so in a
+     * comment; the comment was right about what would happen. */
+    int      openers;
+    int      unlinked;
+
     int      device;                   /* RAMFS64_DEV_*; 0 = an ordinary file */
     int      used;
 
@@ -65,6 +96,10 @@ static int alloc_node(const char* name, int parent, int is_dir) {
     nodes[i].capacity     = 0;
     nodes[i].is_dir       = is_dir;
     nodes[i].is_link      = 0;
+    nodes[i].frames       = 0;
+    nodes[i].nframes      = 0;
+    nodes[i].openers      = 0;
+    nodes[i].unlinked     = 0;
     /* What do_stat used to invent, so a caller that passes no mode is
      * left exactly where it was. */
     nodes[i].mode         = is_dir ? 0755u : 0644u;
@@ -85,9 +120,10 @@ static int alloc_node(const char* name, int parent, int is_dir) {
     return i;
 }
 
-/* Unlinks a node from its parent's child list and returns it to the
- * free list. The caller has already decided this is allowed. */
-static void free_node(int n) {
+/* Takes a node out of its parent's child list. After this nothing can
+ * find it by name; whether it still exists is a separate question, and
+ * the answer is "while somebody has it open". */
+static void detach_from_parent(int n) {
     int parent = nodes[n].parent;
 
     if (parent >= 0 && parent < RAMFS64_MAX_NODES) {
@@ -100,12 +136,52 @@ static void free_node(int n) {
             if (c >= 0) nodes[c].next_sibling = nodes[n].next_sibling;
         }
     }
+    nodes[n].parent       = -1;
+    nodes[n].next_sibling = -1;
+}
+
+/* Lets the storage go and returns the slot. Only ever called when the
+ * node has no name and no openers left. */
+static void release_node(int n) {
+    if (nodes[n].data) kfree64(nodes[n].data);
+    nodes[n].data = 0;
+
+    /* The filesystem holds one owner of each frame; a process that has
+     * the file mapped holds another, so this is a release rather than a
+     * free and the mapping goes on working until it is unmapped. */
+    if (nodes[n].frames) {
+        for (uint64_t i = 0; i < nodes[n].nframes; i++)
+            pmm64_free_frame(nodes[n].frames[i]);
+        kfree64(nodes[n].frames);
+        nodes[n].frames  = 0;
+        nodes[n].nframes = 0;
+    }
 
     nodes[n].used         = 0;
     nodes[n].first_child  = -1;
     nodes[n].next_sibling = free_head;
     free_head             = n;
     if (node_count) node_count--;
+}
+
+/* Unlinks a node and returns it to the free list. The caller has already
+ * decided this is allowed. */
+static void free_node(int n) {
+    detach_from_parent(n);
+    release_node(n);
+}
+
+void ramfs64_ref_node(int node) {
+    if (valid(node)) nodes[node].openers++;
+}
+
+void ramfs64_unref_node(int node) {
+    if (!valid(node)) return;
+    if (nodes[node].openers > 0) nodes[node].openers--;
+    /* The last descriptor on a file that no longer has a name. Nothing
+     * can reach it again, so now it can go. */
+    if (nodes[node].openers == 0 && nodes[node].unlinked)
+        release_node(node);
 }
 
 /* One component of a path, by name, in one directory. */
@@ -412,6 +488,80 @@ int ramfs64_mkdirp(const char* path) {
     return node;
 }
 
+/* Copy between a frame-backed file and a plain buffer. `to_file` says
+ * which way. Page at a time, because the frames are not contiguous -
+ * they come from the allocator one at a time and only the direct map
+ * makes them all reachable at once. */
+static void frame_copy(node64_t* nd, uint64_t off, void* buf,
+                       uint64_t len, int to_file) {
+    uint8_t* b = (uint8_t*)buf;
+    uint64_t done = 0;
+
+    while (done < len) {
+        uint64_t page = (off + done) / PAGE64_SIZE;
+        uint64_t in   = (off + done) % PAGE64_SIZE;
+        uint64_t run  = PAGE64_SIZE - in;
+        uint8_t* p;
+
+        if (page >= nd->nframes) break;
+        if (run > len - done) run = len - done;
+        p = (uint8_t*)phys64_to_virt(nd->frames[page]) + in;
+
+        if (to_file) kmemcpy(p, b + done, run);
+        else         kmemcpy(b + done, p, run);
+        done += run;
+    }
+}
+
+/* Give this file frames, and make them the file.
+ *
+ * Called the first time anything maps it MAP_SHARED. Everything already
+ * in the heap allocation is copied across and the allocation is
+ * released: one file, one copy of its bytes, whichever way it is
+ * reached afterwards. Returns 0 if the frames could not be had, leaving
+ * the node exactly as it was. */
+static int make_framed(node64_t* nd, uint64_t bytes) {
+    uint64_t need = (bytes + PAGE64_SIZE - 1) / PAGE64_SIZE;
+    uint64_t* fresh;
+    uint64_t got = 0;
+
+    if (!need) need = 1;
+    if (nd->frames && nd->nframes >= need) return 1;
+
+    fresh = (uint64_t*)kmalloc64(need * sizeof(uint64_t));
+    if (!fresh) return 0;
+
+    /* The frames it already had keep their contents and their identity -
+     * somebody may be mapping them right now, so growing a shared file
+     * must not move it. */
+    for (; got < nd->nframes && got < need; got++) fresh[got] = nd->frames[got];
+
+    for (; got < need; got++) {
+        uint64_t f = pmm64_alloc_frame();
+        if (!f) {
+            /* Undo, so a failure leaves a file rather than half of one. */
+            for (uint64_t k = nd->nframes; k < got; k++) pmm64_free_frame(fresh[k]);
+            kfree64(fresh);
+            return 0;
+        }
+        kmemset(phys64_to_virt(f), 0, PAGE64_SIZE);
+        fresh[got] = f;
+    }
+
+    if (nd->frames) kfree64(nd->frames);
+    nd->frames  = fresh;
+    nd->nframes = need;
+
+    /* First time: move the contents in and let the heap copy go. */
+    if (nd->data) {
+        frame_copy(nd, 0, nd->data, nd->size, 1);
+        kfree64(nd->data);
+        nd->data     = 0;
+        nd->capacity = 0;
+    }
+    return 1;
+}
+
 static int ensure_capacity(node64_t* nd, uint64_t want) {
     uint64_t cap;
     uint8_t* fresh;
@@ -443,7 +593,8 @@ int64_t ramfs64_read(int node, uint64_t offset, void* buf, uint64_t len) {
     if (offset >= nd->size) return 0;
     if (offset + len > nd->size) len = nd->size - offset;
 
-    kmemcpy(buf, nd->data + offset, len);
+    if (nd->frames) frame_copy(nd, offset, buf, len, 0);
+    else            kmemcpy(buf, nd->data + offset, len);
     return (int64_t)len;
 }
 
@@ -455,9 +606,13 @@ int64_t ramfs64_write(int node, uint64_t offset, const void* buf,
     nd = &nodes[node];
     if (nd->is_dir) return -21;
 
-    if (!ensure_capacity(nd, offset + len)) return -12;
-
-    kmemcpy(nd->data + offset, buf, len);
+    if (nd->frames) {
+        if (!make_framed(nd, offset + len)) return -12;
+        frame_copy(nd, offset, (void*)buf, len, 1);
+    } else {
+        if (!ensure_capacity(nd, offset + len)) return -12;
+        kmemcpy(nd->data + offset, buf, len);
+    }
     if (offset + len > nd->size) nd->size = offset + len;
     return (int64_t)len;
 }
@@ -479,12 +634,32 @@ int ramfs64_resize(int node, uint64_t len) {
     if (nodes[node].is_dir) return -21;             /* -EISDIR */
 
     if (len > nodes[node].size) {
-        if (!ensure_capacity(&nodes[node], len)) return -28;   /* -ENOSPC */
-        kmemset(nodes[node].data + nodes[node].size, 0,
-                len - nodes[node].size);
+        if (nodes[node].frames) {
+            /* Fresh frames arrive zeroed, so growing into them exposes
+             * zeros without doing anything more. */
+            if (!make_framed(&nodes[node], len)) return -28;
+        } else {
+            if (!ensure_capacity(&nodes[node], len)) return -28;  /* -ENOSPC */
+            kmemset(nodes[node].data + nodes[node].size, 0,
+                    len - nodes[node].size);
+        }
     }
     nodes[node].size = len;
     return 0;
+}
+
+/* The frames backing this file, creating them if this is the first
+ * shared mapping. `bytes` is how much of it the caller wants to map.
+ *
+ * The caller takes a reference on each frame it maps: the filesystem
+ * holds one of its own, so a process unmapping the file drops its
+ * reference and the file keeps its contents. */
+const uint64_t* ramfs64_frames(int node, uint64_t bytes, uint64_t* out_n) {
+    if (!valid(node) || nodes[node].is_dir) return 0;
+    if (bytes < nodes[node].size) bytes = nodes[node].size;
+    if (!make_framed(&nodes[node], bytes)) return 0;
+    if (out_n) *out_n = nodes[node].nframes;
+    return nodes[node].frames;
 }
 
 /* rename(2), which is how a program replaces a file without anybody ever
@@ -520,9 +695,11 @@ int ramfs64_rename(const char* oldpath, const char* newpath) {
             return nodes[existing].is_dir ? -21 : -20;   /* EISDIR/ENOTDIR */
         if (nodes[existing].is_dir && nodes[existing].first_child >= 0)
             return -39;                             /* -ENOTEMPTY */
-        if (nodes[existing].data) kfree64(nodes[existing].data);
-        nodes[existing].data = 0;
-        free_node(existing);
+        /* Replacing a file somebody has open is an unlink of the old
+         * one, with the same rule: its name goes, it does not. */
+        detach_from_parent(existing);
+        nodes[existing].unlinked = 1;
+        if (nodes[existing].openers == 0) release_node(existing);
     }
 
     /* A directory cannot be moved into itself or into its own subtree:
@@ -570,12 +747,14 @@ int ramfs64_unlink(const char* path) {
     if (i < 0) return -2;                           /* -ENOENT */
     if (nodes[i].is_dir) return -21;                /* -EISDIR */
 
-    /* Freed immediately: nothing here reference counts. On Linux a file
-     * unlinked while open survives until the last descriptor closes, and
-     * a program relying on that reads freed memory here. */
-    if (nodes[i].data) kfree64(nodes[i].data);
-    nodes[i].data = 0;
-    free_node(i);
+    /* The name goes now; the file goes when the last descriptor on it
+     * closes. Anything still holding it open keeps reading and writing
+     * the same bytes, which is what makes create-size-unlink-map work -
+     * and that is how a program asks a filesystem for anonymous shared
+     * memory. */
+    detach_from_parent(i);
+    nodes[i].unlinked = 1;
+    if (nodes[i].openers == 0) release_node(i);
     return 0;
 }
 

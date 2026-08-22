@@ -225,6 +225,65 @@ uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
  * Uncacheable for the same reason the kernel's own mapping is: a process
  * writing to VRAM through a write-back mapping is writing to the cache,
  * and the screen shows whatever gets evicted. */
+/* Maps a list of frames somebody else owns into this process.
+ *
+ * Unlike uspace64_mmap these frames are not the process's: they belong
+ * to a file, and every process that maps it gets the *same* ones, which
+ * is the whole point - a store by one is a load by the other. So a
+ * reference is taken on each, and munmap's free drops that reference
+ * rather than the frame, because the filesystem is still holding one of
+ * its own.
+ *
+ * The frames are not contiguous, so this cannot be uspace64_map_phys
+ * with a length: they arrive from the allocator one at a time. */
+uint64_t uspace64_map_frames(uint64_t addr, int fixed,
+                             const uint64_t* frames, uint64_t n,
+                             uint64_t prot) {
+    uint64_t start, pflags;
+
+    if (!frames || !n) return (uint64_t)-22;              /* -EINVAL */
+
+    /* MAP_FIXED means exactly here, and for a shared mapping that is not
+     * a preference either. Wine maps its shared user data at
+     * 0x7ffe0000 - Windows' KUSER_SHARED_DATA, an address compiled into
+     * every Windows program - and a mapping that succeeded somewhere
+     * else would be worse than one that failed: the call reports an
+     * address nobody is going to look at. */
+    start = fixed ? (addr & ~(PAGE64_SIZE - 1)) : cur()->mmap_next;
+    if (!fits_in_user_half(start, n * PAGE64_SIZE)) return (uint64_t)-12;
+
+    /* Whatever was there is replaced. It usually is something: Wine
+     * reserves 0x7f000000..0x7fff0000 PROT_NONE long before it maps this
+     * page inside that range, so the pages exist and belong to the
+     * process. They are released rather than abandoned. */
+    if (fixed) {
+        for (uint64_t i = 0; i < n; i++) {
+            uint64_t va = start + i * PAGE64_SIZE, old;
+            if (paging64_translate(va, &old) != PAGING64_OK) continue;
+            paging64_unmap(va);
+            pmm64_free_frame(old & ~(PAGE64_SIZE - 1));
+        }
+    }
+
+    pflags = PAGE64_PRESENT | PAGE64_USER;
+    if (prot & 0x2) pflags |= PAGE64_WRITE;               /* PROT_WRITE */
+
+    for (uint64_t i = 0; i < n; i++) {
+        if (paging64_map(start + i * PAGE64_SIZE, frames[i], pflags)
+                != PAGING64_OK) {
+            for (uint64_t done = 0; done < i; done++) {
+                paging64_unmap(start + done * PAGE64_SIZE);
+                pmm64_free_frame(frames[done]);
+            }
+            return (uint64_t)-12;                         /* -ENOMEM */
+        }
+        pmm64_ref_frame(frames[i]);
+    }
+
+    if (!fixed) cur()->mmap_next = start + n * PAGE64_SIZE;
+    return start;
+}
+
 uint64_t uspace64_map_phys(uint64_t length, uint64_t phys, uint64_t prot) {
     uint64_t start, off, pflags;
 

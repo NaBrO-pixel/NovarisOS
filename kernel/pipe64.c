@@ -3,6 +3,8 @@
 #include "pipe64.h"
 #include "kheap64.h"
 #include "kstring.h"
+#include "ramfs64.h"
+#include "proc64.h"
 
 typedef struct {
     fdpass64_t fds[8];
@@ -25,6 +27,8 @@ typedef struct {
 } pipe64_t;
 
 static pipe64_t pipes[PIPE64_MAX];
+
+static void drop_inflight(const fdpass64_t* f);
 
 void pipe64_init(void) {
     for (int i = 0; i < PIPE64_MAX; i++) {
@@ -92,10 +96,7 @@ void pipe64_unref(int p, int reader, int writer) {
          * able to open anything. */
         while (pipes[p].in_count > 0) {
             batch64_t* b = &pipes[p].inflight[pipes[p].in_head];
-            for (int k = 0; k < b->n; k++) {
-                pipe64_unref(b->fds[k].rx, 1, 0);
-                pipe64_unref(b->fds[k].tx, 0, 1);
-            }
+            for (int k = 0; k < b->n; k++) drop_inflight(&b->fds[k]);
             pipes[p].in_head = (pipes[p].in_head + 1) % PIPE64_INFLIGHT;
             pipes[p].in_count--;
         }
@@ -103,6 +104,19 @@ void pipe64_unref(int p, int reader, int writer) {
         pipes[p].buf  = 0;
         pipes[p].used = 0;
         pipes[p].len  = 0;
+    }
+}
+
+/* Give back a descriptor that was sent and never received.
+ *
+ * It knows which kind because fdpass64_t says so, and it has to: a file
+ * in flight is holding the node open, and a node whose last opener
+ * disappeared without saying so is a file that never goes away. */
+static void drop_inflight(const fdpass64_t* f) {
+    if (f->kind == FD64_FILE) ramfs64_unref_node(f->node);
+    else {
+        pipe64_unref(f->rx, 1, 0);
+        pipe64_unref(f->tx, 0, 1);
     }
 }
 
@@ -134,10 +148,7 @@ int pipe64_recv_fds(int p, fdpass64_t* out, int max) {
     /* Anything the receiver had no room for is dropped, and dropped
      * properly: Linux closes the surplus rather than leaving it in
      * flight, because the sender has already given it away. */
-    for (int k = n; k < b->n; k++) {
-        pipe64_unref(b->fds[k].rx, 1, 0);
-        pipe64_unref(b->fds[k].tx, 0, 1);
-    }
+    for (int k = n; k < b->n; k++) drop_inflight(&b->fds[k]);
 
     pipes[p].in_head = (pipes[p].in_head + 1) % PIPE64_INFLIGHT;
     pipes[p].in_count--;

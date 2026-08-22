@@ -91,6 +91,20 @@ int     ramfs64_resize(int node, uint64_t len);
  * makes "write a temporary and move it into place" atomic. */
 int     ramfs64_rename(const char* oldpath, const char* newpath);
 
+/* The physical frames backing a file, created on the first shared
+ * mapping (Milestone 78). A heap allocation cannot be shared between
+ * two address spaces; frames can, and the wineserver's session data has
+ * to be - it hands every client a descriptor and they all map it
+ * read-write. Returns 0 if the frames could not be had. */
+const uint64_t* ramfs64_frames(int node, uint64_t bytes, uint64_t* out_n);
+
+/* Open descriptors on a node. A file unlinked while open survives until
+ * the last one closes - which is how a program gets anonymous shared
+ * memory out of a filesystem, and what Wine does for every shared
+ * mapping: create, size, unlink, map. */
+void ramfs64_ref_node(int node);
+void ramfs64_unref_node(int node);
+
 /* unlink refuses a directory and rmdir refuses a non-empty one, which
  * is what lets a program tell "wrong kind of thing" from "still in
  * use". */

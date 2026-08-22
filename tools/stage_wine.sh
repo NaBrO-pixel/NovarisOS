@@ -76,10 +76,25 @@ done < <(find "$TREE/dlls" -name "*.so" -type f)
 # the client that follows reports "a wine server seems to be running,
 # but I cannot connect to it". Two misleading messages from one missing
 # 8KB directory.
+# Twice, because the server and the client work the path out
+# differently and both are right about their own layout. The server
+# looks in /usr/share/wine/nls. The client takes the directory of its
+# own /proc/self/exe - /usr/bin - and appends "../../share/wine/nls",
+# which is /share/wine/nls: that arithmetic expects the loader two
+# levels below the prefix, and this installation puts it in bin beside
+# its unix libraries because that is where the loader looks for *them*
+# (Milestone 71). Rather than move the loader and break that, the 8KB
+# is staged in both places.
+#
+# Getting this wrong is not a missing translation. uctable stays NULL
+# and the first ntdll_towupper reads through it - a null dereference in
+# a case conversion, a long way from anything about locales.
 if [ -d "$TREE/nls" ]; then
-    mkdir -p "$DEST/usr/share/wine/nls" || exit 1
-    cp "$TREE"/nls/*.nls "$DEST/usr/share/wine/nls/" 2>/dev/null
-    echo "stage_wine: $(ls "$DEST/usr/share/wine/nls" | wc -l) NLS tables"
+    for d in "$DEST/usr/share/wine/nls" "$DEST/share/wine/nls"; do
+        mkdir -p "$d" || exit 1
+        cp "$TREE"/nls/*.nls "$d/" 2>/dev/null
+    done
+    echo "stage_wine: $(ls "$DEST/usr/share/wine/nls" | wc -l) NLS tables, in both places"
 else
     echo "stage_wine: no nls directory at $TREE/nls" >&2
 fi

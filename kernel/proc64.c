@@ -2,6 +2,7 @@
 
 #include "proc64.h"
 #include "pipe64.h"
+#include "ramfs64.h"
 #include "kstring.h"
 
 static proc64_t procs[PROC64_MAX];
@@ -64,7 +65,10 @@ int proc64_fork_from(int pid) {
      * end of file with the writer still there. */
     for (int f = 0; f < PROC64_FD_MAX; f++) {
         child->fds[f] = parent->fds[f];
-        if (parent->fds[f].used && parent->fds[f].kind == FD64_PIPE) {
+        if (!parent->fds[f].used) continue;
+        if (parent->fds[f].kind == FD64_FILE) {
+            ramfs64_ref_node(parent->fds[f].node);
+        } else {
             pipe64_ref(parent->fds[f].rx, 1, 0);
             pipe64_ref(parent->fds[f].tx, 0, 1);
         }
