@@ -9267,6 +9267,130 @@ and `poll` proves it, because the whole server loop runs on the
 fallback.
 
 
+## Milestone 78 — shared memory, and four things that were not it ⚠️ PARTLY DONE
+
+**`wineboot -u` still does not exit**, so this milestone is not the one
+it was aimed at. What it is: five fixes, each found by making the
+previous one work, that take Wine from "the client and server exchange a
+handshake" to "the client and server share memory". Every one of them
+was a case where this kernel answered a question confidently and wrongly.
+
+### 1. writev only ever served stdout and stderr
+
+Everything else got `-EBADF`, on the reasoning that glibc's stdio was
+the only caller. The wineserver proved otherwise in the most expensive
+way available. Its `send_reply` writes a reply with `write` when the
+reply carries no extra data and with `writev` when it does — and a
+failed `writev` takes the branch that **kills the client's thread**.
+
+So every reply that fitted in the header worked, the whole prefix of
+Milestone 77 was built out of them, and the first reply with a payload
+attached silently ended the conversation, leaving wineboot blocked in
+`recvmsg` waiting for an answer from a thread that no longer existed.
+`write`, `writev`, `read` and `readv` now go through one pair of helpers,
+because the bug was not a missing feature: it was **two answers to one
+question**, where the same descriptor accepted a `write` and refused a
+`writev`.
+
+### 2. The NLS tables were staged where only the server looks
+
+With `writev` fixed the conversation went further and hit a null
+dereference in `ntdll_towupper` — a case conversion, a long way from
+anything about locales. `read_nls_file` had returned NULL and `uctable`
+stayed NULL.
+
+The server looks in `/usr/share/wine/nls`. The client takes the
+directory of its own `/proc/self/exe` and appends `../../share/wine/nls`,
+which with the loader in `/usr/bin` is `/share/wine/nls`. That
+arithmetic expects the loader two levels below the prefix; this
+installation puts it in `bin` beside its unix libraries because that is
+where the loader looks for *those* (Milestone 71). Rather than move the
+loader and break that, the 8KB is staged in both places.
+
+### 3. A writable shared file mapping was refused
+
+`mmap(..., MAP_SHARED|PROT_WRITE, fd)` returned `-ENODEV`, and the
+comment explaining why was a statement about storage rather than about
+meaning: a file lives in a heap allocation, which is not page aligned
+and cannot be mapped, so there was nothing to share.
+
+The wineserver needs what MAP_SHARED *means*. It hands every client a
+descriptor for its session data and all of them map it read-write and
+expect to see each other's stores. So a file now gets **physical frames**
+the first time anything maps it shared; the heap copy is released at that
+point, because two copies of a file's bytes is not a cache but a bug
+waiting for somebody to write to the wrong one.
+
+The reference counting falls out of Milestone 69: `pmm64_free_frame`
+drops an *owner* rather than the frame, so a mapping takes a reference
+and `munmap` releases it while the file keeps its contents.
+
+### 4. A file unlinked while open was freed immediately
+
+This one had been written down in advance. `ramfs64_unlink` said:
+
+> Freed immediately: nothing here reference counts. On Linux a file
+> unlinked while open survives until the last descriptor closes, and a
+> program relying on that reads freed memory here.
+
+Wine is that program, and it is not a corner case — it is how a program
+gets anonymous shared memory out of a filesystem:
+
+```
+openat("tmpmap-0eb884db", O_RDWR|O_CREAT|O_EXCL) = 19
+ftruncate(19, 0x1000)                            = 0
+unlink("tmpmap-0eb884db")                        = 0
+mmap(NULL, 0x1000, RW, MAP_SHARED, fd=19)        = -ENOMEM
+```
+
+After the unlink the only thing referring to the file is the descriptor.
+A node now counts its open descriptors: `unlink` takes the **name**
+away, and the storage goes when the last descriptor closes.
+
+That reference has to be taken everywhere a descriptor is copied —
+`open`, `dup`, `dup2`, `dup3`, `F_DUPFD`, `fork`, and `SCM_RIGHTS` —
+which is now one `fd_take_ref` rather than four hand-written copies,
+because getting one of them wrong looks like a file that vanished or a
+pipe that never reports end of file.
+
+### 5. MAP_FIXED was ignored for a shared mapping
+
+With the above, the mapping succeeded — at the wrong address. For this
+mapping that is worse than failing: Wine maps its shared user data at
+**`0x7ffe0000`**, Windows' `KUSER_SHARED_DATA`, an address compiled into
+every Windows program. A call that reports success somewhere else hands
+back a pointer nobody is ever going to look at.
+
+`0x7ffe0000` is inside Wine's own `0x7f000000`–`0x7fff0000` PROT_NONE
+reservation, so the pages already exist and belong to the process; the
+fixed path releases them rather than abandoning them before mapping the
+file's frames over the top.
+
+### What is measured
+
+- 20 differentials, 0 failures — the existing suite is green.
+- Wine uses `writev` and it succeeds (68, 140, 92, 176 bytes).
+- `3 shared maps made` in a full run, where the count had been 0.
+- `mmap(0x7ffe0000, ..., MAP_SHARED|MAP_FIXED, fd=7)` returns
+  **`0x7ffe0000`**.
+
+### What is not
+
+**There is no differential test for any of this yet**, and that is the
+first thing owed. The five fixes are covered only by the existing suite
+continuing to pass and by Wine getting further, which is evidence and
+not an assertion. A test for the two that matter — a file that survives
+being unlinked while open, and a store through one process's shared
+mapping being visible through another's — is the immediate next step,
+and it should be written before anything else is built on this.
+
+**And `wineboot -u` still does not exit.** The prefix currently reports
+4/7 rather than Milestone 77's 7/7, which is not a regression in the
+prefix: at 77 the client was blocked early and the *server's* periodic
+save wrote the registry, and now the client runs further and dies before
+that save happens. Where it dies is the next thing to find.
+
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
@@ -9329,11 +9453,14 @@ list, and it is shorter than the one above but not smaller:
    77. **A complete Wine prefix exists on this kernel**: registry, drive
    mapping and `drive_c/windows/system32`, 7/7 of the paths checked.
 
-   `wineboot -u` still does not *exit*: what it does after laying the
-   prefix down is start `services.exe` and `explorer.exe` and wait for
-   them, which would be the first **Windows** program this kernel runs
-   under Wine rather than a Unix one. That is the next milestone, and it
-   is the one the whole list has been pointing at.
+   `wineboot -u` still does not *exit*, and Milestone 78 did not change
+   that - it took five fixes to get from "the client and server exchange
+   a handshake" to "the client and server share memory", and each was
+   found by making the previous one work. What it does after laying the
+   prefix down is start `services.exe` and `explorer.exe`, which would
+   be the first **Windows** program this kernel runs under Wine rather
+   than a Unix one. That is still the next milestone, and it is the one
+   the whole list has been pointing at.
 2. ~~**Copy-on-write `fork`.**~~ - done in Milestone 69. An 8MB process
    forks for 14 frames.
 3. ~~**Keyboard and mouse.**~~ - done in Milestone 70, as
