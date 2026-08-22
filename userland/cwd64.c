@@ -193,6 +193,93 @@ int main(void)
     ok("and the target survives it",
        stat("drive_c/windows/system32/ntdll.dll", &st) == 0);
 
+    /* --- rename, which is how a file is replaced (Milestone 77) ---- */
+    /* Not a tidy-up of this test's subject but the same subject: a
+     * rename moves a node between directories, which is the child-list
+     * bookkeeping every assertion above depends on, seen from the one
+     * direction that changes it after the fact.
+     *
+     * The wineserver saves its registry this way - write a temporary,
+     * then move it into place - so that nobody ever reads a half-written
+     * registry. Without it wineboot writes reg30000.tmp and starts
+     * again, forever. */
+    {
+        int fd;
+        char rbuf[16];
+
+        fd = open("tmpfile", O_RDWR | O_CREAT | O_TRUNC, 0644);
+        ok("a temporary file", fd >= 0);
+        ok("with contents", write(fd, "final", 5) == 5);
+        close(fd);
+
+        ok("rename moves it", rename("tmpfile", "realfile") == 0);
+        ok("the old name is gone", stat("tmpfile", &st) < 0);
+        ok("the new name is there", stat("realfile", &st) == 0);
+
+        fd = open("realfile", O_RDONLY);
+        memset(rbuf, 0, sizeof(rbuf));
+        ok("and the contents came with it",
+           read(fd, rbuf, sizeof(rbuf)) == 5 && memcmp(rbuf, "final", 5) == 0);
+        close(fd);
+
+        /* Replacing an existing file is the case that matters: this is
+         * what "install the new registry over the old one" is. */
+        fd = open("tmpfile", O_RDWR | O_CREAT | O_TRUNC, 0644);
+        write(fd, "second", 6);
+        close(fd);
+        ok("rename over an existing file replaces it",
+           rename("tmpfile", "realfile") == 0);
+        fd = open("realfile", O_RDONLY);
+        memset(rbuf, 0, sizeof(rbuf));
+        ok("and the replacement is what is there",
+           read(fd, rbuf, sizeof(rbuf)) == 6 && memcmp(rbuf, "second", 6) == 0);
+        close(fd);
+
+        /* Into another directory, which is the part that exercises the
+         * move rather than the rename. */
+        ok("rename into another directory",
+           rename("realfile", "drive_c/moved") == 0);
+        ok("it is not where it was", stat("realfile", &st) < 0);
+        ok("and it is where it went", stat("drive_c/moved", &st) == 0);
+        ok("with its size intact", st.st_size == 6);
+
+        ok("renaming something that is not there is ENOENT",
+           rename("no_such_file", "anywhere") < 0 && errno == ENOENT);
+        ok("a directory cannot be renamed into itself",
+           rename("drive_c", "drive_c/inside") < 0);
+
+        ok("and it can be removed again", unlink("drive_c/moved") == 0);
+    }
+
+    /* --- ftruncate, both directions -------------------------------- */
+    {
+        int fd = open("trunc", O_RDWR | O_CREAT | O_TRUNC, 0644);
+        char tbuf[16];
+
+        ok("a file to resize", fd >= 0);
+        ok("with eight bytes", write(fd, "abcdefgh", 8) == 8);
+
+        ok("shrinking reports success", ftruncate(fd, 3) == 0);
+        ok("and the file is shorter", stat("trunc", &st) == 0 && st.st_size == 3);
+
+        /* Growing has to expose zeros, not whatever the allocator had.
+         * This heap hands back memory that was somebody else's file a
+         * moment ago, so "it happened to be zero" is not something to
+         * rely on. */
+        ok("growing reports success", ftruncate(fd, 8) == 0);
+        ok("and the file is longer again",
+           stat("trunc", &st) == 0 && st.st_size == 8);
+        lseek(fd, 0, SEEK_SET);
+        memset(tbuf, 0xFF, sizeof(tbuf));
+        ok("what it kept is what was there",
+           read(fd, tbuf, 8) == 8 && memcmp(tbuf, "abc", 3) == 0);
+        ok("and what it grew into reads as zeros",
+           tbuf[3] == 0 && tbuf[4] == 0 && tbuf[5] == 0 &&
+           tbuf[6] == 0 && tbuf[7] == 0);
+        close(fd);
+        ok("and it can be removed", unlink("trunc") == 0);
+    }
+
     /* --- what the kernel refuses --------------------------------- */
 
     ok("rmdir a non-empty directory fails",

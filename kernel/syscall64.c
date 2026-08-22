@@ -297,6 +297,7 @@ static void fd_release(int fd) {
  *
  * A deadline of 0 means "no timeout", which poll(-1) asks for. */
 static uint64_t wait_deadline[SCHED64_MAX_TASKS];
+static uint64_t wait_call[SCHED64_MAX_TASKS];
 static int      wait_pending[SCHED64_MAX_TASKS];
 
 static int wait_slot(void) {
@@ -324,6 +325,7 @@ static uint64_t wait_restart(const syscall64_args_t* args, uint64_t nr,
     int t = wait_slot();
 
     wait_deadline[t] = deadline;
+    wait_call[t]     = nr;
     wait_pending[t]  = 1;
 
     frame_from_args(args, nr, &self);
@@ -547,7 +549,20 @@ static uint64_t do_readlink(const char* given, char* buf, uint64_t size) {
 
 static uint64_t forks, execs, vforks;
 static uint64_t pipes_made, socketpairs_made, sockets_made;
-static uint64_t sendmsgs, recvmsgs, fds_passed;
+static uint64_t sendmsgs, recvmsgs, fds_passed, renames;
+
+/* The process a layer started, as opposed to anything it spawned. See
+ * syscall64_set_leader. */
+static int leader_pid = -1;
+
+/* A wall-clock bound on a run, in timer ticks, or 0. See
+ * syscall64_set_run_ticks. */
+static uint64_t run_deadline;
+static int      run_expired;
+static int      leader_exited;
+
+/* syscall64.s */
+extern void enter_user_mode64_abort(void) __attribute__((noreturn));
 static uint64_t last_fork_frames;
 
 static void frame_from_args(const syscall64_args_t* args, uint64_t rax,
@@ -705,6 +720,7 @@ uint64_t syscall64_sockets(void) { return sockets_made; }
 uint64_t syscall64_sendmsgs(void) { return sendmsgs; }
 uint64_t syscall64_recvmsgs(void) { return recvmsgs; }
 uint64_t syscall64_fds_passed(void) { return fds_passed; }
+uint64_t syscall64_renames(void) { return renames; }
 uint64_t syscall64_last_fork_frames(void) { return last_fork_frames; }
 
 /* The calling thread's complete user state, as a frame it could be
@@ -770,12 +786,69 @@ static int trace;
 
 void syscall64_set_trace(int on) { trace = on; }
 
+/* Which process a layer is actually waiting for.
+ *
+ * enter_user_mode64 returns when the *last* runnable task exits, which
+ * was right while every program this kernel ran was the only one. It
+ * stops being right the moment a program starts a daemon: wineboot
+ * finishes and the wineserver goes on polling for the next client
+ * forever, exactly as it is supposed to, so the run never ends and the
+ * layer never gets to report what happened.
+ *
+ * Naming the leader makes "the thing I started has finished" the end of
+ * the run, and leaves whatever it started behind - which is also what a
+ * shell does. -1 restores the old behaviour. */
+void syscall64_set_leader(int pid) { leader_pid = pid; leader_exited = 0; }
+
+/* Ends a run after `ticks` whether or not anything has finished.
+ *
+ * A layer that runs a real program cannot assume the program ends. This
+ * one runs wineboot, which starts a server that is *supposed* to keep
+ * running, and if wineboot itself stops making progress there is nothing
+ * to notice it - the machine looks exactly like a healthy idle system.
+ * The bound turns "it never finished" into a reported fact rather than a
+ * test that hangs, and it is checked at the syscall boundary because
+ * that is the only place this kernel is ever in.
+ *
+ * 0 disables it. */
+void syscall64_set_run_ticks(uint64_t ticks) {
+    run_deadline = ticks ? clock64_ticks() + ticks : 0;
+    /* Only an armed watchdog clears the verdict. Clearing it on disarm
+     * as well threw away the answer: the layer disarms before it reports,
+     * so a run that had just timed out described itself as having ended
+     * on its own. */
+    if (ticks) run_expired = 0;
+}
+
+int syscall64_run_expired(void) { return run_expired; }
+int syscall64_leader_exited(void) { return leader_exited; }
+
 static uint64_t dispatch(syscall64_args_t* args);
 
 uint64_t syscall64_dispatch(syscall64_args_t* args) {
     uint64_t r;
 
+    if (run_deadline && clock64_ticks() > run_deadline) {
+        run_expired = 1;
+        run_deadline = 0;
+        serial64_puts("\nNOVARIS64: *** the run reached its time limit\n");
+        enter_user_mode64_abort();                     /* never returns */
+    }
+
     if (!trace) return dispatch(args);
+
+    /* A call that is being restarted is not a new call, and printing it
+     * again says nothing that the first line did not. It matters here
+     * rather than being tidiness: the wineserver's idle loop is a poll
+     * with a thirty-second timeout, and a timeout is reached by leaving
+     * and coming back - thousands of times. Traced, one idle server
+     * produced a hundred megabytes of log saying the same thing.
+     *
+     * The first entry is traced, and the line is finished by whatever
+     * the call eventually returns, so a restarted call still reads as
+     * one call with one answer. */
+    if (wait_started() && args->nr == wait_call[wait_slot()])
+        return dispatch(args);
 
     serial64_puts("NOVARIS64: [call] ");
     serial64_putdec(args->nr);
@@ -2085,6 +2158,50 @@ static uint64_t dispatch(syscall64_args_t* args) {
     case SYS64_UMASK:
         return 0;
 
+    /* rename(old, new), and renameat with the working directory.
+     *
+     * This is how a program replaces a file without anybody ever seeing
+     * it half written - write a temporary, then move it into place in
+     * one step. The wineserver saves its registry that way, and without
+     * it wineboot writes reg30000.tmp, cannot install it, and never
+     * finishes. */
+    case SYS64_RENAME:
+    case SYS64_RENAMEAT: {
+        char oldp[PROC64_PATH_MAX], newp[PROC64_PATH_MAX];
+        const char* o = (const char*)(nr == SYS64_RENAME ? a1 : a2);
+        const char* n = (const char*)(nr == SYS64_RENAME ? a2 : args->a4);
+        int64_t e;
+
+        if (nr == SYS64_RENAMEAT) {
+            /* Answered for the case that occurs - AT_FDCWD, or an
+             * absolute path where the dirfd is ignored by definition -
+             * rather than resolved against the wrong directory. */
+            if ((int64_t)(int32_t)a1 != AT_FDCWD_ && o && o[0] != '/')
+                return (uint64_t)-9;
+            if ((int64_t)(int32_t)a3 != AT_FDCWD_ && n && n[0] != '/')
+                return (uint64_t)-9;
+        }
+        if ((e = abs_path(o, oldp)) != 0) return (uint64_t)e;
+        if ((e = abs_path(n, newp)) != 0) return (uint64_t)e;
+        renames++;
+        return (uint64_t)(int64_t)ramfs64_rename(oldp, newp);
+    }
+
+    case SYS64_FTRUNCATE:
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind != FD64_FILE) return (uint64_t)-22;   /* -EINVAL */
+        return (uint64_t)(int64_t)ramfs64_resize(fds[a1].node, a2);
+
+    case SYS64_TRUNCATE: {
+        char path[PROC64_PATH_MAX];
+        int64_t e = abs_path((const char*)a1, path);
+        int node;
+        if (e) return (uint64_t)e;
+        node = ramfs64_lookup(path);
+        if (node < 0) return (uint64_t)-2;
+        return (uint64_t)(int64_t)ramfs64_resize(node, a2);
+    }
+
     /* --- time ------------------------------------------------------- *
      *
      * The epoch here is when the timer was installed, not 1970, and
@@ -2620,6 +2737,15 @@ static uint64_t dispatch(syscall64_args_t* args) {
             vfork_release(me);
             close_all_files();
             proc64_exit(proc64_current_pid(), (int)a1);
+
+            /* The program the layer was waiting for. Whatever else is
+             * still running was started by it and is not what the layer
+             * asked about. */
+            if (leader_pid >= 0 && proc64_current_pid() == leader_pid) {
+                exit_code     = a1;
+                leader_exited = 1;
+                enter_user_mode64_abort();             /* never returns */
+            }
             /* A parent blocked in wait4 is waiting on exactly this. */
             if (parent) sched64_wake(PROC64_WAIT_KEY(parent),
                                      SCHED64_MAX_TASKS);

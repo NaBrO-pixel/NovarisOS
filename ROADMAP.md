@@ -9139,6 +9139,134 @@ to it, and be handed handles by it, which is everything the Windows side
 needed from the Unix side to begin.
 
 
+## Milestone 77 — the prefix, finished ✅ DONE
+
+`rename`, `ftruncate`, and the two pieces of machinery a layer needs
+before it can run a program that starts a daemon. **`wineboot -u`
+creates a complete Wine prefix on this kernel**: the registry, the drive
+mapping, and `drive_c/windows/system32`.
+
+### rename, which is how a file is replaced
+
+A program that must never be caught half-written writes a temporary and
+moves it into place in one step. The wineserver saves its registry that
+way, and without `rename` it wrote `reg30000.tmp`, failed to install it,
+and started again — forever, while looking exactly like a healthy idle
+server.
+
+`ramfs64_rename` moves the **node**, rather than copying it. Its
+contents are not touched and its identity does not change, which is what
+makes the replacement atomic from outside and what a program holding the
+file open expects. The awkward parts are the ones that turn a failed
+rename into a lost tree, so they are refused explicitly: replacing a
+directory with a file or the reverse, replacing a non-empty directory,
+and moving a directory into its own subtree — that last one builds a
+loop with no path back to the root, which every walk in `ramfs64.c`
+would follow forever.
+
+`ftruncate` sets a length either way. Growing has to **zero what it
+exposes**: those bytes were never written by anybody, and this heap
+hands back memory that was somebody else's file a moment ago, so "it
+happened to be zero" is not something to rely on.
+
+Both went into `userland/cwd64.c` rather than a layer of their own. They
+are the same subject as everything else there — a rename moves a node
+between directories, which is the child-list bookkeeping that test
+already exists to check, seen from the one direction that changes it
+after the fact.
+
+### The run has to be able to end
+
+Two things were wrong with how this tree runs a program, and neither
+showed up until a program started a *server*.
+
+**`enter_user_mode64` returns when the last runnable task exits.** That
+was right while every program was the only one. wineboot starts the
+wineserver, and a wineserver that has done its job goes on polling for
+the next client forever — exactly as it should. So the run never ended
+and the layer never got to report anything. `syscall64_set_leader` names
+the process the layer is actually waiting for; whatever that process
+started is left behind, which is also what a shell does.
+
+**And a program might not finish at all.** With a daemon in the picture,
+a wineboot that stopped making progress looks identical to a healthy
+idle system — there is nothing to notice it. `syscall64_set_run_ticks`
+bounds the run, so "it never finished" becomes a reported fact rather
+than a test that hangs.
+
+Getting that reporting *right* took two corrections worth recording,
+because both produced a number that reads like an answer and is not:
+
+- Disarming the watchdog cleared its verdict, and the layer disarms
+  before it reports — so a run that had just timed out described itself
+  as having ended on its own.
+- The exit code after a timed-out run is whatever the last process to
+  end happened to return. It is only wineboot's if wineboot exited, so
+  the layer now says which.
+
+### One idle server produced a hundred megabytes of log
+
+The wineserver's idle loop is `poll(fds, n, 30000)`, and since Milestone
+76 a timeout is reached by leaving the kernel and coming back — thousands
+of times. Every one of those was traced. A restarted call is not a new
+call, so it is not traced again; the first entry still gets its line, and
+that line is finished by whatever the call eventually returns. The same
+run went from 134MB to under 100KB.
+
+### What the prefix contains
+
+Reported path by path rather than as one line saying "exists", because a
+prefix that got as far as its own root directory and no further is not a
+prefix and one word cannot tell the difference:
+
+```
+prefix = yes /root/.wine
+prefix = yes /root/.wine/system.reg
+prefix = yes /root/.wine/user.reg
+prefix = yes /root/.wine/userdef.reg
+prefix = yes /root/.wine/dosdevices/c:
+prefix = yes /root/.wine/drive_c/windows
+prefix = yes /root/.wine/drive_c/windows/system32
+prefix = 7/7 present, 239 nodes, run timed out
+```
+
+All three registry files are written by the wineserver into temporary
+files and installed with `rename`, and all three renames return 0.
+
+| removed | what failed |
+| --- | --- |
+| `rename` detaching from the old parent | the run **hung** — a node in two child lists is a loop, and every walk follows it |
+| growing a file zeroing what it exposes | `and what it grew into reads as zeros` |
+
+331 assertions, 20 differentials, 0 failures, green at 2G and 6G.
+
+### Where Wine stops now, stated exactly
+
+**`wineboot -u` does not exit.** The prefix it was asked to create is
+complete and correct, and after five minutes of emulated time wineboot
+is still running — so the milestone's claim is "the prefix exists",
+which is measured, and not "wineboot succeeded", which is not.
+
+That distinction is the reason the reporting above was worth fixing. An
+earlier version of this layer printed `wineboot exit= 0` after exactly
+this run. It was not wineboot's exit code; it was the last value any
+process happened to return, read out of a variable nobody had cleared.
+It would have been believed.
+
+What is left is what `wineboot -u` does *after* laying the prefix down:
+it starts `services.exe`, and `explorer.exe`, and waits for them. That
+is the first time this kernel would run a **Windows** program under Wine
+rather than a Unix one, which is a milestone rather than a syscall.
+
+Twenty calls are still unimplemented in a full run. The ones with
+plausible bearing on this are `sched_getaffinity` (204, the last one
+asked for), `sigaltstack` (131, Wine's exception handling) and
+`fstatfs` (138); the rest — `epoll_create`, `prlimit64`, `rseq`,
+`clone3`, `setpriority`, `userfaultfd` — Wine already falls back from,
+and `poll` proves it, because the whole server loop runs on the
+fallback.
+
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
@@ -9197,9 +9325,15 @@ list, and it is shorter than the one above but not smaller:
    to it, and is handed handles by it. The version handshake matches and
    the wineserver serves requests.
 
-   It now stops on `rename`, saving the registry - ordinary filesystem
-   work rather than plumbing. `rename` and `ftruncate` are the shortest
-   remaining step before `wineboot -u` can finish.
+   ~~It now stops on `rename`, saving the registry~~ - done in Milestone
+   77. **A complete Wine prefix exists on this kernel**: registry, drive
+   mapping and `drive_c/windows/system32`, 7/7 of the paths checked.
+
+   `wineboot -u` still does not *exit*: what it does after laying the
+   prefix down is start `services.exe` and `explorer.exe` and wait for
+   them, which would be the first **Windows** program this kernel runs
+   under Wine rather than a Unix one. That is the next milestone, and it
+   is the one the whole list has been pointing at.
 2. ~~**Copy-on-write `fork`.**~~ - done in Milestone 69. An 8MB process
    forks for 14 frames.
 3. ~~**Keyboard and mouse.**~~ - done in Milestone 70, as

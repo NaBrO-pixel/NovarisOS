@@ -468,6 +468,96 @@ int ramfs64_truncate(int node) {
     return 0;
 }
 
+/* ftruncate(2): set a file's length, either way.
+ *
+ * Growing has to zero what it exposes. The bytes between the old end and
+ * the new one were never written by anybody, so they must read as zeros
+ * rather than as whatever the allocation happened to contain - and this
+ * heap hands back memory that was somebody else's file a moment ago. */
+int ramfs64_resize(int node, uint64_t len) {
+    if (!valid(node)) return -9;                    /* -EBADF */
+    if (nodes[node].is_dir) return -21;             /* -EISDIR */
+
+    if (len > nodes[node].size) {
+        if (!ensure_capacity(&nodes[node], len)) return -28;   /* -ENOSPC */
+        kmemset(nodes[node].data + nodes[node].size, 0,
+                len - nodes[node].size);
+    }
+    nodes[node].size = len;
+    return 0;
+}
+
+/* rename(2), which is how a program replaces a file without anybody ever
+ * seeing it half written: write a temporary, then move it into place in
+ * one step. The wineserver saves its registry exactly that way, and
+ * without this it writes reg30000.tmp, fails to install it, and starts
+ * again - so `wineboot -u` never finishes.
+ *
+ * The node itself moves. Its contents are not copied and its identity
+ * does not change, which is what makes the replacement atomic from
+ * outside and what a program holding the file open expects. */
+int ramfs64_rename(const char* oldpath, const char* newpath) {
+    char component[RAMFS64_NAME_MAX];
+    int src, dst_parent, existing;
+
+    src = ramfs64_lookup_nofollow(oldpath);
+    if (src < 0) return -2;                         /* -ENOENT */
+    if (src == ROOT) return -16;                    /* -EBUSY */
+
+    dst_parent = walk(newpath, 1, 1, component);
+    if (dst_parent < 0) return -2;
+
+    existing = find_child(dst_parent, component,
+                          kstrnlen(component, RAMFS64_NAME_MAX));
+    if (existing == src) return 0;                  /* the same name */
+
+    if (existing >= 0) {
+        /* Linux refuses to replace a directory with a file or the other
+         * way round, and refuses a non-empty directory either way.
+         * Answering those wrongly turns a failed rename into a lost
+         * tree. */
+        if (nodes[existing].is_dir != nodes[src].is_dir)
+            return nodes[existing].is_dir ? -21 : -20;   /* EISDIR/ENOTDIR */
+        if (nodes[existing].is_dir && nodes[existing].first_child >= 0)
+            return -39;                             /* -ENOTEMPTY */
+        if (nodes[existing].data) kfree64(nodes[existing].data);
+        nodes[existing].data = 0;
+        free_node(existing);
+    }
+
+    /* A directory cannot be moved into itself or into its own subtree:
+     * the result is a loop with no path back to the root, which every
+     * walk in this file would follow forever. */
+    if (nodes[src].is_dir) {
+        for (int a = dst_parent; a >= 0; a = nodes[a].parent) {
+            if (a == src) return -22;               /* -EINVAL */
+            if (a == ROOT) break;
+        }
+    }
+
+    /* Out of the old parent's child list. free_node does this too, but
+     * it also frees the node - here the node is the thing being kept. */
+    {
+        int op = nodes[src].parent;
+        if (op >= 0 && op < RAMFS64_MAX_NODES) {
+            int c = nodes[op].first_child;
+            if (c == src) {
+                nodes[op].first_child = nodes[src].next_sibling;
+            } else {
+                while (c >= 0 && nodes[c].next_sibling != src)
+                    c = nodes[c].next_sibling;
+                if (c >= 0) nodes[c].next_sibling = nodes[src].next_sibling;
+            }
+        }
+    }
+
+    kstrlcpy(nodes[src].name, component, RAMFS64_NAME_MAX);
+    nodes[src].parent       = dst_parent;
+    nodes[src].next_sibling = nodes[dst_parent].first_child;
+    nodes[dst_parent].first_child = src;
+    return 0;
+}
+
 static int has_children(int dir) {
     return valid(dir) && nodes[dir].first_child >= 0;
 }
