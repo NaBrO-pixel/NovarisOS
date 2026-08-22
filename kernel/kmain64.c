@@ -3590,6 +3590,18 @@ void kernel_main(uint32_t magic, void* mbi) {
                 pf_diagnose = 1;
                 syscall64_set_trace(1);
 
+                /* End the run when wineboot finishes, not when the last
+                 * process does. wineboot starts the wineserver, and a
+                 * wineserver that has done its job goes on polling for
+                 * the next client forever - which is correct, and which
+                 * without this means the run never ends and nothing
+                 * below ever prints. */
+                syscall64_set_leader(pid);
+                /* And a bound, because wineboot might not finish. Five
+                 * minutes of emulated time - the server's own idle
+                 * timeout is thirty seconds, so this is ten of them. */
+                syscall64_set_run_ticks(300u * CLOCK64_HZ);
+
                 /* The timer, for the same reason as the layer above and
                  * with a sharper edge: the wineserver's main loop is
                  * poll(fds, n, 30000), and a poll timeout is a deadline.
@@ -3603,6 +3615,8 @@ void kernel_main(uint32_t magic, void* mbi) {
                 vmspace64_switch(&kspace);
 
                 idt64_irq_set_mask(0, 1);
+                syscall64_set_leader(-1);
+                syscall64_set_run_ticks(0);
                 syscall64_set_trace(0);
                 pf_diagnose = 0;
                 serial64_puts("NOVARIS64: --- end ---\n");
@@ -3613,8 +3627,16 @@ void kernel_main(uint32_t magic, void* mbi) {
              * the useful output is the distance travelled, not a
              * pass/fail - an assertion here would only record which
              * step it died on. */
-            serial64_puts("NOVARIS64: wineboot exit= ");
-            serial64_putdec(syscall64_exit_code());
+            /* Only if it really exited. After a timed-out run the exit
+             * code is whatever the last process to end happened to
+             * return - a number that reads like an answer and is not. */
+            serial64_puts("NOVARIS64: wineboot ");
+            if (syscall64_leader_exited()) {
+                serial64_puts("exit= ");
+                serial64_putdec(syscall64_exit_code());
+            } else {
+                serial64_puts("did not exit (still running when the run ended)");
+            }
             serial64_puts(", enosys ");
             serial64_putdec(syscall64_unimplemented_count() - enosys_before);
             serial64_puts(", last ");
@@ -3623,14 +3645,42 @@ void kernel_main(uint32_t magic, void* mbi) {
             serial64_putdec(ramfs64_count());
             serial64_putc('\n');
 
-            serial64_puts("NOVARIS64: prefix  = ");
-            serial64_puts(ramfs64_lookup("/root/.wine") >= 0
-                          ? "/root/.wine exists" : "not created");
-            serial64_puts(", system32 ");
-            serial64_puts(ramfs64_lookup(
-                "/root/.wine/drive_c/windows/system32") >= 0
-                          ? "exists" : "absent");
-            serial64_putc('\n');
+            /* What is actually in it, path by path, rather than
+             * whether the top directory exists. A prefix that got as far
+             * as its own root directory and no further is not a prefix,
+             * and one line saying "exists" cannot tell the difference. */
+            {
+                static const char* const want[] = {
+                    "/root/.wine",
+                    "/root/.wine/system.reg",
+                    "/root/.wine/user.reg",
+                    "/root/.wine/userdef.reg",
+                    "/root/.wine/dosdevices/c:",
+                    "/root/.wine/drive_c/windows",
+                    "/root/.wine/drive_c/windows/system32",
+                    0
+                };
+                int have = 0, total = 0;
+                for (int w = 0; want[w]; w++) {
+                    int there = ramfs64_lookup(want[w]) >= 0;
+                    total++;
+                    if (there) have++;
+                    serial64_puts("NOVARIS64: prefix  = ");
+                    serial64_puts(there ? "yes " : "NO  ");
+                    serial64_puts(want[w]);
+                    serial64_putc('\n');
+                }
+                serial64_puts("NOVARIS64: prefix  = ");
+                serial64_putdec(have);
+                serial64_putc('/');
+                serial64_putdec(total);
+                serial64_puts(" present, ");
+                serial64_putdec(ramfs64_count());
+                serial64_puts(" nodes, run ");
+                serial64_puts(syscall64_run_expired() ? "timed out"
+                                                      : "ended on its own");
+                serial64_putc('\n');
+            }
         }
     }
 

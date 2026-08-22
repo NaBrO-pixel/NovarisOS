@@ -135,6 +135,10 @@ typedef struct {
 #define SYS64_FCHMOD      91
 #define SYS64_SETSID      112
 #define SYS64_UMASK       95
+#define SYS64_RENAME      82
+#define SYS64_RENAMEAT    264
+#define SYS64_FTRUNCATE   77
+#define SYS64_TRUNCATE    76
 
 /* Time. The epoch is when the timer started, not 1970 - see clock64.h. */
 #define SYS64_GETTIMEOFDAY   96
@@ -354,5 +358,22 @@ uint64_t syscall64_sockets(void);
 uint64_t syscall64_sendmsgs(void);
 uint64_t syscall64_recvmsgs(void);
 uint64_t syscall64_fds_passed(void);
+uint64_t syscall64_renames(void);
+
+/* Ends a run when this process exits rather than when the last one
+ * does, so a layer can run a program that leaves a daemon behind. -1
+ * for the old behaviour. */
+void syscall64_set_leader(int pid);
+
+/* Ends a run after this many timer ticks whether or not anything
+ * finished, so that "it never finished" is a reported fact rather than a
+ * test that hangs. 0 disables. */
+void syscall64_set_run_ticks(uint64_t ticks);
+int  syscall64_run_expired(void);
+
+/* Did the leader actually exit? Without this the exit code reported
+ * after a timed-out run is whatever the last process to exit happened to
+ * return - a number that looks like an answer and is not. */
+int  syscall64_leader_exited(void);
 
 #endif

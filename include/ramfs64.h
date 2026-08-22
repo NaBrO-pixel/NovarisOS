@@ -82,6 +82,15 @@ int64_t ramfs64_write(int node, uint64_t offset, const void* buf,
                       uint64_t len);
 int     ramfs64_truncate(int node);
 
+/* ftruncate(2): set the length either way, zeroing anything growing
+ * exposes. */
+int     ramfs64_resize(int node, uint64_t len);
+
+/* rename(2). The node moves rather than being copied, so a program
+ * holding the file open keeps holding the same file - which is what
+ * makes "write a temporary and move it into place" atomic. */
+int     ramfs64_rename(const char* oldpath, const char* newpath);
+
 /* unlink refuses a directory and rmdir refuses a non-empty one, which
  * is what lets a program tell "wrong kind of thing" from "still in
  * use". */
