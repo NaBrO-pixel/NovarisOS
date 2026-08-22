@@ -9374,15 +9374,41 @@ file's frames over the top.
 - `mmap(0x7ffe0000, ..., MAP_SHARED|MAP_FIXED, fd=7)` returns
   **`0x7ffe0000`**.
 
-### What is not
+### The test
 
-**There is no differential test for any of this yet**, and that is the
-first thing owed. The five fixes are covered only by the existing suite
-continuing to pass and by Wine getting further, which is evidence and
-not an assertion. A test for the two that matter — a file that survives
-being unlinked while open, and a store through one process's shared
-mapping being visible through another's — is the immediate next step,
-and it should be written before anything else is built on this.
+`userland/shm64.c` — 24 assertions, exit 119 — and the thing worth
+saying about it is why half of it runs after a `fork`.
+
+**A private copy satisfies every read and write a single process can
+make.** So a MAP_SHARED that quietly handed one back would pass any
+amount of testing done in one process, and the only thing that can tell
+the difference is a second process. The assertions that matter are
+therefore: the child sees a store the parent made through *its* mapping
+before forking, and the parent sees — after the child has exited — both
+a store the child made through its mapping and one the child made
+through the inherited descriptor. That last pair is deliberate: it says
+both routes reach the same bytes, which is what "the frames are the
+file" has to mean once the heap copy is released.
+
+The unlink half is tested as part of the same idiom rather than
+separately, because that is how it is used: create, size, **unlink**,
+map — with `fstat`, `pread`, `pwrite` and `ftruncate` all exercised
+*after* the name is gone, every one of which read freed memory before.
+And a fixed shared mapping is placed over the middle of a PROT_NONE
+reservation, mirroring what Wine does at `KUSER_SHARED_DATA`, asserting
+the address that comes back is the one asked for.
+
+| removed | what failed |
+| --- | --- |
+| `unlink` keeping an open file | `at the size it had`, and every access after |
+| the shared mapping, back to a private copy | the three **cross-process** assertions, and nothing else |
+| `MAP_FIXED` honoured | `at exactly the address asked for` |
+
+The middle row is the one to remember. Answering MAP_SHARED with a copy
+broke only the assertions that involve two processes; everything a
+single process could check still passed.
+
+336 assertions, 21 differentials, 0 failures, green at 2G and 6G.
 
 **And `wineboot -u` still does not exit.** The prefix currently reports
 4/7 rather than Milestone 77's 7/7, which is not a regression in the
