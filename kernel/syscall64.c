@@ -245,6 +245,21 @@ static int fd_is_stream(int fd) {
  * and a pipe with no writers left makes the next read return 0, which is
  * how a client notices the server is. Forget this and both sides wait
  * for each other forever - a hang with nothing in the log. */
+/* A descriptor has just been copied into `fd`. Whatever it refers to now
+ * has one more name, and everything that counts names has to hear about
+ * it - which is the whole list, because getting it wrong in one place
+ * looks like a file that vanished or a pipe that never reports end of
+ * file. */
+static void fd_take_ref(int fd) {
+    if (fd < 0 || fd >= FD_MAX || !fds[fd].used) return;
+    if (fds[fd].kind == FD64_FILE) {
+        ramfs64_ref_node(fds[fd].node);
+    } else {
+        pipe64_ref(fds[fd].rx, 1, 0);
+        pipe64_ref(fds[fd].tx, 0, 1);
+    }
+}
+
 static void fd_release(int fd) {
     if (fd < 0 || fd >= FD_MAX || !fds[fd].used) return;
 
@@ -260,6 +275,9 @@ static void fd_release(int fd) {
         sock64_destroy(s);
         fds[fd].sock = -1;
     }
+    if (fds[fd].kind == FD64_FILE && fds[fd].node >= 0)
+        ramfs64_unref_node(fds[fd].node);
+
     if (fd_is_stream(fd)) {
         int rx = fds[fd].rx, tx = fds[fd].tx;
         pipe64_unref(rx, 1, 0);
@@ -418,6 +436,69 @@ static int64_t do_pipe_read(const syscall64_args_t* args, uint64_t nr,
     return 0;
 }
 
+/* Writing to one descriptor, whatever it turns out to be.
+ *
+ * Factored out because write and writev must not be able to disagree.
+ * They did: writev served only stdout and stderr, so the same
+ * descriptor accepted a write and refused a writev, which is not a
+ * missing feature but two answers to one question.
+ *
+ * `buf` is a ring-3 pointer dereferenced directly - the kernel runs in
+ * the caller's address space - and it is unchecked, which is the honest
+ * state of this ABI.
+ */
+static int64_t fd_write_bytes(uint64_t fd, const char* buf, uint64_t n) {
+    if (fd >= 3) {
+        int64_t w;
+        if (fd >= FD_MAX || !fds[fd].used) return -9;  /* -EBADF */
+        if (fd_is_stream((int)fd)) return do_pipe_write((int)fd, buf, n);
+        if (fds[fd].kind == FD64_SOCKET) return -107;  /* -ENOTCONN */
+        /* /dev/null takes everything and keeps none of it. */
+        if (ramfs64_device(fds[fd].node) == RAMFS64_DEV_NULL)
+            return (int64_t)n;
+        w = ramfs64_write(fds[fd].node, fds[fd].pos, buf, n);
+        if (w > 0) fds[fd].pos += (uint64_t)w;
+        return w;
+    }
+
+    /* 0-2 are never allocated, so stdout and stderr are told apart by
+     * number rather than by a table entry. */
+    if (fd != 1 && fd != 2) return -9;
+    for (uint64_t i = 0; i < n; i++) serial64_putc(buf[i]);
+    bytes_written += n;
+    return (int64_t)n;
+}
+
+/* And reading from one. `nr` is the call to restart as if this blocks -
+ * see do_pipe_read. */
+static int64_t fd_read_bytes(const syscall64_args_t* args, uint64_t nr,
+                             uint64_t fd, void* buf, uint64_t n) {
+    int64_t r;
+    int dev;
+
+    if (fd < 3) return 0;                              /* stdin: end of file */
+    if (fd >= FD_MAX || !fds[fd].used) return -9;
+
+    if (fd_is_stream((int)fd))
+        return do_pipe_read(args, nr, (int)fd, buf, n);
+    if (fds[fd].kind == FD64_SOCKET) return -107;      /* -ENOTCONN */
+
+    dev = ramfs64_device(fds[fd].node);
+    if (dev == RAMFS64_DEV_NULL) return 0;             /* end of file */
+
+    /* An input device is a stream of events, not a file with a
+     * position: there is no offset to advance and nothing to seek to.
+     * Whole records only, which is evdev's contract - a reader that got
+     * half a struct would resynchronise by guessing. */
+    if (dev == RAMFS64_DEV_KBD || dev == RAMFS64_DEV_MOUSE)
+        return input64_read(dev == RAMFS64_DEV_KBD ? INPUT64_KBD
+                                                   : INPUT64_MOUSE, buf, n);
+
+    r = ramfs64_read(fds[fd].node, fds[fd].pos, buf, n);
+    if (r > 0) fds[fd].pos += (uint64_t)r;
+    return r;
+}
+
 static uint64_t do_open(const char* path, uint64_t flags, uint32_t mode) {
     int node = ramfs64_lookup(path);
     int fd;
@@ -436,6 +517,7 @@ static uint64_t do_open(const char* path, uint64_t flags, uint32_t mode) {
 
     fds[fd].kind     = FD64_FILE;
     fds[fd].node     = node;
+    ramfs64_ref_node(node);
     fds[fd].pos      = (flags & O_APPEND) ? ramfs64_size(node) : 0;
     fds[fd].rx       = -1;
     fds[fd].tx       = -1;
@@ -549,7 +631,7 @@ static uint64_t do_readlink(const char* given, char* buf, uint64_t size) {
 
 static uint64_t forks, execs, vforks;
 static uint64_t pipes_made, socketpairs_made, sockets_made;
-static uint64_t sendmsgs, recvmsgs, fds_passed, renames;
+static uint64_t sendmsgs, recvmsgs, fds_passed, renames, shared_maps;
 
 /* The process a layer started, as opposed to anything it spawned. See
  * syscall64_set_leader. */
@@ -721,6 +803,7 @@ uint64_t syscall64_sendmsgs(void) { return sendmsgs; }
 uint64_t syscall64_recvmsgs(void) { return recvmsgs; }
 uint64_t syscall64_fds_passed(void) { return fds_passed; }
 uint64_t syscall64_renames(void) { return renames; }
+uint64_t syscall64_shared_maps(void) { return shared_maps; }
 uint64_t syscall64_last_fork_frames(void) { return last_fork_frames; }
 
 /* The calling thread's complete user state, as a frame it could be
@@ -1086,56 +1169,58 @@ static uint64_t dispatch(syscall64_args_t* args) {
     }
 
     switch (nr) {
-    case SYS64_WRITE: {
-        /* write(fd, buf, count). `buf` is a ring-3 pointer, and it is
-         * dereferenced directly because the kernel is running in the
-         * caller's address space - the high half is shared, so a syscall
-         * never had to leave the space it was called from.
-         *
-         * It is also completely unchecked, which is the honest state of
-         * this ABI: a real implementation validates that the range is
-         * mapped and belongs to the caller before touching it, and does
-         * so without racing the caller. Nothing here does that yet. */
-        const char* buf = (const char*)a2;
-        uint64_t n = a3;
+    case SYS64_WRITE:
+        return (uint64_t)fd_write_bytes(a1, (const char*)a2, a3);
 
-        /* A real file descriptor goes to the filesystem; 1 and 2 are the
-         * serial port. Nothing here has a descriptor table entry for
-         * stdout, so the two cases are told apart by number. */
-        if (a1 >= 3) {
-            int64_t w;
-            if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
-            if (fd_is_stream(a1)) return (uint64_t)do_pipe_write(a1, buf, n);
-            if (fds[a1].kind == FD64_SOCKET) return (uint64_t)-107;  /* -ENOTCONN */
-            /* /dev/null takes everything and keeps none of it. Wine
-             * opens it before anything else, to guarantee that the
-             * three standard descriptors are open. */
-            if (ramfs64_device(fds[a1].node) == RAMFS64_DEV_NULL) return n;
-            w = ramfs64_write(fds[a1].node, fds[a1].pos, buf, n);
-            if (w > 0) fds[a1].pos += (uint64_t)w;
-            return (uint64_t)w;
-        }
-
-        if (a1 != 1 && a1 != 2) return (uint64_t)-9;   /* -EBADF */
-        if (a1 != 1 && a1 != 2) return (uint64_t)-1;   /* stdout/stderr */
-        for (uint64_t i = 0; i < n; i++) serial64_putc(buf[i]);
-        bytes_written += n;
-        return n;
-    }
-    /* writev(fd, iov, iovcnt) - glibc's stdio uses this rather than
-     * write() as soon as it has a buffer to flush. */
+    /* writev(fd, iov, iovcnt).
+     *
+     * This used to serve stdout and stderr and answer -EBADF for
+     * anything else, on the reasoning that glibc's stdio was the only
+     * thing that ever used it. The wineserver is the thing that proved
+     * otherwise, and it did so in the most expensive way available: its
+     * send_reply writes a reply with `write` when the reply carries no
+     * extra data and with `writev` when it does, and a failed writev
+     * takes the branch that kills the client's thread. So every reply
+     * that fitted in the header worked, the prefix was built out of
+     * them, and the first reply with a payload attached silently ended
+     * the conversation - leaving wineboot blocked in recvmsg waiting
+     * for an answer from a thread the server had already killed. */
     case SYS64_WRITEV: {
-        const struct { const char* base; uint64_t len; }* iov =
-            (const void*)a2;
-        uint64_t total = 0;
-        if (a1 != 1 && a1 != 2) return (uint64_t)-9;   /* -EBADF */
+        const iovec64_t* iov = (const iovec64_t*)a2;
+        int64_t total = 0;
+
+        if (!iov && a3) return (uint64_t)-14;          /* -EFAULT */
         for (uint64_t i = 0; i < a3; i++) {
-            for (uint64_t j = 0; j < iov[i].len; j++)
-                serial64_putc(iov[i].base[j]);
-            total += iov[i].len;
+            int64_t w;
+            if (!iov[i].iov_len) continue;
+            w = fd_write_bytes(a1, (const char*)iov[i].iov_base,
+                               iov[i].iov_len);
+            /* An error on the first vector is the call's error; after
+             * that, what has already gone is the answer. */
+            if (w < 0) return total ? (uint64_t)total : (uint64_t)w;
+            total += w;
+            if ((uint64_t)w < iov[i].iov_len) break;   /* a short write */
         }
-        bytes_written += total;
-        return total;
+        return (uint64_t)total;
+    }
+
+    /* readv(fd, iov, iovcnt), for the same reason and by the same
+     * route. */
+    case SYS64_READV: {
+        const iovec64_t* iov = (const iovec64_t*)a2;
+        int64_t total = 0;
+
+        if (!iov && a3) return (uint64_t)-14;
+        for (uint64_t i = 0; i < a3; i++) {
+            int64_t r;
+            if (!iov[i].iov_len) continue;
+            r = fd_read_bytes(args, nr, a1, iov[i].iov_base, iov[i].iov_len);
+            if (r < 0) return total ? (uint64_t)total : (uint64_t)r;
+            total += r;
+            if (r == 0) break;                          /* end of file */
+            if ((uint64_t)r < iov[i].iov_len) break;
+        }
+        return (uint64_t)total;
     }
 
     case SYS64_BRK:
@@ -1186,10 +1271,41 @@ static uint64_t dispatch(syscall64_args_t* args) {
          * a file's bytes in a heap allocation, which is not page
          * aligned and cannot be mapped directly.
          *
-         * MAP_SHARED would have to write back, so it is allowed only
-         * where there is nothing to write back: a read-only mapping. */
-        if ((flags & MAP_SHARED) && (a3 & PROT_WRITE))
-            return (uint64_t)-19;                      /* -ENODEV */
+         * MAP_SHARED is genuinely shared (Milestone 78).
+         *
+         * It used to be refused whenever it was writable, on the
+         * reasoning above: a file lives in a heap allocation, which is
+         * not page aligned and cannot be mapped, so there was nothing to
+         * share and nowhere to write back to. That is a statement about
+         * how this filesystem stores a file, not about what MAP_SHARED
+         * means, and the wineserver needs what it means - it hands every
+         * client a descriptor for its session data and all of them map
+         * it read-write and expect to see each other's stores.
+         *
+         * So the file is given physical frames and every process maps
+         * those same frames. There is no writing back because there is
+         * nowhere else for the bytes to live: the frames are the file.
+         * A copy here would satisfy the call and lose the entire point,
+         * which is the failure this kernel keeps producing and is worth
+         * refusing to produce again. */
+        if (flags & MAP_SHARED) {
+            const uint64_t* frames;
+            uint64_t nframes = 0, want;
+
+            /* An offset would mean mapping from the middle of the frame
+             * list, which is a small change and has no caller: refused
+             * rather than half-answered. */
+            if (off) return (uint64_t)-22;             /* -EINVAL */
+
+            frames = ramfs64_frames(node, a2, &nframes);
+            if (!frames) return (uint64_t)-12;         /* -ENOMEM */
+
+            want = (a2 + PAGE64_SIZE - 1) / PAGE64_SIZE;
+            if (nframes > want) nframes = want;
+            shared_maps++;
+            return uspace64_map_frames(a1, (flags & MAP_FIXED) != 0,
+                                       frames, nframes, a3);
+        }
 
         /* Mapped writable whatever the caller asked for, because the
          * kernel is about to write the file's contents into it. */
@@ -1958,8 +2074,12 @@ static uint64_t dispatch(syscall64_args_t* args) {
                          * returns - and does - so a reference taken only
                          * on arrival would be taken on a pipe that had
                          * already been given back. */
-                        pipe64_ref(fds[sfd].rx, 1, 0);
-                        pipe64_ref(fds[sfd].tx, 0, 1);
+                        if (fds[sfd].kind == FD64_FILE)
+                            ramfs64_ref_node(fds[sfd].node);
+                        else {
+                            pipe64_ref(fds[sfd].rx, 1, 0);
+                            pipe64_ref(fds[sfd].tx, 0, 1);
+                        }
                         ncarried++;
                     }
                 }
@@ -2407,10 +2527,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
             if (nfd < 0) return (uint64_t)-24;         /* -EMFILE */
             fds[nfd] = fds[a1];
             fds[nfd].cloexec = (a2 == F_DUPFD_CLOEXEC);
-            if (fds[nfd].kind == FD64_PIPE) {
-                pipe64_ref(fds[nfd].rx, 1, 0);
-                pipe64_ref(fds[nfd].tx, 0, 1);
-            }
+            fd_take_ref(nfd);
             return (uint64_t)nfd;
         }
         case F_GETLK:
@@ -2429,10 +2546,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
         if (nfd < 0) return (uint64_t)-24;
         fds[nfd] = fds[a1];
         fds[nfd].cloexec = 0;                          /* dup never copies it */
-        if (fds[nfd].kind == FD64_PIPE) {
-            pipe64_ref(fds[nfd].rx, 1, 0);
-            pipe64_ref(fds[nfd].tx, 0, 1);
-        }
+        fd_take_ref(nfd);
         return (uint64_t)nfd;
     }
 
@@ -2448,10 +2562,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
         fd_release((int)a2);
         fds[a2] = fds[a1];
         fds[a2].cloexec = (nr == SYS64_DUP3 && (a3 & O_CLOEXEC)) ? 1 : 0;
-        if (fds[a2].kind == FD64_PIPE) {
-            pipe64_ref(fds[a2].rx, 1, 0);
-            pipe64_ref(fds[a2].tx, 0, 1);
-        }
+        fd_take_ref(a2);
         return a2;
     }
 
@@ -2654,40 +2765,9 @@ static uint64_t dispatch(syscall64_args_t* args) {
                                    : ramfs64_unlink(path));
     }
 
-    case SYS64_READ: {
-        int64_t n;
-        int dev;
+    case SYS64_READ:
+        return (uint64_t)fd_read_bytes(args, nr, a1, (void*)a2, a3);
 
-        if (a1 < 3) return 0;                          /* stdin: end of file */
-        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
-
-        /* A pipe is not a file with a position, so it is answered before
-         * anything asks the filesystem about a node this descriptor does
-         * not have. A read that would block parks the task and is
-         * restarted, which is why this returns through do_pipe_read
-         * rather than inline. */
-        if (fd_is_stream(a1))
-            return (uint64_t)do_pipe_read(args, nr, a1, (void*)a2, a3);
-        if (fds[a1].kind == FD64_SOCKET) return (uint64_t)-107;   /* -ENOTCONN */
-
-        /* An input device is a stream of events, not a file with a
-         * position: there is no offset to advance and nothing to seek
-         * to, and two readers of the same device are not reading the
-         * same bytes. Whole records only, which is evdev's contract -
-         * a reader that got half a struct would resynchronise by
-         * guessing. */
-        dev = ramfs64_device(fds[a1].node);
-        if (dev == RAMFS64_DEV_NULL) return 0;         /* end of file */
-        if (dev == RAMFS64_DEV_KBD || dev == RAMFS64_DEV_MOUSE) {
-            return input64_read(dev == RAMFS64_DEV_KBD ? INPUT64_KBD
-                                                       : INPUT64_MOUSE,
-                                (void*)a2, a3);
-        }
-
-        n = ramfs64_read(fds[a1].node, fds[a1].pos, (void*)a2, a3);
-        if (n > 0) fds[a1].pos += (uint64_t)n;
-        return (uint64_t)n;
-    }
     case SYS64_ECHO:
         last_arg = a1;
         return a1 + 0x1111;

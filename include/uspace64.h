@@ -40,6 +40,14 @@ void uspace64_reset(vmspace64_t* space, uint64_t brk_start);
  * error, which is what glibc's malloc checks for. */
 uint64_t uspace64_brk(uint64_t addr);
 
+/* Maps frames belonging to somebody else - a file's - into this
+ * process, taking a reference on each so that unmapping releases the
+ * reference rather than the frame. This is what makes a MAP_SHARED file
+ * mapping actually shared. */
+uint64_t uspace64_map_frames(uint64_t addr, int fixed,
+                             const uint64_t* frames, uint64_t n,
+                             uint64_t prot);
+
 /* Anonymous, private mappings only. Returns the address, or -ENOMEM. */
 uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                        uint64_t flags);

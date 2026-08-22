@@ -3586,6 +3586,9 @@ void kernel_main(uint32_t magic, void* mbi) {
             }
 
             if (rc == ELF64_OK && stack_ok && rsp) {
+                serial64_puts("NOVARIS64: free    = ");
+                serial64_putdec(pmm64_free_frames());
+                serial64_puts(" frames before wineboot\n");
                 serial64_puts("NOVARIS64: --- wineboot ---\n");
                 pf_diagnose = 1;
                 syscall64_set_trace(1);
@@ -3630,6 +3633,11 @@ void kernel_main(uint32_t magic, void* mbi) {
             /* Only if it really exited. After a timed-out run the exit
              * code is whatever the last process to end happened to
              * return - a number that reads like an answer and is not. */
+            serial64_puts("NOVARIS64: free    = ");
+            serial64_putdec(pmm64_free_frames());
+            serial64_puts(" frames after, ");
+            serial64_putdec(syscall64_shared_maps());
+            serial64_puts(" shared maps made\n");
             serial64_puts("NOVARIS64: wineboot ");
             if (syscall64_leader_exited()) {
                 serial64_puts("exit= ");
