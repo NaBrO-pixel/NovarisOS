@@ -15,6 +15,7 @@
 # defined question, and the one that has to be answered first.
 advapi32.dll
 advpack.dll
+apisetschema.dll
 atl100.dll
 avicap32.dll
 bcrypt.dll

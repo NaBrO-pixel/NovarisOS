@@ -9530,6 +9530,102 @@ anything regressed.
 21 differentials, 336 assertions, 0 failures.
 
 
+## Milestone 80 — a Windows program runs ✅ DONE
+
+**`wineboot.exe` runs, and it finishes the prefix.** All seven paths the
+layer checks are present, registry included:
+
+```
+prefix = yes /root/.wine
+prefix = yes /root/.wine/system.reg
+prefix = yes /root/.wine/user.reg
+prefix = yes /root/.wine/userdef.reg
+prefix = yes /root/.wine/dosdevices/c:
+prefix = yes /root/.wine/drive_c/windows
+prefix = yes /root/.wine/drive_c/windows/system32
+prefix = 7/7 present
+```
+
+Milestone 77 got 7/7 too, and it is worth saying why this is different.
+There, the client was blocked early and the *wineserver's* periodic save
+wrote the registry - Unix code, on the client's behalf, without the
+client having got anywhere. Here `kernel32.dll` is loaded, wineboot.exe's
+Windows code executes, and the registry is written because a Windows
+program asked for it.
+
+Nothing in the kernel changed for this. All three fixes are about
+telling Wine where things are - which is what the last several
+milestones have mostly been, and is worth saying plainly rather than
+dressing up as kernel work.
+
+### 1. The PE modules were in the wrong directory
+
+`stage_wine.sh` put them in `/usr/lib/wine/x86_64-windows`, which is
+where an *installed* Wine keeps them. This Wine looks beside its own
+loader, in `<loader dir>/x86_64-windows`. Milestone 71 established
+exactly this for the unix `.so` halves and Milestone 75 for the NLS
+tables; it is equally true of the PE halves, and this is the third time
+the same distinction has cost a debugging session.
+
+Moved rather than duplicated - 58MB is too much to stage twice - with
+the kernel's "is Wine installed" check moved with it.
+
+### 2. `apisetschema.dll` was never staged
+
+It is not in `tools/wine_prefix_modules.txt`, because that list was
+measured from a `wineboot` run under `WINEDEBUG=+loaddll`, which records
+what gets *loaded* - and the API set schema is consumed by the loader
+itself rather than appearing as a loaded module. The measurement was
+sound and missed it anyway, which is a useful thing to know about that
+list: it is a lower bound.
+
+### 3. Wine was not told it was bootstrapping a prefix
+
+This is the one that took the reading. With the modules in place, Wine
+still reported
+
+```
+wine: could not load kernel32.dll, status c0000135
+```
+
+about a file that was present, in a directory it had already loaded
+`ntdll.dll` and `apisetschema.dll` from. The trace showed it searching
+only the prefix - `C:\windows\system32`, `C:\windows`, then `Z:` - and
+never the builtin directory.
+
+`find_dll_file` falls back to `find_builtin_without_file` when the
+search path fails, and that function begins:
+
+```c
+if (!is_prefix_bootstrap) return STATUS_DLL_NOT_FOUND;
+```
+
+Outside bootstrap, every builtin is expected to have a stub file in
+`C:\windows\system32` - which is precisely what wineboot is about to
+create and had not yet. Wine sets `WINEBOOTSTRAPMODE` for itself when it
+launches wineboot to make a prefix; **this layer runs wineboot
+directly**, which skips the place that sets it. So the loader declined
+to look for kernel32.dll anywhere at all.
+
+`WINEBOOTSTRAPMODE=1` and `WINEDLLPATH` are now in the environment the
+layer gives wineboot. Neither is a workaround: they are what Wine
+arranges for itself when it does this, and running wineboot by hand is
+what made them the caller's job.
+
+### Where it is now
+
+The run no longer dies - it **times out still working**, which is a
+different thing and the reason the watchdog from Milestone 77 earns its
+place. 378 syscalls come back unimplemented in a full run, against 48
+before, because Wine is now doing Windows work rather than failing early.
+
+21 differentials, 336 assertions, 0 failures.
+
+What is not done: wineboot still does not exit, so `services.exe` and
+`explorer.exe` are not reached. The next thing to find is what it is
+spending five minutes of emulated time on.
+
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
@@ -9592,15 +9688,16 @@ list, and it is shorter than the one above but not smaller:
    77. **A complete Wine prefix exists on this kernel**: registry, drive
    mapping and `drive_c/windows/system32`, 7/7 of the paths checked.
 
-   `wineboot -u` still does not *exit*. Milestones 78 and 79 did not
-   change that, but they moved the boundary: **Wine now opens
-   `wineboot.exe`**, resolving the DOS path `C:\windows\system32\` to
-   the PE in the prefix. Opening is not running, and the registry is
-   still not written - but the Windows side has been reached, and
-   memory is no longer the wall.
+   ~~`wineboot -u` still does not *exit*~~ - **a Windows program runs**
+   as of Milestone 80. `kernel32.dll` loads, wineboot.exe's Windows code
+   executes, and it writes the registry itself: 7/7 of the prefix paths,
+   this time because a Windows program asked for them rather than
+   because the Unix-side server saved them on its own timer.
 
-   What remains is running the executable it has opened, and then
-   `services.exe` and `explorer.exe` behind it.
+   wineboot still does not exit - the run times out *still working*
+   rather than dying - so `services.exe` and `explorer.exe` are not
+   reached yet. That is the next thing, and finding out where the five
+   minutes go is the first step.
 2. ~~**Copy-on-write `fork`.**~~ - done in Milestone 69. An 8MB process
    forks for 14 frames.
 3. ~~**Keyboard and mouse.**~~ - done in Milestone 70, as
