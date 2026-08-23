@@ -3612,6 +3612,43 @@ void kernel_main(uint32_t magic, void* mbi) {
             "USER=root",
             "WINEPREFIX=/root/.wine",
             "WINEDEBUG=-all",
+            /* Where the builtin PE modules are.
+             *
+             * Not decoration, and not something the staging could fix.
+             * Wine's set_dll_path only puts the loader's own directory
+             * on the builtin search path when it is *not* running from a
+             * build tree:
+             *
+             *     if (!build_dir) dll_paths[count++] = dll_dir;
+             *
+             * This Wine is running from a build tree - the same fact
+             * Milestone 71 established when the unix .so halves had to
+             * go beside the loader - so that list is empty and
+             * find_builtin_dll has nowhere to look. ntdll, apisetschema
+             * and the .exe stubs are found by a different route that
+             * uses build_dir directly, which is why they loaded and
+             * kernel32.dll did not, from the same directory.
+             *
+             * What that looks like is "could not load kernel32.dll,
+             * status c0000135" about a file that is present. */
+            "WINEDLLPATH=/usr/bin/x86_64-windows",
+            /* And that this is a prefix being bootstrapped.
+             *
+             * Wine sets this for itself: when a process finds no prefix
+             * it runs wineboot with WINEBOOTSTRAPMODE set, and
+             * find_builtin_without_file - the fallback that finds a
+             * builtin DLL when no file for it exists in system32 -
+             * begins
+             *
+             *     if (!is_prefix_bootstrap) return STATUS_DLL_NOT_FOUND;
+             *
+             * because outside bootstrap every builtin is expected to
+             * have a stub file in C:\windows\system32, which is what
+             * wineboot is about to create. Running wineboot *directly*,
+             * as this layer does, skips the place that sets it - so the
+             * loader refuses to look for kernel32.dll anywhere, and
+             * reports 0xc0000135 about a file that is present. */
+            "WINEBOOTSTRAPMODE=1",
             0
         };
 
@@ -3625,7 +3662,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         sock64_init();
         vmspace64_kernel_space(&kspace);
 
-        if (ramfs64_lookup("/usr/lib/wine/x86_64-windows/wineboot.exe") < 0) {
+        if (ramfs64_lookup("/usr/bin/x86_64-windows/wineboot.exe") < 0) {
             /* Not a failure: the build must not require 64MB of Wine in
              * the initrd before `make test` passes. */
             serial64_puts("NOVARIS64: no Wine installation in the initrd - "

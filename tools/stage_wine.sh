@@ -7,7 +7,7 @@
 #
 #   <dest>/usr/bin/wine                        the loader
 #   <dest>/usr/bin/*.so                        the unix halves
-#   <dest>/usr/lib/wine/x86_64-windows/*.dll   the PE halves
+#   <dest>/usr/bin/x86_64-windows/*.dll       the PE halves
 #   <dest>/bin/wineserver                      the server
 #
 # The unix halves go *beside the loader*, not in an x86_64-unix
@@ -40,7 +40,18 @@ fi
 
 BIN="$DEST/usr/bin"
 UNIX="$DEST/usr/bin"
-WIN="$DEST/usr/lib/wine/x86_64-windows"
+# Beside the loader, in an x86_64-windows directory next to it - the
+# same rule as the unix halves and for the same reason (Milestone 71).
+# A Wine running from its build tree takes the directory of its own
+# /proc/self/exe and looks in <that>/x86_64-windows/ for a PE module;
+# /usr/lib/wine is where an *installed* Wine keeps them and is not
+# somewhere this Wine ever looks.
+#
+# Getting it wrong does not fail at load time. Wine finds wineboot.exe
+# by its DOS path in the prefix, starts loading it, cannot resolve an
+# import, and exits with 0xc0000135 - STATUS_DLL_NOT_FOUND - which names
+# nothing.
+WIN="$DEST/usr/bin/x86_64-windows"
 mkdir -p "$BIN" "$UNIX" "$WIN" || exit 1
 
 cp "$TREE/loader/wine" "$BIN/wine" || exit 1
