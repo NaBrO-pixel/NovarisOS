@@ -142,6 +142,7 @@ int         ramfs64_parent(int node);
 #define RAMFS64_DEV_MOUSE 3       /* /dev/input/event1 - the mouse       */
 #define RAMFS64_DEV_SOCK  4       /* a bound Unix-domain socket          */
 #define RAMFS64_DEV_NULL  5       /* /dev/null                           */
+#define RAMFS64_DEV_CON   6       /* /dev/console - the serial port      */
 
 int         ramfs64_set_device(int node, int device);
 int         ramfs64_device(int node);

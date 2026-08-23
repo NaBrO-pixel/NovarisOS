@@ -29,6 +29,37 @@
 
 static uint64_t pages_allocated;
 
+/* One page of zeros that every PROT_NONE reservation points at.
+ *
+ * Wine reserves its address space by asking for 1.7GB of PROT_NONE and
+ * never touching it, three times over, once per process. Allocating a
+ * frame per page for that is not a cost, it is the whole machine: two
+ * Wine processes exhausted 2GB before either had done any work, and the
+ * second one's reservation failed.
+ *
+ * A PROT_NONE page has no contents by definition, so every one of them
+ * can be the same page. What the mapping is still for is the *record*:
+ * the page tables are the only thing this kernel knows about which
+ * ranges are taken, and Wine's own MAP_FIXED_NOREPLACE bookkeeping
+ * depends on that answer being right - see uspace64_mmap. Mapping
+ * nothing would make every reservation read as free.
+ *
+ * It is mapped read-only and never freed, which is what makes sharing it
+ * safe. The three places that could turn one of these pages into a
+ * writable page of its own - a fixed mapping over a reservation, an
+ * mprotect, and munmap - all have to know about it, and do. */
+static uint64_t zero_frame;
+
+uint64_t uspace64_zero_frame(void) { return zero_frame; }
+
+static uint64_t get_zero_frame(void) {
+    if (!zero_frame) {
+        zero_frame = pmm64_alloc_frame();
+        if (zero_frame) kmemset(phys64_to_virt(zero_frame), 0, PAGE64_SIZE);
+    }
+    return zero_frame;
+}
+
 uint64_t uspace64_pages_allocated(void) { return pages_allocated; }
 
 /* The heap and the mmap bump pointer live in the process now rather
@@ -103,10 +134,21 @@ static int map_anon(uint64_t start, uint64_t end, uint64_t flags,
              * that looks like is a NULL list terminator that is not
              * NULL, in a library whose relocations all applied fine. */
             existing &= ~(PAGE64_SIZE - 1);
-            if (zero_existing)
-                kmemset(phys64_to_virt(existing), 0, PAGE64_SIZE);
-            paging64_map(va, existing, flags);
-            continue;
+
+            /* Unless it is the page every reservation shares. Keeping it
+             * would give this mapping somebody else's memory - and
+             * zeroing it would zero *theirs* - so the page a reservation
+             * was standing on is replaced with one of this mapping's
+             * own. This is the case that makes sharing the zero page
+             * safe, and it is exactly the case Wine produces: it
+             * reserves a range PROT_NONE and later maps over pieces of
+             * it. */
+            if (existing != zero_frame) {
+                if (zero_existing)
+                    kmemset(phys64_to_virt(existing), 0, PAGE64_SIZE);
+                paging64_map(va, existing, flags);
+                continue;
+            }
         }
 
         frame = pmm64_alloc_high();
@@ -142,6 +184,7 @@ uint64_t uspace64_brk(uint64_t addr) {
 
 #define MAP_FIXED 0x10
 #define MAP_FIXED_NOREPLACE 0x100000
+#define MAP_ANONYMOUS 0x20
 
 uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                        uint64_t flags) {
@@ -205,7 +248,22 @@ uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     pflags = PAGE64_PRESENT | PAGE64_USER;
     if (prot & 0x2) pflags |= PAGE64_WRITE;        /* PROT_WRITE */
 
-    if (!map_anon(start, end, pflags, 1)) return (uint64_t)-12; /* -ENOMEM */
+    /* A reservation. Nothing may read or write it, so nothing needs a
+     * page of its own; they all point at the same zeros, and the
+     * mapping exists to record that the range is taken. */
+    if (prot == 0 && (flags & MAP_ANONYMOUS)) {
+        uint64_t z = get_zero_frame();
+        if (!z) return (uint64_t)-12;
+        for (uint64_t va = start; va < end; va += PAGE64_SIZE) {
+            uint64_t had;
+            if (paging64_translate(va, &had) == PAGING64_OK) continue;
+            if (paging64_map(va, z, PAGE64_PRESENT | PAGE64_USER)
+                    != PAGING64_OK)
+                return (uint64_t)-12;
+        }
+    } else if (!map_anon(start, end, pflags, 1)) {
+        return (uint64_t)-12;                      /* -ENOMEM */
+    }
 
     /* A fixed mapping does not move the bump pointer: it was placed by
      * the caller, in a range the caller is keeping track of. */
@@ -346,8 +404,10 @@ uint64_t uspace64_munmap(uint64_t addr, uint64_t length) {
     for (uint64_t va = start; va < end; va += PAGE64_SIZE) {
         uint64_t frame;
         if (paging64_translate(va, &frame) != PAGING64_OK) continue;
+        frame &= ~(PAGE64_SIZE - 1);
         paging64_unmap(va);
-        pmm64_free_frame(frame & ~(PAGE64_SIZE - 1));
+        /* Every reservation in the system is standing on this one. */
+        if (frame != zero_frame) pmm64_free_frame(frame);
     }
     return 0;
 }

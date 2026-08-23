@@ -3642,6 +3642,12 @@ void kernel_main(uint32_t magic, void* mbi) {
             proc64_set_current(pid);
             p = proc64_current();
 
+            /* Now that there is a descriptor table to put them in.
+             * Wine hands its standard streams to the wineserver over
+             * SCM_RIGHTS, and a descriptor recognised only by its number
+             * is one the kernel says it does not have. */
+            syscall64_open_std();
+
             check("a space for wineboot", vmspace64_create(&p->space) != 0);
 
             /* Wine reads /proc/self/exe and derives its library
@@ -3726,6 +3732,11 @@ void kernel_main(uint32_t magic, void* mbi) {
             /* Only if it really exited. After a timed-out run the exit
              * code is whatever the last process to end happened to
              * return - a number that reads like an answer and is not. */
+            serial64_puts("NOVARIS64: pages   = ");
+            serial64_putdec(uspace64_pages_allocated());
+            serial64_puts(" by map_anon, ");
+            serial64_putdec(paging64_tables_allocated());
+            serial64_puts(" page tables\n");
             serial64_puts("NOVARIS64: free    = ");
             serial64_putdec(pmm64_free_frames());
             serial64_puts(" frames after, ");

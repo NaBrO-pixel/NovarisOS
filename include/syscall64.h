@@ -369,6 +369,12 @@ uint64_t syscall64_shared_maps(void);
 /* Ends a run when this process exits rather than when the last one
  * does, so a layer can run a program that leaves a daemon behind. -1
  * for the old behaviour. */
+/* Gives the *current* process descriptors 0, 1 and 2 - /dev/null for
+ * stdin, /dev/console for the other two. Called after the process a
+ * layer is about to run has been made current, because that is when
+ * there is a descriptor table to put them in. */
+void syscall64_open_std(void);
+
 void syscall64_set_leader(int pid);
 
 /* Ends a run after this many timer ticks whether or not anything

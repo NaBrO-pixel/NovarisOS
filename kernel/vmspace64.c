@@ -1,6 +1,7 @@
 /* vmspace64.c - one PML4 per process, sharing the kernel's half. */
 
 #include "vmspace64.h"
+#include "uspace64.h"
 #include "paging64.h"
 #include "pmm64.h"
 #include "kheap64.h"
@@ -250,6 +251,25 @@ int vmspace64_clone_cow(uint64_t src_pml4, vmspace64_t* dst) {
                         continue;
                     }
 
+                    /* The page every PROT_NONE reservation shares, which
+                     * is the same situation for a different reason: it
+                     * is read-only, it is already shared by every
+                     * process, and it is never freed.
+                     *
+                     * Counting it would be worse than pointless. Wine
+                     * reserves 1.7GB, so one frame carries 438,681
+                     * mappings; the count saturates almost at once and
+                     * every page after that takes the branch below -
+                     * which allocates a fresh frame and copies a page of
+                     * zeros into it, once per page. That reproduces
+                     * exactly the 1.7GB the shared page was introduced
+                     * to save, by a different route, and it is what a
+                     * fork of a Wine process actually did. */
+                    if (frame == uspace64_zero_frame()) {
+                        *dpte = pte;
+                        continue;
+                    }
+
                     if (pmm64_ref_frame(frame)) {
                         uint64_t shared = share_flags(pte);
                         /* Both sides, because a parent that kept its
@@ -291,6 +311,22 @@ int vmspace64_set_writable(uint64_t va, int writable) {
     if (!pte) return 0;
     e = *pte;
     if (!(e & PAGE64_PRESENT)) return 0;
+
+    /* The page every PROT_NONE reservation shares. Making it writable
+     * would hand one process a page every other process is also
+     * standing on, so it gets one of its own instead - the same
+     * substitution map_anon makes, for the same reason. Wine mprotects
+     * pieces of its reserved ranges, so this is reached rather than
+     * theoretical. */
+    if ((e & ADDR_MASK) == uspace64_zero_frame() && writable) {
+        uint64_t fresh = pmm64_alloc_high();
+        if (!fresh) return 0;
+        kmemset(phys64_to_virt(fresh), 0, PAGE64_SIZE);
+        *pte = fresh | ((e & ~ADDR_MASK) & ~(PAGE64_COW | PAGE64_COW_RW))
+                     | PAGE64_WRITE;
+        __asm__ __volatile__("invlpg (%0)" :: "r"(va) : "memory");
+        return 1;
+    }
 
     if (e & PAGE64_COW) {
         /* Shared. The write bit must stay clear so that the next write

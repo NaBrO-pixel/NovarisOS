@@ -40,6 +40,11 @@ void uspace64_reset(vmspace64_t* space, uint64_t brk_start);
  * error, which is what glibc's malloc checks for. */
 uint64_t uspace64_brk(uint64_t addr);
 
+/* The single page of zeros every PROT_NONE reservation is mapped to, or
+ * 0 before the first one. Anything that would give a page away, free it,
+ * or make it writable has to recognise it - see uspace64.c. */
+uint64_t uspace64_zero_frame(void);
+
 /* Maps frames belonging to somebody else - a file's - into this
  * process, taking a reference on each so that unmapping releases the
  * reference rather than the frame. This is what makes a MAP_SHARED file
