@@ -9417,6 +9417,119 @@ save wrote the registry, and now the client runs further and dies before
 that save happens. Where it dies is the next thing to find.
 
 
+## Milestone 79 — the first Windows executable ⚠️ PARTLY DONE
+
+**Wine opens `wineboot.exe`.** Not runs — opens. It resolves the DOS
+path, finds the PE, and asks for it:
+
+```
+"C:\windows\system32\wineboot.exe"
+"/root/.wine/dosdevices/c:/windows/system32/wineboot.exe"
+"/usr/bin/x86_64-windows/start.exe"
+```
+
+`wineboot -u` still does not exit, so this is not the milestone it was
+aimed at either. Three fixes, and the third is the interesting one
+because it was caused by the second.
+
+### 1. The standard streams were not descriptors
+
+0, 1 and 2 were recognised by number and had no table entry at all.
+`fd_write_bytes` said so: *"0-2 are never allocated, so stdout and
+stderr are told apart by number rather than by a table entry."*
+
+That is enough for `write` and fails the moment something treats them as
+descriptors — and Wine does, immediately. `wine_server_fd_to_handle`
+turns a Unix descriptor into a Windows handle by **sending it to the
+wineserver over SCM_RIGHTS**, and the standard streams are among the
+first it sends. A descriptor with no entry is one the kernel says it
+does not have, so the send was refused:
+
+```
+wine client error:24: sendmsg: Bad file descriptor
+```
+
+Which named the socket, and said nothing about the passenger. Finding
+that took a diagnostic that was informative by *not* firing: none of the
+three guards on the socket rejected the call, so the `EBADF` had to come
+from the fourth place, the control-data parsing rejecting the descriptor
+being carried.
+
+A process now gets real entries: `/dev/null` for stdin, a new
+`/dev/console` for stdout and stderr. The by-number rule remains as the
+fallback for programs a layer set up without opening the standard three,
+so nothing that worked before changed.
+
+### 2. A reservation cost a frame per page
+
+With the streams fixed Wine got far enough to open its PE and then ran
+the machine out of memory: `free = 0 frames`.
+
+Wine reserves 1.7GB of `PROT_NONE` per process and never touches it.
+Allocating a frame per page for that is not a cost, it is the whole
+machine — two Wine processes exhausted 2GB before either had done any
+work, and the second one's reservation failed.
+
+A `PROT_NONE` page has no contents by definition, so they can all be the
+same page. What the mapping is still *for* is the record: the page
+tables are the only thing this kernel knows about which ranges are
+taken, and Wine's own `MAP_FIXED_NOREPLACE` bookkeeping depends on that
+answer, so mapping nothing would make every reservation read as free.
+
+Three places could turn one of those shared pages into a writable page
+of its own, and Wine reaches all three: a fixed mapping over a
+reservation (`map_anon`), an `mprotect` (`vmspace64_set_writable`), and
+`munmap` returning it to the allocator. Each recognises it now.
+
+### 3. And that fix reproduced the cost by another route
+
+It worked — `map_anon` allocated 3,450 frames instead of 438,000 — and
+the machine still ran out: `free = 29 frames`.
+
+The measurement is what settled it, because the reasoning did not. User
+mappings accounted for **27MB**: 6.1MB anonymous, 20.9MB file-backed,
+and 1713.6MB of address space carrying one shared page. Page tables were
+1,195 frames. Nothing added up to the 456,000 frames that had gone, so
+the kernel was asked to count them, and the answer pointed at neither
+`map_anon` nor `paging64`.
+
+It was `vmspace64_clone_cow`. Every shared page is reference-counted on
+fork, and one frame now carried **438,681 mappings**. The count saturates
+almost at once, and the fallback below it is:
+
+```c
+else {
+    /* The count saturated. Copying is always correct;
+     * only the sharing was an optimisation. */
+    uint64_t fresh = pmm64_alloc_high();
+    kmemcpy( ... );
+}
+```
+
+— a fresh frame and a copied page of zeros, once per page, reproducing
+exactly the 1.7GB the shared page was introduced to save. The fallback
+is right in general; it had simply never met a page carrying most of the
+address space.
+
+The zero page is now handed to the child as it stands, which is what the
+framebuffer case three lines above it already did and for the same
+reason: read-only, shared by definition, never freed, nothing to count.
+
+**43MB where there had been 1.74GB.** Free frames after wineboot went
+from 29 to 445,610.
+
+### Where Wine stops now
+
+Still short of running the executable it opened, and still without the
+registry (4/7). What has changed is that memory is no longer the wall
+and the Windows side has been reached at all. `fstatfs` (138) is the
+last call asked for; 48 remain unimplemented in a full run, which is
+more than before because Wine is getting further rather than because
+anything regressed.
+
+21 differentials, 336 assertions, 0 failures.
+
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
@@ -9479,14 +9592,15 @@ list, and it is shorter than the one above but not smaller:
    77. **A complete Wine prefix exists on this kernel**: registry, drive
    mapping and `drive_c/windows/system32`, 7/7 of the paths checked.
 
-   `wineboot -u` still does not *exit*, and Milestone 78 did not change
-   that - it took five fixes to get from "the client and server exchange
-   a handshake" to "the client and server share memory", and each was
-   found by making the previous one work. What it does after laying the
-   prefix down is start `services.exe` and `explorer.exe`, which would
-   be the first **Windows** program this kernel runs under Wine rather
-   than a Unix one. That is still the next milestone, and it is the one
-   the whole list has been pointing at.
+   `wineboot -u` still does not *exit*. Milestones 78 and 79 did not
+   change that, but they moved the boundary: **Wine now opens
+   `wineboot.exe`**, resolving the DOS path `C:\windows\system32\` to
+   the PE in the prefix. Opening is not running, and the registry is
+   still not written - but the Windows side has been reached, and
+   memory is no longer the wall.
+
+   What remains is running the executable it has opened, and then
+   `services.exe` and `explorer.exe` behind it.
 2. ~~**Copy-on-write `fork`.**~~ - done in Milestone 69. An 8MB process
    forks for 14 frames.
 3. ~~**Keyboard and mouse.**~~ - done in Milestone 70, as

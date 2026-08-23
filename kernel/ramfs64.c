@@ -348,6 +348,15 @@ void ramfs64_init(void) {
             ramfs64_set_device(n, RAMFS64_DEV_NULL);
             ramfs64_set_mode(n, 0666);
         }
+        /* And somewhere for stdout and stderr to be. Until Milestone 78
+         * they were not descriptors at all - 0, 1 and 2 were recognised
+         * by number and had no table entry - which is enough for write
+         * and not for anything that treats them as descriptors. */
+        n = ramfs64_create("/dev/console", 0);
+        if (n >= 0) {
+            ramfs64_set_device(n, RAMFS64_DEV_CON);
+            ramfs64_set_mode(n, 0666);
+        }
     }
 
     {

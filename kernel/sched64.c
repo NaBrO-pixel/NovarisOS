@@ -167,11 +167,19 @@ int sched64_exit_current(registers64_t* out_regs, vmspace64_t* out_space,
     tasks[current].used = 0;
     if (task_total > 0) task_total--;
 
-    /* next_task walks from the one that just died, which is still the
-     * right starting point - it is marked unused, so the walk cannot
-     * land back on it. */
+    /* A *runnable* one. This used to take the first task marked used,
+     * blocked or not, and hand its saved frame straight to iretq - which
+     * resumes a task that is parked on a futex, a pipe or a child, with
+     * none of the things its wait was going to give it. `wake_rax` is
+     * never applied, so a restarted syscall comes back with whatever was
+     * in rax when it blocked, and the wake-up it was actually waiting
+     * for arrives later to a task that is already running.
+     *
+     * Nothing had exercised it: exit(2) ends a thread, and every program
+     * here until now was single-threaded or ended with exit_group. It is
+     * fixed on sight rather than left for the run that finds it. */
     for (next = 0; next < SCHED64_MAX_TASKS; next++)
-        if (tasks[next].used) break;
+        if (tasks[next].used && !tasks[next].blocked) break;
     if (next == SCHED64_MAX_TASKS) { current = -1; return 0; }
 
     current = next;
@@ -197,8 +205,9 @@ int sched64_exit_process(int pid, registers64_t* out_regs,
         if (task_total > 0) task_total--;
     }
 
+    /* Runnable, for the same reason as above. */
     for (next = 0; next < SCHED64_MAX_TASKS; next++)
-        if (tasks[next].used) break;
+        if (tasks[next].used && !tasks[next].blocked) break;
     if (next == SCHED64_MAX_TASKS) { current = -1; return 0; }
 
     current = next;

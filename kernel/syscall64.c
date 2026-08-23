@@ -109,11 +109,49 @@ extern uint64_t saved_user_rsp;
 #define FD_MAX PROC64_FD_MAX
 #define fds    (proc64_current()->fds)
 
+/* Gives this process descriptors 0, 1 and 2.
+ *
+ * They used to be recognised by number and have no table entry at all,
+ * which is enough for `write` and for nothing else. Wine turns a Unix
+ * descriptor into a Windows handle by *sending it to the wineserver*
+ * over SCM_RIGHTS, and the standard streams are among the first it
+ * sends - so a descriptor with no entry is one the kernel says it does
+ * not have. What that looks like from outside is
+ *
+ *     wine client error:24: sendmsg: Bad file descriptor
+ *
+ * naming the socket, which was fine, and saying nothing about the
+ * passenger, which was not.
+ *
+ * stdin is /dev/null rather than nothing: a read of end-of-file is what
+ * a program with no input expects, and a descriptor that is simply
+ * absent is not. */
+void syscall64_open_std(void) {
+    int null_node = ramfs64_lookup("/dev/null");
+    int con_node  = ramfs64_lookup("/dev/console");
+
+    for (int i = 0; i < 3; i++) {
+        int node = (i == 0) ? null_node : con_node;
+        if (node < 0) continue;
+        fds[i].kind     = FD64_FILE;
+        fds[i].node     = node;
+        fds[i].pos      = 0;
+        fds[i].rx       = -1;
+        fds[i].tx       = -1;
+        fds[i].sock     = -1;
+        fds[i].nonblock = 0;
+        fds[i].cloexec  = 0;
+        fds[i].used     = 1;
+        ramfs64_ref_node(node);
+    }
+}
+
 void syscall64_reset_files(void) {
     /* Through the macro rather than a local pointer: `fds` expands to a
      * member access, so `p->fds` would expand inside itself. */
     if (!proc64_current()) return;
     for (int i = 0; i < FD_MAX; i++) fds[i].used = 0;
+    syscall64_open_std();
 }
 
 /* What /proc/self/exe resolves to. Per process, because execve replaces
@@ -448,14 +486,24 @@ static int64_t do_pipe_read(const syscall64_args_t* args, uint64_t nr,
  * state of this ABI.
  */
 static int64_t fd_write_bytes(uint64_t fd, const char* buf, uint64_t n) {
-    if (fd >= 3) {
+    /* A descriptor with a table entry is answered from it, whatever its
+     * number. The rule below is what is left for a program set up by a
+     * layer that never opened the standard three. */
+    if (fd < FD_MAX && fds[fd].used) {
         int64_t w;
         if (fd >= FD_MAX || !fds[fd].used) return -9;  /* -EBADF */
         if (fd_is_stream((int)fd)) return do_pipe_write((int)fd, buf, n);
         if (fds[fd].kind == FD64_SOCKET) return -107;  /* -ENOTCONN */
-        /* /dev/null takes everything and keeps none of it. */
+        /* /dev/null takes everything and keeps none of it; the console
+         * is the serial port, which is where this kernel's idea of
+         * stdout has always gone. */
         if (ramfs64_device(fds[fd].node) == RAMFS64_DEV_NULL)
             return (int64_t)n;
+        if (ramfs64_device(fds[fd].node) == RAMFS64_DEV_CON) {
+            for (uint64_t i = 0; i < n; i++) serial64_putc(buf[i]);
+            bytes_written += n;
+            return (int64_t)n;
+        }
         w = ramfs64_write(fds[fd].node, fds[fd].pos, buf, n);
         if (w > 0) fds[fd].pos += (uint64_t)w;
         return w;
@@ -476,8 +524,8 @@ static int64_t fd_read_bytes(const syscall64_args_t* args, uint64_t nr,
     int64_t r;
     int dev;
 
-    if (fd < 3) return 0;                              /* stdin: end of file */
-    if (fd >= FD_MAX || !fds[fd].used) return -9;
+    if (fd >= FD_MAX) return -9;
+    if (!fds[fd].used) return fd < 3 ? 0 : -9;         /* stdin: end of file */
 
     if (fd_is_stream((int)fd))
         return do_pipe_read(args, nr, (int)fd, buf, n);
@@ -2031,10 +2079,31 @@ static uint64_t dispatch(syscall64_args_t* args) {
         int ncarried = 0;
         int64_t total = 0;
 
-        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
-        if (!fd_is_stream(a1)) return (uint64_t)-88;   /* -ENOTSOCK */
+        /* Said out loud while tracing, because "bad file descriptor" is
+         * the same answer to four different questions and the useful
+         * one is which. */
+        if (a1 >= FD_MAX || !fds[a1].used) {
+            if (trace) { serial64_puts("\nNOVARIS64: [sendmsg] fd ");
+                         serial64_putdec(a1);
+                         serial64_puts(" is not open\n"); }
+            return (uint64_t)-9;
+        }
+        if (!fd_is_stream(a1)) {
+            if (trace) { serial64_puts("\nNOVARIS64: [sendmsg] fd ");
+                         serial64_putdec(a1);
+                         serial64_puts(" kind "); serial64_putdec(fds[a1].kind);
+                         serial64_puts(" is not a stream\n"); }
+            return (uint64_t)-88;                      /* -ENOTSOCK */
+        }
         if (!msg) return (uint64_t)-14;
-        if (fds[a1].tx < 0) return (uint64_t)-9;
+        if (fds[a1].tx < 0) {
+            if (trace) { serial64_puts("\nNOVARIS64: [sendmsg] fd ");
+                         serial64_putdec(a1);
+                         serial64_puts(" has no write end (rx ");
+                         serial64_putdec((uint64_t)(int64_t)fds[a1].rx);
+                         serial64_puts(")\n"); }
+            return (uint64_t)-9;
+        }
 
         /* The control data first, because a failure here must not send
          * half a message: the descriptors and the bytes they describe
@@ -2055,8 +2124,21 @@ static uint64_t dispatch(syscall64_args_t* args) {
                         return (uint64_t)-22;
                     for (int k = 0; k < n; k++) {
                         int sfd = sent[k];
-                        if (sfd < 0 || sfd >= FD_MAX || !fds[sfd].used)
+                        if (sfd < 0 || sfd >= FD_MAX || !fds[sfd].used) {
+                            /* The descriptor being *sent*, not the one
+                             * being sent down. Distinguished because
+                             * both are EBADF and Wine reports the call,
+                             * so the message names the socket and says
+                             * nothing about the passenger. */
+                            if (trace) {
+                                serial64_puts("\nNOVARIS64: [sendmsg] fd ");
+                                serial64_putdec(a1);
+                                serial64_puts(" cannot carry fd ");
+                                serial64_putdec((uint64_t)(int64_t)sfd);
+                                serial64_puts(": not open\n");
+                            }
                             return (uint64_t)-9;       /* -EBADF */
+                        }
                         /* A listening or unconnected socket carries
                          * state this record cannot describe, and Wine
                          * never sends one. Refused rather than sent as
