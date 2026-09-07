@@ -120,6 +120,12 @@ static uint64_t read_cr2(void) {
     return v;
 }
 
+static inline uint64_t panic_read_msr(uint32_t msr) {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+
 static void panic(registers64_t* r) {
     uint64_t n = r->int_no;
 
@@ -156,6 +162,10 @@ static void panic(registers64_t* r) {
     serial64_puts("\nNOVARIS64:   rbp="); serial64_puthex(r->rbp);
     serial64_puts(" r12=");                serial64_puthex(r->r12);
     serial64_puts(" r13=");                serial64_puthex(r->r13);
+    serial64_puts("\nNOVARIS64:   fsbase=");
+    serial64_puthex(panic_read_msr(0xC0000100u));
+    serial64_puts(" gsbase=");
+    serial64_puthex(panic_read_msr(0xC0000101u));
     serial64_puts("\nNOVARIS64: *** halted\n");
 
     for (;;) __asm__ __volatile__("cli; hlt");
