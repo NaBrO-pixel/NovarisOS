@@ -2246,10 +2246,12 @@ void kernel_main(uint32_t magic, void* mbi) {
                 serial64_puts("NOVARIS64: --- what Wine asks for ---\n");
                 pf_diagnose = 1;
                 syscall64_set_trace(1);
+                signal64_set_trace(1);
                 vmspace64_switch(&space);
                 enter_user_mode64(interp.entry, rsp, 0);
                 vmspace64_switch(&kspace);
                 syscall64_set_trace(0);
+                signal64_set_trace(0);
                 pf_diagnose = 0;
                 serial64_puts("NOVARIS64: --- end ---\n");
             } else {

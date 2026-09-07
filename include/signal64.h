@@ -77,6 +77,13 @@ int  signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr);
  * points at the ucontext. */
 int  signal64_sigreturn(uint64_t user_rsp, registers64_t* out);
 
+/* Report every signal this kernel hands to a handler: which signal, in
+ * which process, and - the part that matters - where the *original*
+ * fault was, rather than where the handler later died. Off by default,
+ * because a program servicing its own pages through SIGSEGV would bury
+ * the transcript. */
+void signal64_set_trace(int on);
+
 uint64_t signal64_delivered(void);
 uint64_t signal64_returns(void);
 

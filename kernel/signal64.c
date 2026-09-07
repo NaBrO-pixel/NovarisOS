@@ -2,6 +2,8 @@
 
 #include "signal64.h"
 #include "kstring.h"
+#include "serial64.h"
+#include "proc64.h"
 
 #define NSIG 64
 
@@ -49,6 +51,9 @@ int signal64_sigaction(int sig, const ksigaction64_t* act,
     }
     return 0;
 }
+
+static int signal_trace;
+void signal64_set_trace(int on) { signal_trace = on; }
 
 int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
     const ksigaction64_t* sa;
@@ -100,6 +105,30 @@ int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
      * thread whose stack pointer is the reason it faulted will fault
      * again here, in the kernel. See ROADMAP.md. */
     frame = (rt_sigframe64_t*)sp;
+
+    /* Said out loud, for the same reason the pid is on the trace line.
+     * A signal delivered to a program that handles it leaves no trace
+     * at all otherwise: Wine installs a SIGSEGV handler and services
+     * its own write-watch pages through it, so a fault that reaches
+     * ring 3 and is dealt with there is invisible, and a fault that
+     * reaches ring 3 and kills it looks like the handler crashed for
+     * no reason. What is wanted is the *original* fault - where it was
+     * and what it touched - not where the handler died. */
+    if (signal_trace) {
+        serial64_puts("NOVARIS64: [signal ");
+        serial64_putdec((uint64_t)sig);
+        serial64_puts(" pid ");
+        serial64_putdec((uint64_t)proc64_current_pid());
+        serial64_puts("] at rip=");
+        serial64_puthex(r->rip);
+        serial64_puts(" rsp=");
+        serial64_puthex(r->rsp);
+        serial64_puts(" addr=");
+        serial64_puthex(fault_addr);
+        serial64_puts(" err=");
+        serial64_puthex(r->err_code);
+        serial64_putc('\n');
+    }
 
     kmemset(frame, 0, sizeof(*frame));
 
