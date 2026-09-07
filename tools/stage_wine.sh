@@ -75,9 +75,33 @@ fi
 
 # The unix halves. All of them: there are only 25 and the dependency
 # graph between them is not something to guess at.
+#
+# In both places, for the same reason the NLS tables below are: the
+# loader and ntdll work the path out differently and both are right
+# about their own layout.
+#
+# The loader finds *ntdll.so* by reading /proc/self/exe, taking the
+# directory and appending the name - /usr/bin/ntdll.so, which is what
+# Milestone 71 established. ntdll then loads every other unix half
+# itself, and it builds that path as dll_dir + get_so_dir(machine),
+# which is /usr/bin/x86_64-unix/. Only the first of those two was
+# staged, so ntdll.so loaded and nothing else did.
+#
+# It does not fail at load time either. The PE half of a module loads,
+# its DllMain calls into a unix half that is not there, and the process
+# exits 0xc0000142 - STATUS_DLL_INIT_FAILED - naming nothing. What the
+# trace shows is one openat of
+# /usr/bin/x86_64-unix/ws2_32.so returning -ENOENT and then a dead
+# process.
+#
+# Stripped, the 25 of them are 4.9MB, so both copies cost less than the
+# NLS tables did.
+UNIX_ARCH="$DEST/usr/bin/x86_64-unix"
+mkdir -p "$UNIX_ARCH" || exit 1
 found_unix=0
 while IFS= read -r so; do
     cp "$so" "$UNIX/$(basename "$so")" 2>/dev/null && found_unix=$((found_unix+1))
+    cp "$so" "$UNIX_ARCH/$(basename "$so")" 2>/dev/null
 done < <(find "$TREE/dlls" -name "*.so" -type f)
 
 # The NLS tables. 77 files and 8KB in total, and not optional: the
