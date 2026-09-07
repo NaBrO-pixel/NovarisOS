@@ -88,6 +88,7 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/pipe64.o \
        $(BUILD_DIR)/sock64.o \
        $(BUILD_DIR)/clock64.o \
+       $(BUILD_DIR)/rtc.o \
        $(BUILD_DIR)/proc64.o \
        $(BUILD_DIR)/forkexec64_blob.o \
        $(BUILD_DIR)/tree64_blob.o \

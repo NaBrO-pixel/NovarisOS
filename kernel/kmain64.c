@@ -257,6 +257,16 @@ void kernel_main(uint32_t magic, void* mbi) {
 
     serial64_init();
 
+    /* The wall clock, before anything can ask what time it is.
+     *
+     * One read of the CMOS RTC fixes the epoch; clock64_realtime is
+     * that plus elapsed ticks from there on. It happens this early
+     * because a realtime clock that starts at zero is not a lesser
+     * version of one that works - Wine reads time() once, compares it
+     * against a zero-initialised cache timestamp, concludes nothing has
+     * changed, and never scans for its DOS drives. See SYS64_TIME. */
+    clock64_set_epoch_from_rtc();
+
     /* CR0.WP, before anything maps a page read-only (Milestone 69).
      *
      * Without it the write-protect bit in a PTE binds ring 3 only, and
