@@ -147,6 +147,14 @@ typedef struct {
 #define SYS64_CLOCK_GETRES   229
 #define SYS64_CLOCK_NANOSLEEP 230
 
+/* time(2). Normally answered by the vDSO, so a program on Linux rarely
+ * makes the call at all - there is no vDSO here, so glibc falls through
+ * to the syscall and every one of them was being refused. The
+ * wineserver asks once a second, to rebuild the timezone bias it
+ * publishes in user_shared_data, and a -ENOSYS there is not an error it
+ * checks: it is a negative time_t handed to gmtime. */
+#define SYS64_TIME            201
+
 /* poll(2) events, Linux's values. Only these three mean anything here. */
 #define POLL64_IN    0x001
 #define POLL64_OUT   0x004
