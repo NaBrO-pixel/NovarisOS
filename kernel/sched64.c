@@ -11,6 +11,7 @@ typedef struct {
     registers64_t regs;
     vmspace64_t   space;
     uint64_t      fs_base;   /* the thread pointer, per thread          */
+    uint64_t      gs_base;   /* and the TEB, which Wine keeps at GS      */
     uint64_t      wait_addr; /* the futex it is blocked on, 0 if awake  */
     /* What rax becomes when this thread is woken. futex wants 0 - the
      * value FUTEX_WAIT returns - but a syscall that blocks and then
@@ -55,17 +56,45 @@ static inline void fpu_restore(const uint8_t* area) {
 static uint8_t fpu_initial[512] __attribute__((aligned(16)));
 
 #define IA32_FS_BASE 0xC0000100u
+#define IA32_GS_BASE 0xC0000101u
 
-static inline uint64_t read_fs_base(void) {
+static inline uint64_t read_msr_base(uint32_t msr) {
     uint32_t lo, hi;
-    __asm__ __volatile__("rdmsr" : "=a"(lo), "=d"(hi) : "c"(IA32_FS_BASE));
+    __asm__ __volatile__("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
     return ((uint64_t)hi << 32) | lo;
 }
-static inline void write_fs_base(uint64_t v) {
+static inline void write_msr_base(uint32_t msr, uint64_t v) {
     __asm__ __volatile__("wrmsr"
-                         :: "c"(IA32_FS_BASE),
+                         :: "c"(msr),
                             "a"((uint32_t)v), "d"((uint32_t)(v >> 32)));
 }
+static inline uint64_t read_fs_base(void)        { return read_msr_base(IA32_FS_BASE); }
+static inline void     write_fs_base(uint64_t v) { write_msr_base(IA32_FS_BASE, v); }
+
+/* GS is per-thread too, and nothing was saving it.
+ *
+ * This kernel deliberately does not use swapgs - syscall64.s says so and
+ * says why - so IA32_GS_BASE is the *user's* GS base, with no kernel
+ * copy behind it. arch_prctl(ARCH_SET_GS) writes it, and Wine uses it:
+ * the Windows TEB lives at GS on x86-64, and __wine_syscall_dispatcher
+ * begins
+ *
+ *     mov %gs:0x378,%rcx        // this thread's struct syscall_frame
+ *
+ * A switch that restores FS and leaves GS alone hands the incoming
+ * thread the *outgoing* thread's TEB, so that read produces another
+ * thread's syscall frame. The dispatcher then restores its registers
+ * through it and dies on
+ *
+ *     movaps 0x1c0(%rcx),%xmm6
+ *
+ * a general protection fault in ring 3 with no error code, 0x1c0 being
+ * inside the frame's xsave area at 0xc0.
+ *
+ * Invisible while SCHED64_MAX_TASKS was 4, because threads of different
+ * processes barely overlapped. */
+static inline uint64_t read_gs_base(void)        { return read_msr_base(IA32_GS_BASE); }
+static inline void     write_gs_base(uint64_t v) { write_msr_base(IA32_GS_BASE, v); }
 
 static task64_t tasks[SCHED64_MAX_TASKS];
 static int      task_total;
@@ -103,6 +132,7 @@ int sched64_add(uint64_t rip, uint64_t rsp, uint64_t arg,
 
     /* A thread that has never run still needs a valid register file to
      * be restored from the first time it is switched to. */
+    tasks[i].gs_base = read_gs_base();
     for (int b = 0; b < 512; b++) tasks[i].fpu[b] = fpu_initial[b];
 
     /* The frame iretq will consume the first time this task is resumed.
@@ -155,6 +185,7 @@ int sched64_add_frame_for(const registers64_t* regs, const vmspace64_t* space,
     /* This is the path clone and fork take, so it is the one that
      * matters most: a thread resumed with a register file nobody wrote
      * is a thread FXRSTOR may refuse to load at all. */
+    tasks[i].gs_base = read_gs_base();
     for (int b = 0; b < 512; b++) tasks[i].fpu[b] = fpu_initial[b];
     task_total++;
     return i;
@@ -233,6 +264,7 @@ int sched64_exit_current(registers64_t* out_regs, vmspace64_t* out_space,
     /* Nothing to save: the task that was running has ended. */
     current = next;
     fpu_restore(tasks[next].fpu);
+    write_gs_base(tasks[next].gs_base);
     if (out_regs)     *out_regs     = tasks[next].regs;
     if (out_space)    *out_space    = tasks[next].space;
     if (out_fs_base)  *out_fs_base  = tasks[next].fs_base;
@@ -263,6 +295,7 @@ int sched64_exit_process(int pid, registers64_t* out_regs,
     /* Nothing to save: every thread of that process has ended. */
     current = next;
     fpu_restore(tasks[next].fpu);
+    write_gs_base(tasks[next].gs_base);
     if (out_regs)    *out_regs    = tasks[next].regs;
     if (out_space)   *out_space   = tasks[next].space;
     if (out_fs_base) *out_fs_base = tasks[next].fs_base;
@@ -316,9 +349,11 @@ int sched64_block_current(const registers64_t* regs, uint64_t addr,
         return 0;
     }
 
+    tasks[current].gs_base = read_gs_base();
     fpu_save(tasks[current].fpu);
     current = next;
     fpu_restore(tasks[next].fpu);
+    write_gs_base(tasks[next].gs_base);
     if (out_regs)    *out_regs    = tasks[next].regs;
     if (out_space)   *out_space   = tasks[next].space;
     if (out_fs_base) *out_fs_base = tasks[next].fs_base;
@@ -357,9 +392,11 @@ int sched64_yield_current(const registers64_t* regs, registers64_t* out_regs,
     next = next_task(current);
     if (next == current) return 0;
 
+    tasks[current].gs_base = read_gs_base();
     fpu_save(tasks[current].fpu);
     current = next;
     fpu_restore(tasks[next].fpu);
+    write_gs_base(tasks[next].gs_base);
     if (out_regs)    *out_regs    = tasks[next].regs;
     if (out_space)   *out_space   = tasks[next].space;
     if (out_fs_base) *out_fs_base = tasks[next].fs_base;
@@ -396,10 +433,12 @@ void sched64_tick(registers64_t* frame) {
      * frame, so nothing else would have saved it. */
     tasks[current].regs    = *frame;
     tasks[current].fs_base = read_fs_base();
+    tasks[current].gs_base = read_gs_base();
     fpu_save(tasks[current].fpu);
 
     current = next;
     fpu_restore(tasks[current].fpu);
+    write_gs_base(tasks[current].gs_base);
 
     /* And the incoming task, written over the same frame - iretq reloads
      * from exactly this memory when the stub returns. */
