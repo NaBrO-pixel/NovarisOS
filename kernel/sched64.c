@@ -20,7 +20,39 @@ typedef struct {
     int           pid;       /* the process this thread belongs to      */
     int           blocked;
     int           used;
+
+    /* The x87/SSE register file, which nothing else saves.
+     *
+     * The kernel is built -mno-sse and never touches these registers,
+     * so they belong entirely to the task - and a switch that restores
+     * every general register and none of these hands the incoming
+     * thread the outgoing one's xmm0-15, MXCSR and x87 stack.
+     *
+     * While SCHED64_MAX_TASKS was 4 that almost never happened. Raising
+     * it to 128 let a Wine prefix run threads concurrently for the first
+     * time, and the run died on a general protection fault in ring 3, in
+     * PE code, with no error code - which is what an unaligned movaps or
+     * an MXCSR with reserved bits set looks like from outside.
+     *
+     * 512 bytes and 16-byte aligned because that is what FXSAVE writes
+     * and what FXRSTOR refuses to read otherwise. Aligning the member
+     * aligns the struct, which keeps every element of the array aligned
+     * too. */
+    uint8_t       fpu[512] __attribute__((aligned(16)));
 } task64_t;
+
+static inline void fpu_save(uint8_t* area) {
+    __asm__ __volatile__("fxsave64 (%0)" :: "r"(area) : "memory");
+}
+static inline void fpu_restore(const uint8_t* area) {
+    __asm__ __volatile__("fxrstor64 (%0)" :: "r"(area) : "memory");
+}
+
+/* What a thread that has never run starts with. Taken from the hardware
+ * rather than written by hand: FXRSTOR raises #GP if MXCSR has reserved
+ * bits set, so a zeroed area is not a safe starting state and a
+ * hand-built one is a guess about this CPU. */
+static uint8_t fpu_initial[512] __attribute__((aligned(16)));
 
 #define IA32_FS_BASE 0xC0000100u
 
@@ -43,6 +75,14 @@ static uint64_t stop_after;
 static uint64_t stop_rip;
 
 void sched64_init(void) {
+    /* A clean x87 state, then the default MXCSR over the top of it:
+     * fninit does not touch MXCSR, and whatever the boot path left there
+     * is not what a new thread should inherit. 0x1F80 is the reset
+     * value - all exceptions masked, round to nearest. */
+    __asm__ __volatile__("fninit");
+    fpu_save(fpu_initial);
+    *(uint32_t*)(fpu_initial + 24) = 0x1F80;
+
     for (int i = 0; i < SCHED64_MAX_TASKS; i++) tasks[i].used = 0;
     task_total = 0;
     current = -1;
@@ -60,6 +100,10 @@ int sched64_add(uint64_t rip, uint64_t rsp, uint64_t arg,
 
     for (uint64_t* p = (uint64_t*)&tasks[i].regs;
          p < (uint64_t*)(&tasks[i].regs + 1); p++) *p = 0;
+
+    /* A thread that has never run still needs a valid register file to
+     * be restored from the first time it is switched to. */
+    for (int b = 0; b < 512; b++) tasks[i].fpu[b] = fpu_initial[b];
 
     /* The frame iretq will consume the first time this task is resumed.
      * cs and ss are the ring-3 selectors; without IF in rflags the task
@@ -108,6 +152,10 @@ int sched64_add_frame_for(const registers64_t* regs, const vmspace64_t* space,
     tasks[i].blocked   = 0;
     tasks[i].wait_addr = 0;
     tasks[i].used      = 1;
+    /* This is the path clone and fork take, so it is the one that
+     * matters most: a thread resumed with a register file nobody wrote
+     * is a thread FXRSTOR may refuse to load at all. */
+    for (int b = 0; b < 512; b++) tasks[i].fpu[b] = fpu_initial[b];
     task_total++;
     return i;
 }
@@ -182,7 +230,9 @@ int sched64_exit_current(registers64_t* out_regs, vmspace64_t* out_space,
         if (tasks[next].used && !tasks[next].blocked) break;
     if (next == SCHED64_MAX_TASKS) { current = -1; return 0; }
 
+    /* Nothing to save: the task that was running has ended. */
     current = next;
+    fpu_restore(tasks[next].fpu);
     if (out_regs)     *out_regs     = tasks[next].regs;
     if (out_space)    *out_space    = tasks[next].space;
     if (out_fs_base)  *out_fs_base  = tasks[next].fs_base;
@@ -210,7 +260,9 @@ int sched64_exit_process(int pid, registers64_t* out_regs,
         if (tasks[next].used && !tasks[next].blocked) break;
     if (next == SCHED64_MAX_TASKS) { current = -1; return 0; }
 
+    /* Nothing to save: every thread of that process has ended. */
     current = next;
+    fpu_restore(tasks[next].fpu);
     if (out_regs)    *out_regs    = tasks[next].regs;
     if (out_space)   *out_space   = tasks[next].space;
     if (out_fs_base) *out_fs_base = tasks[next].fs_base;
@@ -264,7 +316,9 @@ int sched64_block_current(const registers64_t* regs, uint64_t addr,
         return 0;
     }
 
+    fpu_save(tasks[current].fpu);
     current = next;
+    fpu_restore(tasks[next].fpu);
     if (out_regs)    *out_regs    = tasks[next].regs;
     if (out_space)   *out_space   = tasks[next].space;
     if (out_fs_base) *out_fs_base = tasks[next].fs_base;
@@ -303,7 +357,9 @@ int sched64_yield_current(const registers64_t* regs, registers64_t* out_regs,
     next = next_task(current);
     if (next == current) return 0;
 
+    fpu_save(tasks[current].fpu);
     current = next;
+    fpu_restore(tasks[next].fpu);
     if (out_regs)    *out_regs    = tasks[next].regs;
     if (out_space)   *out_space   = tasks[next].space;
     if (out_fs_base) *out_fs_base = tasks[next].fs_base;
@@ -340,8 +396,10 @@ void sched64_tick(registers64_t* frame) {
      * frame, so nothing else would have saved it. */
     tasks[current].regs    = *frame;
     tasks[current].fs_base = read_fs_base();
+    fpu_save(tasks[current].fpu);
 
     current = next;
+    fpu_restore(tasks[current].fpu);
 
     /* And the incoming task, written over the same frame - iretq reloads
      * from exactly this memory when the stub returns. */
