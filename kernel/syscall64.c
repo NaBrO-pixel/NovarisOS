@@ -1050,15 +1050,45 @@ uint64_t syscall64_dispatch(syscall64_args_t* args) {
  * before the old one is discarded. A failure after that point cannot
  * return an error to a caller that no longer exists.
  */
-#define EXECVE_MAX_ARGS 8
+/* How much of an argument list execve will carry.
+ *
+ * It was 8 entries of 128 bytes, and it truncated silently, which is
+ * the combination that cost Milestone 81 its five minutes.
+ *
+ * Wine's loader re-execs itself to pick the right loader for the target
+ * machine, and it stops the recursion by telling the next image not to
+ * do it again:
+ *
+ *     static char noexec[] = "WINELOADERNOEXEC=1";
+ *     putenv( noexec );
+ *     ... preloader_exec( argv );
+ *
+ * putenv appends. The layer supplies six variables - HOME, USER,
+ * WINEPREFIX, WINEDEBUG, WINEDLLPATH, WINEBOOTSTRAPMODE - and Wine adds
+ * three of its own: WINELOADERNOEXEC, WINEPRELOADRESERVE and
+ * WINESERVERSOCKET. Nine, against a ceiling of eight, and the one that
+ * fell off the end was the guard. The child re-execed, was told nothing,
+ * re-execed again, and after eight rounds of that gave up with 127 -
+ * while wineboot sat waiting for it.
+ *
+ * 128 entries because a real environment is that size: the same
+ * wineboot run on Linux carries 140 variables through execve, and a
+ * ceiling below what the host does is a ceiling this kernel will meet
+ * again. 512 bytes an entry for the same reason - PROC64_PATH_MAX is
+ * 1024, and an argument naming a path was being cut at 128.
+ *
+ * It costs 128KB of bss, in two static stores, and it is not silent any
+ * more: over either limit is -E2BIG, which is what Linux says. */
+#define EXECVE_MAX_ARGS 128
+#define EXECVE_ARG_MAX  512
 
 static uint64_t do_execve(const char* path, const char* const* argv,
                           const char* const* envp,
                           const syscall64_args_t* args) {
     /* Copied into the kernel while the old space still exists. */
     static char  kpath[PROC64_PATH_MAX];
-    static char  kargv_store[EXECVE_MAX_ARGS][128];
-    static char  kenvp_store[EXECVE_MAX_ARGS][128];
+    static char  kargv_store[EXECVE_MAX_ARGS][EXECVE_ARG_MAX];
+    static char  kenvp_store[EXECVE_MAX_ARGS][EXECVE_ARG_MAX];
     static const char* kargv[EXECVE_MAX_ARGS + 1];
     static const char* kenvp[EXECVE_MAX_ARGS + 1];
     const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
@@ -1082,12 +1112,19 @@ static uint64_t do_execve(const char* path, const char* const* argv,
      * execve("./configure") works and so that /proc/self/exe answers
      * with a path that still means something after a chdir. */
     if (abs_path(path, kpath) != 0) return (uint64_t)-2;
-    for (; argv && argv[nargv] && nargv < EXECVE_MAX_ARGS; nargv++) {
+    /* Counted before copying, and refused rather than trimmed. A list
+     * that does not fit is -E2BIG on Linux; quietly delivering a
+     * shorter one is how a loop guard goes missing. */
+    for (; argv && argv[nargv]; nargv++) {
+        if (nargv >= EXECVE_MAX_ARGS) return (uint64_t)-7;      /* -E2BIG */
+        if (kstrlen(argv[nargv]) >= EXECVE_ARG_MAX) return (uint64_t)-7;
         kstrlcpy(kargv_store[nargv], argv[nargv], sizeof(kargv_store[0]));
         kargv[nargv] = kargv_store[nargv];
     }
     kargv[nargv] = 0;
-    for (; envp && envp[nenvp] && nenvp < EXECVE_MAX_ARGS; nenvp++) {
+    for (; envp && envp[nenvp]; nenvp++) {
+        if (nenvp >= EXECVE_MAX_ARGS) return (uint64_t)-7;      /* -E2BIG */
+        if (kstrlen(envp[nenvp]) >= EXECVE_ARG_MAX) return (uint64_t)-7;
         kstrlcpy(kenvp_store[nenvp], envp[nenvp], sizeof(kenvp_store[0]));
         kenvp[nenvp] = kenvp_store[nenvp];
     }
