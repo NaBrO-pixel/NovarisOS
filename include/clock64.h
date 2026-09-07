@@ -26,7 +26,21 @@ void     clock64_tick(void);
 
 uint64_t clock64_ticks(void);
 
-/* Seconds and nanoseconds since the timer started. */
+/* Seconds and nanoseconds since the timer started. Monotonic: it starts
+ * at zero and only goes forwards. */
 void     clock64_now(uint64_t* sec, uint64_t* nsec);
+
+/* The wall clock: the same instant as seconds since the Unix epoch,
+ * anchored by one read of the CMOS RTC at boot.
+ *
+ * Kept apart from clock64_now because the two answer different
+ * questions, and a caller asking CLOCK_MONOTONIC wants an interval
+ * rather than a date. Zero seconds is a valid monotonic answer and a
+ * catastrophic realtime one - see Milestone 81. */
+void     clock64_realtime(uint64_t* sec, uint64_t* nsec);
+
+/* Reads the RTC and fixes the epoch. Called once, during bring-up,
+ * before anything can ask what time it is. */
+void     clock64_set_epoch_from_rtc(void);
 
 #endif

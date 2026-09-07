@@ -2459,41 +2459,60 @@ static uint64_t dispatch(syscall64_args_t* args) {
      * stamped with a fabricated date is worse than one stamped with an
      * obviously small number. What the wineserver needs is that time
      * advances and that two readings subtract correctly. */
+    /* clock_gettime(clkid, ts).
+     *
+     * The distinction is not decoration. CLOCK_REALTIME is a date and
+     * CLOCK_MONOTONIC is an interval, and answering both with "seconds
+     * since the timer started" makes the first of them 1970 - which
+     * Milestone 81 found Wine acting on. 0 is REALTIME and 8
+     * REALTIME_COARSE; 1 MONOTONIC, 4 MONOTONIC_RAW, 6 MONOTONIC_COARSE
+     * and 7 BOOTTIME all measure from an unspecified point, and boot is
+     * one. */
     case SYS64_CLOCK_GETTIME: {
         struct { uint64_t sec, nsec; }* ts = (void*)a2;
         if (!ts) return (uint64_t)-14;
-        clock64_now(&ts->sec, &ts->nsec);
+        if (a1 == 0 || a1 == 8) clock64_realtime(&ts->sec, &ts->nsec);
+        else                    clock64_now(&ts->sec, &ts->nsec);
         return 0;
     }
 
+    /* gettimeofday is a wall clock and has never been anything else. */
     case SYS64_GETTIMEOFDAY: {
         struct { uint64_t sec, usec; }* tv = (void*)a1;
         if (tv) {
             uint64_t s, ns;
-            clock64_now(&s, &ns);
+            clock64_realtime(&s, &ns);
             tv->sec  = s;
             tv->usec = ns / 1000;
         }
         return 0;
     }
 
-    /* time(NULL) - whole seconds, off the same clock gettimeofday
-     * answers from, so the two cannot disagree. Linux lets the result
-     * be written through the pointer as well as returned, and callers
-     * use both spellings.
+    /* time(NULL) - whole seconds since the epoch, off the same wall
+     * clock gettimeofday answers from, so the two cannot disagree.
+     * Linux lets the result be written through the pointer as well as
+     * returned, and callers use both spellings.
      *
-     * Not the epoch. clock64_now counts from the moment the timer
-     * started, so this says 1970 and every process agrees that it is
-     * 1970 - which is a different and much smaller lie than -ENOSYS,
-     * where the wineserver handed a negative time_t to gmtime once a
-     * second. A real wall clock means reading the RTC at boot, which
-     * the 64-bit half does not do yet and which is not this
-     * milestone's. */
+     * It must not answer 0, and that is not a style point. Wine caches
+     * the DOS drive table for one second, in get_drives_info:
+     *
+     *     static time_t last_update;        // zero-initialised
+     *     static unsigned int nb_drives;    // zero-initialised
+     *     time_t now = time(NULL);
+     *     if (now != last_update) { ...scan the drives...  }
+     *
+     * A time() that says 0 on the first call equals last_update, so the
+     * scan never runs, nb_drives stays 0, and the prefix has no C:
+     * drive. What that looks like is "could not load kernel32.dll,
+     * status c0000135" about a file that is present, and it cost this
+     * milestone five runs. Answering -ENOSYS was better than answering
+     * 0, because -1 differs from 0; answering the real time is better
+     * than either. */
     case SYS64_TIME: {
-        uint64_t s, ns;
-        clock64_now(&s, &ns);
-        if (a1) *(uint64_t*)a1 = s;
-        return s;
+        uint64_t sec, ns;
+        clock64_realtime(&sec, &ns);
+        if (a1) *(uint64_t*)a1 = sec;
+        return sec;
     }
 
     case SYS64_CLOCK_GETRES: {
