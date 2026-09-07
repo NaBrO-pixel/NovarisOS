@@ -929,7 +929,25 @@ void syscall64_set_trace(int on) { trace = on; }
  * Naming the leader makes "the thing I started has finished" the end of
  * the run, and leaves whatever it started behind - which is also what a
  * shell does. -1 restores the old behaviour. */
-void syscall64_set_leader(int pid) { leader_pid = pid; leader_exited = 0; }
+void syscall64_set_leader(int pid) {
+    leader_pid = pid;
+    /* Only *arming* clears the verdict, for exactly the reason spelled
+     * out under set_run_ticks below - and this is the same bug, which
+     * was fixed there and left here.
+     *
+     * The layer disarms before it reports:
+     *
+     *     syscall64_set_leader(-1);
+     *     ...
+     *     if (syscall64_leader_exited()) ... else "did not exit"
+     *
+     * so clearing on disarm made syscall64_leader_exited() answer false
+     * every time it was ever asked. "wineboot did not exit" was not a
+     * measurement, it was a constant - and Milestone 80 recorded it as
+     * a finding, as did several runs of Milestone 81 before the trace
+     * showed pid 1, the leader, calling exit_group as its last act. */
+    if (pid >= 0) leader_exited = 0;
+}
 
 /* Ends a run after `ticks` whether or not anything has finished.
  *
