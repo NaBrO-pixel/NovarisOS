@@ -27,7 +27,27 @@
  * There are no priorities, no accounting and no run queue - a fixed
  * array, walked in order. */
 
-#define SCHED64_MAX_TASKS 4
+/* Four was the number of threads a test needs, and it was never
+ * revisited. Building a Wine prefix runs wineboot, the wineserver and a
+ * rundll32 per wine.inf section, each with threads of its own, and the
+ * fifth thread to start is the one that fails.
+ *
+ * It fails as -EAGAIN out of clone, which glibc reports as "Resource
+ * temporarily unavailable" and Wine does not survive. In the trace it
+ * is a whole process that lives for three syscalls:
+ *
+ *     [call pid 6] 273 set_robust_list(...)      = 0
+ *     [call pid 6] 56  clone(0x1200011, 0, 0)    = -11
+ *     [call pid 6] 231 exit_group(1)
+ *
+ * 0x1200011 being CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID|SIGCHLD,
+ * which is a plain fork.
+ *
+ * 128, sized against the host: the same wineboot -u under strace peaks
+ * at 99 threads and processes alive at once. The table is walked in
+ * order on every switch, which is O(n) and fine at this size, and it
+ * costs about 250 bytes a task. */
+#define SCHED64_MAX_TASKS 128
 
 void sched64_init(void);
 
