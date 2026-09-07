@@ -981,7 +981,17 @@ uint64_t syscall64_dispatch(syscall64_args_t* args) {
     if (wait_started() && args->nr == wait_call[wait_slot()])
         return dispatch(args);
 
-    serial64_puts("NOVARIS64: [call] ");
+    /* Which process is asking.
+     *
+     * Without it a trace of a Wine prefix is four programs' syscalls
+     * interleaved on one line-oriented log, and the question that
+     * matters - which of them stopped making progress - cannot be asked
+     * of it at all. wineboot spawns the wineserver and a rundll32 per
+     * wine.inf section, and "the last thing in the log is a poll loop"
+     * describes both a healthy idle server and a wedged client. */
+    serial64_puts("NOVARIS64: [call pid ");
+    serial64_putdec((uint64_t)proc64_current_pid());
+    serial64_puts("] ");
     serial64_putdec(args->nr);
 
     /* Path-taking calls print their path. Without this a trace of a
@@ -2430,6 +2440,25 @@ static uint64_t dispatch(syscall64_args_t* args) {
         return 0;
     }
 
+    /* time(NULL) - whole seconds, off the same clock gettimeofday
+     * answers from, so the two cannot disagree. Linux lets the result
+     * be written through the pointer as well as returned, and callers
+     * use both spellings.
+     *
+     * Not the epoch. clock64_now counts from the moment the timer
+     * started, so this says 1970 and every process agrees that it is
+     * 1970 - which is a different and much smaller lie than -ENOSYS,
+     * where the wineserver handed a negative time_t to gmtime once a
+     * second. A real wall clock means reading the RTC at boot, which
+     * the 64-bit half does not do yet and which is not this
+     * milestone's. */
+    case SYS64_TIME: {
+        uint64_t s, ns;
+        clock64_now(&s, &ns);
+        if (a1) *(uint64_t*)a1 = s;
+        return s;
+    }
+
     case SYS64_CLOCK_GETRES: {
         struct { uint64_t sec, nsec; }* ts = (void*)a2;
         if (ts) { ts->sec = 0; ts->nsec = 1000000000ull / CLOCK64_HZ; }
@@ -2930,7 +2959,9 @@ static uint64_t dispatch(syscall64_args_t* args) {
          * way to find out what a real program wants is to let it ask. */
         unimpl_count++;
         last_unimpl = nr;
-        serial64_puts("NOVARIS64: [enosys] syscall ");
+        serial64_puts("NOVARIS64: [enosys pid ");
+        serial64_putdec((uint64_t)proc64_current_pid());
+        serial64_puts("] syscall ");
         serial64_putdec(nr);
         serial64_putc('\n');
         /* Linux answers an unimplemented call with -ENOSYS, and programs
