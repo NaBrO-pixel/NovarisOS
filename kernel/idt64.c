@@ -139,6 +139,23 @@ static void panic(registers64_t* r) {
         serial64_puts("\nNOVARIS64:   cr2=");
         serial64_puthex(read_cr2());
     }
+
+    /* The general registers, because rip and rsp alone cannot tell the
+     * two things a #GP in ring 3 is usually made of apart: an address
+     * that is merely misaligned, and one that is not canonical. Both
+     * fault the same way and neither is visible without the operand
+     * register - and the operand of the instruction that faulted is
+     * named by the disassembly, not by the frame. Milestone 81 spent
+     * two runs on that distinction. */
+    serial64_puts("\nNOVARIS64:   rax="); serial64_puthex(r->rax);
+    serial64_puts(" rbx=");                serial64_puthex(r->rbx);
+    serial64_puts(" rcx=");                serial64_puthex(r->rcx);
+    serial64_puts("\nNOVARIS64:   rdx="); serial64_puthex(r->rdx);
+    serial64_puts(" rsi=");                serial64_puthex(r->rsi);
+    serial64_puts(" rdi=");                serial64_puthex(r->rdi);
+    serial64_puts("\nNOVARIS64:   rbp="); serial64_puthex(r->rbp);
+    serial64_puts(" r12=");                serial64_puthex(r->r12);
+    serial64_puts(" r13=");                serial64_puthex(r->r13);
     serial64_puts("\nNOVARIS64: *** halted\n");
 
     for (;;) __asm__ __volatile__("cli; hlt");
