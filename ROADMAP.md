@@ -9625,6 +9625,133 @@ What is not done: wineboot still does not exit, so `services.exe` and
 `explorer.exe` are not reached. The next thing to find is what it is
 spending five minutes of emulated time on.
 
+> **Corrected by Milestone 81.** "wineboot still does not exit" was not
+> a measurement. `syscall64_set_leader()` cleared `leader_exited` on
+> every call including the disarming one, and the layer disarms before
+> it reports - so `syscall64_leader_exited()` answered false to every
+> question ever put to it. wineboot reaches `exit_group`. And the five
+> minutes were not being spent on anything: the run was dying and the
+> watchdog was reporting the death as a timeout.
+
+
+## Milestone 81 - four ceilings, two clocks and a broken gauge
+
+Milestone 80 asked where wineboot spent five minutes of emulated time.
+It was not spending it. The run was dying, and two instruments were
+lying about it.
+
+**Nothing here was a missing syscall.** The list Milestone 80 left
+pointed at the Win32 API surface and at unimplemented calls; the answer
+was four numbers sized for a single test program and never revisited,
+each of which failed silently:
+
+| | was | now | measured against |
+|---|---|---|---|
+| `PROC64_FD_MAX` | 32 | 256 | host wineserver peaks at 135 descriptors |
+| `EXECVE_MAX_ARGS` | 8 | 128 | host carries 140 variables through execve |
+| `SCHED64_MAX_TASKS` | 4 | 128 | host peaks at 99 threads and processes |
+| `clock64` | uptime | RTC | `time()` must not answer 0 |
+
+Every measurement is a host differential - `wineboot -u` run to completion on Linux
+under strace, 2.37M syscalls, producing a real 829-file prefix - and
+compared against the guest. That is the same differential method the
+rest of this tree uses, applied to ceilings rather than to behaviour.
+
+**How each one presented, which is the part worth remembering:**
+
+- The descriptor ceiling arrived as a **five-minute timeout**. It was
+  `openat` returning `-EMFILE` and the process dying with
+  `0xc000011f`, `STATUS_TOO_MANY_OPENED_FILES`.
+- `EXECVE_MAX_ARGS` arrived as **nothing at all**. Wine's loader
+  re-execs itself and stops the recursion with
+  `putenv("WINELOADERNOEXEC=1")`. putenv appends; the layer supplies six
+  variables and Wine adds three; nine against a ceiling of eight, and
+  the one that fell off the end was the guard. Eight rounds of re-exec,
+  then `exit(127)`, while wineboot waited for a child that could never
+  finish.
+- `SCHED64_MAX_TASKS` arrived as a bare `-EAGAIN` from `clone`, which
+  glibc reports as "Resource temporarily unavailable" - transient
+  pressure, in the words of a fixed array being full.
+- `time()` arrived as `could not load kernel32.dll` about a file that
+  was present. Wine caches the DOS drive table for a second against a
+  zero-initialised `last_update`, so a `time()` that answers 0 means
+  the scan never runs and the prefix has no `C:` drive. Answering
+  `-ENOSYS` had worked by accident, because -1 differs from 0.
+
+**Two instruments were lying.**
+
+`syscall64_set_leader()` cleared its own verdict on disarm, and the
+layer disarms before it reports - so "wineboot did not exit" was what
+that line printed unconditionally, in this milestone and in 80. The
+function immediately below it, `set_run_ticks`, carries a comment
+describing exactly this bug, found once and fixed there and left here.
+
+And `signal64_set_trace(1)` was armed, by me, against the first of five
+matching anchors - a layer that runs long before Wine. Its silence was
+read as "no signal was delivered" and reported as a finding. Both times
+what was missing was a **positive control**: something to show the
+instrument could fire at all before believing that it had not.
+
+**What was actually broken in the kernel**, beyond the ceilings:
+
+- The scheduler restored `IA32_FS_BASE` and left `IA32_GS_BASE` alone.
+  Wine keeps the Windows TEB at GS and reads its syscall frame from
+  `%gs:0x378`, so an incoming thread ran with the outgoing thread's TEB.
+  Found by disassembling `ntdll.so` at the faulting address rather than
+  by reasoning about the symptom.
+- The scheduler saved no FPU or SSE state at all. Invisible at four task
+  slots; a real bug at 128.
+- `signal64_deliver` aligned the frame to 16 when the ABI wants
+  `rsp % 16 == 8`, the alignment a `call` leaves behind. Every xmm spill
+  in a handler is a `movaps` at a fixed offset from rsp.
+
+**And two things were simply not in the image**: the 24 unix `.so`
+halves other than ntdll, which ntdll looks for in
+`/usr/bin/x86_64-unix/` rather than beside the loader, and `wine.inf`
+itself. The second is why the prefix sat at 4/7 for so long - without
+the inf, `update_wineprefix` takes its `goto done` and nothing ever
+writes `system.reg`, `user.reg` or `userdef.reg`.
+
+### Where it is now
+
+wineboot **exits**, with status 1. The prefix reaches 7/7 in runs that
+get that far. 21 differentials, 0 failures, throughout.
+
+It is not finished. With `wine.inf` staged the run reaches a fault
+chain that is not yet explained:
+
+```
+[signal 11 pid 5] rip=0x6fffff7d5553 addr=0x2ae        err=4
+[signal 11 pid 5] rip=0x1b001b0023   addr=0x1b001b0023 err=4
+```
+
+The second fault has `rip` equal to the faulting address - an
+instruction fetch at garbage - so execution resumes somewhere impossible
+after the first handler returns, and the general protection fault that
+ends the run happens inside the *second* handler, three levels
+downstream of the fault that matters.
+
+The first fault is the one to chase. `struct syscall_frame` keeps
+`xsave` at `0xc0` and `0xc0 + 0x1ee` is `0x2ae`, so it is a null or
+garbage `struct syscall_frame *` dereferenced inside its xsave area -
+the pointer Wine reads from `%gs:0x378`.
+
+Four explanations have been tried and killed, and are recorded so they
+are not tried again:
+
+1. **Unsaved FPU state.** Implemented; the fault did not move.
+2. **A non-canonical pointer.** The register dump says `rax = 0x1b` -
+   a small integer, not a bad address.
+3. **A null `uc_mcontext.fpstate`.** It really is never assigned by this
+   kernel, and Wine guards it in both places that matter. Still a gap
+   worth closing; not this bug.
+4. **A stale GS base.** Both bases are valid at the fault -
+   `gsbase=0x7ffc0000`, `fsbase=0x100000213100`. `%gs:0x378` was read
+   successfully and *contained* null, which is a different problem.
+
+So the next question is why that field is null: which thread's TEB it
+belongs to, and whether Wine ever wrote it for this thread.
+
 
 ## Where chrome.exe actually is from here
 
@@ -9694,10 +9821,13 @@ list, and it is shorter than the one above but not smaller:
    this time because a Windows program asked for them rather than
    because the Unix-side server saved them on its own timer.
 
-   wineboot still does not exit - the run times out *still working*
-   rather than dying - so `services.exe` and `explorer.exe` are not
-   reached yet. That is the next thing, and finding out where the five
-   minutes go is the first step.
+   ~~wineboot still does not exit - the run times out *still working*
+   rather than dying~~ - both halves of that were wrong, and Milestone
+   81 says how. The run was dying, not working; and the gauge that
+   reported "did not exit" was cleared on disarm and answered false to
+   every question ever put to it. wineboot reaches `exit_group` and
+   exits 1. `services.exe` and `explorer.exe` are still not reached,
+   but because wineboot fails rather than because it hangs.
 2. ~~**Copy-on-write `fork`.**~~ - done in Milestone 69. An 8MB process
    forks for 14 frames.
 3. ~~**Keyboard and mouse.**~~ - done in Milestone 70, as
