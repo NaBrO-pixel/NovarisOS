@@ -124,6 +124,36 @@ done < <(find "$TREE/dlls" -name "*.so" -type f)
 # Getting this wrong is not a missing translation. uctable stays NULL
 # and the first ntdll_towupper reads through it - a null dereference in
 # a case conversion, a long way from anything about locales.
+# wine.inf, which is what actually builds the prefix.
+#
+# Not staged at all until Milestone 81, and its absence is quiet in the
+# way this layer keeps being quiet: wineboot creates the directories,
+# reports "created the configuration directory", and then
+# update_wineprefix cannot open the file, takes its `goto done`, and
+# never spawns the rundll32 that runs the inf. The prefix is left
+# without system.reg, user.reg or userdef.reg - which is exactly the
+# three of seven paths the layer was reporting missing - and wineboot
+# exits 1.
+#
+# What it says, once stderr is read rather than the exit code:
+#
+#   wine: failed to update L"\??\Z:\root\.wine"
+#         with L"\\?\Z:\share\wine\wine.inf":
+#
+# and that names the path it wanted. get_wine_inf_path builds it from
+# the loader's own directory as ../../share/wine/wine.inf, which from
+# /usr/bin is /share/wine - the same arithmetic the NLS tables need, so
+# it is staged in both places for the same reason.
+if [ -f "$TREE/loader/wine.inf" ]; then
+    for d in "$DEST/usr/share/wine" "$DEST/share/wine"; do
+        mkdir -p "$d" || exit 1
+        cp "$TREE/loader/wine.inf" "$d/" || exit 1
+    done
+    echo "stage_wine: wine.inf, in both places"
+else
+    echo "stage_wine: no wine.inf at $TREE/loader/wine.inf" >&2
+fi
+
 if [ -d "$TREE/nls" ]; then
     for d in "$DEST/usr/share/wine/nls" "$DEST/share/wine/nls"; do
         mkdir -p "$d" || exit 1
