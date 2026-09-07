@@ -52,6 +52,12 @@ int signal64_sigaction(int sig, const ksigaction64_t* act,
     return 0;
 }
 
+static inline uint64_t read_msr_base(uint32_t msr) {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+
 static int signal_trace;
 void signal64_set_trace(int on) { signal_trace = on; }
 
@@ -127,6 +133,17 @@ int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
         serial64_puthex(fault_addr);
         serial64_puts(" err=");
         serial64_puthex(r->err_code);
+        /* The segment bases, because the address a Windows program
+         * faults on is very often reached through one of them. Wine
+         * keeps the TEB at GS and reads its own syscall frame out of
+         * %gs:0x378, so a GS base that belongs to another thread - or
+         * to nobody - turns into a near-null dereference at whatever
+         * offset the frame was being read at, and says nothing about
+         * segments at all. */
+        serial64_puts("\nNOVARIS64:   fsbase=");
+        serial64_puthex(read_msr_base(0xC0000100u));
+        serial64_puts(" gsbase=");
+        serial64_puthex(read_msr_base(0xC0000101u));
         serial64_putc('\n');
     }
 
