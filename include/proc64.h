@@ -23,7 +23,28 @@
  * a Wine prefix runs wineserver, wineboot, services.exe and explorer.exe
  * at once, and the fifth process to start is the one that fails. */
 #define PROC64_MAX     32
-#define PROC64_FD_MAX  32
+
+/* 32 was the number a program that opens a few files needs, and the
+ * wineserver is not that program. It holds a descriptor per client
+ * thread - the socket, the reply pipe and the wait pipe, three each -
+ * on top of every file the loader has open, and it holds them all at
+ * once.
+ *
+ * Measured rather than guessed, the same way ramfs64's ceilings were:
+ * `wineboot -u` was run to completion on Linux under strace and the
+ * concurrent descriptors counted per process. The wineserver peaks at
+ * 135; nothing else passes 6. At 32 the guest did not survive that -
+ * openat returned -EMFILE and the process died with 0xc000011f,
+ * STATUS_TOO_MANY_OPENED_FILES, which is Wine faithfully reporting the
+ * limit it was given.
+ *
+ * 256 is the next power of two above the measurement, and it costs
+ * 40 bytes a descriptor - 10KB per process, 320KB across all 32.
+ *
+ * It is also poll's bound: the loop below rejects nfds above
+ * FD_MAX * 2, and a server polling 135 descriptors was being told
+ * -EINVAL by a kernel that had sized the check for a smaller machine. */
+#define PROC64_FD_MAX  256
 
 /* 128 was under the 170 characters a real prefix's deepest path needs -
  * measured, see ramfs64.h. */
