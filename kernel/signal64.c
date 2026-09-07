@@ -69,7 +69,31 @@ int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
      * there would corrupt the interrupted function's locals. */
     sp = r->rsp - 128;
     sp -= sizeof(rt_sigframe64_t);
-    sp &= ~15ULL;
+
+    /* Aligned the way a `call` leaves the stack, not the way a 16-byte
+     * boundary looks.
+     *
+     * The handler is entered with rsp pointing at the frame, whose first
+     * field is pretcode - so from the handler's point of view rsp holds
+     * a return address and it is entered exactly as if called. The ABI
+     * says rsp+8 is 16-byte aligned there, which means rsp % 16 == 8.
+     * Rounding to 16 and stopping gets the parity wrong by eight, and
+     * Linux writes the same thing as round_down(sp, 16) - 8.
+     *
+     * Eight bytes of parity is not a detail the compiler forgives. Every
+     * xmm spill in the handler is a movaps against a fixed offset from
+     * rsp, and movaps faults on an address that is merely 8-aligned. It
+     * killed Wine's own SIGSEGV handler, which is not an edge case here:
+     * Wine takes SIGSEGV in the ordinary course of running a prefix, to
+     * service its write-watch pages through virtual_handle_fault.
+     *
+     *     418b9:  movaps %xmm0,0x40(%rsp)   <- #GP, rsp % 16 == 8
+     *     418be:  call   virtual_handle_fault
+     *
+     * so with rsp % 16 == 8 inside the body, 0x40(%rsp) is 8-aligned and
+     * the store is a general protection fault in ring 3 with no error
+     * code, a long way from anything about signals. */
+    sp = (sp & ~15ULL) - 8;
     /* The frame is written from the kernel while the faulting thread's
      * address space is current - a fault handler runs in the space that
      * faulted - so this is an ordinary store. It is also unchecked: a
