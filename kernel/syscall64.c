@@ -1460,6 +1460,28 @@ static uint64_t dispatch(syscall64_args_t* args) {
             want = (a2 + PAGE64_SIZE - 1) / PAGE64_SIZE;
             if (nframes > want) nframes = want;
             shared_maps++;
+            /* Which file, and which physical frame it starts at.
+             *
+             * A shared mapping is only shared if two mappings of the
+             * same file land on the same frames, and that is exactly
+             * what cannot be read off an address. Wine maps its
+             * KUSER_SHARED_DATA read-only at 0x7ffe0000 and then maps
+             * the same section again read-write somewhere else, purely
+             * to store one byte - SystemCall = 1 - which every PE
+             * syscall stub then tests to decide whether to call Wine's
+             * dispatcher or execute a real `syscall` instruction. The
+             * guest is taking the second branch, so that byte is
+             * reading 0, and whether the two mappings share a frame is
+             * the question that decides why. */
+            if (trace) {
+                serial64_puts("NOVARIS64: [shmap node ");
+                serial64_putdec((uint64_t)node);
+                serial64_puts(" frame0 ");
+                serial64_puthex(nframes ? frames[0] : 0);
+                serial64_puts(" at ");
+                serial64_puthex(a1);
+                serial64_putc('\n');
+            }
             return uspace64_map_frames(a1, (flags & MAP_FIXED) != 0,
                                        frames, nframes, a3);
         }
