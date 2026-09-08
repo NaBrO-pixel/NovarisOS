@@ -1032,6 +1032,24 @@ uint64_t syscall64_dispatch(syscall64_args_t* args) {
         serial64_puts("\"");
     }
 
+    /* And execve prints its arguments, not just its path.
+     *
+     * Every Wine process on this machine execs the same file - the
+     * loader, /usr/bin/wine - so the path answers nothing about which
+     * program a pid is. The Windows program is argv[1] and what it was
+     * asked to do is the rest, which is the difference between "pid 5
+     * is a Wine process" and "pid 5 is rundll32 running wine.inf's
+     * DefaultInstall section". Four arguments is enough for that and
+     * short enough not to bury the line. */
+    if (args->nr == SYS64_EXECVE && args->a2) {
+        const char* const* av = (const char* const*)args->a2;
+        for (int i = 0; i < 4 && av[i]; i++) {
+            serial64_puts(i ? " " : " [");
+            serial64_puts(av[i]);
+        }
+        if (av[0]) serial64_puts("]");
+    }
+
     serial64_puts("(");
     serial64_puthex(args->a1);
     serial64_puts(", ");
