@@ -248,8 +248,20 @@ void idt64_install(void) {
     set_gate(0,  (uint64_t)isr0,  0, 0);
     set_gate(1,  (uint64_t)isr1,  0, 0);
     set_gate(2,  (uint64_t)isr2,  IST_NMI, 0);
-    set_gate(3,  (uint64_t)isr3,  0, 0);
-    set_gate(4,  (uint64_t)isr4,  0, 0);
+    /* int3 and into are ring-3 instructions, and their gates have to say
+     * so. A gate at DPL 0 does not make a debug break privileged, it
+     * makes it a general protection fault: the CPU refuses the software
+     * interrupt and raises #GP with the gate's selector as the error
+     * code, which is why this arrived as
+     *
+     *     general protection fault (vector 13) err=0x1a
+     *
+     * 0x1a being (3 << 3) | 2 - IDT entry 3 - and naming vector 3 in a
+     * report about vector 13. Linux gives these two gates DPL 3 for
+     * exactly this reason. ntdll's DbgBreakPoint is `int3; ret`, so
+     * every Wine assertion and every deliberate break lands here. */
+    set_gate(3,  (uint64_t)isr3,  0, 3);
+    set_gate(4,  (uint64_t)isr4,  0, 3);
     set_gate(5,  (uint64_t)isr5,  0, 0);
     set_gate(6,  (uint64_t)isr6,  0, 0);
     set_gate(7,  (uint64_t)isr7,  0, 0);
