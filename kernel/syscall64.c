@@ -3125,6 +3125,22 @@ static uint64_t dispatch(syscall64_args_t* args) {
         serial64_putdec((uint64_t)proc64_current_pid());
         serial64_puts("] syscall ");
         serial64_putdec(nr);
+        /* And where it came from, because the number alone cannot tell
+         * a Linux syscall from a Windows one.
+         *
+         * Wine's PE stubs contain a real `syscall` instruction, taken
+         * when KUSER_SHARED_DATA.SystemCall is 0, and Windows syscall
+         * numbers are small: ntdll's are 0x00-0x1ff. So a stub for
+         * NtSomething 0x2c arrives here indistinguishable from sendto,
+         * and is reported as an unimplemented sendto with nonsense
+         * arguments - one of which, in the run that prompted this, was
+         * 0xc0000005, STATUS_ACCESS_VIOLATION.
+         *
+         * The return address settles it: PE code lives at 0x6fff...,
+         * the Wine loader and libc at 0x1000..., so the caller's rip
+         * says which world the number belongs to. */
+        serial64_puts(" from rip=");
+        serial64_puthex(args->ret_rip);
         serial64_putc('\n');
         /* Linux answers an unimplemented call with -ENOSYS, and programs
          * do check for it, so this is -38 rather than -1. */
