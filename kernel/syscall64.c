@@ -1474,13 +1474,27 @@ static uint64_t dispatch(syscall64_args_t* args) {
              * reading 0, and whether the two mappings share a frame is
              * the question that decides why. */
             if (trace) {
+                uint64_t res_dbg = uspace64_map_frames(a1,
+                                       (flags & MAP_FIXED) != 0,
+                                       frames, nframes, a3);
                 serial64_puts("NOVARIS64: [shmap node ");
                 serial64_putdec((uint64_t)node);
                 serial64_puts(" frame0 ");
                 serial64_puthex(nframes ? frames[0] : 0);
-                serial64_puts(" at ");
-                serial64_puthex(a1);
+                serial64_puts(" -> ");
+                serial64_puthex(res_dbg);
+                /* The byte the Wine syscall stubs test, read through
+                 * the mapping that was just made. Following it across
+                 * processes says who writes it and who sees it, which
+                 * is the whole question: it must be 1 by the time any
+                 * PE stub runs, and it is reading 0. */
+                if ((int64_t)res_dbg > 0 && nframes &&
+                    user_range_ok(res_dbg + 0x308, 1)) {
+                    serial64_puts(" byte308=");
+                    serial64_putdec(*(volatile uint8_t*)(res_dbg + 0x308));
+                }
                 serial64_putc('\n');
+                return res_dbg;
             }
             return uspace64_map_frames(a1, (flags & MAP_FIXED) != 0,
                                        frames, nframes, a3);
