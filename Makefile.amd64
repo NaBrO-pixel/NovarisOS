@@ -455,6 +455,7 @@ INITRD       = $(BUILD_DIR)/initrd64.img
 LD_SO  := $(shell readlink -f /lib64/ld-linux-x86-64.so.2)
 LIBC   := $(shell readlink -f /lib/x86_64-linux-gnu/libc.so.6)
 LIBGCC := $(shell readlink -f /lib/x86_64-linux-gnu/libgcc_s.so.1 2>/dev/null)
+LIBM   := $(shell readlink -f /lib/x86_64-linux-gnu/libm.so.6 2>/dev/null)
 
 # An x86-64 Wine built out-of-tree beside the repository, if there is
 # one. Two candidates because a git worktree sits four levels below the
@@ -487,6 +488,25 @@ $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
 	@# dependency is a much more confusing failure than a spare file.
 	@if [ -f "$(LIBGCC)" ]; then \
 	    cp "$(LIBGCC)" $(INITRD_STAGE)/lib/x86_64-linux-gnu/libgcc_s.so.1; \
+	 fi
+	@# And libm, which win32u.so needs and nothing else does.
+	@#
+	@# Its absence is the most expensive single missing file this tree
+	@# has had. dlopen("win32u.so") fails on it, so win32u's unix half
+	@# never loads, so its init() never runs, so
+	@#
+	@#     KeAddSystemServiceTable( syscalls, NULL, ARRAY_SIZE(syscalls),
+	@#                              arguments, 1 );
+	@#
+	@# is never called and syscall table 1 keeps ServiceLimit = 0. Every
+	@# win32u syscall then fails the dispatcher's bounds check and
+	@# returns STATUS_INVALID_SYSTEM_SERVICE - and user32 does not check
+	@# it, so 0xc000001c is passed on as a GDI handle. What that looks
+	@# like, four layers downstream, is a general protection fault in
+	@# gdi32 dereferencing a null PEB->GdiSharedHandleTable, with
+	@# nothing anywhere naming libm.
+	@if [ -f "$(LIBM)" ]; then \
+	    cp "$(LIBM)" $(INITRD_STAGE)/lib/x86_64-linux-gnu/libm.so.6; \
 	 fi
 	@# Wine's own loader, if a 64-bit Wine has been built beside the
 	@# tree. Optional: the build must not depend on somebody having
