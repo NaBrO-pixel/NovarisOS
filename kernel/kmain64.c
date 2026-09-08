@@ -3621,7 +3621,20 @@ void kernel_main(uint32_t magic, void* mbi) {
             "HOME=/root",
             "USER=root",
             "WINEPREFIX=/root/.wine",
-            "WINEDEBUG=-all",
+            /* err and fixme only - Wine's default channels, not "-all".
+             *
+             * "-all" was right while the question was whether Wine got
+             * anywhere, and wrong the moment the question became why it
+             * stopped: it silences the one narrator who knows. Three
+             * separate walls this milestone were diagnosed from a line
+             * Wine was already writing to stderr and this variable was
+             * throwing away - the missing wine.inf named its own path,
+             * and "could not load kernel32.dll" named the file it could
+             * not find. +all is unusable here (a hundred megabytes of
+             * serial), so this is the middle setting: everything Wine
+             * considers an error or an unimplemented path, nothing it
+             * considers a trace. */
+            "WINEDEBUG=err+all,fixme+all,trace-all,warn-all",
             /* Where the builtin PE modules are.
              *
              * Not decoration, and not something the staging could fix.
