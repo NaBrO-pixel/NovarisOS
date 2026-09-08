@@ -3163,6 +3163,23 @@ static uint64_t dispatch(syscall64_args_t* args) {
          * says which world the number belongs to. */
         serial64_puts(" from rip=");
         serial64_puthex(args->ret_rip);
+        /* And, for a call that came from PE code, the byte its stub
+         * tested to get here.
+         *
+         * KUSER_SHARED_DATA.SystemCall at 0x7ffe0308 decides whether a
+         * Wine syscall stub calls the dispatcher or executes a real
+         * `syscall`. Every process maps that page from the same file
+         * and - measured, not assumed - the same physical frame, so a
+         * write through any mapping of it is visible to all of them.
+         * Printing the byte says whether it is 0 because nobody wrote
+         * it, or 1 with the stub having branched anyway, which would
+         * mean the stub was read wrong rather than the memory. */
+        if (args->ret_rip >= 0x00006F0000000000ULL &&
+            args->ret_rip <  0x0000700000000000ULL &&
+            user_range_ok(0x7ffe0308ULL, 1)) {
+            serial64_puts(" SystemCall=");
+            serial64_putdec(*(volatile uint8_t*)0x7ffe0308ULL);
+        }
         serial64_putc('\n');
         /* Linux answers an unimplemented call with -ENOSYS, and programs
          * do check for it, so this is -38 rather than -1. */
