@@ -154,6 +154,7 @@ typedef struct {
  * publishes in user_shared_data, and a -ENOSYS there is not an error it
  * checks: it is a negative time_t handed to gmtime. */
 #define SYS64_TIME            201
+#define SYS64_SIGALTSTACK     131
 
 /* poll(2) events, Linux's values. Only these three mean anything here. */
 #define POLL64_IN    0x001

@@ -23,7 +23,19 @@
 #define SIG64_SEGV   11
 
 #define SA_SIGINFO   0x00000004
+#define SA_ONSTACK   0x08000000
 #define SA_RESTORER  0x04000000
+
+/* sigaltstack(2)'s stack_t, in Linux's layout. */
+typedef struct {
+    uint64_t ss_sp;
+    int32_t  ss_flags;
+    int32_t  __pad;
+    uint64_t ss_size;
+} altstack64_t;
+
+#define SS_ONSTACK   1
+#define SS_DISABLE   2
 
 /* struct sigcontext_64, which is what uc_mcontext is. Field order is
  * the kernel's and must not be tidied. */
@@ -64,6 +76,18 @@ typedef struct {
 } ksigaction64_t;
 
 void signal64_reset(void);
+
+/* sigaltstack(2). Either pointer may be null. Returns 0 or a negative
+ * errno.
+ *
+ * Not decoration, and not only for programs that overflow their stacks
+ * on purpose: a thread that faults *because* its stack pointer is bad
+ * cannot be handed a frame below that stack pointer, and the kernel
+ * writing one there faults in ring 0. Wine asks for an alternate stack
+ * at every thread start, in init_thread_pipe, and until now the answer
+ * was -ENOSYS. */
+int  signal64_sigaltstack(const altstack64_t* ss, altstack64_t* oss,
+                          uint64_t cur_rsp);
 
 int  signal64_sigaction(int sig, const ksigaction64_t* act,
                         ksigaction64_t* oact);

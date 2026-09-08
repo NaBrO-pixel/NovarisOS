@@ -1827,6 +1827,18 @@ static uint64_t dispatch(syscall64_args_t* args) {
                    (int)a1, (const ksigaction64_t*)a2,
                    (ksigaction64_t*)a3);
 
+    /* sigaltstack(ss, oss).
+     *
+     * Wine asks for one in init_thread_pipe, at every thread start, and
+     * does not check the answer - so -ENOSYS here was invisible until a
+     * thread overflowed its stack and the kernel tried to write the
+     * signal frame below the stack pointer that had just faulted. See
+     * signal64_deliver. */
+    case SYS64_SIGALTSTACK:
+        return (uint64_t)(int64_t)signal64_sigaltstack(
+                   (const altstack64_t*)a1, (altstack64_t*)a2,
+                   saved_user_rsp);
+
     case SYS64_RT_SIGRETURN: {
         registers64_t resumed;
         /* The frame sits on the thread's own stack, which is where the

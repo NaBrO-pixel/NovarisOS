@@ -4,6 +4,7 @@
 #include "kstring.h"
 #include "serial64.h"
 #include "proc64.h"
+#include "paging64.h"
 
 #define NSIG 64
 
@@ -18,6 +19,17 @@ _Static_assert(__builtin_offsetof(sigcontext64_t, rip) == 128, "sc.rip");
 _Static_assert(__builtin_offsetof(sigcontext64_t, eflags) == 136, "sc.eflags");
 _Static_assert(__builtin_offsetof(rt_sigframe64_t, uc) == 8, "frame.uc");
 
+/* The alternate signal stack.
+ *
+ * One, not one per process, for the same reason `handlers` is one table:
+ * this layer is reset between the runs that use it, and every program
+ * that has needed it so far has been the only one asking. It is the
+ * next thing to make per-process, and it is written down here rather
+ * than discovered later.
+ *
+ * ss_size 0 means "none set", which is what a zeroed reset leaves. */
+static altstack64_t altstack;
+
 static ksigaction64_t handlers[NSIG];
 static uint64_t delivered, returns;
 
@@ -27,7 +39,9 @@ void signal64_reset(void) {
         handlers[i].flags    = 0;
         handlers[i].restorer = 0;
         handlers[i].mask     = 0;
-    }
+        altstack.ss_sp = 0;
+    altstack.ss_size = 0;
+}
     delivered = 0;
     returns = 0;
 }
@@ -61,6 +75,60 @@ static inline uint64_t read_msr_base(uint32_t msr) {
 static int signal_trace;
 void signal64_set_trace(int on) { signal_trace = on; }
 
+/* Is `sp` inside the alternate stack? A handler that faults again while
+ * already running on the alternate stack must not be given a second
+ * frame at the same place - Linux keeps delivering on the current stack
+ * in that case, and so does this. */
+static int on_altstack(uint64_t sp) {
+    return altstack.ss_size &&
+           sp >= altstack.ss_sp && sp < altstack.ss_sp + altstack.ss_size;
+}
+
+int signal64_sigaltstack(const altstack64_t* ss, altstack64_t* oss,
+                         uint64_t cur_rsp) {
+    if (oss) {
+        oss->ss_sp    = altstack.ss_sp;
+        oss->ss_size  = altstack.ss_size;
+        oss->ss_flags = on_altstack(cur_rsp) ? SS_ONSTACK
+                      : (altstack.ss_size ? 0 : SS_DISABLE);
+        oss->__pad    = 0;
+    }
+    if (ss) {
+        /* Changing it while running on it is what Linux refuses, and
+         * for the obvious reason: the frame under the caller's feet
+         * would move. */
+        if (on_altstack(cur_rsp)) return -16;          /* -EPERM/-EBUSY */
+        if (ss->ss_flags & SS_DISABLE) {
+            altstack.ss_sp = altstack.ss_size = 0;
+        } else {
+            if (ss->ss_size < 2048) return -12;        /* -ENOMEM */
+            altstack.ss_sp   = ss->ss_sp;
+            altstack.ss_size = ss->ss_size;
+        }
+    }
+    return 0;
+}
+
+/* Is every page of [addr, addr+len) present? Asked before the kernel
+ * writes a signal frame through a pointer the program chose.
+ *
+ * The comment this replaces said the write was unchecked and that a
+ * thread whose stack pointer is the reason it faulted would fault again
+ * here, in the kernel. It did:
+ *
+ *     *** page fault in the program
+ *       cr2=0x7ffffe101d48 rip=0xffffffff80115e90 cs=0x08
+ *     *** halted (the fault was in the kernel)
+ *
+ * cs=0x08 being ring 0 - the kernel pushing a frame onto a stack that
+ * had just run out, on behalf of the fault that said so. */
+static int range_present(uint64_t addr, uint64_t len) {
+    uint64_t p, phys;
+    for (p = addr & ~0xFFFULL; p < addr + len; p += 0x1000)
+        if (paging64_translate(p, &phys) != 0) return 0;
+    return 1;
+}
+
 int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
     const ksigaction64_t* sa;
     rt_sigframe64_t* frame;
@@ -78,7 +146,17 @@ int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
     /* Below the red zone: the ABI lets a leaf function use the 128
      * bytes under rsp without adjusting it, so a signal frame written
      * there would corrupt the interrupted function's locals. */
-    sp = r->rsp - 128;
+    /* On the alternate stack when the handler asked for one and we are
+     * not already running on it; otherwise below the caller's red zone.
+     *
+     * The red zone is the ABI letting a leaf function use the 128 bytes
+     * under rsp without adjusting it, so a frame written there would
+     * corrupt the interrupted function's locals. The alternate stack
+     * has no such caller to protect, so the frame starts at its top. */
+    if ((sa->flags & SA_ONSTACK) && altstack.ss_size && !on_altstack(r->rsp))
+        sp = altstack.ss_sp + altstack.ss_size;
+    else
+        sp = r->rsp - 128;
     sp -= sizeof(rt_sigframe64_t);
 
     /* Aligned the way a `call` leaves the stack, not the way a 16-byte
@@ -110,6 +188,12 @@ int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
      * faulted - so this is an ordinary store. It is also unchecked: a
      * thread whose stack pointer is the reason it faulted will fault
      * again here, in the kernel. See ROADMAP.md. */
+    /* Refused rather than written blind. Returning 0 hands the caller
+     * back the fault it was trying to deliver, which reports and halts
+     * the machine - the same outcome, minus a kernel-mode page fault
+     * on the way to it, and with the original address still in cr2. */
+    if (!range_present(sp, sizeof(rt_sigframe64_t))) return 0;
+
     frame = (rt_sigframe64_t*)sp;
 
     /* Said out loud, for the same reason the pid is on the trace line.
