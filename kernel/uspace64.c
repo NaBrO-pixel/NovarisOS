@@ -326,6 +326,30 @@ uint64_t uspace64_map_frames(uint64_t addr, int fixed,
     pflags = PAGE64_PRESENT | PAGE64_USER;
     if (prot & 0x2) pflags |= PAGE64_WRITE;               /* PROT_WRITE */
 
+    /* Each mapping is an owner.
+     *
+     * The frames belong to the filesystem, and every process that maps
+     * the file maps the same ones. Without a reference per mapping, the
+     * first unmap - or the first MAP_FIXED laid over one of these pages,
+     * or release_node when the file goes - hands the frame straight back
+     * to the allocator while everybody else is still using it. It is
+     * then reallocated and zeroed, and the other mappings quietly become
+     * a page of zeros.
+     *
+     * That is not hypothetical. Wine stores one byte in shared memory -
+     * KUSER_SHARED_DATA.SystemCall - which every Windows syscall stub
+     * tests to decide whether to call Wine's dispatcher or execute a
+     * real `syscall` instruction. Traced across a prefix run, the byte
+     * was written and seen correctly by three processes and then went
+     * back to 0, and every Nt call in every process started arriving
+     * here as a Linux syscall number that happened to collide.
+     *
+     * ramfs64's release_node already says "this is a release rather
+     * than a free and the mapping goes on working until it is
+     * unmapped". It was describing this reference, which did not
+     * exist. */
+    for (uint64_t i = 0; i < n; i++) pmm64_ref_frame(frames[i]);
+
     for (uint64_t i = 0; i < n; i++) {
         if (paging64_map(start + i * PAGE64_SIZE, frames[i], pflags)
                 != PAGING64_OK) {
