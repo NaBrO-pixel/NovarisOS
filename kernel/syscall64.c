@@ -1118,6 +1118,32 @@ uint64_t syscall64_dispatch(syscall64_args_t* args) {
 #define EXECVE_MAX_ARGS 128
 #define EXECVE_ARG_MAX  512
 
+/* Is a user pointer safe to read or write for `len` bytes?
+ *
+ * The kernel reaches into user memory all over this file, and until now
+ * it did so on trust. That is survivable while every caller is a test
+ * program the same tree wrote, and it stops being survivable the moment
+ * a real one passes a value it got from somewhere else: Wine handed
+ * nanosleep -38 - an -ENOSYS return used as a struct timespec * - and
+ * the read of req->tv_sec faulted in ring 0 and halted the machine.
+ * Linux answers -EFAULT and stays up.
+ *
+ * A page-table walk rather than a range check, because the address is
+ * only meaningful in the current space and that is what is mapped. */
+static int user_range_ok(uint64_t addr, uint64_t len) {
+    uint64_t p, phys;
+
+    if (!addr || !len) return 0;
+    /* Nothing user-space owns lives at or above the kernel half, and a
+     * sign-extended small negative - which is what a stray errno looks
+     * like as a pointer - lands there. */
+    if (addr >= 0x0000800000000000ULL) return 0;
+    if (addr + len < addr) return 0;                   /* wrapped */
+    for (p = addr & ~0xFFFULL; p < addr + len; p += 0x1000)
+        if (paging64_translate(p, &phys) != 0) return 0;
+    return 1;
+}
+
 static uint64_t do_execve(const char* path, const char* const* argv,
                           const char* const* envp,
                           const syscall64_args_t* args) {
@@ -1492,6 +1518,31 @@ static uint64_t dispatch(syscall64_args_t* args) {
             return 0;
         case 0x1001:                                   /* ARCH_SET_GS */
             write_msr(0xC0000101u, a2);
+            return 0;
+
+        /* And the getters, which were missing.
+         *
+         * Wine reads the GS base from inside its own signal handler -
+         * GS is where the Windows TEB lives on x86-64, and a handler
+         * that has been entered on an alternate stack has to recover it
+         * from somewhere. arch_prctl(ARCH_GET_GS) answering -EINVAL
+         * means it recovers nothing, and what follows is a rt_sigreturn
+         * that restores a register set built around the answer it did
+         * not get:
+         *
+         *     158(0x1004, ...) = -22        ARCH_GET_GS
+         *     15(...)                       rt_sigreturn
+         *     35(0xffffffffffffffda, ...)   nanosleep(-38, ...)
+         *
+         * -38 being -ENOSYS, used as a struct timespec *, one syscall
+         * after the context was restored. */
+        case 0x1003:                                   /* ARCH_GET_FS */
+            if (!a2) return (uint64_t)-14;             /* -EFAULT */
+            *(uint64_t*)a2 = read_msr(0xC0000100u);
+            return 0;
+        case 0x1004:                                   /* ARCH_GET_GS */
+            if (!a2) return (uint64_t)-14;             /* -EFAULT */
+            *(uint64_t*)a2 = read_msr(0xC0000101u);
             return 0;
         default:
             return (uint64_t)-22;                      /* -EINVAL */
@@ -2590,6 +2641,13 @@ static uint64_t dispatch(syscall64_args_t* args) {
         const struct { uint64_t sec, nsec; }* req =
             (const void*)(nr == SYS64_NANOSLEEP ? a1 : args->a3);
         uint64_t want;
+
+        /* Checked, because this is the call that proved it was needed. */
+        if (!user_range_ok((uint64_t)req, sizeof(*req)))
+            return (uint64_t)-14;                      /* -EFAULT */
+        if (nr == SYS64_NANOSLEEP && a2 &&
+            !user_range_ok(a2, sizeof(*req)))
+            return (uint64_t)-14;
 
         if (wait_started()) {
             if (!wait_expired()) return wait_restart(args, nr,
