@@ -19,17 +19,6 @@ _Static_assert(__builtin_offsetof(sigcontext64_t, rip) == 128, "sc.rip");
 _Static_assert(__builtin_offsetof(sigcontext64_t, eflags) == 136, "sc.eflags");
 _Static_assert(__builtin_offsetof(rt_sigframe64_t, uc) == 8, "frame.uc");
 
-/* The alternate signal stack.
- *
- * One, not one per process, for the same reason `handlers` is one table:
- * this layer is reset between the runs that use it, and every program
- * that has needed it so far has been the only one asking. It is the
- * next thing to make per-process, and it is written down here rather
- * than discovered later.
- *
- * ss_size 0 means "none set", which is what a zeroed reset leaves. */
-static altstack64_t altstack;
-
 static ksigaction64_t handlers[NSIG];
 static uint64_t delivered, returns;
 
@@ -39,9 +28,7 @@ void signal64_reset(void) {
         handlers[i].flags    = 0;
         handlers[i].restorer = 0;
         handlers[i].mask     = 0;
-        altstack.ss_sp = 0;
-    altstack.ss_size = 0;
-}
+    }
     delivered = 0;
     returns = 0;
 }
@@ -79,18 +66,26 @@ void signal64_set_trace(int on) { signal_trace = on; }
  * already running on the alternate stack must not be given a second
  * frame at the same place - Linux keeps delivering on the current stack
  * in that case, and so does this. */
+/* The alternate stack lives on the process, not on this file: three
+ * processes register one in a single prefix run, and a global would
+ * deliver one process's signal onto another's stack. ss_size 0 means
+ * none set. */
 static int on_altstack(uint64_t sp) {
-    return altstack.ss_size &&
-           sp >= altstack.ss_sp && sp < altstack.ss_sp + altstack.ss_size;
+    proc64_t* p = proc64_current();
+    return p && p->sas_size &&
+           sp >= p->sas_sp && sp < p->sas_sp + p->sas_size;
 }
 
 int signal64_sigaltstack(const altstack64_t* ss, altstack64_t* oss,
                          uint64_t cur_rsp) {
+    proc64_t* p = proc64_current();
+
+    if (!p) return -22;                                /* -EINVAL */
     if (oss) {
-        oss->ss_sp    = altstack.ss_sp;
-        oss->ss_size  = altstack.ss_size;
+        oss->ss_sp    = p->sas_sp;
+        oss->ss_size  = p->sas_size;
         oss->ss_flags = on_altstack(cur_rsp) ? SS_ONSTACK
-                      : (altstack.ss_size ? 0 : SS_DISABLE);
+                      : (p->sas_size ? 0 : SS_DISABLE);
         oss->__pad    = 0;
     }
     if (ss) {
@@ -99,11 +94,11 @@ int signal64_sigaltstack(const altstack64_t* ss, altstack64_t* oss,
          * would move. */
         if (on_altstack(cur_rsp)) return -16;          /* -EPERM/-EBUSY */
         if (ss->ss_flags & SS_DISABLE) {
-            altstack.ss_sp = altstack.ss_size = 0;
+            p->sas_sp = p->sas_size = 0;
         } else {
             if (ss->ss_size < 2048) return -12;        /* -ENOMEM */
-            altstack.ss_sp   = ss->ss_sp;
-            altstack.ss_size = ss->ss_size;
+            p->sas_sp   = ss->ss_sp;
+            p->sas_size = ss->ss_size;
         }
     }
     return 0;
@@ -153,10 +148,14 @@ int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
      * under rsp without adjusting it, so a frame written there would
      * corrupt the interrupted function's locals. The alternate stack
      * has no such caller to protect, so the frame starts at its top. */
-    if ((sa->flags & SA_ONSTACK) && altstack.ss_size && !on_altstack(r->rsp))
-        sp = altstack.ss_sp + altstack.ss_size;
-    else
-        sp = r->rsp - 128;
+    {
+        proc64_t* me = proc64_current();
+        if ((sa->flags & SA_ONSTACK) && me && me->sas_size &&
+            !on_altstack(r->rsp))
+            sp = me->sas_sp + me->sas_size;
+        else
+            sp = r->rsp - 128;
+    }
     sp -= sizeof(rt_sigframe64_t);
 
     /* Aligned the way a `call` leaves the stack, not the way a 16-byte

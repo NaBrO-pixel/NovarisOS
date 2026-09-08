@@ -121,6 +121,20 @@ typedef struct {
      * Always absolute, always without a trailing slash except for the
      * root itself. fork inherits it and execve keeps it. */
     char        cwd[PROC64_PATH_MAX];
+
+    /* The alternate signal stack, per process because that is what it
+     * is. A global one was written first and was wrong the moment more
+     * than one process registered one: this prefix run has wineboot,
+     * services.exe and rundll32 all calling sigaltstack, and services
+     * alone registers three - one per thread. Delivering process A's
+     * signal on process B's alternate stack is a write to an address
+     * that is not mapped in A.
+     *
+     * Per thread is what Linux actually does and what Wine assumes; per
+     * process is what this kernel can express today, and it is right for
+     * every single-threaded case and wrong in the same direction as
+     * before for the rest. Said plainly rather than left to be found. */
+    uint64_t    sas_sp, sas_size;
 } proc64_t;
 
 void      proc64_init(void);
