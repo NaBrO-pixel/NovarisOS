@@ -19,6 +19,7 @@
  * causes it.
  */
 
+#define SIG64_TRAP    5
 #define SIG64_SEGV   11
 
 #define SA_SIGINFO   0x00000004

@@ -151,6 +151,26 @@ static volatile uint64_t pf_resume_rip;
 static void breakpoint_handler(registers64_t* r) {
     bp_hits++;
     bp_rip = r->rip;
+
+    /* A ring-3 int3 belongs to the program.
+     *
+     * ntdll's DbgBreakPoint is `int3; ret`, so this is where every Wine
+     * assertion and every deliberate break arrives. On Linux it becomes
+     * SIGTRAP, and Wine's own handler turns that into
+     * EXCEPTION_BREAKPOINT - which it then adjusts, because #BP is a
+     * trap and rip already points past the instruction:
+     *
+     *     if (rec->ExceptionCode == EXCEPTION_BREAKPOINT) context->Rip--;
+     *
+     * Swallowing it here instead would resume the program one byte past
+     * a breakpoint it meant to take, which is not a kinder failure than
+     * a signal - it is the same failure with the evidence removed.
+     *
+     * Only when ring 3 has a handler: signal64_deliver returns 0 if it
+     * has none, and the kernel's own int3 self-test below has none and
+     * still wants the count-and-resume underneath. */
+    if ((r->cs & 3) == 3 && signal64_deliver(SIG64_TRAP, r, r->rip)) return;
+
     /* #BP is a trap: rip already points past the int3, so returning
      * unchanged resumes at the next instruction. */
 }
