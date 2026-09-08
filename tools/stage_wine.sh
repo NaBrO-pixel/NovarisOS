@@ -104,6 +104,29 @@ while IFS= read -r so; do
     cp "$so" "$UNIX_ARCH/$(basename "$so")" 2>/dev/null
 done < <(find "$TREE/dlls" -name "*.so" -type f)
 
+# Every shared library the unix halves ask for, checked here rather than
+# discovered four layers downstream.
+#
+# Milestone 81 lost a long time to libm.so.6 being absent: win32u.so
+# needs it, dlopen fails, win32u's unix half never loads, its init()
+# never runs, KeAddSystemServiceTable is never called for table 1, and
+# every win32u syscall comes back STATUS_INVALID_SYSTEM_SERVICE. user32
+# does not check that, so 0xc000001c travels on as a GDI handle and the
+# process dies in gdi32 on a null PEB->GdiSharedHandleTable. Nothing in
+# that chain mentions libm.
+#
+# So the dependencies are read off the staged files with objdump and
+# reported. This does not copy them - the initrd's library staging is
+# the Makefile's job - it says out loud which ones a loader is going to
+# go looking for, so that a missing one is a line here instead of a
+# fault somewhere else.
+if command -v objdump >/dev/null 2>&1; then
+    need=$(for f in "$UNIX_ARCH"/*.so; do
+               objdump -p "$f" 2>/dev/null | awk '/NEEDED/{print $2}'
+           done | sort -u | grep -v '\.so$' | grep -vE '^(ntdll|win32u)\.so')
+    echo "stage_wine: unix halves need:" $(echo $need | tr '\n' ' ')
+fi
+
 # The NLS tables. 77 files and 8KB in total, and not optional: the
 # wineserver loads l_intl.nls before it will serve anything and dies
 # with "failed to load l_intl.nls" without it - after binding its
