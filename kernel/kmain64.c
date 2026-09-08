@@ -3634,7 +3634,7 @@ void kernel_main(uint32_t magic, void* mbi) {
              * serial), so this is the middle setting: everything Wine
              * considers an error or an unimplemented path, nothing it
              * considers a trace. */
-            "WINEDEBUG=err+all,fixme+all,trace-all,warn-all,+loaddll",
+            "WINEDEBUG=err+all,fixme+all,trace-all,warn-all,+loaddll,+virtual",
             /* Where the builtin PE modules are.
              *
              * Not decoration, and not something the staging could fix.
