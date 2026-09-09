@@ -41,7 +41,13 @@
  * The buffers are allocated per live pipe rather than up front, so the
  * cost of the headroom is the descriptor array; the heap grows to 256MB
  * and 256 live pipes want 16MB of it. */
-#define PIPE64_MAX 256
+/* 256 was sized against a host peak of 90, and the same arithmetic that
+ * sized the descriptor table says it is now the binding one: a
+ * wineserver client connection is a socketpair, which is two pipe
+ * objects, so PROC64_MAX of 128 wants 256 for connections alone and
+ * leaves nothing for the pipes a process makes for itself. 512, at 3.2KB
+ * of in-flight table apiece and buffers still allocated per live pipe. */
+#define PIPE64_MAX 512
 #define PIPE64_BUF 65536
 
 /* Descriptors in flight (Milestone 76).
