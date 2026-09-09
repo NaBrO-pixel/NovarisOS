@@ -177,6 +177,57 @@ else
     echo "stage_wine: no wine.inf at $TREE/loader/wine.inf" >&2
 fi
 
+# --- the display driver -------------------------------------------------
+#
+# Novaris has no X server and no Wayland compositor, so explorer.exe
+# walks HKCU\Software\Wine\Drivers\Graphics, finds nothing it can load,
+# and every program with a window gets
+# "err:winediag:nodrv_CreateWindow ... The graphics driver is missing".
+# winenovaris.drv is how Wine reaches this OS's own window manager
+# (wine/winenovaris.drv, kernel/wmdev.c).
+#
+# What it looks like without this, several minutes into a prefix run, is
+# explorer.exe starting and win32u reporting
+# `err:win:get_desktop_window failed to create desktop window` - which
+# names neither the driver nor the registry key.
+#
+# Skipped rather than fatal when it has not been built: an OS with Wine
+# and no driver still runs console programs, and that is what every
+# milestone before the driver was.
+DRV_PE="$TREE/dlls/winenovaris.drv/x86_64-windows/winenovaris.drv"
+DRV_UNIX="$TREE/dlls/winenovaris.drv/winenovaris.so"
+if [ -f "$DRV_PE" ] && [ -f "$DRV_UNIX" ]; then
+    cp "$DRV_PE" "$WIN/winenovaris.drv" || exit 1
+    # Both places, for the same reason every other unix half is in both:
+    # which one Wine looks in depends on whether it thinks it is
+    # installed or running from its build tree.
+    for d in "$UNIX" "$UNIX_ARCH"; do
+        mkdir -p "$d" || exit 1
+        cp "$DRV_UNIX" "$d/winenovaris.so" || exit 1
+    done
+
+    # And tell Wine to use it. explorer.exe's built-in default list is
+    # "mac,x11,wayland", none of which exists here; this key is the
+    # supported way to change it, and a prefix gets it when wineboot
+    # runs wine.inf. Patched into the staged copies rather than the Wine
+    # tree, so the tree stays a build input.
+    #
+    # Only the first AddReg list is touched - that is [BaseInstall]'s,
+    # which every install in the file needs.
+    for d in "$DEST/usr/share/wine" "$DEST/share/wine"; do
+        [ -f "$d/wine.inf" ] || continue
+        if ! grep -q "NovarisDrivers" "$d/wine.inf"; then
+            sed -i -e '0,/^AddReg=\\$/s||AddReg=\\\n    NovarisDrivers,\\|' \
+                "$d/wine.inf" || exit 1
+            printf '\n[NovarisDrivers]\nHKCU,Software\\Wine\\Drivers,"Graphics",2,"novaris"\n' \
+                >> "$d/wine.inf" || exit 1
+        fi
+    done
+    echo "stage_wine: winenovaris.drv, both halves, and the registry key"
+else
+    echo "stage_wine: no winenovaris.drv - build it with tools/build_wine_driver.sh"
+fi
+
 if [ -d "$TREE/nls" ]; then
     for d in "$DEST/usr/share/wine/nls" "$DEST/share/wine/nls"; do
         mkdir -p "$d" || exit 1

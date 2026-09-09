@@ -9753,6 +9753,85 @@ So the next question is why that field is null: which thread's TEB it
 belongs to, and whether Wine ever wrote it for this thread.
 
 
+## Milestone 82 - one byte, shared by four processes
+
+The answer to that question turned out not to be about TEBs at all.
+
+Every Windows system call in the prefix run was arriving in this kernel
+as a *Linux* system call number. A Wine PE syscall stub does not trap
+into Wine unconditionally: it tests one byte,
+`KUSER_SHARED_DATA.SystemCall` at `0x7ffe0308`, and executes a real
+`syscall` instruction when it is zero. That byte read 0 at trap time,
+3,784 times, in every process - so every `Nt*` call ran the CPU's
+`syscall` and landed here as whatever Linux number it collided with.
+`NtQueryVirtualMemory` arriving as `munmap` is not a failure that names
+itself, which is why it presented as a null TEB field several layers
+away.
+
+**The byte was written correctly and shared correctly.** Three
+measurements were needed to establish that, and each one killed a
+plausible theory:
+
+| question | measurement | answer |
+|---|---|---|
+| Is the page mapped where the stub reads? | `paging64_translate(0x7ffe0308)` at trap time | `0x10a09308` - the right frame |
+| Is the frame really shared? | read the byte through the kernel's direct map | also 0, so the mapping is right and the *contents* are wrong |
+| Was the frame recycled underneath its owners? | name it to the allocator and print every reference | 16 taken, 1 dropped, never freed, never reallocated |
+
+That left one possibility - a store - and the way to find a store is to
+look on both sides of every system call. The byte went `1 -> 0` inside
+one call in one process:
+
+    mmap(0x7ffffe8f0000, 0x144000, PROT_READ,
+         MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0)
+
+`0x7ffffe8f0000` is where that same process had mapped
+KUSER_SHARED_DATA *writable* a moment earlier, to store the 1.
+`virtual_init_user_shared_data()` maps the section read-write, sets
+`SystemCall = 1`, and Wine never unmaps it.
+
+**The bug was in `map_anon`.** A page already mapped in the range was
+adopted and zeroed rather than replaced - which produces the right bytes
+at that address and the wrong ones everywhere else, because the page
+underneath need not belong to this mapping alone. The code already knew
+the hazard: it excluded the shared zero page, with a comment saying that
+zeroing it would zero somebody else's memory. A shared file mapping is
+the same hazard and was not excluded.
+
+Linux replaces here, which is why none of it reproduces on the host:
+`MAP_FIXED` tears down what it covers, the caller gets new anonymous
+pages, and the file's own pages are untouched. `brk` still keeps its
+page - it grows from an unaligned break and that page is full of live
+heap only one process can see.
+
+Measured across the same prefix run:
+
+| | before | after |
+|---|---|---|
+| PE-origin calls arriving as Linux syscalls | 3,784 | 0 |
+| `ENOSYS` over the run | 4,071 | 1,458 |
+| processes reached | 5 | 20+ |
+| GPF, kernel-mode faults | 0 | 0 |
+| base differentials | 21 PASS | 21 PASS |
+
+**Two build traps found on the way, both silent.** `WINE64_LOADER`
+searched only `../wine64-build`, so a Wine configured in its own source
+tree produced a Wine-less initrd and a boot that said so ten minutes
+later. And `tools/build_wine_driver.sh` hard-coded `i386-windows`, so on
+a 64-bit tree it never built the display driver at all - which is what
+`err:win:get_desktop_window failed to create desktop window` had been
+reporting, several layers from the missing file. Both now follow the
+tree.
+
+**The lesson this milestone keeps re-teaching.** Seventeen hypotheses
+about the fault chain were wrong; every one that was settled was settled
+by making the machine print the fact rather than by reasoning toward it.
+Twice the reasoning was not merely unhelpful but actively misleading -
+a "fix" that changed nothing because the reference it added was already
+being taken, and a trace armed against the wrong anchor whose silence
+was reported as a finding.
+
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the

@@ -97,17 +97,39 @@ if [ -n "$NEED_CONFIGURE" ] || [ ! -f "$WINE_SRC/dlls/winenovaris.drv/Makefile" 
     (cd "$WINE_SRC" && ./config.status >/dev/null)
 fi
 
+# Which PE architecture this tree builds.
+#
+# It was i386-windows, written against the 32-bit tree this driver was
+# first built in. A 64-bit Wine puts its PE modules under
+# x86_64-windows and nothing under the other name, so a hard-coded
+# architecture does not fail the build - `make` reports no rule for a
+# target in a directory that does not exist - it just never produces the
+# driver, and Wine comes up with no display driver at all. What that
+# looks like several minutes later is explorer.exe starting and
+# `err:win:get_desktop_window failed to create desktop window`.
+#
+# Asked of ntdll, which every tree builds.
+PEARCH=
+for a in x86_64-windows i386-windows aarch64-windows arm-windows; do
+    if [ -d "$WINE_SRC/dlls/ntdll/$a" ]; then PEARCH=$a; break; fi
+done
+if [ -z "$PEARCH" ]; then
+    echo "cannot tell which PE architecture $WINE_SRC builds" >&2
+    exit 1
+fi
+echo "PE architecture: $PEARCH"
+
 # Both halves by name rather than the directory: `make dlls/<dir>` builds
 # whatever that directory's default target is, which for a driver is the
 # PE module alone.
 echo "building winenovaris.drv"
 (cd "$WINE_SRC" && make -j"$(nproc)" \
-    dlls/winenovaris.drv/i386-windows/winenovaris.drv \
+    "dlls/winenovaris.drv/$PEARCH/winenovaris.drv" \
     dlls/winenovaris.drv/winenovaris.so \
-    programs/explorer/i386-windows/explorer.exe)
+    "programs/explorer/$PEARCH/explorer.exe")
 
 # What tools/install_wine.sh looks for.
-for f in "$WINE_SRC/dlls/winenovaris.drv/i386-windows/winenovaris.drv" \
+for f in "$WINE_SRC/dlls/winenovaris.drv/$PEARCH/winenovaris.drv" \
          "$WINE_SRC/dlls/winenovaris.drv/winenovaris.so"; do
     [ -f "$f" ] || { echo "missing after build: $f" >&2; exit 1; }
     echo "  $f"

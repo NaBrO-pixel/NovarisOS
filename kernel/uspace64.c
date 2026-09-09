@@ -3,6 +3,7 @@
 #include "uspace64.h"
 #include "paging64.h"
 #include "pmm64.h"
+#include "serial64.h"
 #include "kstring.h"
 #include "proc64.h"
 #include "vmspace64.h"
@@ -189,7 +190,21 @@ static int map_anon(uint64_t start, uint64_t end, uint64_t flags,
         }
 
         frame = pmm64_alloc_high();
-        if (!frame) return 0;
+        if (!frame) {
+            /* Says whether this is the machine running out of RAM or the
+             * allocator refusing a frame it has. Replacing a fixed
+             * mapping instead of adopting its pages costs a frame per
+             * page, so the question is now worth asking by number
+             * rather than by argument. */
+            serial64_puts("NOVARIS64: [oom] map_anon at ");
+            serial64_puthex(va);
+            serial64_puts(" free=");
+            serial64_putdec(pmm64_free_frames());
+            serial64_puts("/");
+            serial64_putdec(pmm64_total_frames());
+            serial64_putc('\n');
+            return 0;
+        }
         /* Zeroed through the direct map, which reaches all of RAM since
          * Milestone 66 - so a frame's address no longer decides whether
          * a process is allowed to have it. */
