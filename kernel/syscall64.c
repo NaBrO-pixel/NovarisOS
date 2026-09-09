@@ -1719,6 +1719,35 @@ static uint64_t dispatch(syscall64_args_t* args) {
         if (!(a3 & PROT_WRITE))
             uspace64_protect(mapped, a2, a3);
 
+        /* Which file was copied, and how much of it.
+         *
+         * This branch is a snapshot: the bytes are read out of the file
+         * once, here, and a later write by anyone else is invisible to
+         * the mapping. Linux's MAP_PRIVATE is copy-on-write, so a reader
+         * that never writes goes on seeing the file's current contents -
+         * and a program that maps a file another process keeps updating,
+         * read-only, is relying on exactly that.
+         *
+         * win32u maps Wine's session shared memory read-only and then
+         * cannot find a single object in it, with the ids it expects
+         * changing every time. A frozen copy would look precisely like
+         * that. The trace says whether the session is one of the files
+         * arriving here, which is the difference between that being the
+         * explanation and being a plausible story. */
+        if (trace) {
+            serial64_puts("NOVARIS64: [privmap node ");
+            serial64_putdec((uint64_t)node);
+            serial64_puts(" len ");
+            serial64_puthex(a2);
+            serial64_puts(" size ");
+            serial64_puthex(ramfs64_size(node));
+            serial64_puts(" prot ");
+            serial64_puthex(a3);
+            serial64_puts(" -> ");
+            serial64_puthex(mapped);
+            serial64_putc('\n');
+        }
+
         file_maps++;
         return mapped;
     }
