@@ -22,7 +22,27 @@
 /* Four was enough while the only thing that forked was a test. Building
  * a Wine prefix runs wineserver, wineboot, services.exe and explorer.exe
  * at once, and the fifth process to start is the one that fails. */
-#define PROC64_MAX     32
+/* Every process in the system.
+ *
+ * It was 32, and unlike the pipe table it was not obviously below the
+ * work: a host prefix run peaks at 22 concurrent processes. Measured on
+ * the guest, though, the table fills - and the report says what fills
+ * it, which is the part that decided this. All 32 slots are *running*
+ * processes and none is an unreaped zombie, so this is a table that is
+ * too small rather than one that is leaking. That was worth checking:
+ * a zombie leak looks identical from outside and raising the number
+ * would have hidden it.
+ *
+ * Bounded by SCHED64_MAX_TASKS at 128, because a process needs at least
+ * one task to run and a process table larger than the task table has
+ * slots nothing can ever occupy. 128 slots of proc64_t - which is 12KB
+ * apiece, nearly all of it the 256-entry descriptor table - is 1.5MB of
+ * bss.
+ *
+ * What running out looks like: clone(2) returns -EAGAIN, which is what
+ * Linux returns too, and Wine reports it as NtCreateUserProcess failing
+ * to start explorer.exe. */
+#define PROC64_MAX     128
 
 /* 32 was the number a program that opens a few files needs, and the
  * wineserver is not that program. It holds a descriptor per client

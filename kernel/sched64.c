@@ -2,6 +2,7 @@
 
 #include "sched64.h"
 #include "gdt64.h"
+#include "serial64.h"
 
 #define UCODE_SEL_RPL3 0x23
 #define UDATA_SEL_RPL3 0x1B
@@ -120,12 +121,36 @@ void sched64_init(void) {
     stop_rip = 0;
 }
 
+/* Says once that the task table is full.
+ *
+ * The process table learned to report this and it settled a question
+ * that would otherwise have been argued from the wrong end. This table
+ * is the other half of the same ceiling - a process needs a task to run
+ * - and running out of tasks surfaces as clone(2) returning -EAGAIN,
+ * exactly as running out of processes does. Without a line here the two
+ * are indistinguishable from the log. */
+static void tasks_full(void) {
+    static int said;
+    int blocked = 0, running = 0;
+    if (said) return;
+    said = 1;
+    for (int k = 0; k < SCHED64_MAX_TASKS; k++)
+        if (tasks[k].blocked) blocked++; else running++;
+    serial64_puts("NOVARIS64: [sched] all ");
+    serial64_putdec((uint64_t)SCHED64_MAX_TASKS);
+    serial64_puts(" task slots in use - ");
+    serial64_putdec((uint64_t)running);
+    serial64_puts(" runnable, ");
+    serial64_putdec((uint64_t)blocked);
+    serial64_puts(" blocked\n");
+}
+
 int sched64_add(uint64_t rip, uint64_t rsp, uint64_t arg,
                 const vmspace64_t* space) {
     int i;
 
     for (i = 0; i < SCHED64_MAX_TASKS; i++) if (!tasks[i].used) break;
-    if (i == SCHED64_MAX_TASKS) return -1;
+    if (i == SCHED64_MAX_TASKS) { tasks_full(); return -1; }
 
     for (uint64_t* p = (uint64_t*)&tasks[i].regs;
          p < (uint64_t*)(&tasks[i].regs + 1); p++) *p = 0;
@@ -173,7 +198,7 @@ int sched64_add_frame_for(const registers64_t* regs, const vmspace64_t* space,
     int i;
 
     for (i = 0; i < SCHED64_MAX_TASKS; i++) if (!tasks[i].used) break;
-    if (i == SCHED64_MAX_TASKS) return -1;
+    if (i == SCHED64_MAX_TASKS) { tasks_full(); return -1; }
 
     tasks[i].pid       = pid;
     tasks[i].regs      = *regs;
