@@ -64,7 +64,24 @@
  * It is also poll's bound: the loop below rejects nfds above
  * FD_MAX * 2, and a server polling 135 descriptors was being told
  * -EINVAL by a kernel that had sized the check for a smaller machine. */
-#define PROC64_FD_MAX  256
+/* Every descriptor one process may hold.
+ *
+ * 256 was measured against the host, whose wineserver peaks at 135. It
+ * held until the process table grew, and then the wineserver ran out -
+ * every EMFILE in a prefix run is openat(2) in pid 3, loading PE modules
+ * for its clients, and the DLL that fails to load takes six others down
+ * with it as "not found" several layers up.
+ *
+ * The table says what it spent them on: 82 files, 172 pipes, 2 sockets.
+ * The pipes are the answer. wineserver holds two descriptors per
+ * connected client, so that number is not a working set to trim or a
+ * leak to fix - it is twice the number of live processes, and it has to
+ * grow with them.
+ *
+ * Which makes this arithmetic rather than a guess. PROC64_MAX is 128, so
+ * a wineserver serving all of them holds 256 descriptors for connections
+ * alone, before the hundred-odd files it has open at once. 512. */
+#define PROC64_FD_MAX  512
 
 /* 128 was under the 170 characters a real prefix's deepest path needs -
  * measured, see ramfs64.h. */
