@@ -1,6 +1,7 @@
 /* pipe64.c - a byte stream between two descriptors. */
 
 #include "pipe64.h"
+#include "serial64.h"
 #include "kheap64.h"
 #include "kstring.h"
 #include "ramfs64.h"
@@ -56,7 +57,24 @@ int pipe64_create(void) {
     int i;
 
     for (i = 0; i < PIPE64_MAX; i++) if (!pipes[i].used) break;
-    if (i == PIPE64_MAX) return -1;
+    if (i == PIPE64_MAX) {
+        /* Said once, because a ceiling that is reached is reached
+         * thousands of times and the first one is the news.
+         *
+         * A ceiling this kernel runs into has, every time so far,
+         * presented as something several layers away that names
+         * anything but the ceiling. Saying so here costs one line and
+         * turns the next one into an hour rather than a day. */
+        static int said;
+        if (!said) {
+            said = 1;
+            serial64_puts("NOVARIS64: [pipe] all ");
+            serial64_putdec(PIPE64_MAX);
+            serial64_puts(" pipes are in use - pipe2 and socketpair now"
+                          " return -ENFILE\n");
+        }
+        return -1;
+    }
 
     pipes[i].buf = (uint8_t*)kmalloc64(PIPE64_BUF);
     if (!pipes[i].buf) return -1;
