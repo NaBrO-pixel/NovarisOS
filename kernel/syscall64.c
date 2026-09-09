@@ -229,10 +229,48 @@ static void frame_from_args(const syscall64_args_t* args, uint64_t rax,
 /* Lowest free descriptor at or above `from`. Linux promises the lowest,
  * and it is not a detail: a program that closes 0 and then opens
  * something expects the new descriptor to *be* 0. dup2 relies on it too. */
+static void fds_full(const proc64_fd_t* t);
+
 static int fd_alloc(int from) {
     if (from < 0) from = 0;
     for (int fd = from; fd < FD_MAX; fd++) if (!fds[fd].used) return fd;
+    fds_full(fds);
     return -1;
+}
+
+/* Says once that a process has run out of descriptors, and what it
+ * spent them on.
+ *
+ * The two tables before this one - pipes and processes - both filled,
+ * and in each case the useful question was not "is the number too
+ * small" but "what is holding the slots". A descriptor table full of
+ * open files is a different bug from one full of client connections:
+ * the first is a leak or a working set, the second scales with how many
+ * processes are alive and is a number that has to grow with them.
+ *
+ * Measured here rather than argued, because both look like EMFILE. */
+static void fds_full(const proc64_fd_t* t) {
+    static int said;
+    int files = 0, pipes = 0, socks = 0;
+    if (said) return;
+    said = 1;
+    for (int k = 0; k < FD_MAX; k++) {
+        if (!t[k].used) continue;
+        if      (t[k].kind == FD64_FILE)   files++;
+        else if (t[k].kind == FD64_SOCKET) socks++;
+        else                               pipes++;
+    }
+    serial64_puts("NOVARIS64: [fd] pid ");
+    serial64_putdec((uint64_t)proc64_current_pid());
+    serial64_puts(" used all ");
+    serial64_putdec((uint64_t)FD_MAX);
+    serial64_puts(" descriptors - ");
+    serial64_putdec((uint64_t)files);
+    serial64_puts(" files, ");
+    serial64_putdec((uint64_t)pipes);
+    serial64_puts(" pipes, ");
+    serial64_putdec((uint64_t)socks);
+    serial64_puts(" sockets; open now returns -EMFILE\n");
 }
 
 static void fd_init_pipe(int fd, int rx, int tx, int nonblock, int cloexec) {
@@ -561,7 +599,7 @@ static uint64_t do_open(const char* path, uint64_t flags, uint32_t mode) {
     }
 
     for (fd = 3; fd < FD_MAX; fd++) if (!fds[fd].used) break;
-    if (fd == FD_MAX) return (uint64_t)-24;            /* -EMFILE */
+    if (fd == FD_MAX) { fds_full(fds); return (uint64_t)-24; }  /* -EMFILE */
 
     fds[fd].kind     = FD64_FILE;
     fds[fd].node     = node;
