@@ -3730,6 +3730,28 @@ void kernel_main(uint32_t magic, void* mbi) {
         pipe64_init();
         sock64_init();
         vmspace64_kernel_space(&kspace);
+        /* The devices, after the filesystem they live in.
+         *
+         * Registering them in their own bring-up layer is not enough,
+         * and looked like it was: every layer starts with
+         * ramfs64_init(), which empties the filesystem and puts back
+         * only the two devices ramfs64 makes itself - /dev/null and
+         * /dev/console. A /dev/wm created up there is gone by the time
+         * anything runs, and what that looks like is the symptom of
+         * having no window manager at all: open("/dev/wm") answering
+         * -ENOENT, twenty-seven times in a run, exactly as it did before
+         * the device was written. The boot assertion passed and the run
+         * was unchanged - which is the combination worth remembering,
+         * because either half alone would have been believed.
+         *
+         * /dev/fb0 and the input devices were in the same position and
+         * nothing had noticed, because nothing in a prefix run opens
+         * them yet. They are registered here too rather than left to be
+         * found the same way twice.
+         */
+        fb64_register();
+        input64_register();
+        wmdev64_register();
 
         if (ramfs64_lookup("/usr/bin/x86_64-windows/wineboot.exe") < 0) {
             /* Not a failure: the build must not require 64MB of Wine in
