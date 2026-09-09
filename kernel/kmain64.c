@@ -24,6 +24,7 @@
 #include "serial64.h"
 #include "fb64.h"
 #include "input64.h"
+#include "wmdev64.h"
 #include "gdt64.h"
 #include "idt64.h"
 #include "multiboot.h"
@@ -2908,6 +2909,31 @@ void kernel_main(uint32_t magic, void* mbi) {
               == RAMFS64_DEV_MOUSE);
         check("nothing is queued before anything happens",
               input64_queued(INPUT64_KBD) == 0);
+
+        /* /dev/wm, the surface a display driver draws on.
+         *
+         * Registered here rather than beside /dev/fb0 because it needs
+         * the framebuffer to already be there: with no screen there is
+         * nothing to show a window on, and a device that says so by not
+         * existing is what winenovaris.drv already knows how to handle.
+         *
+         * The assertion is the one the driver makes. Its unix half opens
+         * /dev/wm and asks WMIO_SCREEN, and refuses to register as
+         * Wine's display driver if that fails - so a work area with a
+         * width and a height is the whole of what stands between
+         * `err:win:get_desktop_window failed to create desktop window`
+         * and a desktop. */
+        check("the window device registered as /dev/wm", wmdev64_register());
+        check("and /dev/wm is a window device",
+              ramfs64_device(ramfs64_lookup("/dev/wm")) == RAMFS64_DEV_WM);
+        {
+            struct wm64_rect area = { -1, -1, -1, -1 };
+            check("and it reports a work area to draw on",
+                  wmdev64_screen(&area) == 0 && area.w > 0 && area.h > 0);
+            check("which is the size of the screen",
+                  (uint32_t)area.w == fb64_width() &&
+                  (uint32_t)area.h == fb64_height());
+        }
 
         /* 'A': make 0x1E, break 0x9E. Linux's KEY_A is 30, which is
          * 0x1E - the keycodes for this block *are* the set-1 scancodes,
