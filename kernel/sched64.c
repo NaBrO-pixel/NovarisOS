@@ -145,6 +145,14 @@ static void tasks_full(void) {
     serial64_puts(" blocked\n");
 }
 
+int sched64_space_in_use(uint64_t pml4_phys) {
+    if (!pml4_phys) return 1;                  /* never free nothing */
+    for (int i = 0; i < SCHED64_MAX_TASKS; i++)
+        if (tasks[i].used && tasks[i].space.pml4_phys == pml4_phys)
+            return 1;
+    return 0;
+}
+
 int sched64_add(uint64_t rip, uint64_t rsp, uint64_t arg,
                 const vmspace64_t* space) {
     int i;
