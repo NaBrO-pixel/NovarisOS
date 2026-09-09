@@ -2421,10 +2421,30 @@ static uint64_t dispatch(syscall64_args_t* args) {
         }
 
         if (ncarried && !pipe64_send_fds(fds[a1].tx, carried, ncarried)) {
+            /* Undone the same way it was done. The loop above takes a
+             * node reference for a file and a pipe reference for
+             * anything else, so releasing everything as a pipe leaks the
+             * node and gives back ends that were never taken. */
             for (int k = 0; k < ncarried; k++) {
-                pipe64_unref(carried[k].rx, 1, 0);
-                pipe64_unref(carried[k].tx, 0, 1);
+                if (carried[k].kind == FD64_FILE)
+                    ramfs64_unref_node(carried[k].node);
+                else {
+                    pipe64_unref(carried[k].rx, 1, 0);
+                    pipe64_unref(carried[k].tx, 0, 1);
+                }
             }
+            /* Worth a line whether or not tracing is on. Wine's
+             * send_fd() treats anything but success as fatal, and the
+             * receiving wineserver has no way to tell a descriptor that
+             * was never sent from one that arrived: it records the
+             * server side as -1 and answers the next init_thread with
+             * STATUS_TOO_MANY_OPENED_FILES, several layers away from
+             * here. */
+            serial64_puts("NOVARIS64: [fdpass] queue full on fd ");
+            serial64_putdec(a1);
+            serial64_puts(", ");
+            serial64_putdec((uint64_t)ncarried);
+            serial64_puts(" descriptors refused\n");
             return (uint64_t)-11;                      /* -EAGAIN */
         }
 
@@ -2471,6 +2491,39 @@ static uint64_t dispatch(syscall64_args_t* args) {
         msg->msg_namelen = 0;
 
         ngot = pipe64_recv_fds(fds[a1].rx, got, 8);
+        /* A receiver that asked for ancillary data, got bytes, and got no
+         * descriptor.
+         *
+         * wineserver's receive_fd() reads exactly one `struct send_fd`
+         * - eight bytes - and expects the descriptor those bytes
+         * describe to arrive with them. When it does not, the server
+         * records the server side as -1, and the next init_thread on
+         * that thread answers STATUS_TOO_MANY_OPENED_FILES: the failure
+         * surfaces as NtCreateUserProcess refusing to start explorer.exe,
+         * with nothing in between naming a descriptor.
+         *
+         * So the anomaly is worth a line by itself. Silence here means
+         * every receiver that wanted an fd got one, and the explorer
+         * failure is somewhere else entirely. */
+        if (ngot == 0 && total > 0 && msg->msg_control
+                && msg->msg_controllen >= sizeof(cmsghdr64_t)) {
+            serial64_puts("NOVARIS64: [fdrecv] pid ");
+            serial64_putdec((uint64_t)proc64_current_pid());
+            serial64_puts(" fd ");
+            serial64_putdec(a1);
+            serial64_puts(": ");
+            serial64_putdec((uint64_t)total);
+            serial64_puts(" bytes, no descriptor\n");
+        }
+        if (ngot > 0 && !msg->msg_control) {
+            serial64_puts("NOVARIS64: [fdrecv] pid ");
+            serial64_putdec((uint64_t)proc64_current_pid());
+            serial64_puts(" fd ");
+            serial64_putdec(a1);
+            serial64_puts(": ");
+            serial64_putdec((uint64_t)ngot);
+            serial64_puts(" descriptors dropped, receiver asked for none\n");
+        }
         if (ngot > 0 && msg->msg_control) {
             uint8_t* base = (uint8_t*)msg->msg_control;
             cmsghdr64_t* c = (cmsghdr64_t*)base;
