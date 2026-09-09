@@ -18,6 +18,7 @@
 #include "sched64.h"
 #include "signal64.h"
 #include "ramfs64.h"
+#include "wmdev64.h"
 #include "paging64.h"
 #include "kstring.h"
 #include "proc64.h"
@@ -351,6 +352,14 @@ static void fd_release(int fd) {
         sock64_destroy(s);
         fds[fd].sock = -1;
     }
+    /* A window belongs to the descriptor that made it, so closing the
+     * descriptor is what gives its pixels back. Before the node is
+     * unreferenced, because the check needs the node to still say what
+     * kind of device it was. */
+    if (fds[fd].kind == FD64_FILE && fds[fd].node >= 0 &&
+        ramfs64_device(fds[fd].node) == RAMFS64_DEV_WM && fds[fd].pos)
+        wmdev64_close((int)fds[fd].pos - 1);
+
     if (fds[fd].kind == FD64_FILE && fds[fd].node >= 0)
         ramfs64_unref_node(fds[fd].node);
 
@@ -1560,6 +1569,29 @@ static uint64_t dispatch(syscall64_args_t* args) {
             return uspace64_map_phys(a2, fb64_phys() + off, a3);
         }
 
+        /* A window's pixels. The driver maps these once, at
+         * WMIO_CREATE, and draws into them until the window is closed.
+         *
+         * Not uspace64_map_phys, because a window is a list of frames
+         * rather than a run of physical memory - the allocator hands
+         * them out one at a time and they are not adjacent.
+         * uspace64_map_frames is the same call a shared file mapping
+         * uses, and it takes the reference that keeps the frames alive
+         * while the process has them mapped. */
+        if (ramfs64_device(node) == RAMFS64_DEV_WM) {
+            const uint64_t* frames;
+            uint64_t n = 0, bytes = 0;
+            int win = (int)fds[fd].pos - 1;
+
+            frames = wmdev64_frames(win, &n, &bytes);
+            if (!frames) return (uint64_t)-9;              /* -EBADF */
+            if (off) return (uint64_t)-22;
+            if (!a2 || a2 > bytes) return (uint64_t)-22;
+            n = (a2 + PAGE64_SIZE - 1) / PAGE64_SIZE;
+            return uspace64_map_frames(a1, (flags & MAP_FIXED) != 0,
+                                       frames, n, a3);
+        }
+
         /* --- an ordinary file mapping ---
          *
          * MAP_PRIVATE is a copy: the pages are the process's own, and
@@ -1919,6 +1951,52 @@ static uint64_t dispatch(syscall64_args_t* args) {
          * line_length land in the wrong fields and every scanline is
          * placed from a wrong stride. The differential test in
          * userland/fbdraw64.c checks the values, not just the call. */
+        /* /dev/wm, which is how a display driver above this kernel asks
+         * for a surface. The window is the descriptor's, so it is kept
+         * in the descriptor: each open of /dev/wm is one window, which
+         * is winenovaris.drv's own model - its win_data holds one fd per
+         * window - and it means two windows in one process cannot be
+         * confused for each other. `pos` is the file offset for an
+         * ordinary file and unused for a device, so it carries the
+         * window index, biased by one so that zero still means "no
+         * window yet" on a descriptor that has only just been opened. */
+        if (a1 >= 3 && a1 < FD_MAX && fds[a1].used &&
+            ramfs64_device(fds[a1].node) == RAMFS64_DEV_WM) {
+            int win = (int)fds[a1].pos - 1;
+            int r;
+
+            if (!a3) return (uint64_t)-14;                /* -EFAULT */
+            if (!user_range_ok(a3, 4)) return (uint64_t)-14;
+
+            switch ((uint32_t)a2) {
+            case WMIO64_SCREEN:
+                return (uint64_t)(int64_t)wmdev64_screen(
+                           (struct wm64_rect*)a3);
+            case WMIO64_CREATE:
+                if (win >= 0) return (uint64_t)-22;       /* already has one */
+                r = wmdev64_create((const struct wm64_create*)a3);
+                if (r < 0) return (uint64_t)(int64_t)r;
+                fds[a1].pos = (uint64_t)(r + 1);
+                return 0;
+            case WMIO64_GETINFO:
+                return (uint64_t)(int64_t)wmdev64_getinfo(
+                           win, (struct wm64_info*)a3);
+            case WMIO64_GETSIZE:
+                return (uint64_t)(int64_t)wmdev64_getsize(
+                           win, (struct wm64_rect*)a3);
+            case WMIO64_TITLE:
+                return (uint64_t)(int64_t)wmdev64_title(win, (const char*)a3);
+            case WMIO64_DAMAGE:
+                return (uint64_t)(int64_t)wmdev64_damage(
+                           win, (const struct wm64_rect*)a3);
+            case WMIO64_POLL:
+                return (uint64_t)(int64_t)wmdev64_poll(
+                           win, (struct wm64_event*)a3);
+            default:
+                return (uint64_t)-25;                     /* -ENOTTY */
+            }
+        }
+
         #define FBIOGET_VSCREENINFO 0x4600
         #define FBIOGET_FSCREENINFO 0x4602
 

@@ -64,6 +64,7 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/idt64.o \
        $(BUILD_DIR)/serial64.o \
        $(BUILD_DIR)/fb64.o \
+       $(BUILD_DIR)/wmdev64.o \
        $(BUILD_DIR)/input64.o \
        $(BUILD_DIR)/fbdraw64_blob.o \
        $(BUILD_DIR)/pmm64.o \
