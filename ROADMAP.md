@@ -9896,6 +9896,75 @@ framebuffer, `input64.c` for keyboard and mouse - and none of the layers
 above them.
 
 
+## Milestone 84 - the desktop, and where it stops
+
+Milestone 83 ended by naming the wall: `winenovaris.drv` needs
+`/dev/wm` and this kernel had none. That turned out to be much less work
+than the 4,250-line compositor the estimate assumed, because the driver
+does not need a window manager - it needs a surface, and `fb64.c` and
+`ramfs64`'s device nodes are both already here. 248 lines.
+
+**It works.** Measured across a prefix run:
+
+| | before | after |
+|---|---|---|
+| `open("/dev/wm")` | `-ENOENT` x27 | succeeds x30 |
+| `WMIO_SCREEN` | never reached | 79 calls, all returning 0 |
+| registers as Wine's display driver | no | yes |
+| processes reached | 105 | 390 |
+
+Wine now gets into COM and RPC - `apartment_createwindowifneeded`,
+`rpcrt4_ncacn_np_handoff` - which are a long way past display-driver
+init.
+
+**One lesson on the way, worth more than the device.** The first version
+registered `/dev/wm` in the input bring-up layer, and four boot
+assertions confirmed it: the device registers, it is a window device, it
+reports a work area the size of the screen. All four passed and the run
+did not change by one byte. Every layer in `kmain64.c` begins with
+`ramfs64_init()`, which empties the filesystem and restores only
+`/dev/null` and `/dev/console`, so the device was created, asserted, and
+gone before anything could open it. An assertion that passes and a run
+that does not change: either half alone would have been believed.
+
+**Where it stops now**, and this is a real bug rather than a missing
+subsystem. `NtUserRegisterClassExWOW` cannot get the shared session
+object, 1,026 times. A window class that cannot be registered is a
+window that cannot be created, which is why not one `WMIO_CREATE` ever
+reaches the device. It is first in the run - 2.1% in, against the
+descriptor ceiling at 48.4% - so everything else is downstream of it.
+
+Wine says which step fails, once the `winstation` channel is on:
+
+    warn:winstation:find_shared_session_object
+        Session object id doesn't match expected id e9, d2, b6, af, ...
+
+Not `NtOpenSection` and not `NtMapViewOfSection` - neither warns once.
+The mapping succeeds and its contents are wrong. What the kernel's own
+traces then establish, and each one killed a theory:
+
+  - Every `MAP_SHARED` file mapping in the entire run is
+    KUSER_SHARED_DATA: 117 at `0x7ffe0000`, plus its writable init
+    mapping. The session is not among them.
+  - Every `MAP_PRIVATE` file mapping is a PE module page. The session is
+    not among those either.
+  - The only mapping of the session is a single 1848-byte writable
+    shared one - the server creating it. **No client ever maps it.**
+
+So both calls report success while no mmap for the session ever reaches
+this kernel, and the client reads whatever its memory already held.
+That is the open question: what `NtMapViewOfSection` is doing instead.
+It is a client-side question now, not a compositor one.
+
+Two ceilings were also sized on the way, both against the host and both
+now announcing themselves rather than failing silently: `PIPE64_MAX`
+64 -> 512 (host peaks at 90 concurrent pipe objects) and `PROC64_MAX`
+32 -> 128. And three genuine address-space leaks were fixed - exit never
+freeing a space, the teardown freeing page tables but not the pages
+they described, and execve abandoning the space it replaced - worth
+118MB a run, which is not the 1.7GB that 390 live processes cost.
+
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
