@@ -1,6 +1,7 @@
 /* proc64.c - the state a process owns, as opposed to a thread. */
 
 #include "proc64.h"
+#include "serial64.h"
 #include "pipe64.h"
 #include "ramfs64.h"
 #include "kstring.h"
@@ -30,7 +31,35 @@ int proc64_create(void) {
     int i;
 
     for (i = 0; i < PROC64_MAX; i++) if (!procs[i].used) break;
-    if (i == PROC64_MAX) return -1;
+    if (i == PROC64_MAX) {
+        /* Full. Said once, with the one number that decides what to do
+         * about it.
+         *
+         * A slot is held by a process that is running and by one that
+         * has exited and not been reaped - Unix keeps the second so its
+         * parent can still ask how it died. Those two want opposite
+         * fixes: live processes mean the table is too small, zombies
+         * mean nothing is reaping them. Measured against the host, a
+         * prefix run peaks at 22 concurrent processes against this
+         * table's 32, which says the answer is the second - but saying
+         * it here means not having to infer it. */
+        static int said;
+        if (!said) {
+            int live = 0, dead = 0;
+            said = 1;
+            for (int k = 0; k < PROC64_MAX; k++)
+                if (procs[k].exited) dead++; else live++;
+            serial64_puts("NOVARIS64: [proc] all ");
+            serial64_putdec(PROC64_MAX);
+            serial64_puts(" slots in use - ");
+            serial64_putdec((uint64_t)live);
+            serial64_puts(" running, ");
+            serial64_putdec((uint64_t)dead);
+            serial64_puts(" exited and unreaped; clone now returns"
+                          " -EAGAIN\n");
+        }
+        return -1;
+    }
 
     kmemset(&procs[i], 0, sizeof(procs[i]));
     procs[i].used   = 1;
