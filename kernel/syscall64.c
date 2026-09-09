@@ -3305,8 +3305,32 @@ static uint64_t dispatch(syscall64_args_t* args) {
          * table records the status. */
         if (sched64_exit_process(proc64_current_pid(), &next, &next_space,
                                  &next_fs)) {
+            /* The address space this process was standing in, freed now
+             * that nothing is standing in it.
+             *
+             * It never was. vmspace64_destroy had call sites on fork's
+             * and execve's failure paths and none on the path a process
+             * actually leaves by, so every process that ran gave back
+             * its descriptors and its slot and kept its memory. One
+             * program at a time, that cost nothing and the frames came
+             * back when the run ended. A Wine prefix is a hundred
+             * processes, and this is what ran the machine out of RAM:
+             * 2GB, 524,256 frames, none free, with mmap refusing even
+             * the single page of KUSER_SHARED_DATA.
+             *
+             * Order matters twice. The switch has to come first because
+             * destroying the space you are executing in unmaps the
+             * tables being walked to do it - vmspace64_destroy refuses
+             * that outright - and the check has to come at all because
+             * threads share their process's space, as does a vfork
+             * child until it execs or dies. Only the kernel half of the
+             * mapping is still needed here, and that is the half
+             * free_low_half_tables leaves alone. */
+            vmspace64_t dying = { vmspace64_current_phys() };
             vmspace64_switch(&next_space);
             write_msr(0xC0000100u, next_fs);
+            if (!sched64_space_in_use(dying.pml4_phys))
+                vmspace64_destroy(&dying);
             sched64_resume(&next);                     /* never returns */
         }
         return a1;

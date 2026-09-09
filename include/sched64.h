@@ -68,6 +68,15 @@ int  sched64_add_frame(const registers64_t* regs, const vmspace64_t* space,
 
 /* The same, for a thread belonging to a *different* process - which is
  * what fork produces, and the reason the two are separate calls. */
+/* Whether any live task still stands in this address space.
+ *
+ * Asked before tearing one down. Threads of a process share their
+ * space, and so does a vfork child until it execs or dies, so "the
+ * process that owned it has exited" is not the same question as
+ * "nothing is using it" - and freeing a space somebody is still
+ * executing in unmaps the code doing the freeing. */
+int  sched64_space_in_use(uint64_t pml4_phys);
+
 int  sched64_exit_process(int pid, registers64_t* out_regs,
                           vmspace64_t* out_space, uint64_t* out_fs_base);
 
