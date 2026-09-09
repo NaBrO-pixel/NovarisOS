@@ -1241,6 +1241,29 @@ static int user_range_ok(uint64_t addr, uint64_t len) {
     return 1;
 }
 
+/* How much an address-space teardown actually gave back.
+ *
+ * Three separate leaks have been fixed here and the run still reaches
+ * zero free frames, so the question is no longer "is something
+ * leaking" but "is the reclaim doing anything". A teardown that returns
+ * a handful of frames is a teardown that is not working; one that
+ * returns thousands while memory still runs out means the memory is
+ * held somewhere these paths never touch. The two answers point in
+ * opposite directions and cannot be told apart from an out-of-memory
+ * count. */
+static void reclaim_report(const char* why, uint64_t before) {
+    uint64_t after = pmm64_free_frames();
+    serial64_puts("NOVARIS64: [reclaim ");
+    serial64_puts(why);
+    serial64_puts("] pid ");
+    serial64_putdec((uint64_t)proc64_current_pid());
+    serial64_puts(" gave back ");
+    serial64_putdec(after > before ? after - before : 0);
+    serial64_puts(" frames, free=");
+    serial64_putdec(after);
+    serial64_putc('\n');
+}
+
 static uint64_t do_execve(const char* path, const char* const* argv,
                           const char* const* envp,
                           const syscall64_args_t* args) {
@@ -1417,8 +1440,11 @@ static uint64_t do_execve(const char* path, const char* const* argv,
      * exit path asks, because a vfork child stands in its parent's
      * space until exactly this moment - the parent's task still names
      * it, so sched64_space_in_use says so and the space survives. */
-    if (!sched64_space_in_use(old_space.pml4_phys))
+    if (!sched64_space_in_use(old_space.pml4_phys)) {
+        uint64_t before = pmm64_free_frames();
         vmspace64_destroy(&old_space);
+        reclaim_report("exec", before);
+    }
     sched64_resume(&entry);                            /* never returns */
     return 0;
 }
@@ -3347,8 +3373,11 @@ static uint64_t dispatch(syscall64_args_t* args) {
             vmspace64_t dying = { vmspace64_current_phys() };
             vmspace64_switch(&next_space);
             write_msr(0xC0000100u, next_fs);
-            if (!sched64_space_in_use(dying.pml4_phys))
+            if (!sched64_space_in_use(dying.pml4_phys)) {
+                uint64_t before = pmm64_free_frames();
                 vmspace64_destroy(&dying);
+                reclaim_report("exit", before);
+            }
             sched64_resume(&next);                     /* never returns */
         }
         return a1;
