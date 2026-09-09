@@ -144,10 +144,47 @@ static int map_anon(uint64_t start, uint64_t end, uint64_t flags,
              * reserves a range PROT_NONE and later maps over pieces of
              * it. */
             if (existing != zero_frame) {
-                if (zero_existing)
-                    kmemset(phys64_to_virt(existing), 0, PAGE64_SIZE);
-                paging64_map(va, existing, flags);
-                continue;
+                /* brk keeps the page: it grows the heap from an
+                 * unaligned break, and the page holding the break is
+                 * full of live heap that only this process can see. */
+                if (!zero_existing) {
+                    paging64_map(va, existing, flags);
+                    continue;
+                }
+
+                /* A fresh anonymous mapping replaces the page instead of
+                 * adopting it.
+                 *
+                 * Adopting and zeroing produces the right bytes at this
+                 * address and the wrong ones everywhere else, because
+                 * the page underneath need not belong to this mapping
+                 * alone. The zero page above is one way that happens and
+                 * was already handled; a shared file mapping is the
+                 * other, and was not.
+                 *
+                 * Wine maps KUSER_SHARED_DATA writable, stores
+                 * SystemCall = 1 - the byte every Windows syscall stub
+                 * tests to choose between Wine's dispatcher and a real
+                 * `syscall` instruction - and then, without unmapping
+                 * it, reserves a 0x144000-byte range with
+                 * MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED starting at that
+                 * same address. Adopting the page zeroed the frame all
+                 * four processes had mapped at 0x7ffe0000, so every Nt
+                 * call in the prefix run took the `syscall` branch and
+                 * arrived in this kernel as whatever Linux number it
+                 * happened to collide with. Traced: the byte went 1 -> 0
+                 * inside that one mmap, and the frame was never freed or
+                 * reallocated while it happened.
+                 *
+                 * Linux replaces here, which is why none of this is
+                 * visible on the host: MAP_FIXED tears down what it
+                 * covers and the caller gets new anonymous pages, while
+                 * the file's own pages are untouched. Replacing costs a
+                 * frame per page over a range that already had some;
+                 * that is the price of the mapping meaning what it
+                 * says. */
+                paging64_unmap(va);
+                pmm64_free_frame(existing);
             }
         }
 
