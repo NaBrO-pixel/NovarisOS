@@ -1675,6 +1675,21 @@ static uint64_t dispatch(syscall64_args_t* args) {
                     serial64_puts(" byte308=");
                     serial64_putdec(*(volatile uint8_t*)(res_dbg + 0x308));
                 }
+                /* The first eight bytes of whatever was just mapped.
+                 *
+                 * win32u maps Wine's session shared memory and then
+                 * reports that every object it looks up there has the
+                 * wrong id - many different expected ids, none of them
+                 * found, which is what a page of zeros looks like from
+                 * the far side. The frame is shared: every process maps
+                 * the same one, and three of them map it writable. So
+                 * the question is whether anything is ever written into
+                 * it, and the frame can simply be read to find out. */
+                if ((int64_t)res_dbg > 0 && nframes &&
+                    user_range_ok(res_dbg, 8)) {
+                    serial64_puts(" head=");
+                    serial64_puthex(*(volatile uint64_t*)res_dbg);
+                }
                 serial64_putc('\n');
                 return res_dbg;
             }
