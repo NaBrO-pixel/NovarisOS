@@ -24,7 +24,24 @@
  * a protocol that works everywhere else.
  */
 
-#define PIPE64_MAX 64
+/* Every pipe and every socketpair direction in the system.
+ *
+ * It was 64, sized when a pipe was something a test program made one of.
+ * Measured against the host - `wineboot -u` under strace, tracking each
+ * pipe2 and socketpair end to its close - a run that completes peaks at
+ * 90 concurrent pipe objects, so 64 is below the floor rather than near
+ * the ceiling.
+ *
+ * What running out looks like: socketpair(2) returns -ENFILE, which is
+ * how a new process fails to get its wineserver connection, which is why
+ * NtCreateUserProcess refuses to start explorer.exe, which surfaces
+ * several layers later as `err:win:get_desktop_window failed to create
+ * desktop window`. Nothing in that chain says "pipe".
+ *
+ * The buffers are allocated per live pipe rather than up front, so the
+ * cost of the headroom is the descriptor array; the heap grows to 256MB
+ * and 256 live pipes want 16MB of it. */
+#define PIPE64_MAX 256
 #define PIPE64_BUF 65536
 
 /* Descriptors in flight (Milestone 76).
