@@ -54,6 +54,17 @@ uint64_t pmm64_highest_addr(void);
  * before this existed has to change. */
 int      pmm64_ref_frame(uint64_t phys);
 uint64_t pmm64_frame_owners(uint64_t phys);
+
+/* Watches one frame.
+ *
+ * A frame that is shared by several processes and whose contents go
+ * wrong cannot be diagnosed from either end: the mapping is right, the
+ * translation is right, and the bytes are still wrong. What is missing
+ * is the frame's own history - who took a reference, who dropped one,
+ * and whether it was ever handed back out to a new owner. Naming the
+ * frame makes the allocator report that history instead of it having to
+ * be inferred. Passing 0 turns the watch off. */
+void     pmm64_watch_frame(uint64_t phys);
 int      pmm64_owns(uint64_t phys);
 uint64_t pmm64_refs_phys(void);
 uint64_t pmm64_refs_bytes(void);

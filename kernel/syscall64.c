@@ -974,7 +974,66 @@ int syscall64_leader_exited(void) { return leader_exited; }
 
 static uint64_t dispatch(syscall64_args_t* args);
 
+/* --- the KUSER_SHARED_DATA canary (Milestone 81) --------------------- */
+
+/* The physical address of KUSER_SHARED_DATA.SystemCall, learned when the
+ * page is first mapped shared at 0x7ffe0000. Read through the direct
+ * map, so it reports the frame's contents whatever the current process
+ * has mapped - including from a process that never mapped it at all. */
+static uint64_t usd_byte_phys;
+static uint8_t  usd_last;
+
+void syscall64_watch_usd(uint64_t frame0) {
+    usd_byte_phys = frame0 + 0x308;
+    usd_last = *(volatile uint8_t*)phys64_to_virt(usd_byte_phys);
+}
+
+/* Says whether the byte changed, and reports the change once.
+ *
+ * The byte is written 1 by every process that starts, and every Windows
+ * syscall stub tests it. Measured across a prefix run it goes back to 0
+ * and stays there, and the frame is neither freed nor reallocated while
+ * that happens - so a store is doing it. Checking on both sides of every
+ * system call narrows "a store somewhere in the system" down to one
+ * call in one process, which is as close as the kernel can get to
+ * naming the instruction. */
+static void usd_check(const char* when, syscall64_args_t* args) {
+    uint8_t now;
+    if (!usd_byte_phys) return;
+    now = *(volatile uint8_t*)phys64_to_virt(usd_byte_phys);
+    if (now == usd_last) return;
+    serial64_puts("NOVARIS64: [usd ");
+    serial64_puts(when);
+    serial64_puts("] ");
+    serial64_putdec(usd_last);
+    serial64_puts(" -> ");
+    serial64_putdec(now);
+    serial64_puts(" pid ");
+    serial64_putdec((uint64_t)proc64_current_pid());
+    serial64_puts(" syscall ");
+    serial64_putdec(args->nr);
+    serial64_puts(" rip=");
+    serial64_puthex(args->ret_rip);
+    serial64_putc('\n');
+    usd_last = now;
+}
+
+/* The wrapper exists only so that the canary sees both sides of the
+ * call: the body below has a dozen return points and a store that
+ * happens inside any of them must be attributed to that call, not to
+ * whichever call happens to run next. */
+static uint64_t syscall64_dispatch_inner(syscall64_args_t* args);
+
 uint64_t syscall64_dispatch(syscall64_args_t* args) {
+    uint64_t r;
+
+    usd_check("before", args);
+    r = syscall64_dispatch_inner(args);
+    usd_check("after", args);
+    return r;
+}
+
+static uint64_t syscall64_dispatch_inner(syscall64_args_t* args) {
     uint64_t r;
 
     if (run_deadline && clock64_ticks() > run_deadline) {
@@ -1460,6 +1519,15 @@ static uint64_t dispatch(syscall64_args_t* args) {
             want = (a2 + PAGE64_SIZE - 1) / PAGE64_SIZE;
             if (nframes > want) nframes = want;
             shared_maps++;
+            /* The frame behind KUSER_SHARED_DATA, named by what actually
+             * backs it rather than by a constant: which frame ramfs
+             * hands out depends on everything allocated before it, so
+             * hard-coding the address measured in one run would watch
+             * the wrong page in the next. */
+            if (a1 == 0x7ffe0000ULL && nframes) {
+                pmm64_watch_frame(frames[0]);
+                syscall64_watch_usd(frames[0]);
+            }
             /* Which file, and which physical frame it starts at.
              *
              * A shared mapping is only shared if two mappings of the
@@ -3193,6 +3261,28 @@ static uint64_t dispatch(syscall64_args_t* args) {
             user_range_ok(0x7ffe0308ULL, 1)) {
             serial64_puts(" SystemCall=");
             serial64_putdec(*(volatile uint8_t*)0x7ffe0308ULL);
+            /* Which frame that read actually landed on.
+             *
+             * The byte reads 1 through this same virtual address at the
+             * moment the page is mapped, and 0 here, in the same
+             * process. Only two things can do that: the frame holding
+             * the byte was overwritten, or this address stopped
+             * resolving to that frame. Translating it says which -
+             * `phys` against the 0x10a09000 the mapping reported - and
+             * reading the byte a second time through the direct map,
+             * which does not go through the process page tables at all,
+             * says whether the two views of the same frame agree. */
+            {
+                uint64_t phys = 0;
+                if (paging64_translate(0x7ffe0308ULL, &phys) == PAGING64_OK) {
+                    serial64_puts(" phys=");
+                    serial64_puthex(phys);
+                    serial64_puts(" viaphys=");
+                    serial64_putdec(*(volatile uint8_t*)phys64_to_virt(phys));
+                } else {
+                    serial64_puts(" phys=untranslatable");
+                }
+            }
         }
         serial64_putc('\n');
         /* Linux answers an unimplemented call with -ENOSYS, and programs

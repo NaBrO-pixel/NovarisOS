@@ -18,6 +18,9 @@
  * happens to be at the far end of the window. */
 
 #include "pmm64.h"
+#include "serial64.h"
+
+static void watch_report(const char* what, uint64_t f);
 
 #define KERNEL_VMA        0xFFFFFFFF80000000ULL
 /* How much physical memory boot64.s maps at KERNEL_VMA. */
@@ -251,6 +254,7 @@ uint64_t pmm64_alloc_frame(void) {
         for (uint64_t f = start; f < stop; f++) {
             if (!bitmap_test(f)) {
                 bitmap_set(f);
+                watch_report("ALLOCATED to a new owner", f);
                 alloc_hint = f + 1;
                 return f * PMM64_FRAME_SIZE;
             }
@@ -284,6 +288,7 @@ uint64_t pmm64_alloc_high(void) {
         for (uint64_t f = start; f-- > stop; ) {
             if (!bitmap_test(f)) {
                 bitmap_set(f);
+                watch_report("ALLOCATED to a new owner", f);
                 high_hint = f;
                 return f * PMM64_FRAME_SIZE;
             }
@@ -308,10 +313,30 @@ uint64_t pmm64_alloc_above(uint64_t min_phys) {
     for (uint64_t f = first; f < frame_count; f++) {
         if (!bitmap_test(f)) {
             bitmap_set(f);
+            watch_report("ALLOCATED to a new owner", f);
             return f * PMM64_FRAME_SIZE;
         }
     }
     return 0;
+}
+
+/* --- watching one frame (Milestone 81) ------------------------------- */
+
+static uint64_t watch_phys;
+
+void pmm64_watch_frame(uint64_t phys) { watch_phys = phys & ~(PMM64_FRAME_SIZE - 1); }
+
+/* Reports one event in the watched frame's life. `owners` is read after
+ * the change so the line reads as the new state, not the old one. */
+static void watch_report(const char* what, uint64_t f) {
+    if (!watch_phys || f != watch_phys / PMM64_FRAME_SIZE) return;
+    serial64_puts("NOVARIS64: [frame ");
+    serial64_puthex(watch_phys);
+    serial64_puts("] ");
+    serial64_puts(what);
+    serial64_puts(" owners=");
+    serial64_putdec(bitmap_test(f) ? 1 + (refs ? refs[f] : 0) : 0);
+    serial64_putc('\n');
 }
 
 void pmm64_free_frame(uint64_t phys) {
@@ -322,15 +347,16 @@ void pmm64_free_frame(uint64_t phys) {
      * survive quietly: if the frame was handed out in between, two owners
      * now share it and the damage surfaces somewhere else entirely. Count
      * it rather than clearing the bit a second time. */
-    if (!bitmap_test(f)) { double_frees++; return; }
+    if (!bitmap_test(f)) { double_frees++; watch_report("double-free", f); return; }
 
     /* Shared: this drops one owner, not the frame. The frame goes back
      * only when the last owner lets go, which is the whole contract
      * copy-on-write is built on - a page mapped into a parent and a
      * child must survive either of them exiting. */
-    if (refs && refs[f]) { refs[f]--; return; }
+    if (refs && refs[f]) { refs[f]--; watch_report("unref", f); return; }
 
     bitmap_clear(f);
+    watch_report("FREED to allocator", f);
     if (f < alloc_hint) alloc_hint = f;
     /* Both hints move to include the frame just returned, so neither
      * allocator has to wrap around to find it again. */
@@ -369,6 +395,7 @@ int pmm64_ref_frame(uint64_t phys) {
     if (!bitmap_test(f)) return 0;          /* not allocated: not shareable */
     if (refs[f] >= REF_MAX) return 0;
     refs[f]++;
+    watch_report("ref", f);
     return 1;
 }
 

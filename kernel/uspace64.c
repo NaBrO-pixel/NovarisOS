@@ -348,8 +348,6 @@ uint64_t uspace64_map_frames(uint64_t addr, int fixed,
      * than a free and the mapping goes on working until it is
      * unmapped". It was describing this reference, which did not
      * exist. */
-    for (uint64_t i = 0; i < n; i++) pmm64_ref_frame(frames[i]);
-
     for (uint64_t i = 0; i < n; i++) {
         if (paging64_map(start + i * PAGE64_SIZE, frames[i], pflags)
                 != PAGING64_OK) {
