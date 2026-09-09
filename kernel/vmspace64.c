@@ -112,9 +112,50 @@ static void free_low_half_tables(void) {
                              | ((uint64_t)a << 21) | ((uint64_t)b << 12));
             for (c = 0; c < 512; c++) {
                 uint64_t pde = pd[c];
+                uint64_t* pt;
                 if (!(pde & PAGE64_PRESENT) || (pde & PAGE64_HUGE)) continue;
-                /* The page table itself. Its entries point at pages this
-                 * layer does not own, so only the table is freed. */
+
+                /* The pages themselves, and then the table describing
+                 * them.
+                 *
+                 * This freed only the table, on the reasoning that its
+                 * entries point at pages this layer does not own. That
+                 * was true while the only caller was a failed fork
+                 * undoing a half-built space. It is not true of the
+                 * caller this milestone added: a process that has
+                 * exited owns every page in its low half, and leaving
+                 * them allocated leaks the whole address space. One
+                 * program at a time that cost nothing, because the run
+                 * ending reclaimed them; a hundred Wine processes ran a
+                 * 2GB machine down to zero free frames, and what that
+                 * looked like was mmap refusing the single page of
+                 * KUSER_SHARED_DATA.
+                 *
+                 * pmm64_free_frame is the right call rather than a
+                 * bare free: a frame shared with another process - a
+                 * mapped file, a page still referenced after fork -
+                 * loses one owner here and goes back only when the last
+                 * one lets go.
+                 *
+                 * Two frames are deliberately not freed. The page every
+                 * PROT_NONE reservation shares belongs to no mapping,
+                 * and freeing it once per reservation would give it
+                 * away while every other process still points at it.
+                 * And a device mapped into the low half - a framebuffer
+                 * above RAM - is not a frame this allocator owns;
+                 * pmm64_free_frame ignores an address past the end of
+                 * memory, so that one needs no test here. */
+                pt = (uint64_t*)(0xFFFF000000000000ULL | (REC << 39)
+                                 | ((uint64_t)a << 30) | ((uint64_t)b << 21)
+                                 | ((uint64_t)c << 12));
+                for (int d = 0; d < 512; d++) {
+                    uint64_t pte = pt[d];
+                    uint64_t frame;
+                    if (!(pte & PAGE64_PRESENT)) continue;
+                    frame = pte & ADDR_MASK;
+                    if (frame == uspace64_zero_frame()) continue;
+                    pmm64_free_frame(frame);
+                }
                 pmm64_free_frame(pde & ADDR_MASK);
             }
             pmm64_free_frame(pdpte & ADDR_MASK);
