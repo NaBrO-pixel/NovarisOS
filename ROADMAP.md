@@ -9832,6 +9832,70 @@ being taken, and a trace armed against the wrong anchor whose silence
 was reported as a finding.
 
 
+## Milestone 83 - the wall is a missing subsystem, and it can be named
+
+Milestone 82 removed the reason every Windows syscall was arriving as a
+Linux one. What followed was five walls in a row, each of which looked
+like something other than what it was, and the last of which is not a
+bug at all.
+
+| what it looked like | what it was |
+|---|---|
+| `NtCreateUserProcess` returning `STATUS_TOO_MANY_OPENED_FILES` | `PIPE64_MAX` was 64 against a host peak of 90; `socketpair` returned `-ENFILE` |
+| the same status again, after that | `PROC64_MAX` was 32; `clone` returned `-EAGAIN` |
+| `shell32.dll` unable to find `shlwapi.dll`, which was staged and present | one `EMFILE` in wineserver's `openat`, six cascading "not found" above it |
+| `map_fixed_area out of memory for 0x7ffe0000-0x7ffe1000` | three separate address-space leaks |
+| `err:seh:call_seh_handlers`, forty of them | memory pressure; gone when the pages came back |
+
+**Three leaks, and the measurement that should have come first.**
+`vmspace64_destroy` had call sites on fork's and execve's failure paths
+and none on the path a process leaves by. Wiring it in was necessary and
+did not move the symptom, because `free_low_half_tables` freed the four
+levels of paging structures and left every leaf page allocated - the
+tables describing 2GB are a few megabytes, the pages are the 2GB. And
+execve replaced a process's address space without giving the old one
+back, once per exec, in a run made of execs.
+
+All three were real. Only the second visibly moved the number, and the
+out-of-memory count could never have distinguished "the reclaim is not
+working" from "the memory is held somewhere else" - which is the
+question that mattered and the one that was not asked until last.
+Asking it settled the whole thing in one run:
+
+    exec: 59 teardowns, 6120 frames (23 MB)
+    exit: 68 teardowns, 24460 frames (95 MB)
+    free frames: 456,343 at the start, 1,554 at the end
+
+The teardowns work. 118MB comes back and 1.7GB does not, so the memory
+is held by something these paths never touch - and it is: a hundred and
+five live processes, which is itself the symptom rather than the cause.
+
+**Which is where the chain ends, at something that is simply not
+written.** `winenovaris.drv` says what it needs in its own words - *no
+`/dev/wm`, no windows* - and the 64-bit kernel does not have `/dev/wm`.
+`kernel/wmdev.c` is in `Makefile` and not in `Makefile.amd64`, and it
+could not be added to it: it is built on `wm.h`, `gfx.h`, `desktop.h`
+and `vfs.h`, none of which has a 64-bit counterpart.
+
+    kernel/wm.c        1104 lines      64-bit equivalent: none
+    kernel/gfx.c        797 lines      64-bit equivalent: none
+    kernel/desktop.c   1897 lines      64-bit equivalent: none
+    kernel/wmdev.c      459 lines      64-bit equivalent: none
+
+So `open("/dev/wm", O_RDWR)` fails, twenty-eight times a run; the driver
+loads and declines to draw; `get_desktop_window` fails forty-six times;
+each failure starts another explorer.exe that never exits; and a hundred
+and five of those exhaust 2GB. Every symptom above the compositor is
+downstream of the compositor not existing.
+
+That is the "64-bit compositor" this roadmap already lists as the next
+step, now sized: roughly 4,250 lines across four subsystems, ported from
+the 32-bit kernel's `vfs`/`kheap`/`gfx` onto `ramfs64`/`kheap64`/`fb64`.
+The 64-bit kernel has the primitives it needs - `fb64.c` for the
+framebuffer, `input64.c` for keyboard and mouse - and none of the layers
+above them.
+
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
