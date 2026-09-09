@@ -1258,7 +1258,7 @@ static uint64_t do_execve(const char* path, const char* const* argv,
     const void* image;
     uint64_t len, rsp;
     uint64_t exe_bias = 0, interp_base = 0;
-    vmspace64_t fresh;
+    vmspace64_t fresh, old_space;
     elf64_info_t info, interp;
     registers64_t entry;
     proc64_t* p = proc64_current();
@@ -1368,6 +1368,7 @@ static uint64_t do_execve(const char* path, const char* const* argv,
 
     /* Past this line the old process is being replaced, and there is
      * nothing left to return an error to. */
+    old_space = p->space;
     p->space = fresh;
     proc64_set_current(p->pid);
 
@@ -1401,6 +1402,23 @@ static uint64_t do_execve(const char* path, const char* const* argv,
     sched64_set_current_space(&fresh);
     execs++;
     vmspace64_switch(&fresh);
+    /* The image that was replaced.
+     *
+     * execve builds the new space, points the process at it and jumps
+     * in; nothing ever gave the old one back. That is a whole address
+     * space per exec, and Wine execs constantly - the loader re-execs
+     * itself to pick the loader for the target machine, the wineserver
+     * is exec'd, and every process a prefix run starts is a fork
+     * followed by one of these.
+     *
+     * After the switch, for the reason vmspace64_destroy refuses to do
+     * it any other way: the old tables cannot be walked while they are
+     * the tables being used to walk. And behind the same question the
+     * exit path asks, because a vfork child stands in its parent's
+     * space until exactly this moment - the parent's task still names
+     * it, so sched64_space_in_use says so and the space survives. */
+    if (!sched64_space_in_use(old_space.pml4_phys))
+        vmspace64_destroy(&old_space);
     sched64_resume(&entry);                            /* never returns */
     return 0;
 }
