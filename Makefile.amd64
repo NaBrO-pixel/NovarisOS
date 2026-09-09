@@ -462,11 +462,20 @@ LIBM   := $(shell readlink -f /lib/x86_64-linux-gnu/libm.so.6 2>/dev/null)
 # checkout it belongs to, and the build has to work from either.
 # Override with `make -f Makefile.amd64 WINE64_LOADER=/path/to/wine`.
 WINE64_INSTALL ?=
+# `../wine` is here because a Wine configured in its own source tree puts
+# the loader in exactly the same places as an out-of-tree build does, and
+# looking only for the out-of-tree name fails silently: the recipe below
+# is guarded by `-x $(WINE64_LOADER)`, so a tree under the other name
+# produces a Wine-less initrd and a boot that reports "no Wine
+# installation in the initrd" several minutes later.
 WINE64_LOADER ?= $(firstword $(wildcard \
-    ../wine64-build/loader/wine ../../../../wine64-build/loader/wine))
+    ../wine64-build/loader/wine ../../../../wine64-build/loader/wine \
+    ../wine/loader/wine ../../../../wine/loader/wine))
 WINE64_NTDLL  ?= $(firstword $(wildcard \
     ../wine64-build/dlls/ntdll/ntdll.so \
-    ../../../../wine64-build/dlls/ntdll/ntdll.so))
+    ../../../../wine64-build/dlls/ntdll/ntdll.so \
+    ../wine/dlls/ntdll/ntdll.so \
+    ../../../../wine/dlls/ntdll/ntdll.so))
 
 $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
            $(BUILD_DIR)/forkchild64.elf userland/mkinitrd.py
