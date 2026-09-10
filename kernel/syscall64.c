@@ -455,7 +455,41 @@ static uint64_t wait_restart(const syscall64_args_t* args, uint64_t nr,
  * bug seen from two places. */
 static void close_all_files(void) {
     if (!proc64_current()) return;
-    for (int fd = 0; fd < FD_MAX; fd++) fd_release(fd);
+
+    /* What the process leaves behind on the way out.
+     *
+     * wineserver learns that a client died by seeing end of file on the
+     * socket it shares with it: our poll reports POLLIN when a pipe has
+     * no writers left, which is Linux's behaviour. Measured, that is not
+     * happening - services.exe exits cleanly at 90% of a run, wineboot
+     * blocks three percent later waiting to be told, and the server
+     * polls to the end of the run without ever seeing anything ready.
+     * So a reference on the write end outlives the process that owned
+     * it, and the question is whose.
+     *
+     * Reported only when something is actually left, so a clean exit
+     * stays silent and the line means what it says. */
+    for (int fd = 0; fd < FD_MAX; fd++) {
+        int tx = -1, inflight = 0;
+        if (fds[fd].used && fd_is_stream(fd)) {
+            tx = fds[fd].tx;
+            if (tx >= 0) inflight = pipe64_inflight(tx);
+        }
+        fd_release(fd);
+        if (tx >= 0 && (pipe64_writers(tx) > 0 || inflight > 0)) {
+            serial64_puts("NOVARIS64: [exitfd] pid ");
+            serial64_putdec((uint64_t)proc64_current_pid());
+            serial64_puts(" fd ");
+            serial64_putdec((uint64_t)fd);
+            serial64_puts(" tx ");
+            serial64_putdec((uint64_t)tx);
+            serial64_puts(": writers still ");
+            serial64_putdec((uint64_t)pipe64_writers(tx));
+            serial64_puts(", ");
+            serial64_putdec((uint64_t)inflight);
+            serial64_puts(" descriptor batches never received\n");
+        }
+    }
 }
 
 static int64_t do_pipe_write(int fd, const void* buf, uint64_t n) {
@@ -3733,20 +3767,68 @@ static uint64_t dispatch(syscall64_args_t* args) {
         uint64_t next_fs;
 
         thread_exits++;
+
+        /* Whether this is a thread ending or a process ending, asked of
+         * the one table that knows.
+         *
+         * It used to be decided by sched64_exit_current's return value,
+         * whose comment said "a sibling is still runnable" - and which
+         * answers a different question: whether *any* task is runnable,
+         * in any process. So the last thread of a process that exited
+         * while anything else in the system had work to do took the
+         * thread branch, and its process was never marked exited and
+         * never had its files closed.
+         *
+         * That is not a leak, it is a deadlock, and it is what stopped
+         * a prefix run finishing. wineboot starts services.exe and
+         * waits - INFINITE - for it either to signal that it is up or
+         * to die. services.exe reached exit(2) cleanly at 90% of a run.
+         * Its socket to the wineserver stayed open because nothing
+         * closed it, so the server never saw end of file, never learned
+         * the process was gone, and never woke wineboot. Measured: the
+         * server polled to the end of the run without one ready
+         * descriptor, and wineboot never printed the "Unexpected
+         * termination of services.exe" it prints when it does hear.
+         *
+         * Counting this process's own tasks separates the two cases.
+         * The teardown happens before the switch, while this process is
+         * still the current one - close_all_files and proc64_exit both
+         * ask who that is. */
+        if (sched64_pid_tasks(proc64_current_pid()) <= 1) {
+            proc64_t* me = proc64_current();
+            int parent = me ? me->parent : 0;
+
+            exit_code = a1;
+            vfork_release(me);
+            close_all_files();
+            proc64_exit(proc64_current_pid(), (int)a1);
+
+            /* The same two things exit_group does once the process is
+             * recorded as gone: end the run if this was the program the
+             * layer was waiting for, and wake a parent parked in wait4.
+             * A process that exits by exit(2) is exactly as finished as
+             * one that exits by exit_group, and was being treated as
+             * though it were neither. */
+            if (leader_pid >= 0 && proc64_current_pid() == leader_pid) {
+                leader_exited = 1;
+                enter_user_mode64_abort();             /* never returns */
+            }
+            if (parent) sched64_wake(PROC64_WAIT_KEY(parent),
+                                     SCHED64_MAX_TASKS);
+        }
+
         if (sched64_exit_current(&next, &next_space, &next_fs)) {
-            /* A sibling is still runnable, so this thread simply stops
-             * existing and that one continues. There is no returning to
-             * the caller: the thread it would return to is gone. */
+            /* Something else is runnable - a sibling of this thread, or
+             * another process entirely. Either way there is no
+             * returning to the caller: the thread it would return to is
+             * gone. */
             vmspace64_switch(&next_space);
             write_msr(0xC0000100u, next_fs);        /* its own TLS */
             sched64_resume(&next);                  /* never returns */
         }
-        /* The last thread. Falling through leaves ring 3 the way
-         * exit_group does, which is correct - the process is over. */
+        /* Nothing left to run at all. Falling through leaves ring 3 the
+         * way exit_group does. */
         exit_code = a1;
-        vfork_release(proc64_current());
-        close_all_files();
-        proc64_exit(proc64_current_pid(), (int)a1);
         return a1;
     }
 
