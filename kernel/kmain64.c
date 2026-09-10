@@ -3878,6 +3878,40 @@ void kernel_main(uint32_t magic, void* mbi) {
                 serial64_putdec(syscall64_exit_code());
             } else {
                 serial64_puts("did not exit (still running when the run ended)");
+                /* Every pipe still holding bytes nobody read.
+                 *
+                 * services.exe's threads are parked in read() waiting
+                 * for wineserver replies, and the server polls to the
+                 * end of the run without one ready descriptor. Those
+                 * two cannot both be true unless a request is sitting
+                 * in a pipe the server is not watching, or a reply is
+                 * sitting in one the client is not reading. Whichever
+                 * it is, the bytes are still there, and the pipe table
+                 * can be asked. */
+                {
+                    int stuck = 0;
+                    for (int p = 0; p < PIPE64_MAX; p++) {
+                        uint64_t avail;
+                        if (!pipe64_valid(p)) continue;
+                        avail = pipe64_available(p);
+                        if (!avail) continue;
+                        stuck++;
+                        if (stuck <= 20) {
+                            serial64_puts("\nNOVARIS64: [stuck] pipe ");
+                            serial64_putdec((uint64_t)p);
+                            serial64_puts(": ");
+                            serial64_putdec(avail);
+                            serial64_puts(" bytes unread, ");
+                            serial64_putdec((uint64_t)pipe64_readers(p));
+                            serial64_puts(" readers, ");
+                            serial64_putdec((uint64_t)pipe64_writers(p));
+                            serial64_puts(" writers");
+                        }
+                    }
+                    serial64_puts("\nNOVARIS64: [stuck] ");
+                    serial64_putdec((uint64_t)stuck);
+                    serial64_puts(" pipes hold unread bytes\n");
+                }
             }
             serial64_puts(", enosys ");
             serial64_putdec(syscall64_unimplemented_count() - enosys_before);
