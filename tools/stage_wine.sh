@@ -228,6 +228,34 @@ else
     echo "stage_wine: no winenovaris.drv - build it with tools/build_wine_driver.sh"
 fi
 
+# The Windows Runtime metadata, which wine.inf copies into the prefix.
+#
+# `[WineSourceDirs] WinmdFiles = winmd,include` - an installed Wine keeps
+# them in <datadir>/wine/winmd/, and a Wine built in its own tree keeps
+# them in include/. Neither was staged, so wineboot looked for
+# z:/share/wine/winmd, did not find it, and did not stop looking:
+# measured over a fifteen-minute run, 55,284 opens of z:/share/wine and
+# 27,636 stats of windows.applicationmodel.winmd - 84% of every system
+# call the guest made, in one process, going nowhere.
+#
+# Ten files, and the same both-places rule as wine.inf and the NLS
+# tables, for the same reason: which one Wine reads depends on whether
+# it believes it is installed.
+WINMD=$(find "$TREE" -name '*.winmd' 2>/dev/null | head -1)
+if [ -n "$WINMD" ]; then
+    n=0
+    for d in "$DEST/usr/share/wine/winmd" "$DEST/share/wine/winmd"; do
+        mkdir -p "$d" || exit 1
+        for f in $(dirname "$WINMD")/*.winmd; do
+            cp "$f" "$d/" || exit 1
+        done
+    done
+    n=$(ls "$DEST/share/wine/winmd" | wc -l)
+    echo "stage_wine: $n winmd files, in both places"
+else
+    echo "stage_wine: no .winmd files in $TREE" >&2
+fi
+
 if [ -d "$TREE/nls" ]; then
     for d in "$DEST/usr/share/wine/nls" "$DEST/share/wine/nls"; do
         mkdir -p "$d" || exit 1
