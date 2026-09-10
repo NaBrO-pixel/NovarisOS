@@ -75,6 +75,14 @@ int  sched64_add_frame(const registers64_t* regs, const vmspace64_t* space,
  * process that owned it has exited" is not the same question as
  * "nothing is using it" - and freeing a space somebody is still
  * executing in unmaps the code doing the freeing. */
+/* How many tasks this process still has.
+ *
+ * Asked by exit(2) to tell a thread ending among siblings from the last
+ * thread of a process, which are different events with the same
+ * syscall: the first ends a thread, the second ends a process and has
+ * to close its files and mark it exited. */
+int  sched64_pid_tasks(int pid);
+
 int  sched64_space_in_use(uint64_t pml4_phys);
 
 int  sched64_exit_process(int pid, registers64_t* out_regs,
