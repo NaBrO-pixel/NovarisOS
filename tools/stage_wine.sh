@@ -279,6 +279,29 @@ while IFS= read -r name; do
     fi
 done < "$LIST"
 
+# The kernel drivers, which are PE modules like the rest and are not on
+# the list because the list was written from what a prefix run opened
+# before it ever got as far as starting one.
+#
+# Their unix halves were already being staged - mountmgr.so and
+# nsiproxy.so are both in the initrd - and their PE halves were not, so
+# Wine found one half of a driver and not the other. That is what
+# ZwLoadDriver reports as c0000142, STATUS_DLL_INIT_FAILED, and the
+# chain above it is the whole reason a prefix run does not finish:
+# winedevice.exe cannot load MountMgr or nsiproxy, so the device service
+# never reports itself running, so scmdatabase_autostart_services never
+# returns, so services.exe never reaches SetEvent(started_event) - and
+# wineboot is waiting on exactly that event, INFINITE, with nothing to
+# time it out.
+#
+# Taken by extension rather than by name: there are nineteen of them and
+# a list would be one more thing to keep in step with Wine.
+found_sys=0
+for f in $(find "$TREE" -name '*.sys' -path "*x86_64-windows*" -type f 2>/dev/null); do
+    cp "$f" "$WIN/$(basename "$f")" && found_sys=$((found_sys+1))
+done
+echo "stage_wine: $found_sys kernel drivers"
+
 # Stripping is not tidiness here - it is what makes the initrd fit.
 find "$DEST/usr" "$DEST/bin" -type f -exec strip --strip-debug {} \; 2>/dev/null
 
