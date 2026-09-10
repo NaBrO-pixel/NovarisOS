@@ -1697,6 +1697,54 @@ static uint64_t dispatch(syscall64_args_t* args) {
                                        frames, nframes, a3);
         }
 
+        /* MAP_PRIVATE of a file, copy-on-write, which is what it means.
+         *
+         * The bytes used to be read out of the file here, once, and the
+         * mapping was a snapshot from then on. That is not what Linux
+         * does and the difference is not academic: a reader that never
+         * writes goes on seeing the file's current contents, and Wine
+         * depends on it. wineserver keeps its session shared memory in
+         * a file, maps it MAP_SHARED read-write and writes objects into
+         * it; every client maps that same file MAP_PRIVATE and only
+         * reads. Measured, one prefix run: seventy-one clients, each
+         * given a copy taken before the objects existed. What it looked
+         * like was `Session object id doesn't match expected id`, a
+         * different id every time, 1,026 window classes that could not
+         * be registered, no desktop window, and a mapping that reported
+         * success throughout.
+         *
+         * Only from the start of the file, because ramfs64_frames
+         * counts from there and an offset would mean mapping from the
+         * middle of the list. Every caller that needs this maps from
+         * zero; a PE section mapped at an offset still takes the copy
+         * below, which is wasteful and correct, because a module file
+         * does not change under its reader. */
+        /* A writable private mapping belongs here too, and is in fact
+         * the case that matters: Wine maps the session PROT_READ |
+         * PROT_WRITE and then only reads it. Copy-on-write is exactly
+         * that bargain - the permission is real, and the copy is taken
+         * when it is used rather than before. PAGE64_COW_RW carries the
+         * permission so break_cow can tell that write from a fault. */
+        if (off == 0) {
+            uint64_t nframes = 0;
+            const uint64_t* frames = ramfs64_frames(node, a2, &nframes);
+            uint64_t want = (a2 + PAGE64_SIZE - 1) / PAGE64_SIZE;
+
+            /* All of it, or none of it. A mapping that runs past the end
+             * of the file needs zero pages for the tail, and mixing the
+             * two here would leave a half-built mapping to unpick on
+             * failure. */
+            if (frames && nframes >= want) {
+                uint64_t r = uspace64_map_frames_cow(a1,
+                                 (flags & MAP_FIXED) != 0,
+                                 frames, want, a3);
+                if ((int64_t)r > 0) {
+                    file_maps++;
+                    return r;
+                }
+            }
+        }
+
         /* Mapped writable whatever the caller asked for, because the
          * kernel is about to write the file's contents into it. */
         mapped = uspace64_mmap(a1, a2, PROT_READ | PROT_WRITE,

@@ -53,6 +53,14 @@ uint64_t uspace64_map_frames(uint64_t addr, int fixed,
                              const uint64_t* frames, uint64_t n,
                              uint64_t prot);
 
+/* The same, but copy-on-write: reads see the file as it is now, a write
+ * gets a private page. This is Linux's MAP_PRIVATE of a file, and the
+ * difference from copying the bytes at mmap time is that a reader keeps
+ * up with a writer. */
+uint64_t uspace64_map_frames_cow(uint64_t addr, int fixed,
+                                 const uint64_t* frames, uint64_t n,
+                                 uint64_t prot);
+
 /* Anonymous, private mappings only. Returns the address, or -ENOMEM. */
 uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                        uint64_t flags);

@@ -346,9 +346,9 @@ uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
  *
  * The frames are not contiguous, so this cannot be uspace64_map_phys
  * with a length: they arrive from the allocator one at a time. */
-uint64_t uspace64_map_frames(uint64_t addr, int fixed,
-                             const uint64_t* frames, uint64_t n,
-                             uint64_t prot) {
+static uint64_t map_frames(uint64_t addr, int fixed,
+                           const uint64_t* frames, uint64_t n,
+                           uint64_t prot, int cow) {
     uint64_t start, pflags;
 
     if (!frames || !n) return (uint64_t)-22;              /* -EINVAL */
@@ -377,6 +377,18 @@ uint64_t uspace64_map_frames(uint64_t addr, int fixed,
 
     pflags = PAGE64_PRESENT | PAGE64_USER;
     if (prot & 0x2) pflags |= PAGE64_WRITE;               /* PROT_WRITE */
+
+    /* A private file mapping maps the file's own frames and keeps them
+     * read-only, so that a read sees the file as it is now and a write
+     * traps and gets a page of its own. The write bit stays clear even
+     * when the caller asked for PROT_WRITE - that permission is
+     * remembered in PAGE64_COW_RW, which is what break_cow consults to
+     * tell a legitimate write from a real fault. */
+    if (cow) {
+        pflags &= ~PAGE64_WRITE;
+        pflags |= PAGE64_COW;
+        if (prot & 0x2) pflags |= PAGE64_COW_RW;
+    }
 
     /* Each mapping is an owner.
      *
@@ -414,6 +426,33 @@ uint64_t uspace64_map_frames(uint64_t addr, int fixed,
 
     if (!fixed) cur()->mmap_next = start + n * PAGE64_SIZE;
     return start;
+}
+
+uint64_t uspace64_map_frames(uint64_t addr, int fixed,
+                             const uint64_t* frames, uint64_t n,
+                             uint64_t prot) {
+    return map_frames(addr, fixed, frames, n, prot, 0);
+}
+
+/* The same frames, mapped copy-on-write.
+ *
+ * This is what MAP_PRIVATE of a file means on Linux, and the difference
+ * from a copy is the whole of it: a reader that never writes goes on
+ * seeing the file's current contents. Wine depends on exactly that.
+ * wineserver keeps its session shared memory in a file, maps it
+ * MAP_SHARED read-write, and writes objects into it; every client maps
+ * the same file MAP_PRIVATE and only ever reads. With an eager copy the
+ * client gets a snapshot taken at mmap time and never sees another
+ * object, which is what "Session object id doesn't match expected id"
+ * meant - 1,026 window classes that could not be registered, and no
+ * desktop window, from a mapping that reported success.
+ *
+ * break_cow already does the second half: a write finds more than one
+ * owner on the frame, so it takes a copy rather than the file's page. */
+uint64_t uspace64_map_frames_cow(uint64_t addr, int fixed,
+                                 const uint64_t* frames, uint64_t n,
+                                 uint64_t prot) {
+    return map_frames(addr, fixed, frames, n, prot, 1);
 }
 
 uint64_t uspace64_map_phys(uint64_t length, uint64_t phys, uint64_t prot) {
