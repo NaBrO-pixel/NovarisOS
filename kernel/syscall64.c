@@ -3353,6 +3353,55 @@ static uint64_t dispatch(syscall64_args_t* args) {
     case SYS64_FREMOVEXATTR:
         return (uint64_t)-61;                      /* -ENODATA */
 
+    /* uname(2).
+     *
+     * Six fixed 65-byte fields, 390 bytes in all, checked against the
+     * host: sysname at 0, nodename at 65, release at 130, version at
+     * 195, machine at 260, domainname at 325.
+     *
+     * It says Linux because that is the ABI this kernel implements and
+     * every caller reads the field to decide which one it is talking
+     * to; answering "Novaris" would be truthful about the wrong
+     * question and would send glibc and Wine down paths written for
+     * nothing. The release is a version this kernel really does behave
+     * like - modern enough that a caller does not go looking for
+     * pre-2.6 fallbacks it would not find here.
+     *
+     * The nodename is the part that was costing something. Wine's RPC
+     * runtime asks for the computer name before it will hand off a
+     * named pipe, and -ENOSYS there became `rpcrt4_ncacn_np_handoff
+     * Failed to retrieve the computer name, error 2`. */
+    case SYS64_UNAME: {
+        char* out = (char*)a1;
+        static const char* const f[6] = {
+            "Linux", "novaris", "6.1.0", "#1 SMP NovarisOS", "x86_64", "(none)"
+        };
+        if (!out || !user_range_ok(a1, 390)) return (uint64_t)-14;
+        for (uint64_t i = 0; i < 390; i++) out[i] = 0;
+        for (int k = 0; k < 6; k++) kstrlcpy(out + k * 65, f[k], 65);
+        return 0;
+    }
+
+    /* getrusage(2). Zeroed rather than invented.
+     *
+     * This kernel does not account per-process CPU time, and a made-up
+     * number is worse than a zero: a caller that divides by it, or
+     * compares two samples to measure progress, gets nonsense instead
+     * of an obvious nothing. The struct is 144 bytes and its first two
+     * fields are the timevals every caller actually reads. */
+    case SYS64_GETRUSAGE: {
+        uint8_t* out = (uint8_t*)a2;
+        if (!out || !user_range_ok(a2, 144)) return (uint64_t)-14;
+        for (uint64_t i = 0; i < 144; i++) out[i] = 0;
+        return 0;
+    }
+
+    /* setpriority(2). Accepted and ignored: this scheduler is round
+     * robin and has no priorities to set, and a program that lowers its
+     * own is asking to be polite rather than asking a question. */
+    case SYS64_SETPRIORITY:
+        return 0;
+
     /* sysinfo(2). The layout is Linux's on x86-64, checked against the
      * host: 112 bytes, uptime at 0, totalram at 32, mem_unit at 104.
      *
