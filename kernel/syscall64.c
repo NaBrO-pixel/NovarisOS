@@ -3353,6 +3353,34 @@ static uint64_t dispatch(syscall64_args_t* args) {
     case SYS64_FREMOVEXATTR:
         return (uint64_t)-61;                      /* -ENODATA */
 
+    /* sched_yield(2).
+     *
+     * A caller spinning on a lock calls this to let the holder run, and
+     * -ENOSYS turns that into a spin that never lets go of the CPU
+     * until the timer takes it away. This scheduler already knows how
+     * to hand the CPU on without blocking, so the answer was there;
+     * only the number was missing.
+     *
+     * The frame is built with rax = 0 and the return address left where
+     * it is, unlike the waiting calls above it, which set rip back by
+     * two so the syscall re-executes. A yield does not want restarting:
+     * it wants to come back having already succeeded. */
+    case SYS64_SCHED_YIELD: {
+        registers64_t self, next;
+        vmspace64_t next_space;
+        uint64_t next_fs;
+
+        frame_from_args(args, 0, &self);
+        if (sched64_yield_current(&self, &next, &next_space, &next_fs)) {
+            vmspace64_switch(&next_space);
+            write_msr(0xC0000100u, next_fs);
+            sched64_resume(&next);                     /* never returns */
+        }
+        /* The only runnable task. Linux returns 0 here too - the call
+         * succeeded, there was simply nobody to yield to. */
+        return 0;
+    }
+
     /* uname(2).
      *
      * Six fixed 65-byte fields, 390 bytes in all, checked against the
