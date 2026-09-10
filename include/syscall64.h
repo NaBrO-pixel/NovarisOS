@@ -43,6 +43,16 @@
 #define SYS64_PREAD64         17
 #define SYS64_PWRITE64        18
 #define SYS64_ACCESS          21
+#define SYS64_SYSINFO          99
+#define SYS64_SETXATTR        188
+#define SYS64_LSETXATTR       189
+#define SYS64_FSETXATTR       190
+#define SYS64_REMOVEXATTR     197
+#define SYS64_LREMOVEXATTR    198
+#define SYS64_FREMOVEXATTR    199
+#define SYS64_SCHED_SETAFFINITY 203
+#define SYS64_SCHED_GETAFFINITY 204
+#define SYS64_PRLIMIT64       302
 #define SYS64_STATFS          137
 #define SYS64_FSTATFS         138
 #define SYS64_GETXATTR        191

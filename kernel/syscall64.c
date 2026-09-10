@@ -3334,6 +3334,103 @@ static uint64_t dispatch(syscall64_args_t* args) {
         return 0;
     }
 
+    /* The extended-attribute writes and removals.
+     *
+     * A filesystem with no attributes cannot store one, and Linux says
+     * so with -EOPNOTSUPP rather than -ENOSYS; removing one that was
+     * never there is -ENODATA, the same answer the reads give. The
+     * distinction is not pedantry - it is the reason these are here.
+     * Wine passes an errno it does not recognise through
+     * errno_to_status, and 38 is not one it maps, so every -ENOSYS
+     * became a `Converting errno 38` and a failure several layers up. */
+    case SYS64_SETXATTR:
+    case SYS64_LSETXATTR:
+    case SYS64_FSETXATTR:
+        return (uint64_t)-95;                      /* -EOPNOTSUPP */
+
+    case SYS64_REMOVEXATTR:
+    case SYS64_LREMOVEXATTR:
+    case SYS64_FREMOVEXATTR:
+        return (uint64_t)-61;                      /* -ENODATA */
+
+    /* sysinfo(2). The layout is Linux's on x86-64, checked against the
+     * host: 112 bytes, uptime at 0, totalram at 32, mem_unit at 104.
+     *
+     * The memory figures are the frame allocator's, in units of a page,
+     * which is what mem_unit is for - so a caller that multiplies gets
+     * the real number of bytes rather than a number this kernel made
+     * up. There is no swap on this machine and saying so is the honest
+     * answer, not a placeholder. */
+    case SYS64_SYSINFO: {
+        uint8_t* out = (uint8_t*)a1;
+        if (!out || !user_range_ok(a1, 112)) return (uint64_t)-14;
+        for (uint64_t i = 0; i < 112; i++) out[i] = 0;
+        {   /* Monotonic since boot, which is what uptime means - not
+             * the wall clock, which clock64_realtime answers. */
+            uint64_t sec = 0, nsec = 0;
+            clock64_now(&sec, &nsec);
+            *(uint64_t*)(out + 0) = sec;                     /* uptime  */
+        }
+        *(uint64_t*)(out +  32) = pmm64_total_frames();      /* totalram */
+        *(uint64_t*)(out +  40) = pmm64_free_frames();       /* freeram  */
+        *(uint16_t*)(out +  80) = (uint16_t)proc64_count();  /* procs    */
+        *(uint32_t*)(out + 104) = PAGE64_SIZE;               /* mem_unit */
+        return 0;
+    }
+
+    /* The affinity pair. One CPU, said plainly.
+     *
+     * getaffinity returns the number of bytes it wrote, which is what
+     * glibc uses to size its own mask - returning 0 there makes a
+     * caller believe it has no CPUs at all. setaffinity accepts any
+     * mask that includes the only processor there is. */
+    case SYS64_SCHED_GETAFFINITY: {
+        uint8_t* out = (uint8_t*)a3;
+        uint64_t len = a2 < 8 ? a2 : 8;
+        if (!out || !user_range_ok(a3, len)) return (uint64_t)-14;
+        if (a2 < 8) return (uint64_t)-22;                    /* -EINVAL */
+        for (uint64_t i = 0; i < 8; i++) out[i] = 0;
+        out[0] = 1;                                          /* CPU 0    */
+        return 8;
+    }
+
+    case SYS64_SCHED_SETAFFINITY:
+        return 0;
+
+    /* prlimit64(2), which is how glibc answers getrlimit.
+     *
+     * wineserver asks for RLIMIT_NOFILE at startup and sizes its own
+     * descriptor handling by the answer, so -ENOSYS there is not
+     * harmless: it leaves the server guessing about the one number this
+     * milestone spent two runs raising. The limits reported are this
+     * kernel's real ones - the descriptor table, the process table -
+     * rather than the large round numbers a stub would invent. */
+    case SYS64_PRLIMIT64: {
+        uint64_t* old = (uint64_t*)args->a4;
+        uint64_t cur, max;
+
+        switch ((int)a2) {
+        case 7:  cur = max = PROC64_FD_MAX;   break;   /* RLIMIT_NOFILE */
+        case 6:  cur = max = PROC64_MAX;      break;   /* RLIMIT_NPROC  */
+        /* 64 pages, which is what execve builds - see STACK_PAGES in
+         * do_execve. Reported rather than a round 8MB, because a caller
+         * that believes the larger number and recurses will find the
+         * guard page instead. */
+        case 3:  cur = max = 64 * PAGE64_SIZE; break;          /* STACK */
+        default: cur = max = ~0ULL;           break;   /* RLIM_INFINITY */
+        }
+        if (old) {
+            if (!user_range_ok(args->a4, 16)) return (uint64_t)-14;
+            old[0] = cur;
+            old[1] = max;
+        }
+        /* A new limit is accepted and ignored: these are properties of
+         * the kernel's tables, and a process cannot lower what it does
+         * not own. Refusing would fail callers that only ever set the
+         * soft limit to the hard one. */
+        return 0;
+    }
+
     /* The extended-attribute reads, which this filesystem does not have.
      *
      * -ENOSYS is the wrong refusal and it was costing something: Wine
