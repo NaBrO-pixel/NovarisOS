@@ -3284,6 +3284,99 @@ static uint64_t dispatch(syscall64_args_t* args) {
             && ((const char*)a2)[0] != '/') return (uint64_t)-9;
         return do_readlink((const char*)a2, (char*)a3, args->a4);
 
+    /* statfs(2) and fstatfs(2).
+     *
+     * 50,820 calls in one prefix run answered -ENOSYS. Wine asks how
+     * much room a drive has every time it looks at one, and a drive
+     * whose size cannot be read is one it keeps asking about.
+     *
+     * The layout is Linux's on x86-64, checked against the host rather
+     * than written from memory: 120 bytes, f_type at 0 through f_flags
+     * at 80, and TMPFS_MAGIC because that is what this filesystem most
+     * nearly is - ramfs64 keeps a file's bytes in RAM, so the free space
+     * it should report is the free space the frame allocator has. The
+     * numbers are therefore real rather than invented: a program that
+     * asks whether there is room to write gets an answer that becomes
+     * false in the same way the host's does. */
+    case SYS64_STATFS:
+    case SYS64_FSTATFS: {
+        uint8_t* out;
+        uint64_t total, free_frames;
+
+        if (nr == SYS64_STATFS) {
+            char path[PROC64_PATH_MAX];
+            int64_t e = abs_path((const char*)a1, path);
+            if (e) return (uint64_t)e;
+            if (ramfs64_lookup(path) < 0) return (uint64_t)-2;   /* -ENOENT */
+            out = (uint8_t*)a2;
+        } else {
+            if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+            out = (uint8_t*)a2;
+        }
+
+        if (!out || !user_range_ok((uint64_t)out, 120)) return (uint64_t)-14;
+
+        total       = pmm64_total_frames();
+        free_frames = pmm64_free_frames();
+
+        for (uint64_t i = 0; i < 120; i++) out[i] = 0;
+        *(uint64_t*)(out +  0) = 0x01021994ULL;    /* f_type: TMPFS_MAGIC */
+        *(uint64_t*)(out +  8) = PAGE64_SIZE;      /* f_bsize              */
+        *(uint64_t*)(out + 16) = total;            /* f_blocks             */
+        *(uint64_t*)(out + 24) = free_frames;      /* f_bfree              */
+        *(uint64_t*)(out + 32) = free_frames;      /* f_bavail             */
+        *(uint64_t*)(out + 40) = ramfs64_count();  /* f_files              */
+        /* Inodes are not preallocated, so what is free is what the
+         * allocator could still turn into one. */
+        *(uint64_t*)(out + 48) = free_frames;      /* f_ffree              */
+        *(uint64_t*)(out + 64) = RAMFS64_NAME_MAX - 1; /* f_namelen        */
+        *(uint64_t*)(out + 72) = PAGE64_SIZE;      /* f_frsize             */
+        return 0;
+    }
+
+    /* The extended-attribute reads, which this filesystem does not have.
+     *
+     * -ENOSYS is the wrong refusal and it was costing something: Wine
+     * converts an errno it does not recognise through errno_to_status,
+     * and 38 is not one it maps. -ENODATA is what Linux answers for an
+     * attribute that is not set, which is true of every attribute here,
+     * and callers already handle it because it is the ordinary case on
+     * a filesystem that supports attributes and simply has none. */
+    case SYS64_GETXATTR:
+    case SYS64_LGETXATTR:
+    case SYS64_FGETXATTR:
+        return (uint64_t)-61;                      /* -ENODATA */
+
+    /* utimensat(2). Accepted, and it does not lie about more than it
+     * has to: ramfs64 keeps no timestamps, so there is nothing to
+     * store, and reporting failure is the worse answer of the two.
+     * setupapi copies a file and then stamps it; -ENOSYS there turned
+     * into 76 `Converting errno 38` and a copy error for every driver
+     * .inf in the prefix. */
+    case SYS64_UTIMENSAT:
+        return 0;
+
+    /* faccessat(2) and faccessat2(2), which is faccessat with flags.
+     *
+     * Both answer the question access(2) answers, and answer it the
+     * same way: this kernel has no permission bits to test, so a path
+     * that resolves is a path that is accessible. AT_FDCWD is the only
+     * directory descriptor a caller uses here, and a relative path is
+     * resolved against the working directory by abs_path, which is what
+     * AT_FDCWD means. */
+    case SYS64_FACCESSAT:
+    case SYS64_FACCESSAT2: {
+        char path[PROC64_PATH_MAX];
+        int64_t e;
+        /* -100 is AT_FDCWD. Anything else would need the descriptor's
+         * directory, which nothing asks for; refused rather than
+         * silently resolved against the wrong place. */
+        if ((int)(int32_t)a1 != -100) return (uint64_t)-22;   /* -EINVAL */
+        e = abs_path((const char*)a2, path);
+        if (e) return (uint64_t)e;
+        return ramfs64_lookup(path) >= 0 ? 0 : (uint64_t)-2;  /* -ENOENT */
+    }
+
     case SYS64_ACCESS: {
         char path[PROC64_PATH_MAX];
         int64_t e = abs_path((const char*)a1, path);

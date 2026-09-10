@@ -43,6 +43,14 @@
 #define SYS64_PREAD64         17
 #define SYS64_PWRITE64        18
 #define SYS64_ACCESS          21
+#define SYS64_STATFS          137
+#define SYS64_FSTATFS         138
+#define SYS64_GETXATTR        191
+#define SYS64_LGETXATTR       192
+#define SYS64_FGETXATTR       193
+#define SYS64_FACCESSAT       269
+#define SYS64_UTIMENSAT       280
+#define SYS64_FACCESSAT2      439
 #define SYS64_NEWFSTATAT      262
 #define SYS64_OPENAT          257
 
