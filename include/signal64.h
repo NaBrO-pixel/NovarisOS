@@ -75,7 +75,16 @@ typedef struct {
     uint64_t mask;
 } ksigaction64_t;
 
+/* SIG_IGN as the kernel sees it: Linux's sigaction passes 1 for it, and
+ * it is not an address to jump to. */
+#define SIG64_IGN 1ULL
+
 void signal64_reset(void);
+
+/* The handler table is per process. fork copies it; execve puts every
+ * caught signal back to its default and leaves ignored ones ignored. */
+void signal64_fork(int parent_pid, int child_pid);
+void signal64_exec(void);
 
 /* sigaltstack(2). Either pointer may be null. Returns 0 or a negative
  * errno.

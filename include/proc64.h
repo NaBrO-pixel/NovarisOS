@@ -189,6 +189,12 @@ proc64_t* proc64_current(void);
 void      proc64_set_current(int pid);
 int       proc64_current_pid(void);
 
+/* Which slot a pid occupies. Per-process state that cannot live in
+ * proc64_t - a signal handler table needs signal64.h, which includes
+ * this header - is kept beside its own code and indexed by this. */
+int       proc64_slot_of(int pid);
+int       proc64_current_slot(void);
+
 /* Marks a process finished and records what it exited with, so a parent
  * that asks later has something to be told. */
 void      proc64_exit(int pid, int status);
