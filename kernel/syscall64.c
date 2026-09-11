@@ -2251,12 +2251,65 @@ static uint64_t dispatch(syscall64_args_t* args) {
             if (args->a4) futex_timed++;
             if (!((uint32_t)a2 & (uint32_t)FUTEX_PRIVATE_FLAG)) futex_shared++;
 
+            /* A timed wait that has already begun.
+             *
+             * Measured across a prefix run: 223 of 251 waits carry a
+             * timeout, and this kernel had none - sched64_block_current
+             * takes an address and a wake value and has no deadline at
+             * all - so every one of them was a wait that Linux would
+             * expire and this kernel would not. That is what stopped
+             * services.exe: it and winedevice.exe sat in futex while
+             * the wineserver idled and wineboot waited, INFINITE, for
+             * the started event neither would ever set.
+             *
+             * The value is re-checked on each turn because that is the
+             * contract the interface is built on - a waker changes the
+             * word and then wakes, which is why FUTEX_WAIT is given the
+             * value it expects to find. Restarting rather than blocking
+             * means a deadline can be noticed at all; the cost is that
+             * the thread yields around the loop instead of sleeping,
+             * which is what nanosleep and poll already do here.
+             *
+             * Every futex in the run is PRIVATE - zero without the flag
+             * - so the virtual address is the right key and is left
+             * alone. It would be the wrong key for a futex two
+             * processes map at different addresses, and nothing here
+             * has one. */
+            if (wait_started() && wait_call[wait_slot()] == nr) {
+                if (*(volatile uint32_t*)a1 != (uint32_t)a3) {
+                    wait_done();
+                    return 0;                      /* woken */
+                }
+                if (wait_expired()) {
+                    wait_done();
+                    return (uint64_t)-110;         /* -ETIMEDOUT */
+                }
+                return wait_restart(args, nr, wait_deadline[wait_slot()]);
+            }
+
             /* The comparison is the whole point of the interface, and
              * it is why futex has no race: between the caller deciding
              * to sleep and this check, the waker may already have run
              * and changed the value. If it has, do not sleep. */
             if (*(volatile uint32_t*)a1 != (uint32_t)a3)
                 return (uint64_t)-11;              /* -EAGAIN */
+
+            if (args->a4) {
+                const struct { uint64_t sec, nsec; }* ts =
+                    (const void*)args->a4;
+                uint64_t want;
+
+                if (!user_range_ok(args->a4, sizeof(*ts)))
+                    return (uint64_t)-14;          /* -EFAULT */
+                want = ts->sec * CLOCK64_HZ
+                     + ts->nsec / (1000000000ull / CLOCK64_HZ);
+                /* A deadline already past still gets one turn, so that
+                 * a zero timeout polls once rather than reporting a
+                 * timeout for a word it never looked at. */
+                futex_waits++;
+                return wait_restart(args, nr,
+                                    clock64_ticks() + (want ? want : 1));
+            }
 
             futex_waits++;
             frame_from_args(args, 0, &self);
