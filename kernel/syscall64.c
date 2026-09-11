@@ -829,6 +829,10 @@ static uint64_t do_fork_common(const syscall64_args_t* args,
     uint64_t free_before = pmm64_free_frames();
 
     child_pid = proc64_fork_from(proc64_current_pid());
+    /* The child starts with the parent's handlers, which is what Linux
+     * does and what Wine's loader depends on: it installs them once and
+     * every process forked from it expects to still have them. */
+    if (child_pid > 0) signal64_fork(proc64_current_pid(), child_pid);
     if (child_pid < 0) return (uint64_t)-11;           /* -EAGAIN */
     cp = proc64_get(child_pid);
 
@@ -1437,6 +1441,14 @@ static uint64_t do_execve(const char* path, const char* const* argv,
 
     /* Past this line the old process is being replaced, and there is
      * nothing left to return an error to. */
+    /* A caught signal goes back to its default here, and an ignored one
+     * stays ignored. The new image has never seen the old program's
+     * handler addresses, so entering one lands wherever the new image
+     * happens to put that address - and a process that installed no
+     * handler of its own must get the default action rather than
+     * somebody else's. */
+    signal64_exec();
+
     old_space = p->space;
     p->space = fresh;
     proc64_set_current(p->pid);

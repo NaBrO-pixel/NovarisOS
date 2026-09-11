@@ -25,6 +25,18 @@ static proc64_t* slot_for(int pid) {
 proc64_t* proc64_get(int pid)     { return slot_for(pid); }
 proc64_t* proc64_current(void)    { return slot_for(current_pid); }
 int       proc64_current_pid(void){ return current_pid; }
+
+/* Which slot a pid occupies, so that per-process state kept outside
+ * this file - the signal handler table, which needs signal64.h - can be
+ * indexed without every such table walking this one itself. -1 for a
+ * pid that is not live. */
+int proc64_slot_of(int pid) {
+    for (int i = 0; i < PROC64_MAX; i++)
+        if (procs[i].used && procs[i].pid == pid) return i;
+    return -1;
+}
+
+int proc64_current_slot(void) { return proc64_slot_of(current_pid); }
 void      proc64_set_current(int pid) { current_pid = pid; }
 
 int proc64_create(void) {

@@ -19,7 +19,35 @@ _Static_assert(__builtin_offsetof(sigcontext64_t, rip) == 128, "sc.rip");
 _Static_assert(__builtin_offsetof(sigcontext64_t, eflags) == 136, "sc.eflags");
 _Static_assert(__builtin_offsetof(rt_sigframe64_t, uc) == 8, "frame.uc");
 
-static ksigaction64_t handlers[NSIG];
+/* One table per process, not one for the machine.
+ *
+ * It was a single global array, so every process in the system shared
+ * one set of signal handlers: a handler installed by one was found by
+ * all, and execve - which on Linux resets every caught signal to its
+ * default - left them in place. A process that installed no SIGSEGV
+ * handler therefore did not get the default action of dying; it was
+ * sent to whatever address another process had registered, in an
+ * address space where that address means something else.
+ *
+ * Measured: services.exe took 673,430 SIGSEGVs at one instruction,
+ * reading a page it had itself unmapped, with six rt_sigreturns in the
+ * whole run - so the handler was never really running and never
+ * returning. rsp walked down a little over 2KB per delivery, which is a
+ * frame being pushed for a handler that faults before it does anything.
+ *
+ * Threads share their process's table, which falls out of indexing by
+ * process slot rather than by task. */
+static ksigaction64_t handlers_by_slot[PROC64_MAX][NSIG];
+
+/* The calling process's handlers. Slot -1 - before there is a process,
+ * which is where the bring-up layers run - gets slot 0, so the early
+ * tests keep the single table they were written against. */
+static ksigaction64_t* handlers_of(int slot) {
+    if (slot < 0 || slot >= PROC64_MAX) slot = 0;
+    return handlers_by_slot[slot];
+}
+
+#define handlers (handlers_of(proc64_current_slot()))
 static uint64_t delivered, returns;
 
 void signal64_reset(void) {
@@ -31,6 +59,37 @@ void signal64_reset(void) {
     }
     delivered = 0;
     returns = 0;
+}
+
+/* fork(2): the child starts with the parent's handlers.
+ *
+ * Linux copies the table, and a Wine process depends on it - the loader
+ * installs its handlers once and every process it forks expects to
+ * still have them. */
+void signal64_fork(int parent_pid, int child_pid) {
+    ksigaction64_t* from = handlers_of(proc64_slot_of(parent_pid));
+    ksigaction64_t* to   = handlers_of(proc64_slot_of(child_pid));
+    if (from == to) return;
+    for (int i = 0; i < NSIG; i++) to[i] = from[i];
+}
+
+/* execve(2): a caught signal goes back to its default, an ignored one
+ * stays ignored.
+ *
+ * That is Linux's rule and the reason is the new image: it has never
+ * seen the old program's handler addresses, and jumping to one of them
+ * lands in whatever the new image happens to have at that address.
+ * Ignoring survives because a program that inherited SIG_IGN is
+ * entitled to keep not caring. */
+void signal64_exec(void) {
+    ksigaction64_t* h = handlers_of(proc64_current_slot());
+    for (int i = 0; i < NSIG; i++) {
+        if (h[i].handler == SIG64_IGN) continue;
+        h[i].handler  = 0;
+        h[i].flags    = 0;
+        h[i].restorer = 0;
+        h[i].mask     = 0;
+    }
 }
 
 uint64_t signal64_delivered(void) { return delivered; }
@@ -132,6 +191,12 @@ int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
     if (sig <= 0 || sig >= NSIG) return 0;
     sa = &handlers[sig];
     if (!sa->handler) return 0;
+    /* SIG_IGN is the value 1, not an address. Without this the check
+     * above lets it through and the frame is built to enter the handler
+     * at 1. Discarded instead, which is what ignoring means; a fault
+     * signal that nothing catches still ends the process, because the
+     * caller treats 0 as "nobody handled this". */
+    if (sa->handler == SIG64_IGN) return 0;
 
     /* Only a ring-3 fault can be handed to a ring-3 handler. A fault in
      * the kernel with cs = 0x08 is a kernel bug, and pushing a frame on
