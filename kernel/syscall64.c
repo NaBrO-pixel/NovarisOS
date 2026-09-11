@@ -977,6 +977,7 @@ void syscall64_set_exit_code(uint64_t code) { exit_code = code; }
 /* Threads that actually slept, and wakeups that actually woke one.
  * Counted because "the futex worked" and "the futex was never contended"
  * look identical from outside, and only the first is worth claiming. */
+static uint64_t futex_timed, futex_shared;
 static uint64_t futex_waits, futex_wakes;
 
 /* File-backed mappings made. Counted for the same reason the futex
@@ -987,6 +988,8 @@ static uint64_t file_maps;
 uint64_t syscall64_file_maps(void) { return file_maps; }
 
 uint64_t syscall64_futex_waits(void) { return futex_waits; }
+uint64_t syscall64_futex_timed(void)  { return futex_timed; }
+uint64_t syscall64_futex_shared(void) { return futex_shared; }
 uint64_t syscall64_futex_wakes(void) { return futex_wakes; }
 
 uint64_t syscall64_unimplemented(void) { return last_unimpl; }
@@ -2230,6 +2233,23 @@ static uint64_t dispatch(syscall64_args_t* args) {
             registers64_t self, next;
             vmspace64_t next_space;
             uint64_t next_fs;
+
+            /* Whether this wait was given a deadline, and whether it was
+             * shared between processes.
+             *
+             * This kernel has no timeout for FUTEX_WAIT at all -
+             * sched64_block_current takes an address and a wake value
+             * and nothing else - so a wait that Linux would expire
+             * blocks here forever. And the key is the *virtual*
+             * address, which is right for a private futex and wrong for
+             * one in memory two processes map at different addresses.
+             *
+             * Both would deadlock exactly as observed: services.exe and
+             * winedevice.exe parked in futex while the system idles.
+             * Counting says which, and whether either is even reached,
+             * before either is built. */
+            if (args->a4) futex_timed++;
+            if (!((uint32_t)a2 & (uint32_t)FUTEX_PRIVATE_FLAG)) futex_shared++;
 
             /* The comparison is the whole point of the interface, and
              * it is why futex has no race: between the caller deciding

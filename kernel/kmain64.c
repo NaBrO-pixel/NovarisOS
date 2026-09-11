@@ -3908,7 +3908,14 @@ void kernel_main(uint32_t magic, void* mbi) {
                             serial64_puts(" writers");
                         }
                     }
-                    serial64_puts("\nNOVARIS64: [stuck] ");
+                    serial64_puts("\nNOVARIS64: [futex] ");
+                    serial64_putdec(syscall64_futex_waits());
+                    serial64_puts(" waits, ");
+                    serial64_putdec(syscall64_futex_timed());
+                    serial64_puts(" with a timeout this kernel ignores, ");
+                    serial64_putdec(syscall64_futex_shared());
+                    serial64_puts(" not PRIVATE\n");
+                    serial64_puts("NOVARIS64: [stuck] ");
                     serial64_putdec((uint64_t)stuck);
                     serial64_puts(" pipes hold unread bytes\n");
                 }
