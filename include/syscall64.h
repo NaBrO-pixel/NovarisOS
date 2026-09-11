@@ -359,6 +359,8 @@ uint64_t syscall64_thread_exits(void);
  * woke one. A run where nothing ever contended would show zero here and
  * still pass everything else. */
 uint64_t syscall64_futex_waits(void);
+uint64_t syscall64_futex_timed(void);
+uint64_t syscall64_futex_shared(void);
 uint64_t syscall64_futex_wakes(void);
 
 /* File-backed mmap(2) calls served. Zero would mean every mapping in a
