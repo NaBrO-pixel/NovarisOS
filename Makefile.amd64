@@ -569,14 +569,36 @@ QEMU_RAM ?= 2G
 run: iso
 	qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -serial stdio
 
-# The bring-up test. kernel_main halts rather than exiting, so the run is
-# bounded by `timeout` and judged by what reached the serial port.
+# The bring-up test. kernel_main halts rather than exiting, so the run has
+# to be stopped from outside and judged by what reached the serial port.
+#
+# It used to be stopped by `timeout 30`, which was true when bring-up was
+# a second of kernel assertions. It is not true now: the Wine layer runs
+# wineboot to completion, which takes minutes, so a thirty-second cap cut
+# every run off long before the last line and the suite reported that the
+# kernel never reached the end of kernel_main - on every commit, whatever
+# the commit did. A test that cannot pass is not reporting on the code.
+#
+# So wait for the marker instead of for the clock. TEST_TIMEOUT is the cap
+# for a run that never gets there, which is a real failure - it is not the
+# expected duration, and the run stops as soon as bring-up says it is done.
+TEST_TIMEOUT ?= 900
 test: iso
 	@rm -f $(BUILD_DIR)/serial.log
-	@timeout 30 qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -display none \
-	    -serial file:$(BUILD_DIR)/serial.log -no-reboot >/dev/null 2>&1 || true
-	@echo "--- serial ---"
-	@cat $(BUILD_DIR)/serial.log 2>/dev/null || true
+	@qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -display none \
+	    -serial file:$(BUILD_DIR)/serial.log -no-reboot >/dev/null 2>&1 & \
+	  qpid=$$!; waited=0; \
+	  while [ $$waited -lt $(TEST_TIMEOUT) ]; do \
+	      grep -q "bring-up complete" $(BUILD_DIR)/serial.log 2>/dev/null && break; \
+	      kill -0 $$qpid 2>/dev/null || break; \
+	      sleep 1; waited=$$((waited+1)); \
+	  done; \
+	  kill $$qpid 2>/dev/null; wait $$qpid 2>/dev/null || true
+	@# The log is hundreds of megabytes with the syscall trace on, so show
+	@# the end of it rather than all of it. The assertions below read the
+	@# file, not this excerpt.
+	@echo "--- serial (last 40 lines of `wc -c < $(BUILD_DIR)/serial.log` bytes) ---"
+	@tail -n 40 $(BUILD_DIR)/serial.log 2>/dev/null || true
 	@echo "--------------"
 	@if ! grep -q "bring-up complete" $(BUILD_DIR)/serial.log 2>/dev/null; then \
 	    echo "FAIL: the kernel did not reach the end of kernel_main"; exit 1; fi

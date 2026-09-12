@@ -22,6 +22,28 @@ import subprocess
 import sys
 import time
 
+# How long to let the machine boot before calling it a failure.
+#
+# This was 90 seconds, from when bring-up was a short run of kernel
+# assertions. Bring-up now ends by running wineboot to completion, which
+# takes minutes, so 90 seconds failed every run on the clock rather than
+# on anything the kernel did. It is a cap on a hang, not an estimate of
+# the duration - the wait below stops the moment the marker appears.
+BOOT_TIMEOUT = float(os.environ.get("NOVARIS_TEST_TIMEOUT", "900"))
+
+# The serial log is hundreds of megabytes with the syscall trace on, and
+# this is polled four times a second, so read the end of it rather than
+# the whole thing. The markers we wait for are printed at the end.
+def tail_contains(path, needle, window=65536):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - window))
+            return needle in f.read()
+    except FileNotFoundError:
+        return False
+
+
 WIDTH, HEIGHT = 1024, 768
 
 # (x, y, r, g, b, what it is)
@@ -136,20 +158,17 @@ def main():
         # The kernel halts after kernel_main, so the machine stays up and
         # the last thing drawn stays on the screen. Wait for it to say so
         # rather than sleeping a guessed number of seconds.
-        deadline = time.time() + 90
+        deadline = time.time() + BOOT_TIMEOUT
         while time.time() < deadline:
             if qemu.poll() is not None:
                 print("FAIL: qemu exited before the kernel finished booting")
                 return 1
-            try:
-                with open(serial, "rb") as f:
-                    if b"bring-up complete" in f.read():
-                        break
-            except FileNotFoundError:
-                pass
+            if tail_contains(serial, b"bring-up complete"):
+                break
             time.sleep(0.25)
         else:
-            print("FAIL: the kernel never reached the end of kernel_main")
+            print("FAIL: the kernel never reached the end of kernel_main "
+                  "within %g seconds" % BOOT_TIMEOUT)
             return 1
 
         reply = monitor_command(monsock, "screendump %s" % shot)
