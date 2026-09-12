@@ -9965,6 +9965,67 @@ they described, and execve abandoning the space it replaced - worth
 118MB a run, which is not the 1.7GB that 390 live processes cost.
 
 
+## Milestone 85 - wineboot exits 0
+
+    NOVARIS64: wineboot exit= 0, enosys 78, last 62, nodes 751
+    NOVARIS64: prefix  = 7/7 present, 751 nodes, run ended on its own
+
+Reproduced on consecutive runs, with no GPF, no out-of-memory, and no
+table reaching its ceiling. "Run ended on its own" is the part that took
+the longest to earn: every run before this one was stopped by the
+watchdog and reported a failure that had not happened.
+
+**It was never deadlocked.** wineboot ran to completion and exited 0 at
+87% of its budget, and the remaining 13% was the run waiting to find
+out. The wineserver's own request log said so plainly once it was turned
+on - `terminate_process(handle=0000, exit_code=0) = 0 { self=1 }` - and
+services.exe, the thing that was supposed to be stuck, ended with
+SetEvent on the started event and a wait on exit_event, which is what a
+service control manager does when it is *up*.
+
+**The bug was FD_CLOEXEC.** Every path in this kernel that opens a
+descriptor records it - open(2), fcntl, dup3, even one arriving over
+SCM_RIGHTS with MSG_CMSG_CLOEXEC - and no path ever acted on it. execve
+handed on the whole table. Wine marks its wineserver socket
+close-on-exec precisely so that a process's death becomes visible: the
+server notices a client is gone by seeing end of file on that socket,
+and end of file needs the last writer to let go. Measured at wineboot's
+exit, its sockets still had six writers - the services.exe, explorer and
+rundll32 it had exec'd, each holding a copy it should never have been
+given.
+
+Two more fell out of getting that far. glibc's abort() is
+tgkill(getpid(), gettid(), SIGABRT), and with no tgkill it took its
+fallback path into an instruction the CPU refuses - so a missing syscall
+arrived two steps later as a general protection fault that *halted the
+machine* with thirty processes still alive. tgkill and tkill now deliver
+to the calling thread, and a protection fault or invalid opcode from
+ring 3 ends the process the way an uncaught page fault already did
+rather than stopping the kernel.
+
+**What the graph looked like before it was read properly.** 32 live
+tasks, 31 blocked, 1 runnable - which reads as a deadlock and was not
+one. PlugPlay had reported started and was waiting for control messages;
+winedevice was waiting for device requests; an RPC listener was waiting
+for a connection. Those are the correct resting states of a system that
+has finished booting, and from outside they are indistinguishable from
+being stuck. What separated them was reading what each wait was *for*.
+
+**Three things this milestone reported and had to correct.** The run
+budget is 300 seconds (`syscall64_set_run_ticks`), not the fifteen
+minutes described elsewhere here, so every "did not finish in fifteen
+minutes" was five; raising it to 1800 changed nothing, which is what
+proved the symptom was not a shortage of time. The 84% of syscalls spent
+in a retry loop was a staging gap - ten .winmd files, 110KB - rather
+than anything in the kernel. And the first thread read as wineboot's
+belonged to an earlier bring-up layer, which nearly produced a confident
+wrong answer about the leader exiting immediately.
+
+The prefix is 751 nodes against the host's 829. What is missing is
+listed in the errors that remain: `nodrv_CreateWindow`, `start_rpcss`,
+and four setupapi copy failures.
+
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
