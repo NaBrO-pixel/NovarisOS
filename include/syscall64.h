@@ -43,6 +43,8 @@
 #define SYS64_PREAD64         17
 #define SYS64_PWRITE64        18
 #define SYS64_ACCESS          21
+#define SYS64_TKILL           200
+#define SYS64_TGKILL          234
 #define SYS64_SCHED_YIELD      24
 #define SYS64_UNAME            63
 #define SYS64_GETRUSAGE        98

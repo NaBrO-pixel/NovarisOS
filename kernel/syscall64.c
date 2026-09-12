@@ -3499,6 +3499,59 @@ static uint64_t dispatch(syscall64_args_t* args) {
     case SYS64_FREMOVEXATTR:
         return (uint64_t)-61;                      /* -ENODATA */
 
+    /* tkill(2) and tgkill(2), which is how a program raises a signal on
+     * itself.
+     *
+     * glibc's abort() is raise(SIGABRT), and raise is tgkill(getpid(),
+     * gettid(), sig). With no tgkill it got -ENOSYS, and abort's
+     * fallback for a signal it cannot send is an instruction the CPU
+     * refuses - so a missing syscall arrived two steps later as a
+     * general protection fault that halted the machine.
+     *
+     * Only the calling thread is a target here. Signalling another
+     * thread needs a pending-signal queue this kernel does not have,
+     * and nothing has asked for it: every tgkill measured in a prefix
+     * run is a thread naming itself. A different target is refused
+     * rather than silently delivered to the wrong one. */
+    case SYS64_TKILL:
+    case SYS64_TGKILL: {
+        int sig = (nr == SYS64_TGKILL) ? (int)(int32_t)a3 : (int)(int32_t)a2;
+        int tid = (nr == SYS64_TGKILL) ? (int)(int32_t)a2 : (int)(int32_t)a1;
+        registers64_t self;
+
+        if (sig < 0 || sig >= 64) return (uint64_t)-22;     /* -EINVAL */
+        if (tid != proc64_current_pid()) return (uint64_t)-3; /* -ESRCH */
+        if (sig == 0) return 0;                  /* the existence check */
+
+        /* Entered as if the signal had arrived on the way out of this
+         * call: the frame is this syscall's, so a handler that returns
+         * resumes after it, and one that does not returns wherever it
+         * decides to. */
+        frame_from_args(args, 0, &self);
+        if (signal64_deliver(sig, &self, 0)) sched64_resume(&self);
+
+        /* Uncaught. The default action for the signals that get here -
+         * SIGABRT among them - is to end the process, which is what
+         * abort() is asking for in the first place. */
+        exit_code = 128 + sig;
+        vfork_release(proc64_current());
+        close_all_files();
+        proc64_exit(proc64_current_pid(), 128 + sig);
+        if (leader_pid >= 0 && proc64_current_pid() == leader_pid) {
+            leader_exited = 1;
+            enter_user_mode64_abort();                 /* never returns */
+        }
+        {
+            registers64_t next; vmspace64_t ns; uint64_t nfs;
+            if (sched64_exit_current(&next, &ns, &nfs)) {
+                vmspace64_switch(&ns);
+                write_msr(0xC0000100u, nfs);
+                sched64_resume(&next);                 /* never returns */
+            }
+        }
+        return 0;
+    }
+
     /* sched_yield(2).
      *
      * A caller spinning on a lock calls this to let the holder run, and
