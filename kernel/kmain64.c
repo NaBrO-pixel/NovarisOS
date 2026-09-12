@@ -149,6 +149,54 @@ static volatile uint64_t pf_cr2;
 static volatile uint64_t pf_err;
 static volatile uint64_t pf_resume_rip;
 
+/* A fault the program caused, in the program's own code.
+ *
+ * A general protection fault or an invalid opcode from ring 3 is the
+ * process's to die of, not the machine's. Without this they reached
+ * panic() and halted the kernel - which is how a prefix run ended with
+ * `*** unhandled exception: general protection fault` and `*** halted`,
+ * with thirty other processes still alive and a wineserver that had
+ * done nothing wrong.
+ *
+ * What produced it is worth recording, because it is the same story
+ * twice: glibc's abort() raises SIGABRT through tgkill(2), this kernel
+ * had no tgkill, and the fallback path for an abort that cannot signal
+ * is an instruction the CPU refuses. So one missing syscall became a
+ * halted machine two steps later.
+ *
+ * SIGSEGV for a protection fault and SIGILL for a bad opcode, which is
+ * what Linux sends. A process with no handler for either dies, and the
+ * rest of the system goes on. */
+static void protection_fault_handler(registers64_t* r) {
+    if ((r->cs & 3) == 3) {
+        int sig = (r->int_no == 6) ? 4 /* SIGILL */ : SIG64_SEGV;
+        if (signal64_deliver(sig, r, r->rip)) return;
+
+        /* Nobody caught it. The run ends the way an uncaught page fault
+         * already ends it - reported, with the shell's code for a fatal
+         * signal - rather than stopping the machine with the kernel's
+         * own panic. */
+        serial64_puts("\nNOVARIS64: *** ");
+        serial64_puts(r->int_no == 6 ? "invalid opcode" : "protection fault");
+        serial64_puts(" in the program, uncaught\n");
+        serial64_puts("NOVARIS64:   rip=");  serial64_puthex(r->rip);
+        serial64_puts(" rsp=");              serial64_puthex(r->rsp);
+        serial64_puts(" err=");              serial64_puthex(r->err_code);
+        serial64_putc('\n');
+        syscall64_set_exit_code(139);
+        enter_user_mode64_abort();              /* never returns */
+    }
+
+    /* Ring 0 is this kernel's own bug, and still stops everything. */
+    serial64_puts("\nNOVARIS64: *** ");
+    serial64_puts(r->int_no == 6 ? "invalid opcode" : "protection fault");
+    serial64_puts(" in the kernel\n");
+    serial64_puts("NOVARIS64:   rip=");  serial64_puthex(r->rip);
+    serial64_puts(" err=");              serial64_puthex(r->err_code);
+    serial64_puts("\nNOVARIS64: *** halted\n");
+    for (;;) __asm__ __volatile__("cli; hlt");
+}
+
 static void breakpoint_handler(registers64_t* r) {
     bp_hits++;
     bp_rip = r->rip;
@@ -358,6 +406,8 @@ void kernel_main(uint32_t magic, void* mbi) {
     serial64_puts("NOVARIS64: -- interrupts --\n");
     idt64_install();
     register_interrupt_handler64(3,  breakpoint_handler);
+    register_interrupt_handler64(6,  protection_fault_handler);
+    register_interrupt_handler64(13, protection_fault_handler);
     register_interrupt_handler64(14, page_fault_handler);
 
     /* Registers either side of an int3. If the stub's fifteen pushes and
