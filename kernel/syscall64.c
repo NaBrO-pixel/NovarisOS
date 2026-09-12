@@ -1128,6 +1128,9 @@ static uint64_t syscall64_dispatch_inner(syscall64_args_t* args) {
         run_expired = 1;
         run_deadline = 0;
         serial64_puts("\nNOVARIS64: *** the run reached its time limit\n");
+        /* The one instant the whole system is known to be stuck, which
+         * is the only time this graph means anything. */
+        sched64_dump_blocked();
         enter_user_mode64_abort();                     /* never returns */
     }
 
