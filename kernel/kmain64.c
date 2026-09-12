@@ -3818,7 +3818,7 @@ void kernel_main(uint32_t magic, void* mbi) {
                 serial64_puts(" frames before wineboot\n");
                 serial64_puts("NOVARIS64: --- wineboot ---\n");
                 pf_diagnose = 1;
-                syscall64_set_trace(0);   /* server log only */
+                syscall64_set_trace(1);
                 signal64_set_trace(1);
 
                 /* End the run when wineboot finishes, not when the last
