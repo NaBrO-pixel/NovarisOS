@@ -10026,6 +10026,79 @@ listed in the errors that remain: `nodrv_CreateWindow`, `start_rpcss`,
 and four setupapi copy failures.
 
 
+## Milestone 86 - the clock said 1970, so every wait was already over
+
+`err:winediag:nodrv_CreateWindow`, twelve of them across six processes,
+turned out to be a clock bug. Measured: 12 -> 0.
+
+**The chain, read backwards from the error.** `load_display_driver()`
+read `GraphicsDriver` out of the null GUID key - twenty opens of
+`{00000000-...}` - while the real key,
+`{e580df57-...}\0000\GraphicsDriver`, had held `winenovaris` all
+along. It read the wrong key because
+`NtUserGetProp(hwnd, "__wine_display_device_guid")` found nothing: seven
+`get_window_property` calls for that name and zero `set_window_property`
+anywhere in the run, with no GUID-shaped `add_atom` either. The property
+is set by `desktop_window_proc` on `WM_NCCREATE`, so the desktop window
+had never been through explorer's window procedure. The server had made
+it instead: `get_desktop_window(force=1)` creates a bare top window, and
+explorer's own desktop-class `create_window(parent=0)` then came back
+`parent=00010020` - a child of the server's, not the desktop.
+
+That race is supposed to be lost by the server. `get_desktop_window()`
+starts explorer and calls `NtUserWaitForInputIdle(process, 10000)`
+before it falls back to forcing. The wait returned at once:
+
+    002c: select( timeout=19db1dedc81c890 ) = TIMEOUT
+
+which decodes to 1970-01-01 00:00:12.185, while the server's own clock
+said 2026-09-12. `wait_message()` sends the server an **absolute**
+deadline - `NtQuerySystemTime()` plus the timeout - so a client clock
+stuck in 1970 makes every timed wait in Wine arrive already expired.
+
+**The bug was one constant.** `NtQuerySystemTime` asks `clock_getres`
+whether `CLOCK_REALTIME_COARSE` resolves to a millisecond or better and,
+if it does, uses that clock for every date it reports thereafter. Ours
+does. But this kernel's list of ids meaning "a date" read 0 and 8. 8 is
+`CLOCK_REALTIME_ALARM`; `CLOCK_REALTIME_COARSE` is **5**, and 5 fell
+through to the uptime counter. Measured over one run: 82,572
+`clock_gettime` calls, 81,698 of them id 7 and **874 of them id 5** -
+and all nineteen `clock_getres` calls were about id 5 and nothing else.
+
+This was never only a display bug. It zeroed every timeout in Wine; the
+twelve errors were the visible corner.
+
+**Two more of the same shape, found by looking rather than by failing.**
+`clock_nanosleep` never read its flags, so `TIMER_ABSTIME` was a
+relative sleep - "wake at 09:15" became "sleep for 09:15 from now",
+which on `CLOCK_REALTIME` is fifty-six years. Nothing in the prefix
+calls it: zero calls in a full run. And `clock_getres` never read its
+id at all, answering for clocks this kernel does not have, which tells a
+caller a clock is present when it is not. The three syscalls now share
+one `clock64_kind()` table, because having the list in one of them and
+not the others is exactly how the first bug survived.
+
+**What the differential corrected.** `userland/clock64.c` runs on both
+machines, and the host rejected two assumptions this kernel had been
+built on: Linux leaves `nanosleep`'s remainder **untouched** when the
+sleep runs to completion - it only fills it in after a signal - and it
+**ignores** flag bits it does not know rather than refusing them. Both
+were written the other way round first and changed to match what was
+measured.
+
+**And a harness that had stopped reporting.** The suite had been saying
+"the kernel did not reach the end of kernel_main" on every commit,
+whatever the commit did. Three places stopped the machine on a fixed
+clock chosen when bring-up was a second of assertions - `timeout 30`
+around qemu, 90 seconds in `fbtest.py`, 60 in `inputtest.py` - and
+bring-up now ends by running wineboot to completion. All three cut the
+run off before the last line, so the gate every other assertion sits
+behind could never hold, and the twenty-one differentials behind it had
+not run for as long as the Wine layer has been finishing. They wait for
+the marker now, with the timeout as a cap on a hang rather than as an
+estimate of the duration. 22 checks, 0 failures.
+
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the

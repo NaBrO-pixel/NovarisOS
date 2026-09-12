@@ -119,6 +119,8 @@ extern const unsigned char scm64_elf[];
 extern const unsigned long scm64_elf_len;
 extern const unsigned char shm64_elf[];
 extern const unsigned long shm64_elf_len;
+extern const unsigned char clock64_elf[];
+extern const unsigned long clock64_elf_len;
 extern const unsigned char cwd64_elf[];
 extern const unsigned long cwd64_elf_len;
 extern const unsigned char fbdraw64_elf[];
@@ -3678,6 +3680,93 @@ void kernel_main(uint32_t magic, void* mbi) {
         serial64_puts(" mappings\n");
         check("three shared mappings were made",
               syscall64_shared_maps() - shared_before == 3);
+    }
+
+    /* --- layer 37b: the clocks (Milestone 86) ------------------------ */
+    /* Two syscalls that take an argument saying which behaviour is
+     * wanted, and used to ignore it. clock_gettime read the clock id off
+     * a list that had 8 in it where it should have had 5, so
+     * CLOCK_REALTIME_COARSE - the clock Wine reports every date from -
+     * was answered from the uptime counter and every date Wine had was
+     * 1970. clock_nanosleep never looked at its flags, so TIMER_ABSTIME
+     * became a relative sleep, which turns "wake at 09:15" into a sleep
+     * of fifty-six years.
+     *
+     * Nothing in the prefix calls clock_nanosleep at all - measured, a
+     * full run makes zero of them - which is exactly why it is tested
+     * here rather than left to be found by the first caller that needs
+     * it. */
+    serial64_puts("NOVARIS64: -- the clocks --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 64;
+        vmspace64_t kspace;
+        elf64_info_t info;
+        uint64_t i, rsp;
+        int rc, stack_ok = 1, pid;
+        proc64_t* p;
+        static const char* const clock_argv[] = { "/clock64", 0 };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        syscall64_reset_files();
+        signal64_reset();
+        sched64_init();
+        proc64_init();
+        pipe64_init();
+        sock64_init();
+        vmspace64_kernel_space(&kspace);
+
+        pid = proc64_create();
+        proc64_set_current(pid);
+        p = proc64_current();
+
+        check("a space for it", vmspace64_create(&p->space) != 0);
+        rc = elf64_load(clock64_elf, clock64_elf_len, &p->space, &info);
+        check("the clock program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&p->space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&p->space, info.brk_start);
+        rsp = uspace64_build_stack(&p->space, STACK_TOP, STACK_PAGES,
+                                   clock_argv, &info, 0, 0);
+
+        {
+            registers64_t first;
+            for (i = 0; i < sizeof(first) / 8; i++)
+                ((uint64_t*)&first)[i] = 0;
+            sched64_add_frame_for(&first, &p->space, 0, pid);
+            sched64_set_current(0);
+        }
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        /* The timer, for the same reason the wineserver layer needs it:
+         * a sleep is a deadline, and a deadline is reached by the tick
+         * counter advancing. IRQ0 is masked for most of bring-up so the
+         * layers above are deterministic, and with it masked a sleep of
+         * fifty milliseconds is not a short wait, it is a permanent one.
+         * Masked again afterwards so nothing below sees a tick. */
+        register_interrupt_handler64(32, sched_timer_handler);
+        idt64_irq_set_mask(0, 0);
+
+        vmspace64_switch(&p->space);
+        enter_user_mode64(info.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+
+        idt64_irq_set_mask(0, 1);
+        pf_diagnose = 0;
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("the clocks behaved as Linux's do",
+              syscall64_exit_code() == 127);
     }
 
     /* --- layer 38: a Wine prefix (Milestone 71) ---------------------- */
