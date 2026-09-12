@@ -81,6 +81,10 @@ int  sched64_add_frame(const registers64_t* regs, const vmspace64_t* space,
  * thread of a process, which are different events with the same
  * syscall: the first ends a thread, the second ends a process and has
  * to close its files and mark it exited. */
+/* Prints every live task and the key it is blocked on. The deadlock is
+ * in the graph, not in any one thread. */
+void sched64_dump_blocked(void);
+
 int  sched64_pid_tasks(int pid);
 
 int  sched64_space_in_use(uint64_t pml4_phys);

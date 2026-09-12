@@ -145,6 +145,46 @@ static void tasks_full(void) {
     serial64_puts(" blocked\n");
 }
 
+/* Every task, and what it is waiting for.
+ *
+ * A deadlock is not visible from any one process: each one is simply
+ * blocked, which is what a healthy idle thread looks like too. What
+ * distinguishes them is the graph - who waits on what, and whether
+ * anything is runnable at all - and that only exists in this table.
+ * Printed at the moment the run gives up, which is the one instant the
+ * whole system is known to be stuck.
+ *
+ * wait_addr is the key the task blocked on: a futex address for a lock,
+ * or the encoded pipe key for a read that is waiting for bytes. Two
+ * tasks naming the same key are waiting for the same thing; a key
+ * nobody will ever signal is the deadlock. */
+void sched64_dump_blocked(void) {
+    int live = 0, blocked = 0;
+
+    serial64_puts("\nNOVARIS64: [tasks] --- every live task at the deadline ---\n");
+    for (int i = 0; i < SCHED64_MAX_TASKS; i++) {
+        if (!tasks[i].used) continue;
+        live++;
+        if (tasks[i].blocked) blocked++;
+        serial64_puts("NOVARIS64: [tasks] slot ");
+        serial64_putdec((uint64_t)i);
+        serial64_puts(" pid ");
+        serial64_putdec((uint64_t)tasks[i].pid);
+        serial64_puts(tasks[i].blocked ? " BLOCKED on " : " runnable   ");
+        if (tasks[i].blocked) serial64_puthex(tasks[i].wait_addr);
+        serial64_puts(" rip=");
+        serial64_puthex(tasks[i].regs.rip);
+        serial64_putc('\n');
+    }
+    serial64_puts("NOVARIS64: [tasks] ");
+    serial64_putdec((uint64_t)live);
+    serial64_puts(" live, ");
+    serial64_putdec((uint64_t)blocked);
+    serial64_puts(" blocked, ");
+    serial64_putdec((uint64_t)(live - blocked));
+    serial64_puts(" runnable\n");
+}
+
 int sched64_pid_tasks(int pid) {
     int n = 0;
     for (int i = 0; i < SCHED64_MAX_TASKS; i++)
