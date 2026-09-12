@@ -3116,17 +3116,33 @@ static uint64_t dispatch(syscall64_args_t* args) {
     /* clock_gettime(clkid, ts).
      *
      * The distinction is not decoration. CLOCK_REALTIME is a date and
-     * CLOCK_MONOTONIC is an interval, and answering both with "seconds
-     * since the timer started" makes the first of them 1970 - which
-     * Milestone 81 found Wine acting on. 0 is REALTIME and 8
-     * REALTIME_COARSE; 1 MONOTONIC, 4 MONOTONIC_RAW, 6 MONOTONIC_COARSE
-     * and 7 BOOTTIME all measure from an unspecified point, and boot is
+     * CLOCK_MONOTONIC is an interval, and answering a date with "seconds
+     * since the timer started" puts it in 1970 - which Milestone 81
+     * found Wine acting on.
+     *
+     * The ids have to be right one at a time, because getting one of
+     * them wrong is indistinguishable from not having a wall clock at
+     * all. Milestone 86 had 8 written down as REALTIME_COARSE. 8 is
+     * REALTIME_ALARM; REALTIME_COARSE is 5, and 5 is the one that
+     * matters, because NtQuerySystemTime asks clock_getres whether
+     * REALTIME_COARSE resolves to a millisecond or better and uses it
+     * for every date it ever reports if it does. Ours does, so every
+     * date Wine read came off the uptime counter while the wineserver,
+     * which calls gettimeofday, read the RTC. The two then disagreed by
+     * fifty-six years, and MsgWaitForMultipleObjects - which sends the
+     * server an absolute deadline of "now plus the timeout" - handed it
+     * deadlines in 1970 and got WAIT_TIMEOUT back at once, every time.
+     *
+     * So: 0 REALTIME, 5 REALTIME_COARSE and 8 REALTIME_ALARM are dates.
+     * 1 MONOTONIC, 2 PROCESS_CPUTIME_ID, 3 THREAD_CPUTIME_ID, 4
+     * MONOTONIC_RAW, 6 MONOTONIC_COARSE, 7 BOOTTIME and 9
+     * BOOTTIME_ALARM all measure from an unspecified point, and boot is
      * one. */
     case SYS64_CLOCK_GETTIME: {
         struct { uint64_t sec, nsec; }* ts = (void*)a2;
         if (!ts) return (uint64_t)-14;
-        if (a1 == 0 || a1 == 8) clock64_realtime(&ts->sec, &ts->nsec);
-        else                    clock64_now(&ts->sec, &ts->nsec);
+        if (a1 == 0 || a1 == 5 || a1 == 8) clock64_realtime(&ts->sec, &ts->nsec);
+        else                               clock64_now(&ts->sec, &ts->nsec);
         return 0;
     }
 
