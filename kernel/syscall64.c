@@ -378,6 +378,51 @@ static void fd_release(int fd) {
     fds[fd].tx   = -1;
 }
 
+/* --- which clock is which ------------------------------------------ *
+ *
+ * One table, because clock_gettime, clock_getres and clock_nanosleep all
+ * take a clock id and all have to agree about it. They did not: the id
+ * list lived spelled out in clock_gettime, clock_getres ignored the
+ * argument entirely and answered for anything, and clock_nanosleep never
+ * looked at it. Milestone 86 cost a run to 5 being in one of those
+ * places and not the others, so there is now one place.
+ *
+ * CLOCK_REALTIME and friends are a date - boot_epoch plus uptime. The
+ * monotonic family measures from an unspecified point, and boot is one.
+ * The two CPU-time clocks are answered from the monotonic counter rather
+ * than from per-task accounting, which overstates them for a task that
+ * has been descheduled; they are here so the id is recognised, not
+ * because this kernel measures CPU time. */
+#define CLOCK64_KIND_NONE 0                /* not a clock this kernel has */
+#define CLOCK64_KIND_REAL 1                /* a date                      */
+#define CLOCK64_KIND_MONO 2                /* an interval                 */
+
+static int clock64_kind(uint64_t id) {
+    switch (id) {
+    case 0:                                /* CLOCK_REALTIME           */
+    case 5:                                /* CLOCK_REALTIME_COARSE    */
+    case 8:                                /* CLOCK_REALTIME_ALARM     */
+        return CLOCK64_KIND_REAL;
+    case 1:                                /* CLOCK_MONOTONIC          */
+    case 2:                                /* CLOCK_PROCESS_CPUTIME_ID */
+    case 3:                                /* CLOCK_THREAD_CPUTIME_ID  */
+    case 4:                                /* CLOCK_MONOTONIC_RAW      */
+    case 6:                                /* CLOCK_MONOTONIC_COARSE   */
+    case 7:                                /* CLOCK_BOOTTIME           */
+    case 9:                                /* CLOCK_BOOTTIME_ALARM     */
+        return CLOCK64_KIND_MONO;
+    default:
+        return CLOCK64_KIND_NONE;
+    }
+}
+
+/* Reads whichever clock the id names, so a caller comparing against an
+ * absolute deadline compares against the clock it asked for. */
+static void clock64_read(uint64_t id, uint64_t* sec, uint64_t* nsec) {
+    if (clock64_kind(id) == CLOCK64_KIND_REAL) clock64_realtime(sec, nsec);
+    else                                       clock64_now(sec, nsec);
+}
+
 /* Leave, and come back to the same call.
  *
  * Used by the two syscalls that have to wait for time rather than for an
@@ -3133,16 +3178,13 @@ static uint64_t dispatch(syscall64_args_t* args) {
      * server an absolute deadline of "now plus the timeout" - handed it
      * deadlines in 1970 and got WAIT_TIMEOUT back at once, every time.
      *
-     * So: 0 REALTIME, 5 REALTIME_COARSE and 8 REALTIME_ALARM are dates.
-     * 1 MONOTONIC, 2 PROCESS_CPUTIME_ID, 3 THREAD_CPUTIME_ID, 4
-     * MONOTONIC_RAW, 6 MONOTONIC_COARSE, 7 BOOTTIME and 9
-     * BOOTTIME_ALARM all measure from an unspecified point, and boot is
-     * one. */
+     * Which id is which now lives in clock64_kind, above, because
+     * clock_getres and clock_nanosleep have to answer for the same set. */
     case SYS64_CLOCK_GETTIME: {
         struct { uint64_t sec, nsec; }* ts = (void*)a2;
+        if (clock64_kind(a1) == CLOCK64_KIND_NONE) return (uint64_t)-22;
         if (!ts) return (uint64_t)-14;
-        if (a1 == 0 || a1 == 5 || a1 == 8) clock64_realtime(&ts->sec, &ts->nsec);
-        else                               clock64_now(&ts->sec, &ts->nsec);
+        clock64_read(a1, &ts->sec, &ts->nsec);
         return 0;
     }
 
@@ -3185,8 +3227,26 @@ static uint64_t dispatch(syscall64_args_t* args) {
         return sec;
     }
 
+    /* clock_getres(clkid, res).
+     *
+     * The tick is the answer, because the tick is what the clock is: a
+     * counter incremented CLOCK64_HZ times a second with nothing finer
+     * underneath it. That is worth stating plainly rather than rounding
+     * down to look good, because Wine acts on it - NtQuerySystemTime
+     * asks this about CLOCK_REALTIME_COARSE and, if the answer is a
+     * millisecond or better, uses that clock for every date it reports
+     * for the rest of the process's life. In this prefix it is the only
+     * question anything asks: nineteen calls, all of them about id 5.
+     *
+     * What it must not do is answer for a clock this kernel does not
+     * have. A resolution for every id, valid or not, is the same lie as
+     * a time for every id - it tells the caller the clock is there, and
+     * the caller believes it. res may be NULL: then the call is only
+     * asking whether the clock exists, and the id check is the whole
+     * answer. */
     case SYS64_CLOCK_GETRES: {
         struct { uint64_t sec, nsec; }* ts = (void*)a2;
+        if (clock64_kind(a1) == CLOCK64_KIND_NONE) return (uint64_t)-22;
         if (ts) { ts->sec = 0; ts->nsec = 1000000000ull / CLOCK64_HZ; }
         return 0;
     }
@@ -3209,30 +3269,85 @@ static uint64_t dispatch(syscall64_args_t* args) {
      * reached by going out and coming back. */
     case SYS64_NANOSLEEP:
     case SYS64_CLOCK_NANOSLEEP: {
+        /* The two calls differ in where their arguments sit and in one
+         * flag. nanosleep(req, rem) is always relative to now.
+         * clock_nanosleep(clkid, flags, req, rem) names a clock, and
+         * with TIMER_ABSTIME the request is not a length at all - it is
+         * a point on that clock.
+         *
+         * The flag used to be ignored, and ignoring it is not a small
+         * approximation. An absolute deadline read as a length turns
+         * "wake at 09:15" into "sleep until 09:15 from now", which on a
+         * REALTIME deadline is a sleep of fifty-six years. Nothing in
+         * this prefix calls either syscall today - the count is zero
+         * across a full run - so this is a trap set for the first caller
+         * that does, which is exactly the kind that gets blamed on
+         * something else. */
+        int      abstime = 0;
         const struct { uint64_t sec, nsec; }* req =
             (const void*)(nr == SYS64_NANOSLEEP ? a1 : args->a3);
         uint64_t want;
 
+        if (nr == SYS64_CLOCK_NANOSLEEP) {
+            if (clock64_kind(a1) == CLOCK64_KIND_NONE)
+                return (uint64_t)-22;                  /* -EINVAL */
+            /* The two CPU-time clocks are refused rather than answered.
+             * Linux refuses CLOCK_THREAD_CPUTIME_ID the same way, and
+             * sleeps on CLOCK_PROCESS_CPUTIME_ID until the process has
+             * burned the requested CPU - which, for a process that is
+             * asleep, is never. This kernel does not measure CPU time
+             * per task, so it has nothing to wait for and says so
+             * instead of sleeping forever. */
+            if (a1 == 2 || a1 == 3) return (uint64_t)-95;  /* -ENOTSUP */
+            /* Only TIMER_ABSTIME is read. Bits Linux does not know it
+             * ignores rather than rejects - measured, not assumed - so
+             * rejecting them here would be this kernel being stricter
+             * than the one it is copying. */
+            abstime = (a2 & 1) != 0;
+        }
+
         /* Checked, because this is the call that proved it was needed. */
         if (!user_range_ok((uint64_t)req, sizeof(*req)))
             return (uint64_t)-14;                      /* -EFAULT */
-        if (nr == SYS64_NANOSLEEP && a2 &&
-            !user_range_ok(a2, sizeof(*req)))
-            return (uint64_t)-14;
 
         if (wait_started()) {
             if (!wait_expired()) return wait_restart(args, nr,
                                                      wait_deadline[wait_slot()]);
             wait_done();
-            if (nr == SYS64_NANOSLEEP && a2) {
-                struct { uint64_t sec, nsec; }* rem = (void*)a2;
-                rem->sec = rem->nsec = 0;
-            }
+            /* rem is deliberately not written. Linux only fills it in
+             * when the sleep was cut short by a signal, and leaves
+             * whatever the caller had there alone when the sleep ran to
+             * completion - checked against the host, which leaves a
+             * remainder of -1.-1 exactly as it found it. Nothing here
+             * ends a sleep early, so there is never a remainder to
+             * report. */
             return 0;
         }
 
         if (!req) return (uint64_t)-14;
-        want = req->sec * CLOCK64_HZ + req->nsec / (1000000000ull / CLOCK64_HZ);
+        if (abstime) {
+            /* Subtract on the clock the caller named, then convert. A
+             * REALTIME deadline counts from boot_epoch and a MONOTONIC
+             * one does not, so comparing either against the other is
+             * wrong by the epoch - which is the whole of the bug this
+             * fixes. Taking the difference first also keeps the sleep
+             * the same length whichever clock was named. */
+            uint64_t ns = 0, ss = 0, dsec;
+            int64_t  dns;
+
+            clock64_read(a1, &ss, &ns);
+            if (req->sec < ss || (req->sec == ss && req->nsec <= ns))
+                return 0;                              /* already past */
+
+            dsec = req->sec - ss;
+            dns  = (int64_t)req->nsec - (int64_t)ns;
+            if (dns < 0) { dns += 1000000000; dsec--; }
+            want = dsec * CLOCK64_HZ
+                 + (uint64_t)dns / (1000000000ull / CLOCK64_HZ);
+        } else {
+            want = req->sec * CLOCK64_HZ
+                 + req->nsec / (1000000000ull / CLOCK64_HZ);
+        }
         if (want == 0) return 0;
         return wait_restart(args, nr, clock64_ticks() + want);
     }

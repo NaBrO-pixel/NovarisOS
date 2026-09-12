@@ -96,6 +96,7 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/cwd64_blob.o \
        $(BUILD_DIR)/cowfork64_blob.o \
        $(BUILD_DIR)/vmem64_blob.o \
+       $(BUILD_DIR)/clock64_blob.o \
        $(BUILD_DIR)/spawn64_blob.o \
        $(BUILD_DIR)/pipetest64_blob.o \
        $(BUILD_DIR)/socktest64_blob.o \
@@ -252,6 +253,19 @@ $(BUILD_DIR)/vmem64_blob.c: $(BUILD_DIR)/vmem64.elf userland/embed64.py
 	python3 userland/embed64.py $< $@ vmem64_elf
 
 $(BUILD_DIR)/vmem64_blob.o: $(BUILD_DIR)/vmem64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# The clocks: which id means a date, and what TIMER_ABSTIME means
+# (Milestone 86). Static, like every other differential here.
+$(BUILD_DIR)/clock64.elf: userland/clock64.c | $(BUILD_DIR)
+	gcc -static -O2 -o $@ $<
+	@file $@ | grep -q "statically linked" \
+	    || (echo "ERROR: $@ is not static"; false)
+
+$(BUILD_DIR)/clock64_blob.c: $(BUILD_DIR)/clock64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ clock64_elf
+
+$(BUILD_DIR)/clock64_blob.o: $(BUILD_DIR)/clock64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # posix_spawn, which is clone(CLONE_VM|CLONE_VFORK) and is how Wine
@@ -796,6 +810,21 @@ test: iso
 	    || (echo "FAIL: the host run of the vmem binary did not exit 101"; \
 	        exit 1)
 	@echo "PASS: the address space behaves the same, and exits 101, on both"
+	@# The clocks. Line by line, because the interesting assertions are
+	@# the ones about which clock id means a date and what an absolute
+	@# deadline is - and both of those were wrong in ways that still
+	@# produced a plausible-looking time.
+	@timeout 60 ./$(BUILD_DIR)/clock64.elf > $(BUILD_DIR)/clock64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/clock64.host.status
+	@while read -r line; do \
+	    grep -qF "$$line" $(BUILD_DIR)/serial.log \
+	        || (echo "FAIL: the guest never printed: $$line"; exit 1) \
+	        || exit 1; \
+	done < $(BUILD_DIR)/clock64.host.txt
+	@[ "`cat $(BUILD_DIR)/clock64.host.status`" = "127" ] \
+	    || (echo "FAIL: the host run of the clock binary did not exit 127"; \
+	        exit 1)
+	@echo "PASS: the clocks behave the same, and exit 127, on both"
 	@# posix_spawn. Needs the child staged where both sides look for it,
 	@# the same way the fork/exec differential does.
 	@cp $(BUILD_DIR)/forkchild64.elf /tmp/forkchild64
