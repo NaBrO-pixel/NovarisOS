@@ -1452,6 +1452,30 @@ static uint64_t do_execve(const char* path, const char* const* argv,
      * somebody else's. */
     signal64_exec();
 
+    /* Close-on-exec, which nothing was doing.
+     *
+     * Every path that opens a descriptor records FD_CLOEXEC - open(2),
+     * fcntl, dup3, even one arriving over SCM_RIGHTS with
+     * MSG_CMSG_CLOEXEC - and no path ever acted on it. So exec handed on
+     * the whole table, and a descriptor a program had explicitly marked
+     * "not for my children" went to every one of them.
+     *
+     * Wine marks its wineserver socket close-on-exec, and that is what
+     * makes a process's death visible: the server notices a client is
+     * gone by seeing end of file on that socket, and end of file needs
+     * the last writer to let go. Measured at wineboot's exit, its
+     * sockets still had six writers - the services.exe, explorer and
+     * rundll32 it had exec'd, each holding a copy it should never have
+     * been given. So the server never learned wineboot had died, never
+     * signalled the parent waiting on its process handle, and a prefix
+     * run that actually finished at 87% of its budget sat there until
+     * the deadline and then reported that wineboot never exited.
+     *
+     * Closed here, past the point of no return: a failure before this
+     * still has to return to a caller that owns them. */
+    for (int fd = 0; fd < FD_MAX; fd++)
+        if (fds[fd].used && fds[fd].cloexec) fd_release(fd);
+
     old_space = p->space;
     p->space = fresh;
     proc64_set_current(p->pid);
