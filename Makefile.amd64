@@ -384,6 +384,21 @@ $(BUILD_DIR)/fbdraw64_blob.c: $(BUILD_DIR)/fbdraw64.elf userland/embed64.py
 $(BUILD_DIR)/fbdraw64_blob.o: $(BUILD_DIR)/fbdraw64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# A Windows program that really does make a window (Milestone 87).
+#
+# pe_test/gui_app.c is the opposite test - it runs on this kernel's own
+# PE loader and expects CreateWindowEx to fail. This one runs under
+# Wine, on a kernel that has a display driver now, and expects it to
+# work. Full CRT and real imports from user32 and gdi32, because the
+# question is whether Wine's USER and GDI work here and not whether a
+# hand-written PE loads.
+#
+# Console subsystem deliberately: a GUI-subsystem binary has nowhere to
+# write, and every other layer in this tree reports by writing to the
+# serial port.
+$(BUILD_DIR)/winegui64.exe: userland/pe_test/winegui64.c | $(BUILD_DIR)
+	@if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then 	    x86_64-w64-mingw32-gcc -O2 -o $@ $< -lgdi32 -luser32 	        && echo "  built $@"; 	 else 	    echo "  no mingw, skipping $@"; 	 fi
+
 # A real 64-bit Windows executable - the format chrome.exe is in. Built
 # by mingw, importing from kernel32, linked at a Windows image base, and
 # with no idea Novaris exists.
@@ -499,6 +514,7 @@ WINE64_NTDLL  ?= $(firstword $(wildcard \
 # looks exactly like the fix not working.
 $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
            $(BUILD_DIR)/forkchild64.elf userland/mkinitrd.py \
+           $(BUILD_DIR)/winegui64.exe \
            tools/stage_wine.sh tools/wine_prefix_modules.txt
 	rm -rf $(INITRD_STAGE)
 	mkdir -p $(INITRD_STAGE)
@@ -563,6 +579,14 @@ $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
 	@if [ -n "$(WINE64_INSTALL)" ] && [ -x "$(WINE64_LOADER)" ]; then \
 	    bash tools/stage_wine.sh "$(dir $(WINE64_LOADER)).." \
 	        $(INITRD_STAGE) || exit 1; \
+	 fi
+	@# Beside the rest of the PE modules, which is where Wine looks for
+	@# a builtin - so it is found by name without a path.
+	@if [ -n "$(WINE64_INSTALL)" ] && [ -f "$(BUILD_DIR)/winegui64.exe" ]; then \
+	    mkdir -p $(INITRD_STAGE)/usr/bin/x86_64-windows; \
+	    cp $(BUILD_DIR)/winegui64.exe \
+	       $(INITRD_STAGE)/usr/bin/x86_64-windows/winegui64.exe; \
+	    echo "  initrd: winegui64.exe staged"; \
 	 fi
 	python3 userland/mkinitrd.py $(INITRD_STAGE) $@
 

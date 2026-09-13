@@ -4103,6 +4103,115 @@ void kernel_main(uint32_t magic, void* mbi) {
                                                       : "ended on its own");
                 serial64_putc('\n');
             }
+
+            /* --- and then a Windows program with a window ------------ *
+             *
+             * The prefix exists. This asks the other question, which no
+             * milestone has asked yet: does a program with a user
+             * interface run? wineboot is a console program and never
+             * creates a window, so everything USER and GDI do has been
+             * exercised only by Wine's own startup.
+             *
+             * winegui64.exe registers a class, creates an overlapped
+             * window, shows it, takes a device context off it and pumps
+             * its queue - the sequence every program with an interface
+             * begins with, and the one chrome.exe would begin with too.
+             *
+             * Run in the prefix wineboot has just built, in the session
+             * whose wineserver is still up: no ramfs64_init, no
+             * sched64_init, no proc64_init, nothing reset. Every other
+             * layer in this file starts by wiping the filesystem, and
+             * doing that here would throw away the one thing being
+             * tested. The wineserver, services.exe and the rest are
+             * still running, and that is the point - this is a second
+             * client of a session that already exists. */
+            if (ramfs64_lookup("/usr/bin/x86_64-windows/winegui64.exe") < 0) {
+                serial64_puts("NOVARIS64: winegui = not staged, skipped\n");
+            } else {
+                static const char* const gui_argv[] = {
+                    "/usr/bin/wine", "winegui64.exe", 0
+                };
+                elf64_info_t gexe, ginterp;
+                uint64_t grsp = 0;
+                int grc, gstack_ok = 1, gpid, gslot;
+                proc64_t* gp;
+
+                serial64_puts("NOVARIS64: --- winegui64 ---\n");
+
+                gpid = proc64_create();
+                proc64_set_current(gpid);
+                gp = proc64_current();
+                syscall64_open_std();
+
+                grc = vmspace64_create(&gp->space) != 0 ? ELF64_OK : -1;
+                if (grc == ELF64_OK) {
+                    syscall64_set_exe_path("/usr/bin/wine");
+                    grc = elf64_load_at(image, len, &gp->space, EXE_BIAS, &gexe);
+                }
+                if (grc == ELF64_OK)
+                    grc = elf64_load_at(ld_image, ld_len, &gp->space,
+                                        INTERP_BASE, &ginterp);
+
+                if (grc == ELF64_OK) {
+                    for (i = 0; i < STACK_PAGES; i++) {
+                        uint64_t f = pmm64_alloc_frame();
+                        if (!f || vmspace64_map(&gp->space,
+                                                STACK_TOP - (i + 1) * PAGE64_SIZE,
+                                                f, PAGE64_PRESENT |
+                                                   PAGE64_WRITE |
+                                                   PAGE64_USER) != PAGING64_OK)
+                            gstack_ok = 0;
+                    }
+                    uspace64_reset(&gp->space, gexe.brk_start);
+                    grsp = uspace64_build_stack(&gp->space, STACK_TOP,
+                                                STACK_PAGES, gui_argv, &gexe,
+                                                INTERP_BASE, boot_env);
+                }
+
+                if (grc == ELF64_OK && gstack_ok && grsp) {
+                    registers64_t gfirst;
+                    for (i = 0; i < sizeof(gfirst) / 8; i++)
+                        ((uint64_t*)&gfirst)[i] = 0;
+                    /* The slot it actually went into. Not 0: the
+                     * wineserver and the services wineboot started are
+                     * still in the table, and telling the scheduler that
+                     * slot 0 is current would resume one of them here. */
+                    gslot = sched64_add_frame_for(&gfirst, &gp->space, 0, gpid);
+                    if (gslot >= 0) sched64_set_current(gslot);
+
+                    syscall64_set_leader(gpid);
+                    /* Shorter than wineboot's budget on purpose: the
+                     * prefix is built, the server is warm, and a program
+                     * that has not drawn a window in a minute is not
+                     * about to. */
+                    syscall64_set_run_ticks(60u * CLOCK64_HZ);
+                    syscall64_set_trace(1);
+                    register_interrupt_handler64(32, sched_timer_handler);
+                    idt64_irq_set_mask(0, 0);
+
+                    vmspace64_switch(&gp->space);
+                    enter_user_mode64(ginterp.entry, grsp, 0);
+                    vmspace64_switch(&kspace);
+
+                    idt64_irq_set_mask(0, 1);
+                    syscall64_set_trace(0);
+                    syscall64_set_run_ticks(0);
+                    syscall64_set_leader(-1);
+                }
+                serial64_puts("NOVARIS64: --- end of winegui64 ---\n");
+                serial64_puts("NOVARIS64: winegui = ");
+                if (grc != ELF64_OK || !gstack_ok || !grsp) {
+                    serial64_puts("could not be laid out\n");
+                } else if (!syscall64_leader_exited()) {
+                    serial64_puts("did not exit, run ");
+                    serial64_puts(syscall64_run_expired() ? "timed out\n"
+                                                          : "ended\n");
+                } else {
+                    serial64_puts("exit= ");
+                    serial64_putdec(syscall64_exit_code());
+                    serial64_puts(" (0 = a window was created and drawn)\n");
+                }
+            }
         }
     }
 
