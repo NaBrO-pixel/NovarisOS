@@ -492,8 +492,14 @@ WINE64_NTDLL  ?= $(firstword $(wildcard \
     ../wine/dlls/ntdll/ntdll.so \
     ../../../../wine/dlls/ntdll/ntdll.so))
 
+# tools/stage_wine.sh and its module list are prerequisites because they
+# decide what goes *into* the image. Without them here, editing the list
+# of staged modules leaves the initrd untouched and the next run tests
+# the previous list - which costs a build and a boot to notice, and
+# looks exactly like the fix not working.
 $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
-           $(BUILD_DIR)/forkchild64.elf userland/mkinitrd.py
+           $(BUILD_DIR)/forkchild64.elf userland/mkinitrd.py \
+           tools/stage_wine.sh tools/wine_prefix_modules.txt
 	rm -rf $(INITRD_STAGE)
 	mkdir -p $(INITRD_STAGE)
 	cp $(BUILD_DIR)/dlllib64.dll $(INITRD_STAGE)/dlllib64.dll

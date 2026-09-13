@@ -1,10 +1,29 @@
 # The modules `wineboot -u` loads while creating a prefix, measured
-# rather than guessed.
+# rather than guessed, and then closed under what they import.
 #
 # Wine builds 602 PE DLLs and 108 PE executables. Creating a prefix
 # loads 93 of them. The list was produced by running wineboot against
 # this very Wine tree with WINEDEBUG=+loaddll and taking the distinct
-# module names; regenerate it the same way if Wine is updated.
+# module names; regenerate it the same way if Wine is updated, then run
+# tools/close_wine_modules.py over the result.
+#
+# Measuring is the right way to find the seeds and the wrong way to
+# finish the list, because a module is only measured if the run reached
+# it - and the run does not reach a module whose dependency is missing.
+# Milestone 87 found both halves of that at once. winprint.dll was on
+# the list and winspool.drv, which it imports, was not, so the list
+# contained a module that could never load:
+#
+#   err:module:import_dll Library winspool.drv (which is needed by
+#       L"C:\windows\system32\spool\prtprocs\x64\winprint.dll")
+#       not found
+#
+# And rpcss.exe was on no list at all, because nothing loads it: it is
+# started as a service, and a service that is not on disk is one the
+# SCM cannot open. That was reported four layers away, as
+# `err:ole:start_rpcss Failed to open RpcSs service` and then as every
+# COM marshal failing with E_NOINTERFACE - which is the sort of thing
+# that gets blamed on COM.
 #
 # Unstripped in the build tree these are 174MB; stripped, 58MB. That is
 # the difference between an initrd this kernel can carry and one it
@@ -74,6 +93,7 @@ qedit.dll
 quartz.dll
 resampledmo.dll
 rpcrt4.dll
+rpcss.exe
 rsaenh.dll
 rtworkq.dll
 rundll32.exe
@@ -103,6 +123,7 @@ winevulkan.dll
 wininet.dll
 winmm.dll
 winprint.dll
+winspool.drv
 wintrust.dll
 wmadmod.dll
 wmvdecod.dll
