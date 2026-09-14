@@ -4128,8 +4128,28 @@ void kernel_main(uint32_t magic, void* mbi) {
             if (ramfs64_lookup("/usr/bin/x86_64-windows/winegui64.exe") < 0) {
                 serial64_puts("NOVARIS64: winegui = not staged, skipped\n");
             } else {
+                /* The full unix path, not the bare name.
+                 *
+                 * usr/bin/x86_64-windows is where Wine looks for a
+                 * *builtin* module - a DLL it is expected to provide -
+                 * and not where it looks for an application to run.
+                 * Handed the bare name, Wine found no such program,
+                 * fell through to ShellExecuteEx to see whether some
+                 * file type claimed it, and reported the result of
+                 * that:
+                 *
+                 *   Application could not be started, or no application
+                 *   associated with the specified file.
+                 *   ShellExecuteEx failed = 0x6d          (ERROR_FILE_NOT_FOUND)
+                 *
+                 * which names neither the path it wanted nor the fact
+                 * that it was looking for a document by then. An
+                 * absolute unix path is unambiguous: wineboot maps Z:
+                 * to /, so this resolves to
+                 * Z:\usr\bin\x86_64-windows\winegui64.exe. */
                 static const char* const gui_argv[] = {
-                    "/usr/bin/wine", "winegui64.exe", 0
+                    "/usr/bin/wine",
+                    "/usr/bin/x86_64-windows/winegui64.exe", 0
                 };
                 elf64_info_t gexe, ginterp;
                 uint64_t grsp = 0;
@@ -4139,6 +4159,25 @@ void kernel_main(uint32_t magic, void* mbi) {
                 serial64_puts("NOVARIS64: --- winegui64 ---\n");
 
                 gpid = proc64_create();
+
+                /* Which pid, and what else is still alive. Both matter:
+                 * a pid handed out while its previous owner is still
+                 * running would make set_leader watch the wrong process,
+                 * and a session with no wineserver left in it cannot
+                 * serve a second client however well this one starts. */
+                serial64_puts("NOVARIS64: [winegui] pid ");
+                serial64_putdec((uint64_t)gpid);
+                serial64_puts(", live pids");
+                for (int q = 0; q < PROC64_MAX; q++) {
+                    if (sched64_pid_tasks(q) > 0) {
+                        serial64_putc(' ');
+                        serial64_putdec((uint64_t)q);
+                        serial64_putc('/');
+                        serial64_putdec((uint64_t)sched64_pid_tasks(q));
+                    }
+                }
+                serial64_puts(" (pid/tasks)\n");
+
                 proc64_set_current(gpid);
                 gp = proc64_current();
                 syscall64_open_std();
@@ -4178,6 +4217,13 @@ void kernel_main(uint32_t magic, void* mbi) {
                      * slot 0 is current would resume one of them here. */
                     gslot = sched64_add_frame_for(&gfirst, &gp->space, 0, gpid);
                     if (gslot >= 0) sched64_set_current(gslot);
+                    serial64_puts("NOVARIS64: [winegui] slot ");
+                    serial64_putdec((uint64_t)gslot);
+                    serial64_puts(", ld.so entry 0x");
+                    serial64_puthex(ginterp.entry);
+                    serial64_puts(", rsp 0x");
+                    serial64_puthex(grsp);
+                    serial64_putc('\n');
 
                     syscall64_set_leader(gpid);
                     /* Shorter than wineboot's budget on purpose: the
