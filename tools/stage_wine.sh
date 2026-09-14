@@ -266,6 +266,34 @@ else
     echo "stage_wine: no nls directory at $TREE/nls" >&2
 fi
 
+# The fonts. In both places, for the same reason as the NLS tables.
+#
+# Wine ships thirteen TrueType faces of its own and looks for them in
+# %WINDIR%/fonts and in datadir/fonts. Without them there is no font on
+# the machine at all, and Milestone 88 found what that costs: every
+# system metric derived from the caption font is read out of memory
+# nothing wrote. SM_CYCAPTION measured 6750319, so a 400x300 window came
+# back with a client area zero pixels tall, while a WS_POPUP window -
+# which has no caption - was exactly the size it asked for.
+#
+# Staging libfreetype without these is worse than staging neither.
+# FreeType then loads, finds nothing to load *with*, and the font code
+# goes on into paths that assume at least one face exists: 576 segfaults
+# in one run, against a dozen with no FreeType at all, and wineboot
+# never finished. The library and the faces are one change.
+# Off unless WINE64_FONTS is set - see the note beside FT_LIBS in
+# Makefile.amd64. The faces alone are harmless; they are gated with
+# the library because neither is any use without the other.
+if [ -n "${WINE64_FONTS:-}" ] && ls "$TREE"/fonts/*.ttf >/dev/null 2>&1; then
+    for d in "$DEST/usr/share/wine/fonts" "$DEST/share/wine/fonts"; do
+        mkdir -p "$d" || exit 1
+        cp "$TREE"/fonts/*.ttf "$d/" 2>/dev/null
+    done
+    echo "stage_wine: $(ls "$DEST/usr/share/wine/fonts" | wc -l) fonts, in both places"
+else
+    echo "stage_wine: no fonts at $TREE/fonts" >&2
+fi
+
 # The PE halves, from the measured list.
 found_pe=0
 missing=""
