@@ -3769,6 +3769,23 @@ void kernel_main(uint32_t magic, void* mbi) {
               syscall64_exit_code() == 127);
     }
 
+    /* Everything that draws has drawn.
+     *
+     * tools/fbtest.py takes a QEMU screendump and compares sixteen
+     * pixels against what layers 6c and 21 put on the screen. It used to
+     * wait for "bring-up complete", which was the end of the run and
+     * also, from Milestone 89, five minutes after the last drawing layer
+     * and on the far side of a Wine desktop: winegui64.exe now really
+     * paints its window, the driver blits straight to the framebuffer,
+     * and a white client area landed on the red block. That is the
+     * system working, not a fault, so the screendump moved rather than
+     * the window - it is taken here, while the picture under test is the
+     * picture on the screen.
+     *
+     * fbtest boots its own qemu and stops it at this line, so it also
+     * stops paying for a Wine prefix it never looks at. */
+    serial64_puts("NOVARIS64: ---- display settled ----\n");
+
     /* --- layer 38: a Wine prefix (Milestone 71) ---------------------- */
     /* Milestone 68 removed every reason a prefix could not exist here -
      * the node ceiling, the name and path ceilings, the missing links,
