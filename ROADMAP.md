@@ -10099,6 +10099,91 @@ the marker now, with the timeout as a cap on a hang rather than as an
 estimate of the duration. 22 checks, 0 failures.
 
 
+## Milestone 89 - a Windows program draws a window
+
+    ok   the window class registered
+    ok   a window exists
+    ok   it was shown
+    ok   it has a device context
+    metrics: caption=19 xframe=4 yframe=4 border=1
+    popup  rect  = (10,10)-(210,160)  [asked 10,10 200x150]
+    desktop rect = (0,0)-(1024,768), visible=1
+    ok   its client area is 392x273
+    ok   the message loop ran (1 message, 1 paint)
+    ok   it was destroyed
+    NOVARIS64: winegui = exit= 0
+
+`userland/pe_test/winegui64.c` registers a class, creates an overlapped
+window, shows it, takes a device context, pumps its queue and is
+painted, under Wine, on this kernel. That is the sequence every program
+with a user interface begins with, and the one chrome.exe would begin
+with.
+
+**Two things were wrong and neither was what the previous session said.**
+
+The first was a path. Handed the bare name `winegui64.exe`, Wine found
+no such program - `usr/bin/x86_64-windows` is where it looks for a
+*builtin module*, not for an application - and fell through to
+ShellExecuteEx, which reported `0x6d` about a document association. The
+diagnosis written at the time was a session being torn down under the
+second process, and it was wrong: the process gets pid 46 with no
+collision, nine processes are live including the wineserver at pid 3,
+and it makes 10,407 syscalls whose last pairs are working
+`write(5)`/`read(6)` on the server pipes. Nothing was torn down. An
+absolute unix path resolves through Z: and it runs.
+
+The second was a font, four layers from where it showed. `SM_CYCAPTION`
+measured **6750319**, so a 400x300 window came back
+`(100,100)-(6750524,6750427)` with a client area zero pixels tall -
+while a `WS_POPUP` window, which has no caption, was exactly the size it
+asked for, and the desktop was exactly the screen. One number out of
+four. The caption height comes from the caption font and there was no
+font: **win32u dlopens libfreetype rather than linking it**, so it
+appears in no NEEDED anywhere and the objdump-based dependency check in
+`stage_wine.sh` could not have found it. That is the Milestone 81 libm
+bug one level further out - libm was missing and *named*; this was
+missing and named nowhere.
+
+**Staging FreeType alone made it much worse**, which is worth writing
+down because it is the sort of half-fix that looks like progress:
+
+| staged | segfaults | wineboot |
+|---|---|---|
+| nothing | 12 | exits 0 |
+| FreeType | 865 | never finishes |
+| FreeType + 13 fonts | 865 | never finishes |
+| FreeType + fontconfig + expat + fonts | 13 | exits 0 |
+
+793 of those crashes were one null dereference at offset 0xc, in a
+process that also searched four directories for `libfontconfig.so.1`
+and found none. FreeType with nothing to answer its queries is not an
+improvement on no FreeType.
+
+**So the list is derived rather than written.** Wine's own `config.h`
+names every library it dlopens - three `SONAME_*` entries, two of them
+present on this host - and `stage_wine.sh` now reads that, resolves each
+against `ldconfig`, closes the set under `ldd` and stages what it finds
+under the sonames the loader will ask for. A tree configured with more
+optional libraries stages them without the script being edited; one
+configured with fewer does not carry libraries nothing will open. The
+thirteen faces Wine ships go beside the NLS tables, in both places, for
+the same reason they do.
+
+The prefix is 792 nodes against the host's 829, up from 751.
+
+**And the screendump moved.** `fbtest.py` compares sixteen pixels
+against the picture layers 6c and 21 drew, and it waited for the end of
+the run to look. The end of the run is now on the far side of a Wine
+desktop with a real window painted on it, and a white client area landed
+on the red block. The window is entitled to be there, so the screendump
+is taken at a new `---- display settled ----` marker instead - after
+everything that draws has drawn, before the Wine layer starts. fbtest
+boots its own qemu and stops it there, so it also stops paying for a
+prefix it never looks at.
+
+22 checks, 0 failures.
+
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the

@@ -155,20 +155,21 @@ def main():
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     try:
-        # The kernel halts after kernel_main, so the machine stays up and
-        # the last thing drawn stays on the screen. Wait for it to say so
-        # rather than sleeping a guessed number of seconds.
+        # Wait for the kernel to say every drawing layer has run, rather
+        # than sleeping a guessed number of seconds - and specifically
+        # not for the end of the whole run: since Milestone 89 a Wine
+        # window is painted after that point, and it is entitled to be.
         deadline = time.time() + BOOT_TIMEOUT
         while time.time() < deadline:
             if qemu.poll() is not None:
                 print("FAIL: qemu exited before the kernel finished booting")
                 return 1
-            if tail_contains(serial, b"bring-up complete"):
+            if tail_contains(serial, b"display settled"):
                 break
             time.sleep(0.25)
         else:
-            print("FAIL: the kernel never reached the end of kernel_main "
-                  "within %g seconds" % BOOT_TIMEOUT)
+            print("FAIL: the kernel never reached the display-settled "
+                  "marker within %g seconds" % BOOT_TIMEOUT)
             return 1
 
         reply = monitor_command(monsock, "screendump %s" % shot)

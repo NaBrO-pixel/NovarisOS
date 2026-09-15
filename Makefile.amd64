@@ -487,31 +487,6 @@ LIBC   := $(shell readlink -f /lib/x86_64-linux-gnu/libc.so.6)
 LIBGCC := $(shell readlink -f /lib/x86_64-linux-gnu/libgcc_s.so.1 2>/dev/null)
 LIBM   := $(shell readlink -f /lib/x86_64-linux-gnu/libm.so.6 2>/dev/null)
 
-# The fonts.
-#
-# win32u does not link FreeType, it dlopens it - `#define
-# SONAME_LIBFREETYPE "libfreetype.so.6"` and a dlopen at first use - so
-# objdump on the staged unix halves does not mention it and the
-# dependency check in stage_wine.sh, which is an objdump, never could.
-# That is the same blind spot Milestone 81 hit with libm, one level
-# further out: libm was missing and *named* in NEEDED, this is missing
-# and named nowhere.
-#
-# What its absence looks like is not a missing font. Wine prints "Wine
-# cannot find the FreeType font library" once, keeps going, and then
-# every system metric derived from the caption font is whatever was in
-# the memory that should have held it. Milestone 88 measured
-# SM_CYCAPTION as 6750319 - so a 400x300 window came back
-# (100,100)-(6750524,6750427) with a client area 0 pixels tall, while a
-# WS_POPUP window, which has no caption, was exactly the size it asked
-# for. One number out of four, from a library nothing said was missing.
-#
-# The closure, because FreeType has dependencies of its own and a
-# dlopen that fails halfway is the same silence as one that fails at
-# the start.
-FT_LIBS := $(foreach l,libfreetype.so.6 libz.so.1 libbz2.so.1.0 \
-                       libpng16.so.16 libbrotlidec.so.1 libbrotlicommon.so.1,\
-             $(shell readlink -f /lib/x86_64-linux-gnu/$(l) 2>/dev/null))
 
 # An x86-64 Wine built out-of-tree beside the repository, if there is
 # one. Two candidates because a git worktree sits four levels below the
@@ -580,32 +555,6 @@ $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
 	@if [ -f "$(LIBM)" ]; then \
 	    cp "$(LIBM)" $(INITRD_STAGE)/lib/x86_64-linux-gnu/libm.so.6; \
 	 fi
-	@# FreeType and what it needs, under the sonames the loader asks
-	@# for rather than the versioned names readlink resolves to.
-	@#
-	@# Off by default, and that is a finding rather than caution. With
-	@# FreeType absent, Wine says so once and a run makes a dozen
-	@# segfaults and finishes. With FreeType present it makes 865 and
-	@# wineboot never finishes at all - the same with the thirteen
-	@# fonts staged beside it. The crash is a null dereference at
-	@# offset 0xc, 793 times from one address, in a library this
-	@# process also failed to find: it looks for libfontconfig.so.1 in
-	@# four places and gets none of them. So the font stack needs
-	@# fontconfig and whatever that null is, and half of it is worse
-	@# than none of it. Turn it on with WINE64_FONTS=1 to work on that.
-	@if [ -n "$(WINE64_FONTS)" ]; then for f in $(FT_LIBS); do \
-	    [ -f "$$f" ] || continue; \
-	    case "$$f" in \
-	      *freetype*)     n=libfreetype.so.6 ;; \
-	      *libz.so*)      n=libz.so.1 ;; \
-	      *bz2*)          n=libbz2.so.1.0 ;; \
-	      *png16*)        n=libpng16.so.16 ;; \
-	      *brotlidec*)    n=libbrotlidec.so.1 ;; \
-	      *brotlicommon*) n=libbrotlicommon.so.1 ;; \
-	      *)              n=`basename $$f` ;; \
-	    esac; \
-	    cp "$$f" $(INITRD_STAGE)/lib/x86_64-linux-gnu/$$n; \
-	 done; echo "  initrd: FreeType and its closure staged"; fi
 	@# Wine's own loader, if a 64-bit Wine has been built beside the
 	@# tree. Optional: the build must not depend on somebody having
 	@# spent an hour compiling Wine, so this is copied when present and
@@ -629,7 +578,6 @@ $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
 	@# test run would pay for it. Turn it on with
 	@#     make -f Makefile.amd64 WINE64_INSTALL=1 test-wine-prefix
 	@if [ -n "$(WINE64_INSTALL)" ] && [ -x "$(WINE64_LOADER)" ]; then \
-	    WINE64_FONTS="$(WINE64_FONTS)" \
 	    bash tools/stage_wine.sh "$(dir $(WINE64_LOADER)).." \
 	        $(INITRD_STAGE) || exit 1; \
 	 fi
