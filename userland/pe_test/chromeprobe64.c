@@ -70,6 +70,7 @@ static LONG CALLBACK on_exception( EXCEPTION_POINTERS *ep )
 
 #define CHROME_EXE L"Z:\\opt\\chromium\\chrome.exe"
 #define CHROME_ELF L"Z:\\opt\\chromium\\chrome_elf.dll"
+#define CHROME_DLL L"Z:\\opt\\chromium\\chrome.dll"
 
 int main( void )
 {
@@ -196,6 +197,35 @@ int main( void )
     mod = LoadLibraryW( CHROME_ELF );
     printf( "     LoadLibrary(chrome_elf) = %p (err %lu)\n",
             (void *)mod, mod ? 0UL : GetLastError() );
+    fflush( stdout );
+
+    /* --- and chrome.dll, which is the whole question ---------------- *
+     *
+     * Asked here rather than inferred from a chrome.exe run, because a
+     * chrome.exe run does not answer it. Milestone 91 left chrome.exe
+     * spending a 300-second budget on Chromium's startup and timing out
+     * before it ever reached main_dll_loader_win.cc - so the log had no
+     * loader error in it, and "no error" looked like success without
+     * being it. The load is one call; making the program that already
+     * loads chrome_elf make it too turns twenty-five minutes of
+     * inference into one line of measurement.
+     *
+     * LOAD_WITH_ALTERED_SEARCH_PATH so that the directory searched for
+     * chrome.dll's own imports is the one chrome.dll is in. chrome_elf
+     * lives beside it and nowhere else, and without this flag the search
+     * starts from this program's directory instead - which would report
+     * a missing dependency that is actually present. */
+    say( "     loading chrome.dll, the 332MB one..." );
+    mod = LoadLibraryExW( CHROME_DLL, NULL, LOAD_WITH_ALTERED_SEARCH_PATH );
+    if (mod)
+        printf( "ok   chrome.dll LOADED at %p\n", (void *)mod );
+    else
+    {
+        DWORD e = GetLastError();
+        printf( "bad  chrome.dll did not load, error %lu (0x%lx)%s\n", e, e,
+                e == 126 ? " = MOD_NOT_FOUND, a dependency is missing" :
+                e == 193 ? " = BAD_EXE_FORMAT, the image was rejected" : "" );
+    }
     fflush( stdout );
 
     say( "chromeprobe64: survived" );

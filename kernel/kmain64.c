@@ -4343,7 +4343,7 @@ void kernel_main(uint32_t magic, void* mbi) {
             run_wine_program(image, len, ld_image, ld_len, boot_env, &kspace,
                              "chromeprobe", "every question answered",
                              "/usr/bin/x86_64-windows/chromeprobe64.exe",
-                             60u * CLOCK64_HZ, 1);
+                             240u * CLOCK64_HZ, 1);
 
             /* And then the one this tree is aimed at.
              *
