@@ -2135,6 +2135,56 @@ void kernel_main(uint32_t magic, void* mbi) {
         check("and the initrd's contents were carried into it",
               ramfs64_lookup("/dlllib64.dll") >= 0);
 
+        /* A file bigger than any single heap block.
+         *
+         * The kernel heap is 256MB in total and ensure_capacity doubles
+         * a kmalloc64 until the file fits, so every file used to have a
+         * ceiling well under that - and a file over it was created,
+         * stored nowhere, and reported as zero bytes to everyone who
+         * asked. Chromium's 332MB chrome.dll found that the expensive
+         * way. Written here in chunks that straddle the threshold, so
+         * what is tested is both the large case and the migration from
+         * a heap block to frames, then read back at the far end where a
+         * file that only pretended to be written has nothing. */
+        {
+            static uint8_t pat[65536];
+            const uint64_t BIG = RAMFS64_CONTIGUOUS_MAX + (8ull << 20);
+            int big = ramfs64_create("/big.bin", 0);
+            uint64_t off = 0;
+            int wrote_all = 1;
+
+            for (i = 0; i < sizeof(pat); i++) pat[i] = (uint8_t)(i * 7 + 3);
+            check("a file larger than one heap block can be created", big >= 0);
+            while (big >= 0 && off < BIG) {
+                uint64_t run = BIG - off;
+                if (run > sizeof(pat)) run = sizeof(pat);
+                if (ramfs64_write(big, off, pat, run) != (int64_t)run) {
+                    wrote_all = 0;
+                    break;
+                }
+                off += run;
+            }
+            check("and every write of it was accepted", wrote_all);
+            check("and it is as long as what was written",
+                  big >= 0 && ramfs64_size(big) == BIG);
+            {
+                static uint8_t back[4096];
+                int same = 1;
+                uint64_t at = BIG - sizeof(back);
+                if (big < 0 || ramfs64_read(big, at, back, sizeof(back))
+                        != (int64_t)sizeof(back)) same = 0;
+                else for (i = 0; i < sizeof(back); i++)
+                    if (back[i] != pat[(at + i) % sizeof(pat)]) { same = 0; break; }
+                check("and its last page reads back what was put there", same);
+            }
+            /* It is stored in frames, so it has no single pointer - and
+             * ramfs64_data has to say so rather than hand back a stale
+             * one, because execve believes it. */
+            check("and a framed file offers no contiguous pointer",
+                  big < 0 || ramfs64_data(big) == 0);
+            if (big >= 0) ramfs64_unlink("/big.bin");
+        }
+
         vmspace64_kernel_space(&kspace);
         check("a space for it", vmspace64_create(&space) != 0);
 
@@ -4015,6 +4065,14 @@ void kernel_main(uint32_t magic, void* mbi) {
 
         ramfs64_init();
         ramfs64_seed_from_initrd();
+        /* Asserted, not assumed. chrome.dll is 332MB and this
+         * filesystem used to accept it, store none of it, and report it
+         * to every reader as a file of zero bytes that was definitely
+         * there; the first thing to notice was Chromium, calling it a
+         * bad EXE four layers away. A file the image shipped that did
+         * not survive being loaded is a failed boot, so say so here. */
+        check("every file in the image was stored",
+              ramfs64_seed_failures() == 0);
         syscall64_reset_files();
         signal64_reset();
         sched64_init();
