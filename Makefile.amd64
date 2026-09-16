@@ -516,6 +516,21 @@ WINE64_INSTALL ?=
 # launcher and the DLL it imports are 4.6MB and go in; chrome.dll is
 # 332MB and does not, yet.
 CHROMIUM64_DIR ?=
+# The launcher and the DLL it imports, and no more by default: 4.6MB
+# against an initrd that is 107MB with Wine in it, and `make test` boots
+# with QEMU_RAM=2G. The whole runtime set is 358MB and makes a 483MB
+# initrd, which needs more memory than the test target gives it, so it
+# is opt-in:
+#
+#   make -f Makefile.amd64 WINE64_INSTALL=1 CHROMIUM64_DIR=... \
+#        CHROMIUM64_FILES="chrome.exe chrome_elf.dll chrome.dll \
+#            resources.pak chrome_100_percent.pak chrome_200_percent.pak \
+#            icudtl.dat v8_context_snapshot.bin locales/en-US.pak" iso
+#
+# Measured, and it changes nothing: with the whole install staged,
+# chrome_elf still breakpoints at the same +0xbe678 and chrome.dll is
+# never opened at all. The failure is inside chrome_elf's DllMain,
+# before anything reaches the rest of the install.
 CHROMIUM64_FILES ?= chrome.exe chrome_elf.dll
 # `../wine` is here because a Wine configured in its own source tree puts
 # the loader in exactly the same places as an out-of-tree build does, and
@@ -632,6 +647,7 @@ $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
 	    mkdir -p $(INITRD_STAGE)/opt/chromium; \
 	    for f in $(CHROMIUM64_FILES); do \
 	        [ -f "$(CHROMIUM64_DIR)/$$f" ] || continue; \
+	        mkdir -p "$(INITRD_STAGE)/opt/chromium/$$(dirname $$f)"; \
 	        cp "$(CHROMIUM64_DIR)/$$f" $(INITRD_STAGE)/opt/chromium/$$f; \
 	    done; \
 	    echo "  initrd: chromium, $$(du -sh $(INITRD_STAGE)/opt/chromium | cut -f1)"; \
