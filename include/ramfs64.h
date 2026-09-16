@@ -124,7 +124,39 @@ int     ramfs64_child(int dir, uint64_t index, int* out_node);
 int ramfs64_path(int node, char* out, uint64_t size);
 
 const char* ramfs64_name(int node);
+/* Above this, a file lives in frames rather than in one heap block.
+ *
+ * ensure_capacity doubles a kmalloc64 until the file fits, and the whole
+ * kernel heap is KHEAP64_MAX_SIZE - 256MB. chrome.dll is 332MB, so no
+ * amount of doubling was ever going to hold it: the allocation failed,
+ * ramfs64_write returned -ENOMEM, and the seeding loop threw that away
+ * and left a file that existed and was empty. What reached Wine was the
+ * wineserver fstat'ing chrome.dll as zero bytes, and get_image_params
+ * opens with `if (!file_size) return STATUS_INVALID_FILE_FOR_SECTION` -
+ * which surfaced four layers up as chrome.exe reporting "Bad EXE format"
+ * about a perfectly well-formed DLL.
+ *
+ * Frames need no contiguity and come from the physical allocator rather
+ * than the heap, so they have the machine's memory to work with. The
+ * threshold sits above every file that has to stay contiguous - only
+ * execve reads a file straight out of the heap, through ramfs64_data,
+ * and the largest thing this system execve's is the wineserver at
+ * 4.7MB - and well below the heap's own ceiling. */
+#define RAMFS64_CONTIGUOUS_MAX (32ull * 1024 * 1024)
+
+/* The file's bytes in one piece, or NULL if it has none in one piece.
+ *
+ * Only small files are stored contiguously; a large one lives in frames
+ * and has no single pointer to give, so this returns NULL for it. Every
+ * caller must handle that - execve does, by reporting -ENOEXEC. Anything
+ * that wants the contents regardless of how they are stored should call
+ * ramfs64_read instead, which works either way. */
 const void* ramfs64_data(int node);
+
+/* How many initrd files could not be stored when the filesystem was
+ * seeded. Anything but zero means a file the image shipped is missing or
+ * truncated, and the boot path says so. */
+uint64_t ramfs64_seed_failures(void);
 uint64_t    ramfs64_size(int node);
 /* The permission bits a node was created with. Stored rather than
  * invented, because the wineserver creates its socket directory 0700 and

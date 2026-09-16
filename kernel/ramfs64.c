@@ -41,6 +41,14 @@ typedef struct {
     uint64_t* frames;
     uint64_t  nframes;
 
+    /* How many entries the frames array can hold, as against how many
+     * are in use. Without it make_framed reallocated and recopied the
+     * whole array on every write, so appending to a framed file cost
+     * O(n) a write and O(n^2) overall - which is exactly the shape of
+     * what the wineserver does when it saves the registry a page at a
+     * time. */
+    uint64_t  fcap;
+
     /* How many descriptors are open on this node, and whether its name
      * has been taken away (Milestone 78).
      *
@@ -98,6 +106,7 @@ static int alloc_node(const char* name, int parent, int is_dir) {
     nodes[i].is_link      = 0;
     nodes[i].frames       = 0;
     nodes[i].nframes      = 0;
+    nodes[i].fcap         = 0;
     nodes[i].openers      = 0;
     nodes[i].unlinked     = 0;
     /* What do_stat used to invent, so a caller that passes no mode is
@@ -155,6 +164,7 @@ static void release_node(int n) {
         kfree64(nodes[n].frames);
         nodes[n].frames  = 0;
         nodes[n].nframes = 0;
+        nodes[n].fcap    = 0;
     }
 
     nodes[n].used         = 0;
@@ -307,8 +317,26 @@ void ramfs64_init(void) {
         nodes = (node64_t*)kmalloc64(sizeof(node64_t) * RAMFS64_MAX_NODES);
         if (!nodes) return;              /* nothing else here can work */
     } else {
-        for (int i = 0; i < RAMFS64_MAX_NODES; i++)
-            if (nodes[i].used && nodes[i].data) kfree64(nodes[i].data);
+        /* Everything the previous filesystem held, given back - the heap
+         * block and the frames both.
+         *
+         * Freeing only ->data was enough while frames arrived solely
+         * through mmap, and stopped being enough the moment large files
+         * began living in them. Every bring-up layer re-seeds the
+         * initrd, so each one leaked every frame of every large file it
+         * had loaded, and by the Wine layer the physical allocator had
+         * nothing left to give: the frames were gone, make_framed could
+         * not get more, and the seeding that reported it was the check
+         * added for exactly this. */
+        for (int i = 0; i < RAMFS64_MAX_NODES; i++) {
+            if (!nodes[i].used) continue;
+            if (nodes[i].data) kfree64(nodes[i].data);
+            if (nodes[i].frames) {
+                for (uint64_t f = 0; f < nodes[i].nframes; f++)
+                    pmm64_free_frame(nodes[i].frames[f]);
+                kfree64(nodes[i].frames);
+            }
+        }
     }
 
     /* Every node free, threaded into one list, so allocating the last
@@ -318,6 +346,9 @@ void ramfs64_init(void) {
         nodes[i].data         = 0;
         nodes[i].capacity     = 0;
         nodes[i].size         = 0;
+        nodes[i].frames       = 0;
+        nodes[i].nframes      = 0;
+        nodes[i].fcap         = 0;
         nodes[i].first_child  = -1;
         nodes[i].next_sibling = i + 1 < RAMFS64_MAX_NODES ? i + 1 : -1;
     }
@@ -537,28 +568,37 @@ static int make_framed(node64_t* nd, uint64_t bytes) {
     if (!need) need = 1;
     if (nd->frames && nd->nframes >= need) return 1;
 
-    fresh = (uint64_t*)kmalloc64(need * sizeof(uint64_t));
-    if (!fresh) return 0;
-
-    /* The frames it already had keep their contents and their identity -
+    /* Grow the array by doubling, so a file appended to a page at a time
+     * pays for the array once per doubling instead of once per write.
+     * The frames it already had keep their contents and their identity -
      * somebody may be mapping them right now, so growing a shared file
      * must not move it. */
-    for (; got < nd->nframes && got < need; got++) fresh[got] = nd->frames[got];
+    if (need > nd->fcap) {
+        uint64_t cap = nd->fcap ? nd->fcap : 16;
+        while (cap < need) cap *= 2;
 
-    for (; got < need; got++) {
+        fresh = (uint64_t*)kmalloc64(cap * sizeof(uint64_t));
+        if (!fresh) return 0;
+        for (; got < nd->nframes; got++) fresh[got] = nd->frames[got];
+
+        if (nd->frames) kfree64(nd->frames);
+        nd->frames = fresh;
+        nd->fcap   = cap;
+    }
+
+    for (got = nd->nframes; got < need; got++) {
         uint64_t f = pmm64_alloc_frame();
         if (!f) {
-            /* Undo, so a failure leaves a file rather than half of one. */
-            for (uint64_t k = nd->nframes; k < got; k++) pmm64_free_frame(fresh[k]);
-            kfree64(fresh);
+            /* Undo, so a failure leaves a file rather than half of one.
+             * The array keeps any room it just gained, which costs
+             * nothing and is visible to nobody. */
+            for (uint64_t k = nd->nframes; k < got; k++)
+                pmm64_free_frame(nd->frames[k]);
             return 0;
         }
         kmemset(phys64_to_virt(f), 0, PAGE64_SIZE);
-        fresh[got] = f;
+        nd->frames[got] = f;
     }
-
-    if (nd->frames) kfree64(nd->frames);
-    nd->frames  = fresh;
     nd->nframes = need;
 
     /* First time: move the contents in and let the heap copy go. */
@@ -615,12 +655,16 @@ int64_t ramfs64_write(int node, uint64_t offset, const void* buf,
     nd = &nodes[node];
     if (nd->is_dir) return -21;
 
-    if (nd->frames) {
+    if (!nd->frames && offset + len <= RAMFS64_CONTIGUOUS_MAX &&
+        ensure_capacity(nd, offset + len)) {
+        kmemcpy(nd->data + offset, buf, len);
+    } else {
+        /* Either it is framed already, or it is too big for a single
+         * heap block, or the heap refused - frames answer all three.
+         * ensure_capacity leaves the node untouched when it fails, so
+         * falling through to here loses nothing. */
         if (!make_framed(nd, offset + len)) return -12;
         frame_copy(nd, offset, (void*)buf, len, 1);
-    } else {
-        if (!ensure_capacity(nd, offset + len)) return -12;
-        kmemcpy(nd->data + offset, buf, len);
     }
     if (offset + len > nd->size) nd->size = offset + len;
     return (int64_t)len;
@@ -845,6 +889,14 @@ int ramfs64_device(int node) {
 
 uint64_t ramfs64_count(void) { return node_count; }
 
+/* Files the initrd held that this filesystem could not store. Reported
+ * rather than printed from here: this runs before the console is a
+ * reliable place to write, and a count the boot path reads out is
+ * checkable from outside the kernel. */
+static uint64_t seed_failures;
+
+uint64_t ramfs64_seed_failures(void) { return seed_failures; }
+
 void ramfs64_seed_from_initrd(void) {
     uint64_t n = initrd64_file_count();
 
@@ -872,7 +924,12 @@ void ramfs64_seed_from_initrd(void) {
         }
 
         node = ramfs64_create(path, 0);
-        if (node < 0) continue;
-        ramfs64_write(node, 0, data, len);
+        if (node < 0) { seed_failures++; continue; }
+
+        /* Checked, because the version that did not check cost a
+         * milestone. A file too big to store was created, left empty,
+         * and reported to every reader as a zero-length file that was
+         * definitely there - and nothing anywhere said so. */
+        if (ramfs64_write(node, 0, data, len) != (int64_t)len) seed_failures++;
     }
 }

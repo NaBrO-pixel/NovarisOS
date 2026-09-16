@@ -38,6 +38,7 @@ apisetschema.dll
 atl100.dll
 avicap32.dll
 bcrypt.dll
+bcryptprimitives.dll
 colorcnv.dll
 combase.dll
 comctl32.dll
