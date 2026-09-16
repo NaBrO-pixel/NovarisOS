@@ -322,6 +322,142 @@ static void page_fault_handler(registers64_t* r) {
     r->rip = pf_resume_rip;
 }
 
+/* Run one Windows program under the Wine this layer has already started.
+ *
+ * Milestone 89 ran winegui64.exe as a one-off; Milestone 90 wanted
+ * chrome.exe as well, and two copies of this would have been two places
+ * to get the scheduler slot wrong. Everything is passed in because the
+ * prefix, the session and the wineserver belong to the caller's layer
+ * and none of it may be reset here.
+ *
+ * `program` is an absolute unix path, not a bare name:
+ * usr/bin/x86_64-windows is where Wine looks for a *builtin module*, not
+ * for an application, so a bare name sends Wine to ShellExecuteEx and it
+ * reports 0x6d about a document association. Z: maps to /, so an
+ * absolute path resolves.
+ */
+static void run_wine_program(const void* image, uint64_t len,
+                             const void* ld_image, uint64_t ld_len,
+                             const char* const* env, vmspace64_t* kspace,
+                             const char* label, const char* success,
+                             const char* program, uint64_t budget)
+{
+    const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+    const uint64_t STACK_PAGES = 128;
+    const uint64_t EXE_BIAS    = 0x0000555555554000ULL;
+    const uint64_t INTERP_BASE = 0x00007FFFF7000000ULL;
+    const char* argv[3];
+    elf64_info_t exe, interp;
+    uint64_t rsp = 0, i;
+    int rc, stack_ok = 1, pid, slot;
+    proc64_t* p;
+
+    argv[0] = "/usr/bin/wine";
+    argv[1] = program;
+    argv[2] = 0;
+
+    serial64_puts("NOVARIS64: --- ");
+    serial64_puts(label);
+    serial64_puts(" ---\n");
+
+    if (ramfs64_lookup(program) < 0) {
+        serial64_puts("NOVARIS64: ");
+        serial64_puts(label);
+        serial64_puts(" = not staged, skipped\n");
+        return;
+    }
+
+    pid = proc64_create();
+    /* Which pid, and what else is still alive. A pid handed out while
+     * its previous owner is still running would make set_leader watch
+     * the wrong process, and a session with no wineserver left in it
+     * cannot serve a second client however well this one starts. */
+    serial64_puts("NOVARIS64: [");
+    serial64_puts(label);
+    serial64_puts("] pid ");
+    serial64_putdec((uint64_t)pid);
+    serial64_puts(", live pids");
+    for (int q = 0; q < PROC64_MAX; q++) {
+        if (sched64_pid_tasks(q) > 0) {
+            serial64_putc(' ');
+            serial64_putdec((uint64_t)q);
+            serial64_putc('/');
+            serial64_putdec((uint64_t)sched64_pid_tasks(q));
+        }
+    }
+    serial64_puts(" (pid/tasks)\n");
+
+    proc64_set_current(pid);
+    p = proc64_current();
+    syscall64_open_std();
+
+    rc = vmspace64_create(&p->space) != 0 ? ELF64_OK : -1;
+    if (rc == ELF64_OK) {
+        syscall64_set_exe_path("/usr/bin/wine");
+        rc = elf64_load_at(image, len, &p->space, EXE_BIAS, &exe);
+    }
+    if (rc == ELF64_OK)
+        rc = elf64_load_at(ld_image, ld_len, &p->space, INTERP_BASE, &interp);
+
+    if (rc == ELF64_OK) {
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&p->space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        uspace64_reset(&p->space, exe.brk_start);
+        rsp = uspace64_build_stack(&p->space, STACK_TOP, STACK_PAGES,
+                                   argv, &exe, INTERP_BASE, env);
+    }
+
+    if (rc == ELF64_OK && stack_ok && rsp) {
+        registers64_t first;
+        for (i = 0; i < sizeof(first) / 8; i++) ((uint64_t*)&first)[i] = 0;
+        /* The slot it actually went into. Not 0: the wineserver and the
+         * services wineboot started are still in the table, and telling
+         * the scheduler that slot 0 is current would resume one of them
+         * here. */
+        slot = sched64_add_frame_for(&first, &p->space, 0, pid);
+        if (slot >= 0) sched64_set_current(slot);
+
+        syscall64_set_leader(pid);
+        syscall64_set_run_ticks(budget);
+        syscall64_set_trace(1);
+        register_interrupt_handler64(32, sched_timer_handler);
+        idt64_irq_set_mask(0, 0);
+
+        vmspace64_switch(&p->space);
+        enter_user_mode64(interp.entry, rsp, 0);
+        vmspace64_switch(kspace);
+
+        idt64_irq_set_mask(0, 1);
+        syscall64_set_trace(0);
+        syscall64_set_run_ticks(0);
+        syscall64_set_leader(-1);
+    }
+
+    serial64_puts("NOVARIS64: --- end of ");
+    serial64_puts(label);
+    serial64_puts(" ---\nNOVARIS64: ");
+    serial64_puts(label);
+    serial64_puts(" = ");
+    if (rc != ELF64_OK || !stack_ok || !rsp) {
+        serial64_puts("could not be laid out\n");
+    } else if (!syscall64_leader_exited()) {
+        serial64_puts("did not exit, run ");
+        serial64_puts(syscall64_run_expired() ? "timed out\n" : "ended\n");
+    } else {
+        serial64_puts("exit= ");
+        serial64_putdec(syscall64_exit_code());
+        serial64_puts(" (0 = ");
+        serial64_puts(success);
+        serial64_puts(")\n");
+    }
+}
+
 void kernel_main(uint32_t magic, void* mbi) {
     uint64_t cr0, cr4, efer, rip;
     uint64_t before, after, probed;
@@ -4121,160 +4257,43 @@ void kernel_main(uint32_t magic, void* mbi) {
                 serial64_putc('\n');
             }
 
-            /* --- and then a Windows program with a window ------------ *
+            /* --- and then Windows programs, in the prefix just built --- *
              *
-             * The prefix exists. This asks the other question, which no
-             * milestone has asked yet: does a program with a user
-             * interface run? wineboot is a console program and never
-             * creates a window, so everything USER and GDI do has been
-             * exercised only by Wine's own startup.
+             * Both run in the prefix wineboot has just built, in the
+             * session whose wineserver is still up: no ramfs64_init, no
+             * sched64_init, nothing reset. Every other layer in this
+             * file starts by wiping the filesystem, and doing that here
+             * would throw away the thing being tested. */
+            run_wine_program(image, len, ld_image, ld_len, boot_env, &kspace,
+                             "winegui", "a window was created and drawn",
+                             "/usr/bin/x86_64-windows/winegui64.exe",
+                             60u * CLOCK64_HZ);
+
+            /* Before chrome, the questions chrome_elf asks. Cheap, and
+             * it means a failing chrome run is read against measured
+             * answers rather than against a guess about which CHECK
+             * fired. */
+            run_wine_program(image, len, ld_image, ld_len, boot_env, &kspace,
+                             "chromeprobe", "every question answered",
+                             "/usr/bin/x86_64-windows/chromeprobe64.exe",
+                             60u * CLOCK64_HZ);
+
+            /* And then the one this tree is aimed at.
              *
-             * winegui64.exe registers a class, creates an overlapped
-             * window, shows it, takes a device context off it and pumps
-             * its queue - the sequence every program with an interface
-             * begins with, and the one chrome.exe would begin with too.
-             *
-             * Run in the prefix wineboot has just built, in the session
-             * whose wineserver is still up: no ramfs64_init, no
-             * sched64_init, no proc64_init, nothing reset. Every other
-             * layer in this file starts by wiping the filesystem, and
-             * doing that here would throw away the one thing being
-             * tested. The wineserver, services.exe and the rest are
-             * still running, and that is the point - this is a second
-             * client of a session that already exists. */
-            if (ramfs64_lookup("/usr/bin/x86_64-windows/winegui64.exe") < 0) {
-                serial64_puts("NOVARIS64: winegui = not staged, skipped\n");
-            } else {
-                /* The full unix path, not the bare name.
-                 *
-                 * usr/bin/x86_64-windows is where Wine looks for a
-                 * *builtin* module - a DLL it is expected to provide -
-                 * and not where it looks for an application to run.
-                 * Handed the bare name, Wine found no such program,
-                 * fell through to ShellExecuteEx to see whether some
-                 * file type claimed it, and reported the result of
-                 * that:
-                 *
-                 *   Application could not be started, or no application
-                 *   associated with the specified file.
-                 *   ShellExecuteEx failed = 0x6d          (ERROR_FILE_NOT_FOUND)
-                 *
-                 * which names neither the path it wanted nor the fact
-                 * that it was looking for a document by then. An
-                 * absolute unix path is unambiguous: wineboot maps Z:
-                 * to /, so this resolves to
-                 * Z:\usr\bin\x86_64-windows\winegui64.exe. */
-                static const char* const gui_argv[] = {
-                    "/usr/bin/wine",
-                    "/usr/bin/x86_64-windows/winegui64.exe", 0
-                };
-                elf64_info_t gexe, ginterp;
-                uint64_t grsp = 0;
-                int grc, gstack_ok = 1, gpid, gslot;
-                proc64_t* gp;
-
-                serial64_puts("NOVARIS64: --- winegui64 ---\n");
-
-                gpid = proc64_create();
-
-                /* Which pid, and what else is still alive. Both matter:
-                 * a pid handed out while its previous owner is still
-                 * running would make set_leader watch the wrong process,
-                 * and a session with no wineserver left in it cannot
-                 * serve a second client however well this one starts. */
-                serial64_puts("NOVARIS64: [winegui] pid ");
-                serial64_putdec((uint64_t)gpid);
-                serial64_puts(", live pids");
-                for (int q = 0; q < PROC64_MAX; q++) {
-                    if (sched64_pid_tasks(q) > 0) {
-                        serial64_putc(' ');
-                        serial64_putdec((uint64_t)q);
-                        serial64_putc('/');
-                        serial64_putdec((uint64_t)sched64_pid_tasks(q));
-                    }
-                }
-                serial64_puts(" (pid/tasks)\n");
-
-                proc64_set_current(gpid);
-                gp = proc64_current();
-                syscall64_open_std();
-
-                grc = vmspace64_create(&gp->space) != 0 ? ELF64_OK : -1;
-                if (grc == ELF64_OK) {
-                    syscall64_set_exe_path("/usr/bin/wine");
-                    grc = elf64_load_at(image, len, &gp->space, EXE_BIAS, &gexe);
-                }
-                if (grc == ELF64_OK)
-                    grc = elf64_load_at(ld_image, ld_len, &gp->space,
-                                        INTERP_BASE, &ginterp);
-
-                if (grc == ELF64_OK) {
-                    for (i = 0; i < STACK_PAGES; i++) {
-                        uint64_t f = pmm64_alloc_frame();
-                        if (!f || vmspace64_map(&gp->space,
-                                                STACK_TOP - (i + 1) * PAGE64_SIZE,
-                                                f, PAGE64_PRESENT |
-                                                   PAGE64_WRITE |
-                                                   PAGE64_USER) != PAGING64_OK)
-                            gstack_ok = 0;
-                    }
-                    uspace64_reset(&gp->space, gexe.brk_start);
-                    grsp = uspace64_build_stack(&gp->space, STACK_TOP,
-                                                STACK_PAGES, gui_argv, &gexe,
-                                                INTERP_BASE, boot_env);
-                }
-
-                if (grc == ELF64_OK && gstack_ok && grsp) {
-                    registers64_t gfirst;
-                    for (i = 0; i < sizeof(gfirst) / 8; i++)
-                        ((uint64_t*)&gfirst)[i] = 0;
-                    /* The slot it actually went into. Not 0: the
-                     * wineserver and the services wineboot started are
-                     * still in the table, and telling the scheduler that
-                     * slot 0 is current would resume one of them here. */
-                    gslot = sched64_add_frame_for(&gfirst, &gp->space, 0, gpid);
-                    if (gslot >= 0) sched64_set_current(gslot);
-                    serial64_puts("NOVARIS64: [winegui] slot ");
-                    serial64_putdec((uint64_t)gslot);
-                    serial64_puts(", ld.so entry 0x");
-                    serial64_puthex(ginterp.entry);
-                    serial64_puts(", rsp 0x");
-                    serial64_puthex(grsp);
-                    serial64_putc('\n');
-
-                    syscall64_set_leader(gpid);
-                    /* Shorter than wineboot's budget on purpose: the
-                     * prefix is built, the server is warm, and a program
-                     * that has not drawn a window in a minute is not
-                     * about to. */
-                    syscall64_set_run_ticks(60u * CLOCK64_HZ);
-                    syscall64_set_trace(1);
-                    register_interrupt_handler64(32, sched_timer_handler);
-                    idt64_irq_set_mask(0, 0);
-
-                    vmspace64_switch(&gp->space);
-                    enter_user_mode64(ginterp.entry, grsp, 0);
-                    vmspace64_switch(&kspace);
-
-                    idt64_irq_set_mask(0, 1);
-                    syscall64_set_trace(0);
-                    syscall64_set_run_ticks(0);
-                    syscall64_set_leader(-1);
-                }
-                serial64_puts("NOVARIS64: --- end of winegui64 ---\n");
-                serial64_puts("NOVARIS64: winegui = ");
-                if (grc != ELF64_OK || !gstack_ok || !grsp) {
-                    serial64_puts("could not be laid out\n");
-                } else if (!syscall64_leader_exited()) {
-                    serial64_puts("did not exit, run ");
-                    serial64_puts(syscall64_run_expired() ? "timed out\n"
-                                                          : "ended\n");
-                } else {
-                    serial64_puts("exit= ");
-                    serial64_putdec(syscall64_exit_code());
-                    serial64_puts(" (0 = a window was created and drawn)\n");
-                }
-            }
+             * chrome.exe is 3MB and chrome_elf.dll, which it imports, is
+             * 1.5MB. Between them they need fifteen DLLs and 368
+             * functions and Wine has an export for all but two -
+             * AddConditionalAce and
+             * DeriveAppContainerSidFromAppContainerName, both
+             * delay-loaded, so neither costs anything unless it is
+             * called. That is a far smaller surface than the 1316
+             * functions Milestone 45 measured chrome.dll importing,
+             * because chrome.exe is only the launcher: chrome_elf loads
+             * chrome.dll, and chrome.dll is 332MB. */
+            run_wine_program(image, len, ld_image, ld_len, boot_env, &kspace,
+                             "chrome", "chrome.exe ran",
+                             "/opt/chromium/chrome.exe",
+                             120u * CLOCK64_HZ);
         }
     }
 

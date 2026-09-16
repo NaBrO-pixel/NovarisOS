@@ -397,7 +397,23 @@ $(BUILD_DIR)/fbdraw64_blob.o: $(BUILD_DIR)/fbdraw64_blob.c
 # write, and every other layer in this tree reports by writing to the
 # serial port.
 $(BUILD_DIR)/winegui64.exe: userland/pe_test/winegui64.c | $(BUILD_DIR)
-	@if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then 	    x86_64-w64-mingw32-gcc -O2 -o $@ $< -lgdi32 -luser32 	        && echo "  built $@"; 	 else 	    echo "  no mingw, skipping $@"; 	 fi
+	@if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then \
+	    x86_64-w64-mingw32-gcc -O2 -o $@ $< -lgdi32 -luser32 \
+	        && echo "  built $@"; \
+	 else \
+	    echo "  no mingw, skipping $@"; \
+	 fi
+
+# The probe that asks chrome_elf's own questions (Milestone 90). It is a
+# console program like the rest, and it links version.dll because
+# reading chrome.exe's VS_VERSION_INFO is one of the things it checks.
+$(BUILD_DIR)/chromeprobe64.exe: userland/pe_test/chromeprobe64.c | $(BUILD_DIR)
+	@if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then \
+	    x86_64-w64-mingw32-gcc -O2 -o $@ $< -lversion -ladvapi32 \
+	        && echo "  built $@"; \
+	 else \
+	    echo "  no mingw, skipping $@"; \
+	 fi
 
 # A real 64-bit Windows executable - the format chrome.exe is in. Built
 # by mingw, importing from kernel32, linked at a Windows image base, and
@@ -493,6 +509,14 @@ LIBM   := $(shell readlink -f /lib/x86_64-linux-gnu/libm.so.6 2>/dev/null)
 # checkout it belongs to, and the build has to work from either.
 # Override with `make -f Makefile.amd64 WINE64_LOADER=/path/to/wine`.
 WINE64_INSTALL ?=
+
+# An unpacked Chromium chrome-win directory, if there is one, and which
+# of its files to carry. Milestone 90 measured chrome.exe as needing
+# fifteen DLLs and 368 functions with Wine covering all but two, so the
+# launcher and the DLL it imports are 4.6MB and go in; chrome.dll is
+# 332MB and does not, yet.
+CHROMIUM64_DIR ?=
+CHROMIUM64_FILES ?= chrome.exe chrome_elf.dll
 # `../wine` is here because a Wine configured in its own source tree puts
 # the loader in exactly the same places as an out-of-tree build does, and
 # looking only for the out-of-tree name fails silently: the recipe below
@@ -515,7 +539,7 @@ WINE64_NTDLL  ?= $(firstword $(wildcard \
 # looks exactly like the fix not working.
 $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
            $(BUILD_DIR)/forkchild64.elf userland/mkinitrd.py \
-           $(BUILD_DIR)/winegui64.exe \
+           $(BUILD_DIR)/winegui64.exe $(BUILD_DIR)/chromeprobe64.exe \
            tools/stage_wine.sh tools/wine_prefix_modules.txt
 	rm -rf $(INITRD_STAGE)
 	mkdir -p $(INITRD_STAGE)
@@ -588,6 +612,29 @@ $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
 	    cp $(BUILD_DIR)/winegui64.exe \
 	       $(INITRD_STAGE)/usr/bin/x86_64-windows/winegui64.exe; \
 	    echo "  initrd: winegui64.exe staged"; \
+	 fi
+	@if [ -n "$(WINE64_INSTALL)" ] && [ -f "$(BUILD_DIR)/chromeprobe64.exe" ]; then \
+	    cp $(BUILD_DIR)/chromeprobe64.exe \
+	       $(INITRD_STAGE)/usr/bin/x86_64-windows/chromeprobe64.exe; \
+	    echo "  initrd: chromeprobe64.exe staged"; \
+	 fi
+	@# Chromium, if a build has been unpacked beside the tree.
+	@#
+	@# In its own directory rather than among the PE modules: chrome.exe
+	@# imports chrome_elf.dll, and Windows looks in the application's own
+	@# directory first, which is also how a real Chromium install is laid
+	@# out. usr/bin/x86_64-windows is for builtins.
+	@#
+	@# What goes in is chosen by CHROMIUM64_FILES rather than by copying
+	@# the directory: the whole build is 808MB against an initrd that is
+	@# 107MB with Wine already in it.
+	@if [ -n "$(CHROMIUM64_DIR)" ] && [ -d "$(CHROMIUM64_DIR)" ]; then \
+	    mkdir -p $(INITRD_STAGE)/opt/chromium; \
+	    for f in $(CHROMIUM64_FILES); do \
+	        [ -f "$(CHROMIUM64_DIR)/$$f" ] || continue; \
+	        cp "$(CHROMIUM64_DIR)/$$f" $(INITRD_STAGE)/opt/chromium/$$f; \
+	    done; \
+	    echo "  initrd: chromium, $$(du -sh $(INITRD_STAGE)/opt/chromium | cut -f1)"; \
 	 fi
 	python3 userland/mkinitrd.py $(INITRD_STAGE) $@
 

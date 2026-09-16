@@ -60,6 +60,7 @@ ieframe.dll
 iexplore.exe
 imm32.dll
 iphlpapi.dll
+jsproxy.dll
 kernel32.dll
 kernelbase.dll
 localspl.dll
@@ -120,6 +121,7 @@ wineboot.exe
 winedevice.exe
 winedmo.dll
 winevulkan.dll
+winhttp.dll
 wininet.dll
 winmm.dll
 winprint.dll
