@@ -10360,6 +10360,79 @@ floor, and the cost was a wrong answer about a different program four
 layers away.
 
 
+## Milestone 92 - chrome.dll loads
+
+    ok   chrome.dll LOADED at 00006fffea9d0000
+    NOVARIS64: chromeprobe = exit= 0 (0 = every question answered)
+
+All 332,455,424 bytes of it, mapped under Wine on this kernel, every
+import resolved. Milestone 45 measured that DLL as importing 1316
+functions across 67 DLLs and called the number unreachable. It is
+reached.
+
+Two things stood between Milestone 91 and this line.
+
+**DirectWrite.** With chrome.dll finally stored whole, the loader
+stopped saying "Bad EXE format" and started saying "Module not found" -
+0xC1 to 0x7E, which is the difference between "this is not a PE" and
+"this is a PE and something it needs is absent". Measured rather than
+guessed: of chrome.dll's 66 imported DLLs, 35 were unstaged, but only
+two of those were *ordinary* imports, and an ordinary import is the
+only kind that can stop a load. One was chrome_elf.dll, already sitting
+beside chrome.dll. The other was `DWrite.dll`, in the Wine tree,
+never staged, imported for exactly one function. The other 33 are
+delay-loaded - free unless called - or api-ms-win-* API sets that Wine
+answers internally and has no file for. The 24 delay-loaded ones the
+tree can supply went in anyway, since finding out one at a time that
+another is missing is how the last three milestones went; closing that
+under PE imports pulled in wined3d, opengl32, bluetoothapis and
+netutils, for 128 modules.
+
+**And asking the right program.** The first run after staging DWrite
+looked like this:
+
+    NOVARIS64: chrome = did not exit, run timed out
+    chrome.dll mentions in the log: 0
+
+No loader error - because chrome.exe spent its entire 300-second budget
+inside Chromium's startup and never reached
+`main_dll_loader_win.cc` at all. The run before it, which did reach the
+load, reported the error in under two seconds. So "no error" and
+"loaded" produce identical logs, and only one of them was true.
+
+That is the same shape as the bug in Milestone 91, one level up: a
+thing that did not happen, indistinguishable from a thing that
+succeeded. The fix was to stop inferring. chromeprobe64 already loads
+chrome_elf.dll and prints GetLastError; it loads chrome.dll now too,
+with LOAD_WITH_ALTERED_SEARCH_PATH so the search for its imports starts
+in chrome.dll's own directory where chrome_elf lives. One call,
+answered in the chromeprobe layer, instead of requiring all of
+Chromium's startup to survive first.
+
+For the record the DirectWrite change did move chrome.exe: that run
+reached seven Wine calls the previous one never did, among them
+NtSetInformationThread, RtlSetHeapInformation, GetUserObjectSecurity
+and EtwRegisterTraceGuidsW. Further was just not far enough to prove
+anything.
+
+**What chrome.exe still needs**, measured from its own run rather than
+guessed - the syscalls it asks this kernel for and does not get:
+
+| nr | name | seen |
+|---|---|---|
+| 334 | `rseq` | 5 |
+| 323 | `membarrier` | 4 |
+| 157 | `prctl` | 3 |
+| 62 | `kill` | 2 |
+| 435 | `clone3` | 1 |
+| 100 | `times` | 1 |
+
+`kill` is the interesting one and is not a small job: `tkill` and
+`tgkill` exist but both begin `if (tid != proc64_current_pid()) return
+-ESRCH`, so this kernel has no cross-process signal delivery at all -
+and Chromium is a process tree.
+
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
