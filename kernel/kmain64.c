@@ -336,11 +336,20 @@ static void page_fault_handler(registers64_t* r) {
  * reports 0x6d about a document association. Z: maps to /, so an
  * absolute path resolves.
  */
+/* `trace` prints every syscall the program makes. It is how nearly
+ * everything in this file was diagnosed, and it is not free: a traced
+ * run spends most of its budget in serial64_puts, and the run that first
+ * loaded chrome.dll wrote 136MB of trace and still timed out before
+ * chrome.exe reached the load. Turning it off does not make the run
+ * silent - Wine's own err:/fixme: lines and Chromium's LOG output go to
+ * stderr, which is a different path - so a program too big to trace is
+ * still a program that says what went wrong. */
 static void run_wine_program(const void* image, uint64_t len,
                              const void* ld_image, uint64_t ld_len,
                              const char* const* env, vmspace64_t* kspace,
                              const char* label, const char* success,
-                             const char* program, uint64_t budget)
+                             const char* program, uint64_t budget,
+                             int trace)
 {
     const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
     const uint64_t STACK_PAGES = 128;
@@ -425,7 +434,7 @@ static void run_wine_program(const void* image, uint64_t len,
 
         syscall64_set_leader(pid);
         syscall64_set_run_ticks(budget);
-        syscall64_set_trace(1);
+        syscall64_set_trace(trace);
         register_interrupt_handler64(32, sched_timer_handler);
         idt64_irq_set_mask(0, 0);
 
@@ -4325,7 +4334,7 @@ void kernel_main(uint32_t magic, void* mbi) {
             run_wine_program(image, len, ld_image, ld_len, boot_env, &kspace,
                              "winegui", "a window was created and drawn",
                              "/usr/bin/x86_64-windows/winegui64.exe",
-                             60u * CLOCK64_HZ);
+                             60u * CLOCK64_HZ, 1);
 
             /* Before chrome, the questions chrome_elf asks. Cheap, and
              * it means a failing chrome run is read against measured
@@ -4334,7 +4343,7 @@ void kernel_main(uint32_t magic, void* mbi) {
             run_wine_program(image, len, ld_image, ld_len, boot_env, &kspace,
                              "chromeprobe", "every question answered",
                              "/usr/bin/x86_64-windows/chromeprobe64.exe",
-                             60u * CLOCK64_HZ);
+                             60u * CLOCK64_HZ, 1);
 
             /* And then the one this tree is aimed at.
              *
@@ -4351,7 +4360,7 @@ void kernel_main(uint32_t magic, void* mbi) {
             run_wine_program(image, len, ld_image, ld_len, boot_env, &kspace,
                              "chrome", "chrome.exe ran",
                              "/opt/chromium/chrome.exe",
-                             120u * CLOCK64_HZ);
+                             300u * CLOCK64_HZ, 0);
         }
     }
 
