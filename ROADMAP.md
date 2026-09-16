@@ -10184,6 +10184,102 @@ prefix it never looks at.
 22 checks, 0 failures.
 
 
+## Milestone 90 - chrome.exe runs, and stops at one instruction
+
+    NOVARIS64: --- chrome ---
+    err:module:loader_init "chrome_elf.dll" failed to initialize, aborting
+    err:module:loader_init Initializing dlls for
+        L"Z:\opt\chromium\chrome.exe" failed, status 80000003
+    NOVARIS64: chrome = exit= 2147483651
+
+The real binary. The proxy denies dl.google.com but allows
+commondatastorage.googleapis.com, so the official Chromium Win_x64
+snapshot (r1698704, 156.0.8062.0) downloads: 356MB zipped, 808MB
+unpacked, chrome.exe 3MB and chrome.dll 332MB.
+
+**The number this file has called unmeasured since Milestone 45.** The
+other 509 Wine DLLs were "what running things needs, and that number is
+not yet measured". For chrome.exe it is now measured, and it is small:
+
+| binary | DLLs | imported functions | no Wine export |
+|---|---|---|---|
+| `chrome.exe` | 15 | 368 | 7 |
+| `chrome_elf.dll` | 8 | 229 | **0** |
+
+Five of the seven are chrome_elf's own exports, which Chromium ships
+beside the launcher. The real gap is two functions - `AddConditionalAce`
+and `DeriveAppContainerSidFromAppContainerName` - and both are
+delay-loaded, so neither costs anything unless called. That is nothing
+like the 1316 functions chrome.dll imports, because **chrome.exe is only
+the launcher**: it is 4.6MB with chrome_elf, and everything else it
+needs was already staged except winhttp.dll.
+
+**What works.** chrome.exe is found, mapped at its own image base
+(0x140000000), and executes. chrome_elf.dll is found beside it, loaded,
+and its DllMain runs. Then it stops.
+
+**Where it stops, exactly.** 0x80000003 is STATUS_BREAKPOINT - an
+`int3`, which in Chromium means a CHECK called IMMEDIATE_CRASH.
+chrome_elf ships no symbols, so `userland/pe_test/chromeprobe64.c` asks
+the machine what chrome_elf asks and installs a vectored handler that
+turns the exception into an address:
+
+    RtlGetVersion = 10.0 build 19045   <- what Chromium reads
+    GetVersionEx  = 6.2 build 9200
+    GetFileVersionInfoSize(chrome.exe) = 2420
+    chrome.exe file version = 156.0.8062.0
+    LoadLibraryEx(AS_DATAFILE) = ok
+    BREAKPOINT at Z:\opt\chromium\chrome_elf.dll + 0xbe678
+
+and at +0xbe678:
+
+    mov  r8d, [rsi+0x128]
+    mov  rdx, [rsi+0x120]
+    mov  ecx, [rsi+0x8]
+    call QWORD PTR [rip+0x9e7c8]   ; a global function pointer, returns bool
+    test al, al
+    jne  <carry on>
+    ...
+    cmp  DWORD PTR [rsi+0x8], 3
+    je   <int3; ud2>
+    add  rsi, 0x12c                ; stride an array of 300-byte structs
+
+**Five things it is not**, each ruled out by measurement rather than by
+argument:
+
+- *The OS version.* `GetVersionEx` says 6.2, which looks damning and is
+  not: Windows lies to programs with no compatibility manifest and Wine
+  copies it. Chromium calls `RtlGetVersion` for exactly that reason and
+  gets 10.0.19045.
+- *The version resource.* Read perfectly, 2420 bytes, 156.0.8062.0.
+- *An incomplete install.* The whole 358MB runtime set - chrome.dll, the
+  .pak files, icudtl.dat, the v8 snapshot, en-US - was staged and the
+  breakpoint did not move. chrome.dll is never opened at all.
+- *Process mitigation policies.* Wine's `SetProcessMitigationPolicy` is
+  a stub returning TRUE and prints a FIXME; no such FIXME appears, so
+  chrome_elf never calls it.
+- *Channel detection.* `DetermineChannel` returns immediately when
+  `USE_GOOGLE_UPDATE_INTEGRATION` is off, which it is for Chromium.
+
+DllMain, fetched from the Chromium mirror, makes two calls before
+anything is wrapped in `__try`:
+
+    install_static::InitializeProductDetailsForPrimaryModule();
+    install_static::InitializeProcessType();
+
+so the check is in one of those two. Everything after them is inside
+`__try/__except`, and cannot be what aborts the loader. The remaining
+work is matching r1698704's sources rather than `main`, which is where
+the next session starts.
+
+Staged behind `CHROMIUM64_DIR`, minimal by default: 4.6MB is what
+reproduces this, and the full 358MB set makes a 483MB initrd that
+`make test`'s 2G would not boot. The one-off winegui64 block is now
+`run_wine_program()`, called three times.
+
+22 checks, 0 failures.
+
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
