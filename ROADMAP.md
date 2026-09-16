@@ -10280,6 +10280,86 @@ reproduces this, and the full 358MB set makes a 483MB initrd that
 22 checks, 0 failures.
 
 
+## Milestone 91 - a file too big to store, reported as a file of zero bytes
+
+    NOVARIS64: --- chrome ---
+    [0916/...:ERROR:main_dll_loader_win.cc(240)] Failed to load Chrome DLL
+        from Z:\opt\chromium\chrome.dll: Bad EXE format (0xC1)
+
+chrome.dll is 332,455,424 bytes and perfectly well formed. The
+wineserver's own trace says what really happened: it opened the file,
+`fstat`'d it, `dup`'d, `fstat`'d again, closed - and never once
+`pread`. Wine's `server/mapping.c` begins `get_image_params` with
+
+    if (!file_size) return STATUS_INVALID_FILE_FOR_SECTION;
+    size = pread( unix_fd, &mz, sizeof(mz), 0 );
+
+so the missing `pread` is proof rather than inference: the size we
+reported was **zero**. "Bad EXE format" was four layers downstream of a
+filesystem that had quietly stored nothing.
+
+Three defects, each of which hid the next.
+
+**`ramfs64_write` could not store it.** `ensure_capacity` doubles a
+`kmalloc64` until the file fits, and the entire kernel heap is
+`KHEAP64_MAX_SIZE` - 256MB. A 332MB file was never going to fit, at any
+amount of doubling; this was a ceiling, not fragmentation. Files above
+`RAMFS64_CONTIGUOUS_MAX` now live in frames: page-granular, from the
+physical allocator, needing no contiguity. The threshold sits above
+everything that has to stay contiguous, because only `execve` reads a
+file straight out of the heap - through `ramfs64_data` - and the largest
+thing this system execve's is the wineserver at 4.7MB.
+
+**The seeding loop threw the error away.** `ramfs64_seed_from_initrd`
+ignored `ramfs64_write`'s return value, so a file too big to store was
+created, left empty, and reported to every reader as a zero-length file
+that was definitely there. That is the whole reason this cost a
+milestone: not that the write failed, but that nothing anywhere said so.
+The failures are counted now and the boot path asserts the count is zero.
+
+**`ramfs64_init` leaked every frame.** It freed `->data` and never gave
+the frames back to the PMM - survivable while frames arrived only
+through `mmap`, and not for a moment longer than that. Every bring-up
+layer re-seeds the initrd, so each one leaked the frames of every large
+file it had loaded. Fixing the first two exposed this on the very next
+run, exactly as it should have:
+
+    NOVARIS64: free    = 0 frames after
+    NOVARIS64: FAIL  every file in the image was stored
+
+A check written for one bug finding a different one is the test earning
+its keep. Frames before wineboot: **0 -> 252,900**.
+
+And one cliff this change created rather than found: `make_framed`
+reallocated and recopied the whole frame array on every write, so
+appending to a framed file cost O(n) a write and O(n^2) overall - which
+is the exact shape of the wineserver saving the registry a page at a
+time. It grows the array geometrically now, tracked by `fcap`.
+
+The new checks write a file larger than any single heap block in chunks
+that straddle the threshold, so what is tested is both the large case
+and the migration from heap block to frames, then read it back at the
+far end - where a file that only pretended to be written has nothing:
+
+    ok    a file larger than one heap block can be created
+    ok    and every write of it was accepted
+    ok    and it is as long as what was written
+    ok    and its last page reads back what was put there
+    ok    and a framed file offers no contiguous pointer
+    ok    every file in the image was stored
+
+`bcryptprimitives.dll` is on the staged module list too - Milestone 90
+ended by finding `[FATAL:rand_util_win.cc(33)] Check failed: hmod.`,
+which is `LoadLibraryW(L"bcryptprimitives.dll")` and a CHECK on the
+result.
+
+**The lesson this tree keeps paying for**: a failure that is not
+reported is not a failure that did not happen. `ramfs64_write` returned
+`-ENOMEM` correctly every single time. One caller dropped it on the
+floor, and the cost was a wrong answer about a different program four
+layers away.
+
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
