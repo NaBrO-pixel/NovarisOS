@@ -1157,12 +1157,93 @@ static void usd_check(const char* when, syscall64_args_t* args) {
  * whichever call happens to run next. */
 static uint64_t syscall64_dispatch_inner(syscall64_args_t* args);
 
+/* End the calling process because a signal nothing caught says to.
+ *
+ * Returns only when there was no other thread to hand the CPU to, which
+ * the caller reports as an ordinary syscall return; every other path out
+ * of here resumes somebody else and never comes back. Shared by tgkill,
+ * which is a process asking for this about itself, and by kill(2)
+ * delivery, where another process asked for it. */
+static void die_by_signal(int sig) {
+    exit_code = 128 + sig;
+    vfork_release(proc64_current());
+    close_all_files();
+    /* Recorded as a death rather than as an exit, so the parent's
+     * wait(2) can say WIFSIGNALED. 128+sig stays the exit_status for
+     * everything that only reads that. */
+    proc64_exit_signalled(proc64_current_pid(), sig);
+    if (leader_pid >= 0 && proc64_current_pid() == leader_pid) {
+        leader_exited = 1;
+        enter_user_mode64_abort();                     /* never returns */
+    }
+    {
+        registers64_t next; vmspace64_t ns; uint64_t nfs;
+        if (sched64_exit_current(&next, &ns, &nfs)) {
+            vmspace64_switch(&ns);
+            write_msr(0xC0000100u, nfs);
+            sched64_resume(&next);                     /* never returns */
+        }
+    }
+}
+
 uint64_t syscall64_dispatch(syscall64_args_t* args) {
     uint64_t r;
 
     usd_check("before", args);
     r = syscall64_dispatch_inner(args);
     usd_check("after", args);
+
+    /* Anything kill(2) left for this process, taken on the way out.
+     *
+     * This is where Linux acts on an asynchronous signal too: not when
+     * it is sent, but when the target next crosses back into user mode.
+     * Here rather than in the timer interrupt because the default action
+     * has to be expressible - ending a process needs close_all_files, a
+     * vfork release and a successor to resume, none of which belong in
+     * an interrupt handler.
+     *
+     * What that costs: a process making no syscalls does not notice a
+     * signal until it makes one. A process spinning in user code is
+     * therefore unkillable here, where Linux would stop it at the next
+     * tick. Everything in this system is a Wine process making thousands
+     * of calls a second, so the gap is real and never reached - said
+     * plainly rather than left for somebody to discover.
+     *
+     * A process that has already exited is skipped: the dispatch it just
+     * came out of may have been its exit, and the frame below would be
+     * built from a thread that is gone. */
+    {
+        int me = proc64_current_pid();
+        proc64_t* p = proc64_current();
+
+        if (me >= 0 && p && !p->exited && signal64_has_pending(me)) {
+            int sig;
+
+            while ((sig = signal64_take_pending(me)) > 0) {
+                int disp = signal64_disposition(me, sig);
+
+                if (disp == SIG64_DISP_IGNORE) continue;
+
+                if (disp == SIG64_DISP_HANDLER) {
+                    registers64_t self;
+
+                    /* rax = r, so a handler that returns lands after the
+                     * syscall with the value the syscall produced. The
+                     * signal interrupted the return, not the call. */
+                    frame_from_args(args, r, &self);
+                    if (signal64_deliver(sig, &self, 0))
+                        sched64_resume(&self);         /* never returns */
+                    /* Fell through: a handler is installed but no frame
+                     * could be built for it. Treated as uncaught, which
+                     * is what signal64_deliver returning 0 means. */
+                }
+
+                die_by_signal(sig);
+                break;
+            }
+        }
+    }
+
     return r;
 }
 
@@ -2084,7 +2165,19 @@ static uint64_t dispatch(syscall64_args_t* args) {
             /* wait4 reports a *wait status*, not an exit code: the low
              * byte says how it died and the next says with what. A
              * caller using WEXITSTATUS shifts it back down. */
-            if (a2) *(int*)a2 = (status & 0xFF) << 8;
+            /* A process killed by a signal is not a process that
+             * exited, and wait(2) encodes the two differently: the
+             * signal goes in the low seven bits, where WIFSIGNALED
+             * looks, and an exit code goes in the second byte, where
+             * WEXITSTATUS looks. Reporting a killed child as having
+             * exited with 128+sig is what a *shell* prints; a parent
+             * reading the raw status - which is what Chromium does to
+             * manage its children - would see a clean exit. */
+            {
+                int tsig = proc64_reaped_signal();
+                if (a2) *(int*)a2 = tsig ? (tsig & 0x7F)
+                                         : ((status & 0xFF) << 8);
+            }
             return (uint64_t)reaped;
         }
 
@@ -3645,6 +3738,59 @@ static uint64_t dispatch(syscall64_args_t* args) {
      * run is a thread naming itself. A different target is refused
      * rather than silently delivered to the wrong one. */
     case SYS64_TKILL:
+    /* kill(2).
+     *
+     * Chromium asks for this twice in a run and got -ENOSYS both times,
+     * which is what a process tree gets from a kernel whose only signal
+     * calls are tkill and tgkill - and both of those begin
+     * `if (tid != proc64_current_pid()) return -ESRCH`, so until now
+     * nothing here could signal anything but itself.
+     *
+     * To itself, the signal is delivered now, on this frame, exactly as
+     * tgkill does it: raise() and abort() expect the handler to have run
+     * by the time the call returns, not at some later syscall.
+     *
+     * To another process, there is no frame to rewrite - the target may
+     * be blocked, or on no CPU at all - so the signal is recorded and
+     * acted on where the target next returns from a syscall. See the
+     * delivery point in syscall64_dispatch.
+     */
+    case SYS64_KILL: {
+        int pid = (int)(int32_t)a1;
+        int sig = (int)(int32_t)a2;
+        proc64_t* target;
+        registers64_t self;
+
+        if (sig < 0 || sig >= 64) return (uint64_t)-22;    /* -EINVAL */
+
+        /* pid <= 0 selects a process group, every process the caller may
+         * signal, or the caller's own group. This kernel has no process
+         * groups and no credentials to decide "may" with, so there is no
+         * honest answer: refused rather than quietly signalling one
+         * process and reporting that a group was signalled. */
+        if (pid <= 0) return (uint64_t)-38;                /* -ENOSYS */
+
+        target = proc64_get(pid);
+        if (!target || !target->used || target->exited)
+            return (uint64_t)-3;                           /* -ESRCH  */
+
+        /* Signal 0 is the existence check and nothing else: the checks
+         * above are the whole of its work. */
+        if (sig == 0) return 0;
+
+        if (pid == proc64_current_pid()) {
+            frame_from_args(args, 0, &self);
+            if (signal64_deliver(sig, &self, 0))
+                sched64_resume(&self);                 /* never returns */
+            if (signal64_disposition(pid, sig) == SIG64_DISP_IGNORE)
+                return 0;
+            die_by_signal(sig);
+            return 0;
+        }
+
+        return (uint64_t)(int64_t)signal64_raise(pid, sig);
+    }
+
     case SYS64_TGKILL: {
         int sig = (nr == SYS64_TGKILL) ? (int)(int32_t)a3 : (int)(int32_t)a2;
         int tid = (nr == SYS64_TGKILL) ? (int)(int32_t)a2 : (int)(int32_t)a1;
@@ -3664,22 +3810,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
         /* Uncaught. The default action for the signals that get here -
          * SIGABRT among them - is to end the process, which is what
          * abort() is asking for in the first place. */
-        exit_code = 128 + sig;
-        vfork_release(proc64_current());
-        close_all_files();
-        proc64_exit(proc64_current_pid(), 128 + sig);
-        if (leader_pid >= 0 && proc64_current_pid() == leader_pid) {
-            leader_exited = 1;
-            enter_user_mode64_abort();                 /* never returns */
-        }
-        {
-            registers64_t next; vmspace64_t ns; uint64_t nfs;
-            if (sched64_exit_current(&next, &ns, &nfs)) {
-                vmspace64_switch(&ns);
-                write_msr(0xC0000100u, nfs);
-                sched64_resume(&next);                 /* never returns */
-            }
-        }
+        die_by_signal(sig);
         return 0;
     }
 

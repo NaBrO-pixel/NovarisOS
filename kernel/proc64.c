@@ -135,14 +135,30 @@ void proc64_exit(int pid, int status) {
      * system that has ever had fork. */
 }
 
+/* The signal that ended the process most recently reaped, so that
+ * wait4 can encode a death the way Linux does without every caller of
+ * proc64_reap_child growing another out-parameter. */
+static int reaped_signal;
+
+int proc64_reaped_signal(void) { return reaped_signal; }
+
+void proc64_exit_signalled(int pid, int sig) {
+    proc64_t* p = slot_for(pid);
+    if (!p) return;
+    p->term_sig = sig;
+    proc64_exit(pid, 128 + sig);
+}
+
 int proc64_reap_child(int parent, int* status) {
     for (int i = 0; i < PROC64_MAX; i++) {
         if (!procs[i].used || !procs[i].exited) continue;
         if (procs[i].parent != parent) continue;
         if (status) *status = procs[i].exit_status;
+        reaped_signal = procs[i].term_sig;
         procs[i].used = 0;
         return procs[i].pid;
     }
+    reaped_signal = 0;
     return -1;
 }
 

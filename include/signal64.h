@@ -20,7 +20,17 @@
  */
 
 #define SIG64_TRAP    5
+#define SIG64_KILLSIG 9
 #define SIG64_SEGV   11
+#define SIG64_TERM   15
+#define SIG64_CHLD   17
+#define SIG64_CONT   18
+#define SIG64_STOP   19
+#define SIG64_TSTP   20
+#define SIG64_TTIN   21
+#define SIG64_TTOU   22
+#define SIG64_URG    23
+#define SIG64_WINCH  28
 
 #define SA_SIGINFO   0x00000004
 #define SA_ONSTACK   0x08000000
@@ -118,7 +128,40 @@ int  signal64_sigreturn(uint64_t user_rsp, registers64_t* out);
  * the transcript. */
 void signal64_set_trace(int on);
 
+/* --- kill(2): a signal from one process to another ------------------
+ *
+ * Everything above this point is synchronous: a fault, delivered to the
+ * thread that caused it, at the moment it causes it. kill(2) is the
+ * other kind. The sender is not the target, so there is no frame to
+ * rewrite when the call is made - the target may not even be on a CPU.
+ * So the signal is recorded against the target and acted on when that
+ * process next returns from a syscall, which is where Linux acts on one
+ * too.
+ */
+
+/* Record `sig` against `pid`. Returns 0, or a negative errno. */
+int  signal64_raise(int pid, int sig);
+
+/* Whether anything is recorded against this process. */
+int  signal64_has_pending(int pid);
+
+/* The lowest-numbered signal recorded against it, removed from the set.
+ * 0 when there is none. Lowest-first because that is the order Linux
+ * delivers in, and it puts SIGKILL ahead of most things. */
+int  signal64_take_pending(int pid);
+
+/* What this process would do with `sig` as things stand. The caller
+ * cannot work this out from signal64_deliver's return value, because
+ * that answers 0 both for "nothing is installed" and for "SIG_IGN" -
+ * which is right for a fault, where either way the process dies, and
+ * badly wrong for kill(2), where one of them means discard it. */
+#define SIG64_DISP_TERM     0   /* default action: end the process     */
+#define SIG64_DISP_IGNORE   1   /* discard it                          */
+#define SIG64_DISP_HANDLER  2   /* enter the installed handler         */
+int  signal64_disposition(int pid, int sig);
+
 uint64_t signal64_delivered(void);
 uint64_t signal64_returns(void);
+uint64_t signal64_raised(void);
 
 #endif

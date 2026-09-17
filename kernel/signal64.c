@@ -48,7 +48,92 @@ static ksigaction64_t* handlers_of(int slot) {
 }
 
 #define handlers (handlers_of(proc64_current_slot()))
-static uint64_t delivered, returns;
+static uint64_t delivered, returns, raised;
+
+/* What kill(2) has recorded and the target has not acted on yet, one
+ * bit per signal, indexed by process slot exactly as the handler table
+ * is. A set rather than a queue: this is the non-realtime behaviour,
+ * where a second SIGTERM arriving before the first is taken does not
+ * produce two SIGTERMs. Linux does the same for signals below 32. */
+static uint64_t pending_by_slot[PROC64_MAX];
+
+/* Whether the default action for a signal is to ignore it.
+ *
+ * The rest end the process, and getting this list wrong is not a
+ * subtle failure: SIGCHLD is sent to every process whose child exits,
+ * and a kernel that treats an uncaught SIGCHLD as fatal would kill
+ * every parent in the system the moment it reaped anything. */
+static int default_is_ignore(int sig) {
+    switch (sig) {
+    case SIG64_CHLD: case SIG64_CONT: case SIG64_URG: case SIG64_WINCH:
+        return 1;
+
+    /* The four stopping signals, recorded and dropped. There is no job
+     * control here - nothing to stop a process into, and nothing to
+     * continue it from - so this is wrong in a way worth naming: a
+     * program sent SIGSTOP keeps running. It is the lesser wrong.
+     * Treating them as fatal would end processes that Linux merely
+     * pauses, which is a difference a test could not recover from. */
+    case SIG64_STOP: case SIG64_TSTP: case SIG64_TTIN: case SIG64_TTOU:
+        return 1;
+
+    default:
+        return 0;
+    }
+}
+
+int signal64_disposition(int pid, int sig) {
+    const ksigaction64_t* h;
+
+    if (sig <= 0 || sig >= NSIG) return SIG64_DISP_IGNORE;
+
+    /* SIGKILL cannot be caught or ignored. Linux refuses to install a
+     * handler for it in sigaction; this kernel's sigaction does not
+     * refuse, so the rule is enforced here, where it is acted on -
+     * otherwise a process could make itself unkillable by installing
+     * one. */
+    if (sig == SIG64_KILLSIG) return SIG64_DISP_TERM;
+
+    h = handlers_of(proc64_slot_of(pid));
+    if (h[sig].handler == SIG64_IGN) return SIG64_DISP_IGNORE;
+    if (h[sig].handler)              return SIG64_DISP_HANDLER;
+    return default_is_ignore(sig) ? SIG64_DISP_IGNORE : SIG64_DISP_TERM;
+}
+
+int signal64_raise(int pid, int sig) {
+    int slot = proc64_slot_of(pid);
+
+    if (sig <= 0 || sig >= NSIG)     return -22;       /* -EINVAL */
+    if (slot < 0 || slot >= PROC64_MAX) return -3;     /* -ESRCH  */
+
+    pending_by_slot[slot] |= 1ull << sig;
+    raised++;
+    return 0;
+}
+
+int signal64_has_pending(int pid) {
+    int slot = proc64_slot_of(pid);
+    if (slot < 0 || slot >= PROC64_MAX) return 0;
+    return pending_by_slot[slot] != 0;
+}
+
+int signal64_take_pending(int pid) {
+    int slot = proc64_slot_of(pid);
+    uint64_t set;
+
+    if (slot < 0 || slot >= PROC64_MAX) return 0;
+    set = pending_by_slot[slot];
+    if (!set) return 0;
+
+    for (int sig = 1; sig < NSIG; sig++) {
+        if (!(set & (1ull << sig))) continue;
+        pending_by_slot[slot] &= ~(1ull << sig);
+        return sig;
+    }
+    return 0;
+}
+
+uint64_t signal64_raised(void) { return raised; }
 
 void signal64_reset(void) {
     for (int i = 0; i < NSIG; i++) {
@@ -57,8 +142,16 @@ void signal64_reset(void) {
         handlers[i].restorer = 0;
         handlers[i].mask     = 0;
     }
+    /* Every slot, not just this one. The handler table above is reset
+     * per process because that is what sigaction owns, but a pending
+     * signal belongs to a process that may since have gone: leaving a
+     * bit set means the next process to land in that slot inherits a
+     * SIGTERM nobody sent it. */
+    for (int i = 0; i < PROC64_MAX; i++) pending_by_slot[i] = 0;
+
     delivered = 0;
     returns = 0;
+    raised = 0;
 }
 
 /* fork(2): the child starts with the parent's handlers.
@@ -69,6 +162,13 @@ void signal64_reset(void) {
 void signal64_fork(int parent_pid, int child_pid) {
     ksigaction64_t* from = handlers_of(proc64_slot_of(parent_pid));
     ksigaction64_t* to   = handlers_of(proc64_slot_of(child_pid));
+    int cslot = proc64_slot_of(child_pid);
+
+    /* The child starts with nothing pending, which is Linux's rule and
+     * is also what stops a recycled slot from carrying a dead process's
+     * signals into a live one. */
+    if (cslot >= 0 && cslot < PROC64_MAX) pending_by_slot[cslot] = 0;
+
     if (from == to) return;
     for (int i = 0; i < NSIG; i++) to[i] = from[i];
 }

@@ -129,6 +129,16 @@ typedef struct {
     int         exited;
     int         exit_status;
 
+    /* The signal that ended it, or 0 if it ended by exiting.
+     *
+     * Kept apart from exit_status because wait(2) does not encode them
+     * the same way, and a parent tells them apart with WIFSIGNALED. A
+     * process killed by SIGTERM used to be recorded as having exited
+     * with status 128+SIGTERM - which is what a shell *prints*, not what
+     * the kernel reports - so every parent in this system saw a clean
+     * exit where Linux would have shown a death. */
+    int         term_sig;
+
     /* The pid of a parent suspended in vfork waiting for this process,
      * or 0. glibc's posix_spawn is clone(CLONE_VM|CLONE_VFORK) and Wine
      * reaches the wineserver through it, so "the parent does not run
@@ -201,6 +211,15 @@ void      proc64_exit(int pid, int status);
 
 /* The first exited child of `parent`, or -1. Reaps it. */
 int       proc64_reap_child(int parent, int* status);
+
+/* Mark a process as ended by a signal rather than by exiting. Sets the
+ * same exited/exit_status a normal exit would, so nothing that only
+ * looks at those changes behaviour. */
+void      proc64_exit_signalled(int pid, int sig);
+
+/* The signal that ended the last process reaped, or 0. Read straight
+ * after proc64_reap_child, which is the only caller that needs it. */
+int       proc64_reaped_signal(void);
 
 /* Does this process have any children at all, exited or not? wait4 has
  * to tell "nothing to reap yet" from "there was never anything". */
