@@ -1617,6 +1617,17 @@ static uint64_t do_execve(const char* path, const char* const* argv,
     p->mmap_next = USPACE64_MMAP_BASE;
     kstrlcpy(p->exe_path, kpath, PROC64_PATH_MAX);
 
+    /* And the name, which execve resets to the new program's basename.
+     * Measured on the host: a process that called PR_SET_NAME and then
+     * exec'd reads back the name of what it became, not what it chose.
+     * The old name belonged to the old image. */
+    {
+        const char* base = kpath;
+        for (const char* c = kpath; *c; c++)
+            if (*c == '/') base = c + 1;
+        kstrlcpy(p->comm, base, sizeof(p->comm));
+    }
+
     /* The exe's own info either way - AT_PHDR and friends describe the
      * program, not the interpreter - plus where ld.so was put, which is
      * AT_BASE and how it finds itself. */
@@ -2023,6 +2034,79 @@ static uint64_t dispatch(syscall64_args_t* args) {
     /* arch_prctl(ARCH_SET_FS, addr) is how a thread pointer is set on
      * x86-64, and glibc does it before it can touch a single piece of
      * thread-local storage - errno included. Nothing works before this. */
+    /* prctl(2), and only the two options anything here asks for.
+     *
+     * Wine calls it in three places and two of them are PR_SET_NAME:
+     * env.c when a process learns what it is called, and the preloader,
+     * which is the only one of the three that looks at the answer -
+     * `if (wld_prctl(15, name) == -1) return;`. chrome.exe's run asked
+     * for prctl three times and got -ENOSYS every time.
+     *
+     * The third is PR_SET_PTRACER, Wine's comment calling it a work
+     * around for "Ubuntu's ptrace breakage". That is a Yama option, and
+     * a kernel built without Yama answers EINVAL - measured on the host,
+     * which does exactly that - so falling through to the default below
+     * is not a gap, it is the same answer Linux gives.
+     *
+     * Everything else is EINVAL, which is what Linux says about an
+     * option it does not implement. Reported once per option, because
+     * EINVAL from a syscall that exists is much harder to notice than
+     * ENOSYS from one that does not, and the next program to want
+     * PR_SET_PDEATHSIG should not have to be guessed at. */
+    case SYS64_PRCTL: {
+        proc64_t* p = proc64_current();
+
+        switch ((int)a1) {
+        case PRCTL64_SET_NAME: {
+            char tmp[PRCTL64_COMM_LEN];
+
+            /* NULL is the EFAULT this can catch. A pointer that is not
+             * null but is not mapped either would fault in ring 0
+             * instead of returning EFAULT, because this kernel has no
+             * copy-from-user: every syscall here reads user memory
+             * directly. That is the tree's existing bargain, not
+             * something prctl introduces, and it is the same for wait4's
+             * status pointer two hundred lines up. Named so the next
+             * person does not have to discover it. */
+            if (!a2) return (uint64_t)-14;             /* -EFAULT */
+            if (!p)  return (uint64_t)-22;
+
+            /* Truncated, not refused: Linux copies at most fifteen
+             * characters and terminates, and returns 0 either way. */
+            kstrlcpy(tmp, (const char*)a2, PRCTL64_COMM_LEN);
+            kstrlcpy(p->comm, tmp, sizeof(p->comm));
+            return 0;
+        }
+
+        case PRCTL64_GET_NAME: {
+            if (!a2) return (uint64_t)-14;             /* -EFAULT */
+            if (!p)  return (uint64_t)-22;
+
+            /* Sixteen bytes, because that is what the caller is
+             * required to provide and what Linux writes. */
+            kmemset((void*)a2, 0, PRCTL64_COMM_LEN);
+            kstrlcpy((char*)a2, p->comm, PRCTL64_COMM_LEN);
+            return 0;
+        }
+
+        default: {
+            static int said[8];
+            static int nsaid;
+            int already = 0;
+
+            for (int i = 0; i < nsaid; i++)
+                if (said[i] == (int)a1) { already = 1; break; }
+            if (!already && nsaid < 8) {
+                said[nsaid++] = (int)a1;
+                serial64_puts("NOVARIS64: [prctl] option ");
+                serial64_putdec((uint64_t)(uint32_t)a1);
+                serial64_puts(" is not implemented - EINVAL\n");
+            }
+            return (uint64_t)-22;                      /* -EINVAL */
+        }
+        }
+    }
+
     case SYS64_ARCH_PRCTL:
         switch (a1) {
         case 0x1002:                                   /* ARCH_SET_FS */

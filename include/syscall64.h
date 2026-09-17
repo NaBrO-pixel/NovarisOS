@@ -261,7 +261,16 @@ typedef struct {
 #define SYS64_GETEGID         108
 #define SYS64_CLONE           56
 #define SYS64_GETTID          186
+#define SYS64_PRCTL           157
 #define SYS64_ARCH_PRCTL      158
+
+/* The prctl options this kernel answers. Everything else is EINVAL,
+ * which is what Linux says about an option it does not know - including
+ * PR_SET_PTRACER, the Yama one Wine asks for, which a kernel without
+ * Yama refuses in exactly the same way. Measured on the host. */
+#define PRCTL64_SET_NAME      15
+#define PRCTL64_GET_NAME      16
+#define PRCTL64_COMM_LEN      16
 #define SYS64_FUTEX           202
 #define SYS64_SET_TID_ADDRESS 218
 #define SYS64_EXIT_GROUP      231

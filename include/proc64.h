@@ -157,6 +157,19 @@ typedef struct {
     proc64_fd_t fds[PROC64_FD_MAX];
     char        exe_path[PROC64_PATH_MAX];
 
+    /* prctl(PR_SET_NAME)'s answer, and execve's. Sixteen bytes because
+     * that is Linux's TASK_COMM_LEN and the limit is visible: a longer
+     * name is truncated to fifteen characters and a NUL, not refused,
+     * so a caller that sets one and reads it back gets a shorter string
+     * and no error. Measured on the host rather than assumed.
+     *
+     * Per process, where Linux keeps it per thread. Threads here share
+     * a process slot, so two threads of one process cannot have
+     * different names - right for every single-threaded case and wrong
+     * in the same direction as sigaltstack above, and said rather than
+     * left to be found. */
+    char        comm[16];
+
     /* The working directory, as text rather than as a node index.
      *
      * A node index would go stale: the directory a process sits in can
