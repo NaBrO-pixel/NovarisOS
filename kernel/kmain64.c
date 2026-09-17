@@ -123,6 +123,8 @@ extern const unsigned char clock64_elf[];
 extern const unsigned long clock64_elf_len;
 extern const unsigned char kill64_elf[];
 extern const unsigned long kill64_elf_len;
+extern const unsigned char wait64_elf[];
+extern const unsigned long wait64_elf_len;
 extern const unsigned char cwd64_elf[];
 extern const unsigned long cwd64_elf_len;
 extern const unsigned char fbdraw64_elf[];
@@ -4047,6 +4049,84 @@ void kernel_main(uint32_t magic, void* mbi) {
               syscall64_exit_code() == 127);
         check("and something was actually signalled across processes",
               signal64_raised() > 0);
+    }
+
+    /* --- wait4's pid and options (Milestone 94) ---------------------- *
+     *
+     * Both were read and discarded, which left one call doing the work
+     * of three: WNOHANG blocked, a named pid reaped whichever child
+     * happened to be first, and a process group was answered as though
+     * it had been asked about. The first is the one a poll loop
+     * notices; the second is the one that silently destroys a status.
+     *
+     * Needs the timer, because every assertion below is about a child
+     * that has or has not finished yet, and "yet" is the tick counter. */
+    serial64_puts("NOVARIS64: -- wait4 --\n");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 64;
+        vmspace64_t kspace;
+        elf64_info_t info;
+        uint64_t i, rsp;
+        int rc, stack_ok = 1, pid;
+        proc64_t* p;
+        static const char* const wait_argv[] = { "/wait64", 0 };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        syscall64_reset_files();
+        signal64_reset();
+        sched64_init();
+        proc64_init();
+        pipe64_init();
+        sock64_init();
+        vmspace64_kernel_space(&kspace);
+
+        pid = proc64_create();
+        proc64_set_current(pid);
+        p = proc64_current();
+
+        check("a space for it", vmspace64_create(&p->space) != 0);
+        rc = elf64_load(wait64_elf, wait64_elf_len, &p->space, &info);
+        check("the wait program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&p->space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&p->space, info.brk_start);
+        rsp = uspace64_build_stack(&p->space, STACK_TOP, STACK_PAGES,
+                                   wait_argv, &info, 0, 0);
+
+        {
+            registers64_t first;
+            int slot;
+            for (i = 0; i < sizeof(first) / 8; i++)
+                ((uint64_t*)&first)[i] = 0;
+            slot = sched64_add_frame_for(&first, &p->space, 0, pid);
+            if (slot >= 0) sched64_set_current(slot);
+        }
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        register_interrupt_handler64(32, sched_timer_handler);
+        idt64_irq_set_mask(0, 0);
+
+        vmspace64_switch(&p->space);
+        enter_user_mode64(info.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+
+        idt64_irq_set_mask(0, 1);
+        pf_diagnose = 0;
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("wait4 behaved as Linux's does",
+              syscall64_exit_code() == 127);
     }
 
     /* Everything that draws has drawn.

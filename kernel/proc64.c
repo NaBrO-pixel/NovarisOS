@@ -149,10 +149,11 @@ void proc64_exit_signalled(int pid, int sig) {
     proc64_exit(pid, 128 + sig);
 }
 
-int proc64_reap_child(int parent, int* status) {
+int proc64_reap_child_pid(int parent, int want, int* status) {
     for (int i = 0; i < PROC64_MAX; i++) {
         if (!procs[i].used || !procs[i].exited) continue;
         if (procs[i].parent != parent) continue;
+        if (want > 0 && procs[i].pid != want) continue;
         if (status) *status = procs[i].exit_status;
         reaped_signal = procs[i].term_sig;
         procs[i].used = 0;
@@ -162,10 +163,21 @@ int proc64_reap_child(int parent, int* status) {
     return -1;
 }
 
-int proc64_has_children(int pid) {
-    for (int i = 0; i < PROC64_MAX; i++)
-        if (procs[i].used && procs[i].parent == pid) return 1;
+int proc64_reap_child(int parent, int* status) {
+    return proc64_reap_child_pid(parent, -1, status);
+}
+
+int proc64_has_child(int pid, int want) {
+    for (int i = 0; i < PROC64_MAX; i++) {
+        if (!procs[i].used || procs[i].parent != pid) continue;
+        if (want > 0 && procs[i].pid != want) continue;
+        return 1;
+    }
     return 0;
+}
+
+int proc64_has_children(int pid) {
+    return proc64_has_child(pid, -1);
 }
 
 uint64_t proc64_count(void) {

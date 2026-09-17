@@ -210,6 +210,16 @@ int       proc64_current_slot(void);
 void      proc64_exit(int pid, int status);
 
 /* The first exited child of `parent`, or -1. Reaps it. */
+/* Reap an exited child. `want` is a particular child's pid, or -1 for
+ * whichever of them has exited.
+ *
+ * The pid mattered and was being thrown away: wait4 passed its caller's
+ * first argument nowhere, so waitpid(child_a, ...) would happily reap
+ * child_b and report child_b's pid - and a parent polling for one
+ * specific child would consume, and lose, the status of another. */
+int       proc64_reap_child_pid(int parent, int want, int* status);
+
+/* The same, for whichever child has exited. */
 int       proc64_reap_child(int parent, int* status);
 
 /* Mark a process as ended by a signal rather than by exiting. Sets the
@@ -224,6 +234,12 @@ int       proc64_reaped_signal(void);
 /* Does this process have any children at all, exited or not? wait4 has
  * to tell "nothing to reap yet" from "there was never anything". */
 int       proc64_has_children(int pid);
+
+/* Whether this parent has a child matching `want` (-1 for any), exited
+ * or not. wait(2) returns -ECHILD on the strength of this and not on
+ * whether one has exited: a parent whose child simply has not finished
+ * yet must wait, not be told it has no children. */
+int       proc64_has_child(int pid, int want);
 
 /* The address a parent blocks on while waiting. Not a real address -
  * user pointers stop well below this - so it cannot collide with a

@@ -883,7 +883,7 @@ static uint64_t do_fork_common(const syscall64_args_t* args,
 
     if (!vmspace64_create(&cp->space)) {
         proc64_exit(child_pid, 0);
-        proc64_reap_child(proc64_current_pid(), 0);
+        proc64_reap_child_pid(proc64_current_pid(), child_pid, 0);
         return (uint64_t)-12;                          /* -ENOMEM */
     }
     /* Shared, not copied (Milestone 69). The eager clone is still there
@@ -893,7 +893,7 @@ static uint64_t do_fork_common(const syscall64_args_t* args,
     if (!vmspace64_clone_cow(vmspace64_current_phys(), &cp->space)) {
         vmspace64_destroy(&cp->space);
         proc64_exit(child_pid, 0);
-        proc64_reap_child(proc64_current_pid(), 0);
+        proc64_reap_child_pid(proc64_current_pid(), child_pid, 0);
         return (uint64_t)-12;
     }
 
@@ -2154,12 +2154,46 @@ static uint64_t dispatch(syscall64_args_t* args) {
         return do_execve((const char*)a1, (const char* const*)a2,
                          (const char* const*)a3, args);
 
+    /* wait4(pid, status, options, rusage).
+     *
+     * Both of the first and third arguments used to be read and thrown
+     * away, which made this "reap whichever child has exited, and block
+     * until one does" wearing the name of a call that means neither.
+     *
+     * WNOHANG is the one that gets noticed, because a poll loop written
+     * against it does not poll - it blocks on the first turn, and a
+     * supervisor that meant "has anything finished?" asks "wait until
+     * something does". Chromium's child management is exactly that loop.
+     *
+     * The pid is the quieter of the two and the worse: waitpid(child_a)
+     * would reap child_b, report child_b's pid, and destroy the status
+     * child_a's parent was waiting for.
+     */
     case SYS64_WAIT4: {
-        int status = 0;
-        int reaped = proc64_reap_child(proc64_current_pid(), &status);
+        int want    = (int)(int32_t)a1;
+        int options = (int)(int32_t)a3;
+        int status  = 0;
+        int reaped;
         registers64_t self, next;
         vmspace64_t next_space;
         uint64_t next_fs;
+
+        /* pid < -1 waits on a process group, and 0 on the caller's own.
+         * There are no process groups here and no way to invent one
+         * honestly, so: 0 is treated as "any child", which is what it
+         * means on a system where everything shares one group, and a
+         * named group is -ECHILD rather than a wrong answer. */
+        if (want < -1) return (uint64_t)-10;           /* -ECHILD */
+        if (want == 0) want = -1;
+
+        /* WUNTRACED and WCONTINUED ask to hear about children that
+         * stopped or continued. Nothing stops here - see the note on
+         * the stopping signals in signal64.c - so there is never such a
+         * child to report, and honouring the flags is the same as
+         * ignoring them. That is true today and would stop being true
+         * the moment job control arrived. */
+
+        reaped = proc64_reap_child_pid(proc64_current_pid(), want, &status);
 
         if (reaped >= 0) {
             /* wait4 reports a *wait status*, not an exit code: the low
@@ -2186,8 +2220,13 @@ static uint64_t dispatch(syscall64_args_t* args) {
          * the entire point of the call, and returning -ECHILD to a
          * parent whose child simply has not been scheduled yet is the
          * difference between a working fork and a racing one. */
-        if (!proc64_has_children(proc64_current_pid()))
+        if (!proc64_has_child(proc64_current_pid(), want))
             return (uint64_t)-10;                      /* -ECHILD */
+
+        /* There is a child and it has not finished. WNOHANG says to
+         * report that and return rather than wait for it, and 0 is how
+         * wait4 says "nothing to report": not an error, not a pid. */
+        if (options & WAIT64_NOHANG) return 0;
 
         /* Blocked, and restarted rather than resumed: rewind rip by the
          * two bytes of the `syscall` instruction and put the number
