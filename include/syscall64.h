@@ -43,6 +43,13 @@
 #define SYS64_PREAD64         17
 #define SYS64_PWRITE64        18
 #define SYS64_ACCESS          21
+/* wait4's options. WNOHANG is the only one this kernel can act on;
+ * the other two ask about stopped and continued children and there is
+ * no job control here to produce either. */
+#define WAIT64_NOHANG         1
+#define WAIT64_UNTRACED       2
+#define WAIT64_CONTINUED      8
+
 #define SYS64_KILL            62
 #define SYS64_TKILL           200
 #define SYS64_TGKILL          234
