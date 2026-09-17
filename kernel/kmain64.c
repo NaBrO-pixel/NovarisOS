@@ -440,6 +440,7 @@ static void run_wine_program(const void* image, uint64_t len,
 
         syscall64_set_leader(pid);
         syscall64_set_run_ticks(budget);
+        syscall64_reset_calls();
         syscall64_set_trace(trace);
         register_interrupt_handler64(32, sched_timer_handler);
         idt64_irq_set_mask(0, 0);
@@ -454,6 +455,7 @@ static void run_wine_program(const void* image, uint64_t len,
         syscall64_set_leader(-1);
     }
 
+    syscall64_report_calls();
     serial64_puts("NOVARIS64: --- end of ");
     serial64_puts(label);
     serial64_puts(" ---\nNOVARIS64: ");
