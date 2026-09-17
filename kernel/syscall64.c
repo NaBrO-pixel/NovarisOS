@@ -41,6 +41,18 @@
 extern void syscall64_entry(void);
 
 static uint64_t call_count;
+
+/* Where the time goes, by process and by syscall number.
+ *
+ * chrome.exe spends a 300-second budget inside Chromium's startup and
+ * times out before it reaches the DLL load, and "it is slow" is not a
+ * diagnosis - it does not say whether chrome is doing a great deal of
+ * work or being starved by something else that is. A global call count
+ * cannot tell those apart; a per-process one can, and a histogram of
+ * syscall numbers shows a spin for what it is. */
+static uint64_t calls_by_slot[PROC64_MAX];
+static uint64_t calls_by_nr[512];
+static int      pid_of_slot[PROC64_MAX];
 static uint64_t last_arg;
 static uint64_t exit_code;
 
@@ -1676,6 +1688,14 @@ static uint64_t dispatch(syscall64_args_t* args) {
     uint64_t a1 = args->a1, a2 = args->a2, a3 = args->a3;
 
     call_count++;
+    {
+        int sl = proc64_current_slot();
+        if (sl >= 0 && sl < PROC64_MAX) {
+            calls_by_slot[sl]++;
+            pid_of_slot[sl] = proc64_current_pid();
+        }
+        if (nr < 512) calls_by_nr[nr]++;
+    }
 
     /* A Win32 import, arriving through one of pe64.c's thunks. Checked
      * before the switch because the range is contiguous and has nothing
@@ -4523,5 +4543,59 @@ static uint64_t dispatch(syscall64_args_t* args) {
 }
 
 uint64_t syscall64_count(void)     { return call_count; }
+
+void syscall64_reset_calls(void) {
+    for (int i = 0; i < PROC64_MAX; i++) { calls_by_slot[i] = 0; pid_of_slot[i] = 0; }
+    for (int i = 0; i < 512; i++) calls_by_nr[i] = 0;
+}
+
+/* Who called, and what. Printed at the end of a layer rather than as it
+ * happens, because the point is the shape of the run and not any one
+ * call - and because printing per call is the syscall trace, which is
+ * what made the run too slow to finish in the first place. */
+void syscall64_report_calls(void) {
+    uint64_t total = 0;
+
+    for (int i = 0; i < PROC64_MAX; i++) total += calls_by_slot[i];
+    if (!total) return;
+
+    serial64_puts("NOVARIS64: [calls] ");
+    serial64_putdec(total);
+    serial64_puts(" total, by pid:");
+    for (int i = 0; i < PROC64_MAX; i++) {
+        if (!calls_by_slot[i]) continue;
+        serial64_puts(" ");
+        serial64_putdec((uint64_t)pid_of_slot[i]);
+        serial64_puts("=");
+        serial64_putdec(calls_by_slot[i]);
+        /* Percent, because the absolute numbers are large and the
+         * question is which process owns the machine. */
+        serial64_puts("(");
+        serial64_putdec(calls_by_slot[i] * 100 / total);
+        serial64_puts("%)");
+    }
+    serial64_puts("\n");
+
+    /* The five busiest syscall numbers. A spin shows up here as one
+     * number with most of the run in it. */
+    serial64_puts("NOVARIS64: [calls] busiest syscalls:");
+    for (int k = 0; k < 5; k++) {
+        int best = -1;
+        uint64_t bestn = 0;
+        static int taken[512];
+        if (k == 0) for (int i = 0; i < 512; i++) taken[i] = 0;
+        for (int i = 0; i < 512; i++) {
+            if (taken[i] || calls_by_nr[i] <= bestn) continue;
+            bestn = calls_by_nr[i]; best = i;
+        }
+        if (best < 0) break;
+        taken[best] = 1;
+        serial64_puts(" ");
+        serial64_putdec((uint64_t)best);
+        serial64_puts("x");
+        serial64_putdec(bestn);
+    }
+    serial64_puts("\n");
+}
 uint64_t syscall64_last_arg(void)  { return last_arg; }
 uint64_t syscall64_exit_code(void) { return exit_code; }
