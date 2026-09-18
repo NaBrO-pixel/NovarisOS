@@ -46,7 +46,14 @@ ISO       = novaris64.iso
 CFLAGS = -std=gnu99 -ffreestanding -fno-builtin -fno-stack-protector \
          -fno-pic -fno-pie -m64 -mcmodel=kernel -mno-red-zone \
          -mno-sse -mno-mmx \
-         -Wall -Wextra -O2 -Iinclude -MMD -MP
+         -Wall -Wextra -O2 -Iinclude -MMD -MP $(CFLAGS_EXTRA)
+
+# Anything extra a one-off run wants to define, without editing source.
+# Used for the chrome.exe budget, which `make test` cannot afford to
+# raise but an investigation needs to:
+#
+#   make -f Makefile.amd64 CFLAGS_EXTRA=-DCHROME64_BUDGET_SECS=1800u ...
+CFLAGS_EXTRA ?=
 
 # -w+error=label-orphan turns "label alone on a line" into an error. NASM
 # accepts an unrecognised mnemonic as a label definition, so a 64-bit

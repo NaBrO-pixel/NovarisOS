@@ -4566,7 +4566,27 @@ void kernel_main(uint32_t magic, void* mbi) {
                 serial64_putc('\n');
             }
 
-            /* --- and then Windows programs, in the prefix just built --- *
+        /* How long chrome.exe is given, in seconds.
+ *
+ * 300 is what a full `make test` can afford: the boot reaches this
+ * layer about ten minutes in, and the budget is wall clock on top of
+ * that. It is not enough for chrome.exe to finish Chromium's startup -
+ * it gets about 42,000 syscalls done and stops in the same place every
+ * time, in locale setup, without reaching main_dll_loader_win.cc.
+ *
+ * That number did not move when the wineserver's poll spin went away
+ * (13,975,980 syscalls in a run down to 152,353, and chrome's own count
+ * unchanged at ~42,000), which is how we know chrome is limited by how
+ * fast it runs and not by what it is competing with. Raise this to find
+ * out how much it actually needs:
+ *
+ *   make -f Makefile.amd64 CFLAGS_EXTRA=-DCHROME64_BUDGET_SECS=1800u ...
+ */
+#ifndef CHROME64_BUDGET_SECS
+#define CHROME64_BUDGET_SECS 300u
+#endif
+
+    /* --- and then Windows programs, in the prefix just built --- *
              *
              * Both run in the prefix wineboot has just built, in the
              * session whose wineserver is still up: no ramfs64_init, no
@@ -4602,7 +4622,7 @@ void kernel_main(uint32_t magic, void* mbi) {
             run_wine_program(image, len, ld_image, ld_len, boot_env, &kspace,
                              "chrome", "chrome.exe ran",
                              "/opt/chromium/chrome.exe",
-                             300u * CLOCK64_HZ, 0);
+                             CHROME64_BUDGET_SECS * CLOCK64_HZ, 0);
         }
     }
 
