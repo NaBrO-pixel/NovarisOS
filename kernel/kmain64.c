@@ -456,6 +456,19 @@ static void run_wine_program(const void* image, uint64_t len,
     }
 
     syscall64_report_calls();
+
+    /* A run that used up its budget without the program exiting: say
+     * what every thread was doing when the clock ran out.
+     *
+     * "It ran out of time" does not distinguish a program that is slow
+     * from one that is stuck, and chrome.exe turned out to be the
+     * second: six times the budget bought it 42,581 syscalls against
+     * 42,000, and it stopped at the same instruction. A thread that is
+     * merely slow is runnable; a thread that is stuck is blocked on
+     * something, and the wait address says on what. */
+    if (!syscall64_leader_exited() && syscall64_run_expired())
+        sched64_dump_blocked();
+
     serial64_puts("NOVARIS64: --- end of ");
     serial64_puts(label);
     serial64_puts(" ---\nNOVARIS64: ");
