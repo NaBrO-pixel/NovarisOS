@@ -134,6 +134,25 @@ int sched64_yield_current(const registers64_t* regs, registers64_t* out_regs,
 
 int sched64_wake(uint64_t addr, int max);
 
+/* The address threads park on when what they wait for cannot be named
+ * by one address - a poll(2) over several descriptors, or a wait that
+ * has only a deadline. Never a user virtual address and never a futex
+ * key: the top of the address space is not mappable. Every
+ * sched64_wake releases these, because the only correct answer to
+ * "something changed somewhere" is to let them look again. */
+#define SCHED64_COND_KEY 0xFFFFFFFFFFFFFF01ULL
+
+/* Block with a deadline in ticks, 0 for none.
+ *
+ * If nothing else is runnable and something is waiting on the clock,
+ * the machine halts until an interrupt rather than declaring deadlock -
+ * which is what lets a timed wait sleep instead of spinning around a
+ * loop to watch for its own timeout. */
+int sched64_block_until(const registers64_t* regs, uint64_t addr,
+                        uint64_t wake_rax, uint64_t deadline,
+                        registers64_t* out_regs, vmspace64_t* out_space,
+                        uint64_t* out_fs_base);
+
 /* Wake every blocked thread of a process, whatever it waits on - what a
  * signal does to a wait, so that a sleeping target can reach the point
  * where a pending signal is taken. Returns how many were woken. */

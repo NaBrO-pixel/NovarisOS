@@ -1,6 +1,8 @@
 /* sched64.c - round-robin preemption, done inside the timer interrupt. */
 
 #include "sched64.h"
+#include "clock64.h"
+#include "idt64.h"
 #include "gdt64.h"
 #include "serial64.h"
 
@@ -19,6 +21,17 @@ typedef struct {
      * *restarts* needs its own number back there instead, or the
      * re-executed `syscall` invokes whatever call 0 happens to be. */
     uint64_t      wake_rax;
+
+    /* The tick this thread stops waiting at, or 0 for "no deadline".
+     *
+     * Without it a wait that has a timeout cannot sleep: it has to
+     * reach ring 3 to notice its own deadline, so it yields around a
+     * loop instead. That is what a poll(2) with nothing ready did -
+     * 13,870,656 times in one chrome.exe run, 99% of every syscall the
+     * machine made, while chrome's own processes got 0.3% and timed
+     * out. */
+    uint64_t      deadline;
+
     int           pid;       /* the process this thread belongs to      */
     int           blocked;
     int           used;
@@ -385,6 +398,71 @@ int sched64_exit_process(int pid, registers64_t* out_regs,
 
 /* A blocked task is not a candidate: it is waiting on a futex and has
  * nothing to run until somebody wakes it. */
+/* True while the machine has nothing to run and is waiting for an
+ * interrupt. `current` still names the thread that parked, and its
+ * frame is already saved, so the timer must not try to switch away from
+ * it: there is no live task frame to save over. */
+static volatile int idling;
+
+static int first_runnable(void) {
+    for (int i = 0; i < SCHED64_MAX_TASKS; i++)
+        if (tasks[i].used && !tasks[i].blocked) return i;
+    return -1;
+}
+
+/* Whether anything is waiting on the clock rather than on an event.
+ *
+ * This is the difference between idle and deadlock. If some thread has
+ * a deadline then the timer will release it and the machine has a
+ * future; if none has, and nothing is runnable, then nothing will ever
+ * happen and halting would be a hang. */
+static int any_deadline(void) {
+    for (int i = 0; i < SCHED64_MAX_TASKS; i++)
+        if (tasks[i].used && tasks[i].blocked && tasks[i].deadline) return 1;
+    return 0;
+}
+
+/* Release every blocked thread whose deadline has passed. The clock
+ * notices the timeout, which is what lets the thread sleep through it
+ * rather than spin to watch for it. A thread woken early re-checks what
+ * it was waiting for and parks again, so waking one costs a re-check. */
+static void expire_deadlines(void) {
+    uint64_t now = clock64_ticks();
+
+    for (int i = 0; i < SCHED64_MAX_TASKS; i++) {
+        if (!tasks[i].used || !tasks[i].blocked) continue;
+        if (!tasks[i].deadline || now < tasks[i].deadline) continue;
+        tasks[i].blocked   = 0;
+        tasks[i].wait_addr = 0;
+        tasks[i].deadline  = 0;
+        tasks[i].regs.rax  = tasks[i].wake_rax;
+    }
+}
+
+/* Halt until an interrupt makes something runnable.
+ *
+ * Syscalls run with interrupts off - FMASK clears IF on entry and the
+ * stub never turns it back on - so a kernel with nothing to run must
+ * enable them itself or the tick that would end the wait can never
+ * arrive. `sti; hlt` is one unit on x86: sti defers enabling by one
+ * instruction precisely so that the halt cannot be missed. cli again on
+ * the way out, because the caller is still inside a syscall and the
+ * rest of it expects interrupts off. */
+static int idle_until_runnable(void) {
+    int n;
+
+    idling = 1;
+    for (;;) {
+        __asm__ __volatile__("sti; hlt; cli");
+        expire_deadlines();
+        n = first_runnable();
+        if (n >= 0) break;
+        if (!any_deadline()) { n = -1; break; }
+    }
+    idling = 0;
+    return n;
+}
+
 static int next_task(int from) {
     for (int n = 1; n <= SCHED64_MAX_TASKS; n++) {
         int i = (from + n) % SCHED64_MAX_TASKS;
@@ -397,6 +475,14 @@ int sched64_block_current(const registers64_t* regs, uint64_t addr,
                           uint64_t wake_rax,
                           registers64_t* out_regs, vmspace64_t* out_space,
                           uint64_t* out_fs_base) {
+    return sched64_block_until(regs, addr, wake_rax, 0,
+                               out_regs, out_space, out_fs_base);
+}
+
+int sched64_block_until(const registers64_t* regs, uint64_t addr,
+                        uint64_t wake_rax, uint64_t deadline,
+                        registers64_t* out_regs, vmspace64_t* out_space,
+                        uint64_t* out_fs_base) {
     int next;
 
     if (current < 0 || !tasks[current].used) return 0;
@@ -418,15 +504,38 @@ int sched64_block_current(const registers64_t* regs, uint64_t addr,
     tasks[current].blocked   = 1;
     tasks[current].wait_addr = addr;
     tasks[current].wake_rax  = wake_rax;
+    tasks[current].deadline  = deadline;
 
     next = next_task(current);
     if (next == current || tasks[next].blocked) {
-        /* Nothing else can run. Really this is a deadlock, and Linux
-         * would simply block forever; unblocking the caller and letting
-         * it see -EDEADLK is more useful than a machine that stops. */
-        tasks[current].blocked   = 0;
-        tasks[current].wait_addr = 0;
-        return 0;
+        /* Nothing else can run *right now*.
+         *
+         * That used to mean deadlock, and it was a fair reading while
+         * every wait was a yield-loop: a waiting thread stayed
+         * runnable, so "nobody else can run" really did mean nobody
+         * ever would. Once waits sleep, a parent waiting on a sleeping
+         * child is this, and it is ordinary.
+         *
+         * So: halt and let the clock decide. Only when something is
+         * actually waiting on the clock - otherwise nothing will ever
+         * happen and halting is a hang, and the old answer is the
+         * honest one. The timer being masked says the same thing: most
+         * bring-up layers run with IRQ0 off on purpose, and there the
+         * deadline would never arrive. */
+        if (idt64_irq_is_masked(0) || !any_deadline()) {
+            tasks[current].blocked   = 0;
+            tasks[current].wait_addr = 0;
+            tasks[current].deadline  = 0;
+            return 0;
+        }
+
+        next = idle_until_runnable();
+        if (next < 0) {
+            tasks[current].blocked   = 0;
+            tasks[current].wait_addr = 0;
+            tasks[current].deadline  = 0;
+            return 0;
+        }
     }
 
     tasks[current].gs_base = read_gs_base();
@@ -521,11 +630,34 @@ int sched64_wake(uint64_t addr, int max) {
         tasks[i].regs.rax = tasks[i].wake_rax;
         woken++;
     }
+
+    /* Any wake at all also releases the threads parked on the shared
+     * condition key, uncounted. A poll(2) cannot name one address - it
+     * waits for whichever descriptor becomes ready first - so it parks
+     * on one key and re-checks its whole set when anything anywhere
+     * changes. Wider than it needs to be, and still far cheaper than
+     * the spin it replaces; a spurious wake costs one re-check. */
+    for (int i = 0; i < SCHED64_MAX_TASKS; i++) {
+        if (!tasks[i].used || !tasks[i].blocked) continue;
+        if (tasks[i].wait_addr != SCHED64_COND_KEY) continue;
+        tasks[i].blocked   = 0;
+        tasks[i].wait_addr = 0;
+        tasks[i].deadline  = 0;
+        tasks[i].regs.rax  = tasks[i].wake_rax;
+    }
     return woken;
 }
 
 void sched64_tick(registers64_t* frame) {
     int next;
+
+    expire_deadlines();
+
+    /* While idling there is no running task whose frame this is - it is
+     * the idle loop's - so switching would save the halt over a parked
+     * thread's continuation. idle_until_runnable picks the successor
+     * itself once expire_deadlines above has produced one. */
+    if (idling) return;
 
     if (current < 0 || task_total < 2) return;
 

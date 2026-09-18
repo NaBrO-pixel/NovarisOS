@@ -48,6 +48,9 @@ void idt64_install(void);
  * only produce an interrupt nobody is prepared to service. */
 void idt64_irq_set_mask(int irq, int masked);
 
+/* Whether that line is masked at this moment. */
+int idt64_irq_is_masked(int irq);
+
 /* Same contract as the 32-bit register_interrupt_handler: vectors 0-31 are
  * CPU exceptions, 32-47 the remapped IRQs. */
 void register_interrupt_handler64(uint8_t n, isr64_handler_t handler);
