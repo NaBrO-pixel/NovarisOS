@@ -215,6 +215,25 @@ static void pic64_remap(void) {
     outb(PIC2_DATA, 0xFF);
 }
 
+/* Whether a line is masked right now, read back from the PIC rather
+ * than remembered.
+ *
+ * The scheduler needs it: a thread may only sleep on a deadline if
+ * something will still be running to notice the deadline pass, and the
+ * only thing that notices is the timer. Most bring-up layers keep IRQ0
+ * masked so they stay deterministic, and a thread that sleeps until a
+ * tick that never comes has not waited, it has stopped. */
+int idt64_irq_is_masked(int irq) {
+    uint16_t port;
+    uint8_t bit;
+
+    if (irq < 0 || irq > 15) return 1;
+    if (irq < 8) { port = PIC1_DATA; bit = (uint8_t)irq; }
+    else         { port = PIC2_DATA; bit = (uint8_t)(irq - 8); }
+
+    return (inb(port) & (uint8_t)(1u << bit)) != 0;
+}
+
 void idt64_irq_set_mask(int irq, int masked) {
     uint16_t port;
     uint8_t bit, value;

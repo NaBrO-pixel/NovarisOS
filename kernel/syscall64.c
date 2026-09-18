@@ -514,6 +514,35 @@ static uint64_t wait_restart(const syscall64_args_t* args, uint64_t nr,
     frame_from_args(args, nr, &self);
     self.rip = args->ret_rip - 2;
 
+    /* Sleep rather than yield around a loop.
+     *
+     * This handed the CPU on and came straight back, because
+     * sched64_block_current had no deadline and a wait with a timeout
+     * has to reach ring 3 to notice its own. The scheduler takes a
+     * deadline now and halts when there is nothing to run, so the
+     * thread parks and the clock wakes it.
+     *
+     * What that cost: a chrome.exe run made 13,975,980 syscalls and
+     * 13,931,034 of them - 99% - were the wineserver re-running one
+     * poll that never had anything ready, while chrome's own processes
+     * got 0.3% of the machine and timed out. poll x13,870,656 here
+     * against poll x9,465 in the layer before is not a busier
+     * workload, it is a spin.
+     *
+     * The key is shared because a poll cannot name what it waits for,
+     * so any wake anywhere releases it and it looks again - which is
+     * what every caller of this does on re-entry regardless.
+     *
+     * Falling through to a yield keeps the old behaviour wherever
+     * sleeping is not safe: the scheduler refuses when the timer is
+     * masked or nothing is waiting on the clock. */
+    if (sched64_block_until(&self, SCHED64_COND_KEY, nr, deadline,
+                            &next, &next_space, &next_fs)) {
+        vmspace64_switch(&next_space);
+        write_msr(0xC0000100u, next_fs);
+        sched64_resume(&next);                         /* never returns */
+    }
+
     if (sched64_yield_current(&self, &next, &next_space, &next_fs)) {
         vmspace64_switch(&next_space);
         write_msr(0xC0000100u, next_fs);
