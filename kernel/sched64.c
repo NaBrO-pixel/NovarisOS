@@ -484,6 +484,30 @@ int sched64_yield_current(const registers64_t* regs, registers64_t* out_regs,
     return 1;
 }
 
+/* Wake every blocked thread of one process, whatever it is waiting on.
+ *
+ * This is what a signal does to a wait. A thread blocked in read(2) on
+ * an empty pipe, or in wait4, or in an untimed futex, never reaches the
+ * boundary where a pending signal is taken - so without this, kill(2)
+ * to a process that is asleep is a signal nothing will ever deliver.
+ * Linux interrupts a blocking syscall for exactly this reason.
+ *
+ * The woken thread re-runs its syscall, and the delivery point at the
+ * end of syscall64_dispatch is where the signal is taken. */
+int sched64_wake_pid(int pid) {
+    int woken = 0;
+
+    for (int i = 0; i < SCHED64_MAX_TASKS; i++) {
+        if (!tasks[i].used || !tasks[i].blocked) continue;
+        if (tasks[i].pid != pid) continue;
+        tasks[i].blocked   = 0;
+        tasks[i].wait_addr = 0;
+        tasks[i].regs.rax  = tasks[i].wake_rax;
+        woken++;
+    }
+    return woken;
+}
+
 int sched64_wake(uint64_t addr, int max) {
     int woken = 0;
 

@@ -40,6 +40,14 @@ static void ok(const char *what, int cond)
         failures++;
 }
 
+static void nap(long ms)
+{
+    struct timespec t;
+    t.tv_sec  = ms / 1000;
+    t.tv_nsec = (ms % 1000) * 1000000L;
+    syscall(SYS_nanosleep, &t, NULL);
+}
+
 static int sys_kill(int pid, int sig)
 {
     return (int)syscall(SYS_kill, pid, sig);
@@ -223,6 +231,50 @@ int main(void)
     errno = 0;
     ok("kill(reaped child, 0) is ESRCH",
        sys_kill(child, 0) == -1 && errno == ESRCH);
+
+    /* --- a signal to a process that is asleep ------------------------ *
+     *
+     * The child blocks in read(2) on a pipe nobody will ever write to.
+     * That is not a spin and not a timeout: it is parked in the kernel,
+     * and it will never reach the boundary where a pending signal is
+     * taken unless something wakes it. Linux interrupts a blocking
+     * syscall when a signal arrives for exactly this reason.
+     *
+     * Without that, kill(2) to a sleeping process is a signal nothing
+     * ever delivers, and the only way to see it is a test that blocks
+     * for real rather than sleeping in a loop. */
+    {
+        int pipefd[2];
+        pid_t sleeper;
+        int status = 0;
+
+        if (pipe(pipefd) == 0) {
+            sleeper = fork();
+            if (sleeper == 0) {
+                char c;
+                ssize_t n;
+                close(pipefd[1]);         /* this copy; the parent holds one */
+                n = read(pipefd[0], &c, 1);   /* parks here for good */
+                _exit(n == 0 ? 41 : 42);
+            }
+
+            ok("a child that blocks in read exists", sleeper > 0);
+            /* The parent keeps the write end open on purpose. Closing
+             * it here would give the child end-of-file instead of a
+             * wait, and a child that returns from read(2) is not
+             * testing what this is for - the host caught exactly that
+             * and reported the child exiting 41 rather than dying. */
+            nap(100);                     /* it is certainly parked */
+
+            ok("kill(sleeping child, SIGKILL) returns 0",
+               sys_kill(sleeper, SIGKILL) == 0);
+
+            waitpid(sleeper, &status, 0);
+            ok("and the signal reached it where it slept",
+               WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+            close(pipefd[0]);
+        }
+    }
 
     printf("kill64: %d failures\n", failures);
     return failures ? 1 : 127;
