@@ -466,8 +466,10 @@ static void run_wine_program(const void* image, uint64_t len,
      * 42,000, and it stopped at the same instruction. A thread that is
      * merely slow is runnable; a thread that is stuck is blocked on
      * something, and the wait address says on what. */
-    if (!syscall64_leader_exited() && syscall64_run_expired())
+    if (!syscall64_leader_exited() && syscall64_run_expired()) {
         sched64_dump_blocked();
+        syscall64_report_pipe_waits();
+    }
 
     serial64_puts("NOVARIS64: --- end of ");
     serial64_puts(label);

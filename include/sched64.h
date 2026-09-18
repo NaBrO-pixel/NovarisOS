@@ -85,6 +85,12 @@ int  sched64_add_frame(const registers64_t* regs, const vmspace64_t* space,
  * in the graph, not in any one thread. */
 void sched64_dump_blocked(void);
 
+/* What task slot `i` is blocked on, 0 if it is runnable or unused, and
+ * which process it belongs to. For a caller that can interpret the wait
+ * keys - syscall64.c owns PIPE64_WAIT_KEY and the rest. */
+uint64_t sched64_blocked_on(int i);
+int      sched64_blocked_pid(int i);
+
 int  sched64_pid_tasks(int pid);
 
 int  sched64_space_in_use(uint64_t pml4_phys);

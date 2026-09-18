@@ -350,6 +350,11 @@ uint64_t syscall64_count(void);
  * being starved by something else that was. */
 void     syscall64_reset_calls(void);
 void     syscall64_report_calls(void);
+
+/* For every thread parked on a pipe, whether the bytes it waits for are
+ * already there - which separates "nobody wrote" from "somebody wrote
+ * and this thread was never woken". */
+void     syscall64_report_pipe_waits(void);
 uint64_t syscall64_last_arg(void);
 uint64_t syscall64_exit_code(void);
 uint64_t syscall64_bytes_written(void);

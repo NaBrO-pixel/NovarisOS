@@ -198,6 +198,21 @@ void sched64_dump_blocked(void) {
     serial64_puts(" runnable\n");
 }
 
+/* What slot `i` is blocked on, or 0 if it is not blocked. Lets a layer
+ * that knows what the wait keys mean - syscall64.c owns PIPE64_WAIT_KEY
+ * - say something useful about them. */
+uint64_t sched64_blocked_on(int i) {
+    if (i < 0 || i >= SCHED64_MAX_TASKS) return 0;
+    if (!tasks[i].used || !tasks[i].blocked) return 0;
+    return tasks[i].wait_addr;
+}
+
+int sched64_blocked_pid(int i) {
+    if (i < 0 || i >= SCHED64_MAX_TASKS) return -1;
+    if (!tasks[i].used || !tasks[i].blocked) return -1;
+    return tasks[i].pid;
+}
+
 int sched64_pid_tasks(int pid) {
     int n = 0;
     for (int i = 0; i < SCHED64_MAX_TASKS; i++)

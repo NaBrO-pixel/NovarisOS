@@ -4617,6 +4617,50 @@ void syscall64_reset_calls(void) {
  * happens, because the point is the shape of the run and not any one
  * call - and because printing per call is the syscall trace, which is
  * what made the run too slow to finish in the first place. */
+/* For every thread parked on a pipe, whether what it waits for is
+ * already in that pipe.
+ *
+ * This is the question a list of blocked threads cannot answer and the
+ * one that decides where to look: a reader waiting on an empty pipe is
+ * behaving correctly and the fault is upstream, in whoever should have
+ * written. A reader waiting on a pipe that already holds bytes was
+ * never woken, and the fault is here.
+ *
+ * chrome.exe's run ends with every Wine client blocked on a pipe and
+ * only the wineserver runnable, so this says which of the two it is. */
+void syscall64_report_pipe_waits(void) {
+    int said = 0;
+
+    for (int i = 0; i < SCHED64_MAX_TASKS; i++) {
+        uint64_t key = sched64_blocked_on(i);
+        int p;
+
+        if (!key) continue;
+        if ((key & 0xF000000000000000ULL) != 0x3000000000000000ULL) continue;
+        p = (int)(key - 0x3000000000000000ULL);
+        if (p < 0 || p >= PIPE64_MAX) continue;
+
+        if (!said) {
+            serial64_puts("NOVARIS64: [pipewait] who is waiting on what\n");
+            said = 1;
+        }
+        serial64_puts("NOVARIS64: [pipewait] pid ");
+        serial64_putdec((uint64_t)sched64_blocked_pid(i));
+        serial64_puts(" on pipe ");
+        serial64_putdec((uint64_t)p);
+        serial64_puts(": ");
+        serial64_putdec(pipe64_available(p));
+        serial64_puts(" ready, ");
+        serial64_putdec((uint64_t)pipe64_writers(p));
+        serial64_puts(" writers, ");
+        serial64_putdec((uint64_t)pipe64_readers(p));
+        serial64_puts(" readers");
+        if (pipe64_available(p) > 0)
+            serial64_puts("   <- DATA IS THERE AND IT IS ASLEEP");
+        serial64_putc('\n');
+    }
+}
+
 void syscall64_report_calls(void) {
     uint64_t total = 0;
 
