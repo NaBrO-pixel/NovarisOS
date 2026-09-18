@@ -475,6 +475,29 @@ static int wait_expired(void) {
 }
 
 static int wait_started(void) { return wait_pending[wait_slot()]; }
+
+/* Forget whatever the previous occupant of this task slot was waiting
+ * for.
+ *
+ * The bookkeeping above is indexed by task slot, and slots are
+ * recycled. While a waiting thread always came back to ring 3 - which
+ * is what yielding around a loop meant - it always cleared its own
+ * entry on the way out. A thread that sleeps does not: it can block,
+ * be woken, and exit without ever passing through wait_done, leaving
+ * wait_pending set for whoever gets the slot next. That thread's first
+ * timed wait then finds a deadline already in the past and returns at
+ * once.
+ *
+ * Measured, not imagined: the wait4 differential's child was told to
+ * sleep 400ms and exited immediately, and the kill differential's
+ * child ran through five hundred sleeps without pausing long enough
+ * for a signal to reach it. */
+static void wait_slot_reset(int t) {
+    if (t < 0 || t >= SCHED64_MAX_TASKS) return;
+    wait_pending[t]  = 0;
+    wait_deadline[t] = 0;
+    wait_call[t]     = 0;
+}
 static void wait_done(void)   { wait_pending[wait_slot()] = 0; }
 
 static uint64_t wait_restart(const syscall64_args_t* args, uint64_t nr,
@@ -931,10 +954,14 @@ static uint64_t do_fork_common(const syscall64_args_t* args,
      * fs:0x10; with FS_BASE at 0 that is a read of linear address 0x10
      * and the child dies on a null dereference that has nothing
      * visibly to do with fork. */
-    if (sched64_add_frame_for(&child, &cp->space,
-                              read_msr(0xC0000100u), child_pid) < 0) {
-        vmspace64_destroy(&cp->space);
-        return (uint64_t)-11;
+    {
+        int slot = sched64_add_frame_for(&child, &cp->space,
+                                         read_msr(0xC0000100u), child_pid);
+        if (slot < 0) {
+            vmspace64_destroy(&cp->space);
+            return (uint64_t)-11;
+        }
+        wait_slot_reset(slot);
     }
     forks++;
     {
@@ -2237,6 +2264,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
         tid = sched64_add_frame(&child, space,
                                 (a1 & CLONE_SETTLS) ? args->a5 : 0);
         if (tid < 0) return (uint64_t)-11;              /* -EAGAIN */
+        wait_slot_reset(tid);
 
         /* The parent gets the child's tid; the child gets 0 above. */
         return (uint64_t)tid + 1;
@@ -3931,7 +3959,14 @@ static uint64_t dispatch(syscall64_args_t* args) {
             return 0;
         }
 
-        return (uint64_t)(int64_t)signal64_raise(pid, sig);
+        {
+            int rc = signal64_raise(pid, sig);
+            /* And wake it, because a sleeping process never reaches the
+             * boundary where a pending signal is taken. Linux interrupts
+             * a blocking syscall for exactly this reason. */
+            if (rc == 0) sched64_wake_pid(pid);
+            return (uint64_t)(int64_t)rc;
+        }
     }
 
     case SYS64_TGKILL: {

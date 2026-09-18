@@ -134,6 +134,11 @@ int sched64_yield_current(const registers64_t* regs, registers64_t* out_regs,
 
 int sched64_wake(uint64_t addr, int max);
 
+/* Wake every blocked thread of a process, whatever it waits on - what a
+ * signal does to a wait, so that a sleeping target can reach the point
+ * where a pending signal is taken. Returns how many were woken. */
+int sched64_wake_pid(int pid);
+
 /* Enters a saved thread directly. Never returns. Implemented in
  * syscall64.s, and it depends on registers64_t's exact layout. */
 extern void sched64_resume(const registers64_t* regs)
