@@ -134,7 +134,11 @@ extern const unsigned long clock64_elf_len;
  * waiting on when it never wakes:
  *
  *   make -f Makefile.amd64 \
- *     CFLAGS_EXTRA='-DWINE64_DEBUG_STR="WINEDEBUG=err+all,fixme+all,trace+server"' ...
+ *     CFLAGS_EXTRA='-DWINE64_DEBUG_STR=\"WINEDEBUG=err+all,fixme+all,trace+server\"' ...
+ *
+ * The backslashes are not decoration: make hands the value to a shell,
+ * which eats an unescaped pair, and gcc then sees a -D whose value is
+ * not a string at all. Written the obvious way it fails to compile.
  */
 #ifndef WINE64_DEBUG_STR
 #define WINE64_DEBUG_STR \
