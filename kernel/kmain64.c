@@ -121,6 +121,26 @@ extern const unsigned char shm64_elf[];
 extern const unsigned long shm64_elf_len;
 extern const unsigned char clock64_elf[];
 extern const unsigned long clock64_elf_len;
+/* What Wine is told to report.
+ *
+ * The default is the middle setting: everything Wine considers an error
+ * or an unimplemented path, nothing it considers a trace. +all is
+ * unusable here - a hundred megabytes of serial.
+ *
+ * An investigation can ask for more without editing this file. In
+ * particular `trace+server` makes ntdll start the wineserver with -d,
+ * and the server then prints every request it handles and every
+ * "*wakeup* signaled=" - which is how to find out what a thread is
+ * waiting on when it never wakes:
+ *
+ *   make -f Makefile.amd64 \
+ *     CFLAGS_EXTRA='-DWINE64_DEBUG_STR="WINEDEBUG=err+all,fixme+all,trace+server"' ...
+ */
+#ifndef WINE64_DEBUG_STR
+#define WINE64_DEBUG_STR \
+    "WINEDEBUG=err+all,fixme+all,trace-all,warn-all,warn+winstation"
+#endif
+
 extern const unsigned char kill64_elf[];
 extern const unsigned long kill64_elf_len;
 extern const unsigned char wait64_elf[];
@@ -4289,7 +4309,7 @@ void kernel_main(uint32_t magic, void* mbi) {
              * serial), so this is the middle setting: everything Wine
              * considers an error or an unimplemented path, nothing it
              * considers a trace. */
-            "WINEDEBUG=err+all,fixme+all,trace-all,warn-all,warn+winstation",
+            WINE64_DEBUG_STR,
             /* Where the builtin PE modules are.
              *
              * Not decoration, and not something the staging could fix.
