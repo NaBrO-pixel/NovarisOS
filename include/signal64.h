@@ -142,6 +142,19 @@ void signal64_set_trace(int on);
 /* Record `sig` against `pid`. Returns 0, or a negative errno. */
 int  signal64_raise(int pid, int sig);
 
+/* The same, addressed to one thread by tid rather than to a process.
+ * tgkill(2)'s delivery; see the note on pending_by_task in signal64.c
+ * for why the two sets cannot be one. */
+int  signal64_raise_task(int tid, int sig);
+int  signal64_has_pending_task(int tid);
+int  signal64_take_pending_task(int tid);
+void signal64_clear_task(int tid);
+
+/* The pending sets themselves, read without taking anything: a call
+ * about to block asks these whether a signal is waiting. */
+uint64_t signal64_pending_set(int pid);
+uint64_t signal64_pending_set_task(int tid);
+
 /* Whether anything is recorded against this process. */
 int  signal64_has_pending(int pid);
 

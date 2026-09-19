@@ -4,6 +4,7 @@
 #include "kstring.h"
 #include "serial64.h"
 #include "proc64.h"
+#include "sched64.h"
 #include "paging64.h"
 
 #define NSIG 64
@@ -56,6 +57,17 @@ static uint64_t delivered, returns, raised;
  * where a second SIGTERM arriving before the first is taken does not
  * produce two SIGTERMs. Linux does the same for signals below 32. */
 static uint64_t pending_by_slot[PROC64_MAX];
+
+/* The same thing for a signal addressed to one thread rather than to a
+ * process, indexed by task slot - which is what a tid is here.
+ *
+ * Linux keeps these two sets apart and so must this: kill(2) may be
+ * taken by whichever thread reaches the boundary first, but tgkill(2)
+ * names a thread, and the wineserver's use of it depends on that. It
+ * stops a thread by sending it SIGUSR1 and then asks that thread for
+ * its register context; delivered to a sibling, the context handed back
+ * would be the wrong thread's and the suspended one would never stop. */
+static uint64_t pending_by_task[SCHED64_MAX_TASKS];
 
 /* Whether the default action for a signal is to ignore it.
  *
@@ -133,6 +145,57 @@ int signal64_take_pending(int pid) {
     return 0;
 }
 
+int signal64_raise_task(int tid, int sig) {
+    if (sig <= 0 || sig >= NSIG)            return -22;  /* -EINVAL */
+    if (tid < 0 || tid >= SCHED64_MAX_TASKS) return -3;  /* -ESRCH  */
+    if (sched64_task_pid(tid) < 0)           return -3;  /* -ESRCH  */
+
+    pending_by_task[tid] |= 1ull << sig;
+    raised++;
+    return 0;
+}
+
+int signal64_has_pending_task(int tid) {
+    if (tid < 0 || tid >= SCHED64_MAX_TASKS) return 0;
+    return pending_by_task[tid] != 0;
+}
+
+int signal64_take_pending_task(int tid) {
+    uint64_t set;
+
+    if (tid < 0 || tid >= SCHED64_MAX_TASKS) return 0;
+    set = pending_by_task[tid];
+    if (!set) return 0;
+
+    for (int sig = 1; sig < NSIG; sig++) {
+        if (!(set & (1ull << sig))) continue;
+        pending_by_task[tid] &= ~(1ull << sig);
+        return sig;
+    }
+    return 0;
+}
+
+/* Task slots are recycled, so a new thread must not inherit what was
+ * addressed to the one that used to live in its slot. clone(2) and
+ * fork(2) call this for the slot they were given. */
+void signal64_clear_task(int tid) {
+    if (tid < 0 || tid >= SCHED64_MAX_TASKS) return;
+    pending_by_task[tid] = 0;
+}
+
+/* What is pending without taking any of it, so that a caller about to
+ * block can ask whether it should return -EINTR instead. */
+uint64_t signal64_pending_set(int pid) {
+    int slot = proc64_slot_of(pid);
+    if (slot < 0 || slot >= PROC64_MAX) return 0;
+    return pending_by_slot[slot];
+}
+
+uint64_t signal64_pending_set_task(int tid) {
+    if (tid < 0 || tid >= SCHED64_MAX_TASKS) return 0;
+    return pending_by_task[tid];
+}
+
 uint64_t signal64_raised(void) { return raised; }
 
 void signal64_reset(void) {
@@ -148,6 +211,7 @@ void signal64_reset(void) {
      * bit set means the next process to land in that slot inherits a
      * SIGTERM nobody sent it. */
     for (int i = 0; i < PROC64_MAX; i++) pending_by_slot[i] = 0;
+    for (int i = 0; i < SCHED64_MAX_TASKS; i++) pending_by_task[i] = 0;
 
     delivered = 0;
     returns = 0;

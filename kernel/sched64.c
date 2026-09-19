@@ -345,6 +345,12 @@ _Static_assert(__builtin_offsetof(registers64_t, rflags) == 152, "rflags");
 _Static_assert(__builtin_offsetof(registers64_t, rsp)    == 160, "rsp");
 _Static_assert(__builtin_offsetof(registers64_t, ss)     == 168, "ss");
 
+/* Defined with the rest of the idle machinery further down; needed
+ * here because a thread can exit while every one of its siblings is
+ * asleep on the clock. */
+static int any_deadline(void);
+static int idle_until_runnable(void);
+
 int sched64_exit_current(registers64_t* out_regs, vmspace64_t* out_space,
                          uint64_t* out_fs_base) {
     int next;
@@ -367,7 +373,24 @@ int sched64_exit_current(registers64_t* out_regs, vmspace64_t* out_space,
      * fixed on sight rather than left for the run that finds it. */
     for (next = 0; next < SCHED64_MAX_TASKS; next++)
         if (tasks[next].used && !tasks[next].blocked) break;
-    if (next == SCHED64_MAX_TASKS) { current = -1; return 0; }
+
+    /* Nothing runnable at this instant is not the same as nothing left
+     * to run: a sibling asleep on the clock becomes runnable when the
+     * timer says so. Without this, a thread that exits while every
+     * other thread of its process is in nanosleep ends the whole run -
+     * measured in the tgkill differential as a program that stopped
+     * printing the moment its second thread finished, having passed
+     * every assertion up to that one.
+     *
+     * The guard is the one the blocking path uses: halting is safe only
+     * while the timer can still interrupt and something is genuinely
+     * waiting on it. Otherwise there really is nothing to come back
+     * for. */
+    if (next == SCHED64_MAX_TASKS && !idt64_irq_is_masked(0) &&
+        any_deadline())
+        next = idle_until_runnable();
+
+    if (next < 0 || next >= SCHED64_MAX_TASKS) { current = -1; return 0; }
 
     /* Nothing to save: the task that was running has ended. */
     current = next;
@@ -395,10 +418,17 @@ int sched64_exit_process(int pid, registers64_t* out_regs,
         if (task_total > 0) task_total--;
     }
 
-    /* Runnable, for the same reason as above. */
+    /* Runnable, for the same reason as above - and idle rather than
+     * give up, for the same reason as above too: one process ending
+     * while another sleeps on the clock is not the end of the run. */
     for (next = 0; next < SCHED64_MAX_TASKS; next++)
         if (tasks[next].used && !tasks[next].blocked) break;
-    if (next == SCHED64_MAX_TASKS) { current = -1; return 0; }
+
+    if (next == SCHED64_MAX_TASKS && !idt64_irq_is_masked(0) &&
+        any_deadline())
+        next = idle_until_runnable();
+
+    if (next < 0 || next >= SCHED64_MAX_TASKS) { current = -1; return 0; }
 
     /* Nothing to save: every thread of that process has ended. */
     current = next;
@@ -630,6 +660,21 @@ int sched64_wake_pid(int pid) {
         woken++;
     }
     return woken;
+}
+
+int sched64_task_pid(int tid) {
+    if (tid < 0 || tid >= SCHED64_MAX_TASKS) return -1;
+    if (!tasks[tid].used) return -1;
+    return tasks[tid].pid;
+}
+
+int sched64_wake_tid(int tid) {
+    if (tid < 0 || tid >= SCHED64_MAX_TASKS) return 0;
+    if (!tasks[tid].used || !tasks[tid].blocked) return 0;
+    tasks[tid].blocked   = 0;
+    tasks[tid].wait_addr = 0;
+    tasks[tid].regs.rax  = tasks[tid].wake_rax;
+    return 1;
 }
 
 int sched64_wake(uint64_t addr, int max) {
