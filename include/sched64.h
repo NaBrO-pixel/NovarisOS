@@ -164,6 +164,21 @@ int sched64_block_until(const registers64_t* regs, uint64_t addr,
  * where a pending signal is taken. Returns how many were woken. */
 int sched64_wake_pid(int pid);
 
+/* The pid a task slot belongs to, or -1 if the slot is not in use.
+ *
+ * clone(2) gives a new thread a slot of its own and its creator's pid,
+ * so this is what makes a thread group expressible here: every task
+ * that answers the same pid is a thread of the same process. tgkill(2)
+ * checks its tgid argument against exactly that. */
+int sched64_task_pid(int tid);
+
+/* Wake one blocked task by slot, rather than every thread of a process.
+ * Returns 1 if it was blocked and is now runnable, 0 otherwise.
+ *
+ * A thread-directed signal has one target, and waking its siblings
+ * would return them from blocking calls they have no reason to leave. */
+int sched64_wake_tid(int tid);
+
 /* Enters a saved thread directly. Never returns. Implemented in
  * syscall64.s, and it depends on registers64_t's exact layout. */
 extern void sched64_resume(const registers64_t* regs)

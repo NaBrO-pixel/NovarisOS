@@ -497,8 +497,33 @@ static void wait_slot_reset(int t) {
     wait_pending[t]  = 0;
     wait_deadline[t] = 0;
     wait_call[t]     = 0;
+    /* And anything tgkill(2) addressed to whoever held this slot
+     * before. A new thread inheriting a dead one's pending SIGUSR1
+     * would stop on a suspend nobody asked it for. */
+    signal64_clear_task(t);
 }
 static void wait_done(void)   { wait_pending[wait_slot()] = 0; }
+
+/* Whether a signal is waiting that this thread would actually act on.
+ *
+ * A pending signal whose disposition is to ignore it is not one: it
+ * would be dropped at the delivery point and the caller would have
+ * returned -EINTR for nothing. */
+static int signal_interrupts_wait(void) {
+    int me = proc64_current_pid();
+    uint64_t set;
+
+    if (me < 0) return 0;
+    set = signal64_pending_set_task(sched64_current()) |
+          signal64_pending_set(me);
+    if (!set) return 0;
+
+    for (int sig = 1; sig < 64; sig++) {
+        if (!(set & (1ull << sig))) continue;
+        if (signal64_disposition(me, sig) != SIG64_DISP_IGNORE) return 1;
+    }
+    return 0;
+}
 
 static uint64_t wait_restart(const syscall64_args_t* args, uint64_t nr,
                              uint64_t deadline) {
@@ -506,6 +531,26 @@ static uint64_t wait_restart(const syscall64_args_t* args, uint64_t nr,
     vmspace64_t next_space;
     uint64_t next_fs;
     int t = wait_slot();
+
+    /* A signal waiting for this thread ends the call here rather than
+     * parking, because parking is where it would be lost: a task that
+     * blocks leaves through the scheduler and never reaches the
+     * delivery point at the end of syscall64_dispatch, so the handler
+     * would not run until something else happened to wake it.
+     *
+     * Linux interrupts a blocking call for exactly this reason, and
+     * Wine depends on it. The wineserver stops a thread by sending it
+     * SIGUSR1 and the thread it stops is very often asleep in a read on
+     * its wait descriptor; without this, the signal sits pending and
+     * the thread sleeps through its own suspension.
+     *
+     * -EINTR is returned to the syscall's caller, and the signal is
+     * delivered on the way out with that in rax - which is what a
+     * handler installed without SA_RESTART sees on Linux. */
+    if (signal_interrupts_wait()) {
+        wait_pending[t] = 0;
+        return (uint64_t)-4;                               /* -EINTR */
+    }
 
     wait_deadline[t] = deadline;
     wait_call[t]     = nr;
@@ -648,6 +693,16 @@ static int64_t do_pipe_read(const syscall64_args_t* args, uint64_t nr,
     r = pipe64_read(fds[fd].rx, buf, n);
     if (r != -11) return r;                            /* data, or EOF */
     if (fds[fd].nonblock) return -11;                  /* -EAGAIN */
+
+    /* This is the read a Wine client sleeps in - the wineserver writes
+     * a thread's wakeup to it - so it is the one that has to end when
+     * the server signals that thread to stop. A signal that waits for
+     * the sleeper to wake up by itself never arrives.
+     *
+     * Checked after the pipe, not before: data already there is
+     * returned rather than discarded in favour of -EINTR, which is
+     * Linux's order too. */
+    if (signal_interrupts_wait()) return -4;           /* -EINTR */
 
     frame_from_args(args, nr, &self);
     self.rip = args->ret_rip - 2;
@@ -1284,10 +1339,19 @@ uint64_t syscall64_dispatch(syscall64_args_t* args) {
         int me = proc64_current_pid();
         proc64_t* p = proc64_current();
 
-        if (me >= 0 && p && !p->exited && signal64_has_pending(me)) {
+        /* Two sets are drained here, the thread's before the process's.
+         * A signal sent with tgkill(2) names this thread and no other,
+         * so it is kept against the task slot; one sent with kill(2)
+         * belongs to the process and may be taken by whichever thread
+         * gets here first. Linux keeps them apart for the same reason
+         * and takes the thread's first. */
+        if (me >= 0 && p && !p->exited &&
+            (signal64_has_pending_task(sched64_current()) ||
+             signal64_has_pending(me))) {
             int sig;
 
-            while ((sig = signal64_take_pending(me)) > 0) {
+            while ((sig = signal64_take_pending_task(sched64_current())) > 0 ||
+                   (sig = signal64_take_pending(me)) > 0) {
                 int disp = signal64_disposition(me, sig);
 
                 if (disp == SIG64_DISP_IGNORE) continue;
@@ -2389,6 +2453,13 @@ static uint64_t dispatch(syscall64_args_t* args) {
          * wait4 says "nothing to report": not an error, not a pid. */
         if (options & WAIT64_NOHANG) return 0;
 
+        /* A signal waiting for this thread ends the call rather than
+         * parking it, because parking is where it would be lost: a
+         * task that blocks leaves through the scheduler and never
+         * reaches the delivery point at the end of syscall64_dispatch.
+         * See the longer note in wait_restart. */
+        if (signal_interrupts_wait()) return (uint64_t)-4;  /* -EINTR */
+
         /* Blocked, and restarted rather than resumed: rewind rip by the
          * two bytes of the `syscall` instruction and put the number
          * back in rax, so waking re-executes the call and re-checks.
@@ -2687,6 +2758,9 @@ static uint64_t dispatch(syscall64_args_t* args) {
                 return wait_restart(args, nr,
                                     clock64_ticks() + (want ? want : 1));
             }
+
+            if (signal_interrupts_wait())
+                return (uint64_t)-4;               /* -EINTR */
 
             futex_waits++;
             frame_from_args(args, 0, &self);
@@ -3011,6 +3085,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
 
         if (rc == -11) {                               /* -EAGAIN */
             if (fds[a1].nonblock) return (uint64_t)-11;
+            if (signal_interrupts_wait()) return (uint64_t)-4;  /* -EINTR */
 
             frame_from_args(args, nr, &self);
             self.rip = args->ret_rip - 2;
@@ -3923,21 +3998,6 @@ static uint64_t dispatch(syscall64_args_t* args) {
     case SYS64_FREMOVEXATTR:
         return (uint64_t)-61;                      /* -ENODATA */
 
-    /* tkill(2) and tgkill(2), which is how a program raises a signal on
-     * itself.
-     *
-     * glibc's abort() is raise(SIGABRT), and raise is tgkill(getpid(),
-     * gettid(), sig). With no tgkill it got -ENOSYS, and abort's
-     * fallback for a signal it cannot send is an instruction the CPU
-     * refuses - so a missing syscall arrived two steps later as a
-     * general protection fault that halted the machine.
-     *
-     * Only the calling thread is a target here. Signalling another
-     * thread needs a pending-signal queue this kernel does not have,
-     * and nothing has asked for it: every tgkill measured in a prefix
-     * run is a thread naming itself. A different target is refused
-     * rather than silently delivered to the wrong one. */
-    case SYS64_TKILL:
     /* kill(2).
      *
      * Chromium asks for this twice in a run and got -ENOSYS both times,
@@ -3998,27 +4058,93 @@ static uint64_t dispatch(syscall64_args_t* args) {
         }
     }
 
+    /* tkill(2) and tgkill(2): a signal addressed to one thread.
+     *
+     * glibc's abort() is raise(SIGABRT), and raise is tgkill(getpid(),
+     * gettid(), sig). With no tgkill it got -ENOSYS, and abort's
+     * fallback for a signal it cannot send is an instruction the CPU
+     * refuses - so a missing syscall arrived two steps later as a
+     * general protection fault that halted the machine.
+     *
+     * That self-signal was all this used to do: `if (tid !=
+     * proc64_current_pid()) return -ESRCH`, on the reasoning that every
+     * tgkill measured in a prefix run was a thread naming itself. Two
+     * things were wrong with it. A tid is not a pid - gettid(2) returns
+     * a task slot and getpid(2) a process - so the comparison was
+     * between different numbers that happened to agree for a
+     * single-threaded process. And chrome.exe is not single-threaded:
+     * its StackSamplingProfiler calls NtSuspendThread on the main
+     * thread, the wineserver implements that by sending the target
+     * SIGUSR1 and then asking it for its register context, and -ESRCH
+     * to that tgkill left the server believing the thread had died -
+     * it clears unix_pid and unix_tid on ESRCH - while the thread
+     * itself ran on, permanently marked suspended. Every wait that
+     * thread then made was answered with STATUS_PENDING by a server
+     * that will not let a suspended thread acquire anything, which is
+     * where chrome.exe stopped: waiting forever on an unowned mutex
+     * that was signalled the whole time.
+     *
+     * So the target is a thread, named by slot, and the signal reaches
+     * that thread and no other. */
+    case SYS64_TKILL:
     case SYS64_TGKILL: {
-        int sig = (nr == SYS64_TGKILL) ? (int)(int32_t)a3 : (int)(int32_t)a2;
-        int tid = (nr == SYS64_TGKILL) ? (int)(int32_t)a2 : (int)(int32_t)a1;
+        int tgid = (nr == SYS64_TGKILL) ? (int)(int32_t)a1 : -1;
+        int tid  = (nr == SYS64_TGKILL) ? (int)(int32_t)a2 : (int)(int32_t)a1;
+        int sig  = (nr == SYS64_TGKILL) ? (int)(int32_t)a3 : (int)(int32_t)a2;
+        int slot, tpid;
         registers64_t self;
 
         if (sig < 0 || sig >= 64) return (uint64_t)-22;     /* -EINVAL */
-        if (tid != proc64_current_pid()) return (uint64_t)-3; /* -ESRCH */
+        if (tid <= 0)             return (uint64_t)-22;     /* -EINVAL */
+        if (nr == SYS64_TGKILL && tgid <= 0) return (uint64_t)-22;
+
+        /* A tid here is a task slot counted from one, because that is
+         * what gettid(2) returns. */
+        slot = tid - 1;
+        tpid = sched64_task_pid(slot);
+        if (tpid < 0) return (uint64_t)-3;                  /* -ESRCH */
+
+        /* tgkill's first argument names the thread group the tid must
+         * belong to, and checking it is the whole reason the call
+         * exists alongside tkill: a tid recycled into another process
+         * must not be signalled by a caller that meant the old one.
+         * Every thread of a process answers the same pid here, because
+         * clone(2) gives a new task its creator's - so the group is
+         * expressible and this is a real check rather than a skipped
+         * one. */
+        if (nr == SYS64_TGKILL && tpid != tgid) return (uint64_t)-3;
+
         if (sig == 0) return 0;                  /* the existence check */
 
-        /* Entered as if the signal had arrived on the way out of this
-         * call: the frame is this syscall's, so a handler that returns
-         * resumes after it, and one that does not returns wherever it
-         * decides to. */
-        frame_from_args(args, 0, &self);
-        if (signal64_deliver(sig, &self, 0)) sched64_resume(&self);
+        if (slot == sched64_current()) {
+            /* Entered as if the signal had arrived on the way out of
+             * this call: the frame is this syscall's, so a handler that
+             * returns resumes after it, and one that does not returns
+             * wherever it decides to. raise() and abort() want the
+             * handler to have run by the time the call returns, not at
+             * some later syscall. */
+            frame_from_args(args, 0, &self);
+            if (signal64_deliver(sig, &self, 0)) sched64_resume(&self);
+            if (signal64_disposition(tpid, sig) == SIG64_DISP_IGNORE)
+                return 0;
 
-        /* Uncaught. The default action for the signals that get here -
-         * SIGABRT among them - is to end the process, which is what
-         * abort() is asking for in the first place. */
-        die_by_signal(sig);
-        return 0;
+            /* Uncaught. The default action for the signals that get
+             * here - SIGABRT among them - is to end the process, which
+             * is what abort() is asking for in the first place. */
+            die_by_signal(sig);
+            return 0;
+        }
+
+        /* Another thread. There is no frame to rewrite - it may be
+         * blocked, or on no CPU at all - so the signal is recorded
+         * against its slot and acted on where that thread next returns
+         * from a syscall, and the thread is woken so that it reaches
+         * that point. See the delivery in syscall64_dispatch. */
+        {
+            int rc = signal64_raise_task(slot, sig);
+            if (rc == 0) sched64_wake_tid(slot);
+            return (uint64_t)(int64_t)rc;
+        }
     }
 
     /* sched_yield(2).
