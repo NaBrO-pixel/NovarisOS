@@ -4661,6 +4661,54 @@ void syscall64_report_pipe_waits(void) {
     }
 }
 
+/* Every pipe that has bytes nobody has taken.
+ *
+ * The pipe-wait report says what blocked readers are waiting for, and
+ * found all of them waiting on empty pipes. That answers half the
+ * question: the readers are correct and somebody upstream did not
+ * write. The other half is whether anything was written that nobody
+ * read - a request sitting unread in a pipe is a server that is not
+ * listening, and it looks identical from the client side to a server
+ * that heard and did not answer.
+ *
+ * So: every pipe with data in it, and whether any thread is parked on
+ * it. Data with a waiter is a wakeup that has not happened yet. Data
+ * with no waiter is somebody who should be reading and is not. */
+void syscall64_report_unread_pipes(void) {
+    int said = 0;
+
+    for (int p = 0; p < PIPE64_MAX; p++) {
+        uint64_t avail = pipe64_available(p);
+        int waiter = 0;
+
+        if (!avail) continue;
+
+        for (int i = 0; i < SCHED64_MAX_TASKS; i++)
+            if (sched64_blocked_on(i) == PIPE64_WAIT_KEY(p)) { waiter = 1; break; }
+
+        if (!said) {
+            serial64_puts("NOVARIS64: [unread] pipes holding bytes nobody"
+                          " has taken\n");
+            said = 1;
+        }
+        serial64_puts("NOVARIS64: [unread] pipe ");
+        serial64_putdec((uint64_t)p);
+        serial64_puts(": ");
+        serial64_putdec(avail);
+        serial64_puts(" bytes, ");
+        serial64_putdec((uint64_t)pipe64_writers(p));
+        serial64_puts(" writers, ");
+        serial64_putdec((uint64_t)pipe64_readers(p));
+        serial64_puts(" readers");
+        serial64_puts(waiter ? "   <- a thread is parked on it"
+                             : "   <- NOBODY IS WAITING FOR IT");
+        serial64_putc('\n');
+    }
+    if (!said)
+        serial64_puts("NOVARIS64: [unread] every pipe in the system is"
+                      " empty\n");
+}
+
 void syscall64_report_calls(void) {
     uint64_t total = 0;
 
