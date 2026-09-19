@@ -355,6 +355,11 @@ void     syscall64_report_calls(void);
  * already there - which separates "nobody wrote" from "somebody wrote
  * and this thread was never woken". */
 void     syscall64_report_pipe_waits(void);
+
+/* Every pipe holding bytes nobody has taken, and whether any thread is
+ * parked on it - which separates "a wakeup is owed" from "somebody who
+ * should be reading is not". */
+void     syscall64_report_unread_pipes(void);
 uint64_t syscall64_last_arg(void);
 uint64_t syscall64_exit_code(void);
 uint64_t syscall64_bytes_written(void);
