@@ -88,6 +88,36 @@ if ! grep -q 'novaris,mac,x11,wayland' "$WINE_SRC/programs/explorer/desktop.c"; 
     }
 fi
 
+# And how long a process waits for explorer.
+#
+# The first process to want a window finds no desktop, starts
+# `explorer.exe /desktop`, and waits for it with
+# NtUserWaitForInputIdle(process, 10000). If explorer is not idle in ten
+# seconds, win32u stops waiting and asks the server to force a desktop
+# window into existence - one with no display GUID on it, because only
+# explorer sets that. From then on every process that loads its display
+# driver looks the GUID up, finds nothing, and reports "The explorer
+# process failed to start", Notepad included.
+#
+# On real hardware explorer is idle in well under a second. On an
+# emulated machine, in the middle of wineboot, it was measured at about
+# twenty: explorer.exe loaded 14s after `wine notepad.exe` was typed and
+# loaded winenovaris.drv at 23s. So whether `make test-wine-gui` passed
+# was a matter of which side of ten seconds that landed. Two minutes is
+# far past it, and costs nothing when explorer dies instead: the same
+# call waits on the process handle and returns the moment it exits.
+#
+# One `sed`, and it is idempotent.
+if ! grep -q 'NtUserWaitForInputIdle( process, 120000, FALSE )' "$WINE_SRC/dlls/win32u/winstation.c"; then
+    echo "giving explorer two minutes to start, not ten seconds"
+    sed -i 's|NtUserWaitForInputIdle( process, 10000, FALSE )|NtUserWaitForInputIdle( process, 120000, FALSE )|' \
+        "$WINE_SRC/dlls/win32u/winstation.c"
+    grep -q 'NtUserWaitForInputIdle( process, 120000, FALSE )' "$WINE_SRC/dlls/win32u/winstation.c" || {
+        echo "could not patch win32u's explorer wait" >&2
+        exit 1
+    }
+fi
+
 # The generated Makefile is what `make` reads; it comes from configure,
 # which comes from configure.ac.
 if [ -n "$NEED_CONFIGURE" ] || [ ! -f "$WINE_SRC/dlls/winenovaris.drv/Makefile" ]; then
@@ -126,6 +156,7 @@ echo "building winenovaris.drv"
 (cd "$WINE_SRC" && make -j"$(nproc)" \
     "dlls/winenovaris.drv/$PEARCH/winenovaris.drv" \
     dlls/winenovaris.drv/winenovaris.so \
+    dlls/win32u/win32u.so \
     "programs/explorer/$PEARCH/explorer.exe")
 
 # What tools/install_wine.sh looks for.
