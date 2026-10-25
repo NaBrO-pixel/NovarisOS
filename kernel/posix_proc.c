@@ -210,6 +210,13 @@ int posix_proc_count(void) {
     return n;
 }
 
+/* The slot whatever its state, for the F12 dump - which wants to know
+ * when a descriptor survives in the table of a process that is gone. */
+posix_proc_t* posix_proc_slot(int index) {
+    if (index < 0 || index >= POSIX_MAX_PROCS) return 0;
+    return &procs[index];
+}
+
 posix_proc_t* posix_proc_at(int index) {
     if (index < 0 || index >= POSIX_MAX_PROCS) return 0;
     return procs[index].in_use ? &procs[index] : 0;

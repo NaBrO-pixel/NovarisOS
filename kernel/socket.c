@@ -1555,8 +1555,9 @@ static void sdump_holders(socket_t* s) {
     char num[12];
     int any = 0;
     for (int i = 0; i < POSIX_MAX_PROCS; i++) {
-        posix_proc_t* p = posix_proc_at(i);
+        posix_proc_t* p = posix_proc_slot(i);
         if (!p) continue;
+        const char* gone = !p->in_use ? " [slot free]" : p->exited ? " [exited]" : "";
         for (int fd = 0; fd < POSIX_MAX_FDS; fd++) {
             if (p->fds[fd].kind != FD_SOCKET || p->fds[fd].sock != s) continue;
             const char* exe = p->exe_path;
@@ -1569,6 +1570,7 @@ static void sdump_holders(socket_t* s) {
             sdump_hex(p->page_directory);
             serial_writestring(") fd ");
             ku32_to_dec((uint32_t)fd, num);     serial_writestring(num);
+            serial_writestring(gone);
             any = 1;
         }
     }

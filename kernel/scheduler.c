@@ -45,8 +45,19 @@
  * child is a task like any other and so is a thread, so a Wine batch is
  * the loader, a wineserver, wineboot and its helpers, and every thread
  * each of them creates. Sixteen was enough for one unthreaded program
- * and a server; it is not enough for a threaded one. */
-#define MAX_PROCESSES 32
+ * and a server; it is not enough for a threaded one.
+ *
+ * And thirty-two is not enough for a prefix. The table is append-only -
+ * a task that exits keeps its slot until the batch is reaped - so the
+ * number that matters is every task the run ever creates, and a first
+ * wineboot that installs Wine's services creates 82 of them, measured on
+ * the host with strace -f: 17 processes and the rest their threads.
+ * Past the 32nd every fork and clone failed, so the next service or
+ * installer process could not start, and whatever waited for it waited
+ * with every other task in the machine. A live slot costs an 8KB kernel
+ * stack and an FPU area, which an exited one holds until the reap anyway;
+ * this is the table, not the memory. */
+#define MAX_PROCESSES 256
 /* 8KB, not 4KB. Milestone 17 runs Win32 programs as scheduler tasks, and
  * their kernel-side call chains are far deeper than a demo task's
  * sys_write: int 0x81 -> win32_dispatch -> printf -> the format engine ->
@@ -980,6 +991,13 @@ void scheduler_dump_tasks(void) {
             if ((f->cs & 3) == 3) {
                 serial_writestring(" sys ");
                 dump_dec(f->eax);
+                serial_writestring("(");
+                dump_dec(f->ebx);
+                serial_writestring(", ");
+                dump_hex(f->ecx);
+                serial_writestring(", ");
+                dump_dec(f->edx);
+                serial_writestring(")");
                 serial_writestring(" eip ");
                 dump_hex(f->eip);
             }
