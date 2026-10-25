@@ -290,19 +290,52 @@ if [ -d "$WINE_BUILD/fonts" ]; then
     cp "$WINE_BUILD"/fonts/*.ttf "$DATADIR/fonts/" 2>/dev/null || true
 fi
 
-# And the rasteriser, which is not in any binary's NEEDED list because
-# win32u dlopen()s it by SONAME - so the "ask the binaries" loop below
-# cannot find it. Named here, with what it needs, because a library
-# nothing links against is exactly the kind that gets forgotten.
-for lib in libfreetype.so.6 libz.so.1 libbz2.so.1.0 libpng16.so.16 \
-           libbrotlidec.so.1 libbrotlicommon.so.1; do
-    for dir in "$HOST_LIB32" /usr/lib/i386-linux-gnu; do
-        if [ -f "$dir/$lib" ]; then
-            cp "$dir/$lib" "$ROOT/lib32/$lib"
-            break
+# And the libraries win32u dlopen()s by SONAME, which are in no binary's
+# NEEDED list - so the "ask the binaries" loop below cannot find them.
+#
+# This was a hand-written list naming FreeType and what FreeType needs,
+# and it was wrong the moment a Wine was configured with fontconfig as
+# well: win32u then dlopens libfontconfig.so.1, finds FreeType without
+# it, and crashes in its font setup. That crash is inside init_user(),
+# before winstation_init(), so no process ever gets a window station -
+# what it looks like is "Cannot get server thread queue" and "failed to
+# create desktop window", with nothing anywhere naming a font. The
+# 64-bit side measured the same thing in Milestone 89: FreeType alone was
+# 865 segfaults, FreeType with fontconfig was 13.
+#
+# So the list is Wine's own config.h, as tools/stage_wine.sh does it: one
+# SONAME_* line per library this tree will dlopen, each resolved to the
+# host's i386 copy and closed under ldd, because a dlopen that fails on
+# a dependency is the same silence as one that fails on the library.
+CFG="$WINE_BUILD/include/config.h"
+if [ -f "$CFG" ]; then
+    staged=0 skipped=""
+    for so in $(sed -n 's/^#define SONAME_[A-Z0-9_]*  *"\(.*\)"/\1/p' "$CFG"); do
+        # ldconfig lists both architectures; "(libc6)" alone is i386.
+        path=$(ldconfig -p 2>/dev/null |
+               awk -v s="$so" '$1==s && $2=="(libc6)" {print $NF; exit}')
+        if [ -z "$path" ] || [ ! -f "$path" ]; then
+            skipped="$skipped $so"
+            continue
         fi
+        for pair in "$so|$path" $(ldd "$path" 2>/dev/null |
+                        sed -n 's/^[[:space:]]*\([^ ]*\) => \([^ ]*\).*/\1|\2/p'); do
+            name=${pair%%|*}
+            file=${pair#*|}
+            case "$name" in
+                # Staged below from HOST_LIB32, with the ld.so they match.
+                libc.so.6|libm.so.6|libgcc_s.so.1|ld-linux*) continue ;;
+            esac
+            [ -f "$file" ] || continue
+            cp "$file" "$ROOT/lib32/$name" && staged=$((staged+1))
+        done
     done
-done
+    echo "  $staged dlopen libraries and dependencies, from config.h"
+    [ -n "$skipped" ] && echo "  not on this host:$skipped"
+else
+    echo "  no config.h at $CFG - no dlopen libraries staged" >&2
+fi
+
 # The NLS tables, whole rather than hand-picked: wineserver calls
 # fatal_error() if it cannot load l_intl.nls, and kernelbase's
 # init_locale walks sortdefault.nls without checking that it got it. A
