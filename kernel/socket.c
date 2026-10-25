@@ -343,7 +343,18 @@ void socket_close(socket_t* s) {
         scheduler_wake_on((uint32_t)s->peer, MAX_SOCKETS, 0);
     }
     for (uint32_t i = 0; i < s->backlog_count; i++) sock_free(s->backlog[i]);
+    /* Descriptors still queued here will never be received, and each
+     * holds a reference to what it names - see posix_fd_discard(). Taken
+     * out of the socket first, because releasing one can close another
+     * socket; that one cannot be this one, since a queued descriptor
+     * naming this socket would hold a reference and it would not be
+     * closing. */
+    uint32_t tokens[MAX_PASSED_FDS];
+    uint32_t ntok = s->passed_count;
+    for (uint32_t i = 0; i < ntok; i++) tokens[i] = s->passed[i].token;
+    s->passed_count = 0;
     sock_free(s);
+    for (uint32_t i = 0; i < ntok; i++) posix_fd_discard(tokens[i]);
 }
 
 /* --- connecting a pair --------------------------------------------------- */
@@ -1562,6 +1573,11 @@ static void sdump_holders(socket_t* s) {
         }
     }
     if (!any) serial_writestring(" held by nobody");
+    serial_writestring(" [refs ");
+    ku32_to_dec((uint32_t)s->refs, num); serial_writestring(num);
+    serial_writestring(", in flight ");
+    ku32_to_dec((uint32_t)posix_in_flight_refs(s), num); serial_writestring(num);
+    serial_writestring("]");
 }
 
 void socket_dump_pending(void) {
@@ -1593,9 +1609,33 @@ void socket_dump_pending(void) {
         }
         serial_writestring("\n");
     }
+    /* And every socket somebody is parked on, whatever it holds: a
+     * waiter's socket and its peer, and who holds each, is what says
+     * whose turn it is. */
+    for (int i = 0; i < MAX_SOCKETS; i++) {
+        socket_t* s = &sockets[i];
+        if (s->state == SS_FREE) continue;
+        int w = scheduler_waiters_on((uint32_t)s);
+        if (!w) continue;
+        serial_writestring("[socks] waited on: ");
+        sdump_hex((uint32_t)s);
+        serial_writestring(s->peer_closed ? " (peer closed)" : "");
+        serial_writestring(", ");
+        ku32_to_dec(s->count, num); serial_writestring(num);
+        serial_writestring(" bytes;");
+        sdump_holders(s);
+        if (s->peer) {
+            serial_writestring("; peer ");
+            sdump_hex((uint32_t)s->peer);
+            sdump_holders(s->peer);
+        }
+        serial_writestring("\n");
+    }
     serial_writestring("[socks] ");
     ku32_to_dec((uint32_t)live, num);    serial_writestring(num);
     serial_writestring(" live, ");
     ku32_to_dec((uint32_t)pending, num); serial_writestring(num);
-    serial_writestring(" holding something unread\n");
+    serial_writestring(" holding something unread, ");
+    ku32_to_dec((uint32_t)posix_in_flight_used(), num); serial_writestring(num);
+    serial_writestring(" descriptors in flight\n");
 }

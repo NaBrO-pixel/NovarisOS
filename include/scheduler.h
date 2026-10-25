@@ -417,4 +417,7 @@ void scheduler_tick(registers_t* regs);
  * the keyboard interrupt when F12 is pressed; see scheduler.c. */
 void scheduler_dump_tasks(void);
 
+/* Blocked tasks parked on `addr`; see scheduler.c. */
+int scheduler_waiters_on(uint32_t addr);
+
 #endif

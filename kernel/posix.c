@@ -157,6 +157,49 @@ int posix_fd_import(uint32_t token) {
     return fd;
 }
 
+/* A descriptor that was sent and will never be received - its socket is
+ * being freed with the message still in it - released the way close()
+ * would release it.
+ *
+ * Without this the in-flight entry, and the reference it holds, lasted
+ * for ever. That leaks a slot of a 32-entry table, which is bad, and it
+ * keeps the passed object open, which is worse: a pipe or socket end
+ * nobody can ever close again is one whose peer never sees end of
+ * stream. Wine is where that bit. A client that exits with the server's
+ * last descriptor still queued to it - the server answering a request
+ * the client no longer waits for - left the objects in that message
+ * alive, and the wineserver, which learns of a client's death from the
+ * hang-up on its descriptors, never learnt of this one. So the process
+ * handle never became signalled, and wineboot, waiting on it, waited
+ * with every other task in the machine: a first boot that went silent
+ * after the last terminate_process and stayed that way. */
+/* How many queued, not-yet-received descriptors name `sock` - for the F12
+ * dump, so a socket that no process holds can be told apart from one
+ * that is kept alive by a message nobody will read. */
+int posix_in_flight_refs(struct socket* sock) {
+    int n = 0;
+    for (int i = 0; i < MAX_IN_FLIGHT; i++) {
+        if (in_flight[i].kind == FD_SOCKET && in_flight[i].sock == sock) n++;
+    }
+    return n;
+}
+
+int posix_in_flight_used(void) {
+    int n = 0;
+    for (int i = 0; i < MAX_IN_FLIGHT; i++) if (in_flight[i].kind != FD_FREE) n++;
+    return n;
+}
+
+void posix_fd_discard(uint32_t token) {
+    if (!token || token > MAX_IN_FLIGHT) return;
+    fd_entry_t* e = &in_flight[token - 1];
+    if (e->kind == FD_SOCKET) socket_close(e->sock);
+    if (e->kind == FD_FILE) vfs_node_unref(e->node);
+    e->kind = FD_FREE;
+    e->node = 0;
+    e->sock = 0;
+}
+
 /* --- files kept alive by a mapping (Milestone 30) ------------------------
  *
  * A shared mapping outlives the descriptor it was made from, and on Unix
@@ -308,8 +351,9 @@ static void process_teardown(int status) {
 
     /* Every descriptor this process still holds. A socket's peer has to
      * find out, or a reader on the far side waits for a writer that has
-     * gone - which is precisely how a pipe reports end of file. */
-    for (int i = 3; i < MAX_FDS; i++) {
+     * gone - which is precisely how a pipe reports end of file. From 0,
+     * not 3: a standard stream can be a pipe - see sys_close(). */
+    for (int i = 0; i < MAX_FDS; i++) {
         if (p->fds[i].kind == FD_SOCKET) socket_close(p->fds[i].sock);
         if (p->fds[i].kind == FD_FILE) vfs_node_unref(p->fds[i].node);
         p->fds[i].kind = FD_FREE;
@@ -352,7 +396,7 @@ void posix_exit_process_group(int wstatus) {
     /* Force the teardown even though siblings exist: they are about to
      * stop too. */
     posix_proc_t* p = posix_current();
-    for (int i = 3; i < MAX_FDS; i++) {
+    for (int i = 0; i < MAX_FDS; i++) {
         if (p->fds[i].kind == FD_SOCKET) socket_close(p->fds[i].sock);
         if (p->fds[i].kind == FD_FILE) vfs_node_unref(p->fds[i].node);
         p->fds[i].kind = FD_FREE;
@@ -1103,7 +1147,18 @@ static int32_t sys_open(const char* path, int flags, uint32_t mode) {
 static int32_t sys_close(int fd) {
     fd_entry_t* e = fd_get(fd);
     if (!e) return -EBADF;
-    if (fd < 3) return 0; /* closing a standard stream is a no-op here */
+    /* Closing the console is a no-op here - there is one console and
+     * every process shares it. That used to be "closing descriptors 0, 1
+     * and 2 is a no-op", whatever they held, and they do not always hold
+     * the console: a process given standard handles dup2s pipes and
+     * sockets onto them, which is how Wine starts every child with its
+     * handles. A pipe there was never closed - not by close(), and not by
+     * the dup2 that "closed" it before overwriting the entry, so its
+     * reference was simply lost. Its peer then never saw end of stream,
+     * and the peer was the wineserver, which learns of a client's death
+     * from exactly that: the process handle was never signalled, and a
+     * first wineboot waited on it with every other task in the machine. */
+    if (e->kind == FD_CONSOLE) return 0;
     if (e->kind == FD_SOCKET) socket_close(e->sock);
     if (e->kind == FD_FILE) vfs_node_unref(e->node);
     e->kind = FD_FREE;

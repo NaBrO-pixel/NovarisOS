@@ -808,6 +808,18 @@ int scheduler_expire_waits(uint32_t now, int32_t result) {
     return n;
 }
 
+/* How many blocked tasks are parked on `addr` - for the F12 dump, which
+ * describes the socket behind every wait. */
+int scheduler_waiters_on(uint32_t addr) {
+    int n = 0;
+    for (int i = 0; i < process_count; i++) {
+        process_t* p = &process_table[i];
+        if (p->state != PROC_BLOCKED) continue;
+        for (int w = 0; w < p->wait_count; w++) if (p->wait_addr[w] == addr) n++;
+    }
+    return n;
+}
+
 int scheduler_blocked_count(void) {
     int n = 0;
     for (int i = 0; i < process_count; i++) {
