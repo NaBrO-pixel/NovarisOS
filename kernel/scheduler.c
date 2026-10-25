@@ -39,6 +39,7 @@
 #include "fpu.h"
 #include "pit.h"
 #include "posix.h"   /* EAGAIN, ETIMEDOUT - the values a woken waiter gets */
+#include "serial.h"  /* scheduler_dump_tasks writes straight to COM1 */
 
 /* Thirty-two since Milestone 31, sixteen since Milestone 29. A forked
  * child is a task like any other and so is a thread, so a Wine batch is
@@ -902,4 +903,86 @@ void scheduler_run_until_idle(void) {
      * caller's back first. */
     paging_switch_address_space(caller_as);
     reap_all();
+}
+
+/* Every task, what state it is in and what it is waiting for - printed
+ * straight to COM1, on F12.
+ *
+ * Made for one diagnosis and kept because the shape recurs: a run that
+ * goes silent with the CPU halted in an idle loop is a machine where
+ * every task is parked and nothing will ever wake any of them. Which
+ * task waits on what is the whole question, and nothing could ask it -
+ * the shell is behind the `wine` command that never returns. The
+ * keyboard interrupt still arrives while the CPU idles, so the keyboard
+ * driver calls this when F12 goes down, and the answer lands in the
+ * serial log the run is already writing.
+ *
+ * Serial rather than the console because this runs in the interrupt
+ * handler, and the console draws. A blocked task is inside a syscall, so
+ * its ring-3 frame is the registers_t at the top of its kernel stack:
+ * eax there is the syscall number (rewound for the retry) and eip is
+ * where in user space it made the call. */
+static void dump_hex(uint32_t v) {
+    static const char hex[] = "0123456789abcdef";
+    char b[11];
+    b[0] = '0'; b[1] = 'x';
+    for (int i = 0; i < 8; i++) b[2 + i] = hex[(v >> (28 - 4 * i)) & 0xF];
+    b[10] = 0;
+    serial_writestring(b);
+}
+
+static void dump_dec(uint32_t v) {
+    char b[12];
+    int i = 11;
+    b[i] = 0;
+    do { b[--i] = (char)('0' + v % 10); v /= 10; } while (v);
+    serial_writestring(&b[i]);
+}
+
+void scheduler_dump_tasks(void) {
+    serial_writestring("\n[tasks] tick ");
+    dump_dec(pit_get_ticks());
+    serial_writestring(", ");
+    dump_dec((uint32_t)process_count);
+    serial_writestring(" slots\n");
+    for (int i = 0; i < process_count; i++) {
+        process_t* p = &process_table[i];
+        const char* st = "?";
+        if (p->state == PROC_READY) st = "ready";
+        else if (p->state == PROC_RUNNING) st = "running";
+        else if (p->state == PROC_BLOCKED) st = "BLOCKED";
+        else if (p->state == PROC_ZOMBIE) st = "zombie";
+        if (p->state == PROC_ZOMBIE) continue;
+        serial_writestring("[tasks] ");
+        dump_dec((uint32_t)i);
+        serial_writestring(" pid ");
+        dump_dec((uint32_t)p->pid);
+        serial_writestring(" ");
+        serial_writestring(p->name);
+        serial_writestring(" pd ");
+        dump_hex(p->page_directory);
+        serial_writestring(" ");
+        serial_writestring(st);
+        if (p->kernel_stack_top) {
+            registers_t* f = (registers_t*)(p->kernel_stack_top - sizeof(registers_t));
+            if ((f->cs & 3) == 3) {
+                serial_writestring(" sys ");
+                dump_dec(f->eax);
+                serial_writestring(" eip ");
+                dump_hex(f->eip);
+            }
+        }
+        if (p->state == PROC_BLOCKED) {
+            serial_writestring(" on");
+            for (int w = 0; w < p->wait_count; w++) {
+                serial_writestring(" ");
+                dump_hex(p->wait_addr[w]);
+            }
+            if (p->wait_deadline) {
+                serial_writestring(" until ");
+                dump_dec(p->wait_deadline);
+            }
+        }
+        serial_writestring("\n");
+    }
 }

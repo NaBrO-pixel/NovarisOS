@@ -20,7 +20,9 @@
  */
 
 #include "socket.h"
+#include "serial.h"   /* socket_dump_pending writes straight to COM1 */
 #include "posix.h"
+#include "posix_proc.h"  /* socket_dump_pending names who holds what */
 #include "kheap.h"
 #include "kstring.h"
 #include "scheduler.h"
@@ -1518,3 +1520,82 @@ uint32_t socket_open_count(void) {
 }
 uint32_t socket_bytes_moved(void) { return stat_bytes; }
 uint32_t socket_fds_passed(void) { return stat_fds; }
+
+/* Every socket (pipes are sockets here) holding something nobody has
+ * taken yet - bytes, a pending connection, or descriptors in flight -
+ * for the F12 task dump. A task parked in read() on a socket that has
+ * bytes is a lost wakeup in this kernel; a server polling while a
+ * client's request sits unread is a poll that missed it; and if nothing
+ * is pending anywhere, every waiter is waiting on somebody who has
+ * nothing to say, which is a different bug entirely. */
+static void sdump_hex(uint32_t v) {
+    static const char hex[] = "0123456789abcdef";
+    char b[11];
+    b[0] = '0'; b[1] = 'x';
+    for (int i = 0; i < 8; i++) b[2 + i] = hex[(v >> (28 - 4 * i)) & 0xF];
+    b[10] = 0;
+    serial_writestring(b);
+}
+
+/* Which process holds `s`, and as which descriptor - so a pending socket
+ * can be read as "the server has not taken this" or "this client has
+ * not". The two ends of one socket pair are two sockets here. */
+static void sdump_holders(socket_t* s) {
+    char num[12];
+    int any = 0;
+    for (int i = 0; i < POSIX_MAX_PROCS; i++) {
+        posix_proc_t* p = posix_proc_at(i);
+        if (!p) continue;
+        for (int fd = 0; fd < POSIX_MAX_FDS; fd++) {
+            if (p->fds[fd].kind != FD_SOCKET || p->fds[fd].sock != s) continue;
+            const char* exe = p->exe_path;
+            for (const char* c = p->exe_path; *c; c++) if (*c == '/') exe = c + 1;
+            serial_writestring(any ? ", " : " held by ");
+            serial_writestring(exe[0] ? exe : "?");
+            serial_writestring(" (pid ");
+            ku32_to_dec((uint32_t)p->pid, num); serial_writestring(num);
+            serial_writestring(", pd ");
+            sdump_hex(p->page_directory);
+            serial_writestring(") fd ");
+            ku32_to_dec((uint32_t)fd, num);     serial_writestring(num);
+            any = 1;
+        }
+    }
+    if (!any) serial_writestring(" held by nobody");
+}
+
+void socket_dump_pending(void) {
+    char num[12];
+    int live = 0, pending = 0;
+    for (int i = 0; i < MAX_SOCKETS; i++) {
+        socket_t* s = &sockets[i];
+        if (s->state == SS_FREE) continue;
+        live++;
+        if (!s->count && !s->backlog_count && !s->passed_count) continue;
+        pending++;
+        serial_writestring("[socks] ");
+        sdump_hex((uint32_t)s);
+        serial_writestring(" peer ");
+        sdump_hex((uint32_t)s->peer);
+        serial_writestring(": ");
+        ku32_to_dec(s->count, num);         serial_writestring(num);
+        serial_writestring(" bytes, ");
+        ku32_to_dec(s->backlog_count, num); serial_writestring(num);
+        serial_writestring(" connections, ");
+        ku32_to_dec(s->passed_count, num);  serial_writestring(num);
+        serial_writestring(" fds pending");
+        if (s->path[0]) { serial_writestring(" at "); serial_writestring(s->path); }
+        serial_writestring("\n[socks]   this end");
+        sdump_holders(s);
+        if (s->peer) {
+            serial_writestring("; peer");
+            sdump_holders(s->peer);
+        }
+        serial_writestring("\n");
+    }
+    serial_writestring("[socks] ");
+    ku32_to_dec((uint32_t)live, num);    serial_writestring(num);
+    serial_writestring(" live, ");
+    ku32_to_dec((uint32_t)pending, num); serial_writestring(num);
+    serial_writestring(" holding something unread\n");
+}
