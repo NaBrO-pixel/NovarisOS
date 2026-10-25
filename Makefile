@@ -394,11 +394,21 @@ HOST_LIB32 ?= /lib32
 #
 # With WINE_BUILD set, the ordinary `make` installs Wine into the OS image
 # it builds - see tools/install_wine.sh and the initrd rule below. Without
-# it, the same `make` builds the same OS with no Wine in it. Switching
-# back needs a `make clean`: the staging directory is built up rather than
-# rebuilt, so an install already in it stays until it is wiped.
-WINE_BUILD ?=
-WINE_STRIP ?= 1
+# it, the same `make` builds the same OS with no Wine in it.
+#
+# The setting sticks. build/wine.config records the last one given, and a
+# `make` that does not mention WINE_BUILD at all - `make test-wine` after
+# `make WINE_BUILD=../wine` - uses it rather than quietly rebuilding
+# without Wine. Giving it, on the command line or in the environment,
+# replaces it, and an empty one (`make WINE_BUILD=`) turns Wine off.
+# Either change rebuilds the initrd by itself.
+WINE_CONFIG = $(BUILD_DIR)/wine.config
+ifeq ($(origin WINE_BUILD),undefined)
+WINE_BUILD := $(shell sed -n 's/^WINE_BUILD=//p' $(WINE_CONFIG) 2>/dev/null)
+endif
+ifeq ($(origin WINE_STRIP),undefined)
+WINE_STRIP := $(or $(shell sed -n 's/^WINE_STRIP=//p' $(WINE_CONFIG) 2>/dev/null),1)
+endif
 
 # Which of Wine's 601 DLLs ship is decided in tools/install_wine.sh, and
 # only there.
@@ -578,9 +588,24 @@ $(BUILD_DIR)/user/hello64.exe: userland/pe_test/x64_marker.c | $(BUILD_DIR)
 	mkdir -p $(BUILD_DIR)/user
 	$(MINGW_CC64) -O2 -nostdlib -e mainCRTStartup -o $@ $<
 
+# Which Wine, if any, the staging directory was built with (see
+# WINE_CONFIG above), as a file whose contents change when that does.
+# Without it `make WINE_BUILD=...` after a plain `make` finds
+# wine-installed.stamp already touched by the Wine-less build and installs
+# nothing, and turning Wine back off leaves the old install in the staging
+# directory. Rewritten only when it differs, so an unchanged configuration
+# is still an up-to-date build.
+WINE_CONFIG_TEXT = WINE_BUILD=$(if $(strip $(WINE_BUILD)),$(abspath $(WINE_BUILD)))\nWINE_STRIP=$(WINE_STRIP)
+$(shell mkdir -p $(BUILD_DIR); \
+    [ "`cat $(WINE_CONFIG) 2>/dev/null`" = "`printf '$(WINE_CONFIG_TEXT)'`" ] \
+    || printf '$(WINE_CONFIG_TEXT)\n' > $(WINE_CONFIG))
+
 # Everything that ends up packed into the initrd: the static files in
-# userland/initrd_files/ plus the compiled demo programs.
-$(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
+# userland/initrd_files/ plus the compiled demo programs. The staging
+# directory is emptied first, so what Wine installs into it below is
+# exactly what this configuration asked for and nothing a previous one
+# left behind.
+$(BUILD_DIR)/initrd_staging/helloelf.elf: $(WINE_CONFIG) $(BUILD_DIR)/user/hello_c.bin \
         $(BUILD_DIR)/user/hello_elf.elf $(BUILD_DIR)/user/posixtest.elf $(BUILD_DIR)/user/sigtest.elf \
         $(BUILD_DIR)/user/pthtest.elf $(BUILD_DIR)/user/crashelf.elf \
         $(BUILD_DIR)/user/fstest.elf $(BUILD_DIR)/user/kmaptest.elf \
@@ -597,6 +622,7 @@ $(BUILD_DIR)/initrd_staging/helloelf.elf: $(BUILD_DIR)/user/hello_c.bin \
         $(BUILD_DIR)/user/hello64.exe $(BUILD_DIR)/user/lowbase.exe \
         $(BUILD_DIR)/user/crash.exe $(BUILD_DIR)/user/qsorttest.exe \
         $(BUILD_DIR)/user/threads.exe
+	rm -rf $(BUILD_DIR)/initrd_staging
 	mkdir -p $(BUILD_DIR)/initrd_staging
 	cp userland/initrd_files/* $(BUILD_DIR)/initrd_staging/
 	cp $(BUILD_DIR)/user/hello_c.bin $(BUILD_DIR)/initrd_staging/helloc.bin
