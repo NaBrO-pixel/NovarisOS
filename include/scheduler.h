@@ -413,4 +413,8 @@ void scheduler_terminate_all(void);
  * register frame, exactly as isr.s's shared stub built it. */
 void scheduler_tick(registers_t* regs);
 
+/* Prints every task's state and what it waits on to COM1. Called from
+ * the keyboard interrupt when F12 is pressed; see scheduler.c. */
+void scheduler_dump_tasks(void);
+
 #endif

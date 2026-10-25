@@ -130,6 +130,10 @@ int32_t socket_read(socket_t* s, void* buf, uint32_t len, registers_t* regs);
 int32_t socket_write(socket_t* s, const void* buf, uint32_t len);
 void    socket_close(socket_t* s);
 
+/* Prints every socket holding unread bytes, connections or descriptors
+ * to COM1, for the F12 task dump. See socket.c. */
+void    socket_dump_pending(void);
+
 /* --- Milestone 29 ---------------------------------------------------------
  *
  * Two descriptors can now name one socket: dup() makes it happen on

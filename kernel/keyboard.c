@@ -1,6 +1,8 @@
 #include "keyboard.h"
 #include "io.h"
 #include "idt.h"
+#include "scheduler.h"   /* scheduler_dump_tasks, on F12 */
+#include "socket.h"      /* socket_dump_pending, likewise */
 
 #define KBD_DATA_PORT 0x60
 
@@ -137,6 +139,15 @@ static void keyboard_handler(registers_t* regs) {
         else mods &= (uint8_t)~bit;
     } else if (sc == SC_CAPS && pressed) {
         mods ^= KEY_MOD_CAPS;
+    }
+
+    /* F12 dumps the task table to the serial port as well as being a
+     * key - see scheduler_dump_tasks(). From the interrupt, because the
+     * moment it is wanted is the moment nothing else in the system will
+     * run to read a key. */
+    if (!ext && sc == 0x58 && pressed) {
+        scheduler_dump_tasks();
+        socket_dump_pending();
     }
 
     uint16_t special = special_key(sc, ext);
