@@ -123,6 +123,14 @@ PEDIR=$ROOT/usr/lib/wine/i386-windows
 BINDIR=$ROOT/usr/bin
 DATADIR=$ROOT/usr/share/wine
 
+# From empty, every time. The Makefile reruns this script whenever it
+# changes, into a staging directory it does not otherwise clear, so a
+# module taken off the lists below stayed installed from the previous
+# run - which is how appwiz.cpl, removed because it holds wineboot at a
+# dialog, was still in the image and still holding it. Only the two
+# directories that are Wine's and nobody else's.
+rm -rf "$ROOT/usr/lib/wine" "$DATADIR"
+
 mkdir -p "$UNIXDIR" "$PEDIR" "$BINDIR" "$DATADIR/nls" \
          "$ROOT/lib" "$ROOT/lib32" "$ROOT/etc"
 
@@ -222,6 +230,84 @@ for p in $PE_PROGS; do
     else
         MISSING_PROGS="$MISSING_PROGS $p"
     fi
+done
+
+# And what a prefix actually loads, which the lists above are not.
+#
+# They were written for the programs this OS runs, and they are enough
+# for those - but wineboot starts services, and a service is a module
+# nothing imports: the SCM opens it by name, so no dependency walk from
+# the programs ever reaches it. rpcss.exe was not here, so the RpcSs
+# service could not start, so every out-of-process COM call failed
+# ("err:ole:start_rpcss Failed to open RpcSs service", then
+# CoMarshalInterface with E_NOINTERFACE). atl100.dll was not here, so
+# every fake DLL wine.inf registers failed with "failed to create
+# IRegistrar". And svchost, plugplay, winedevice and the kernel drivers
+# were not here, so services.exe never finished starting its autostart
+# services and wineboot sat out Wine's whole five-minute boot timeout on
+# every fresh prefix ("run_wineboot boot event wait timed out").
+#
+# That was settled on the host, not in the emulator: the staged tree run
+# in a chroot on Linux shows every one of those errors, the full Wine
+# tree shows none of the three, and the difference in what loads is
+# this list.
+#
+# tools/wine_prefix_modules.txt is the 64-bit side's measured list,
+# closed under PE imports (tools/close_wine_modules.py), and it names
+# modules rather than architectures: every entry in it exists in the
+# i386 tree. The kernel drivers go in by extension for the same reason
+# stage_wine.sh gives. The last few are what the i386 run loads beyond
+# that list, measured the same way - and hal.dll, which i386's
+# ntoskrnl.exe imports and x86_64's does not, so a list closed under the
+# 64-bit tree's imports cannot have it. Without it ntoskrnl does not
+# load, so no driver does, so Winedevice never starts and wineboot waits
+# out its timeout for it. Checked by reading every staged module's
+# imports: with it, nothing staged imports a module the tree could
+# supply and does not.
+#
+# Not appwiz.cpl, although the i386 run loads it. It is the Add/Remove
+# Programs applet, and the one thing wineboot uses it for is
+# `control.exe appwiz.cpl install_mono` and its Gecko equivalent: a
+# dialog asking whether to download Wine Mono. Under a display driver
+# that dialog opens on the Wine desktop and waits for a click, and
+# wineboot waits for it - the first boot stopped there, every task
+# parked, until the run was killed. On the host it fails at once for
+# want of a display, which is why the reference run never showed it.
+# Without the applet the call fails the same way it does on the 64-bit
+# side, whose list has never had it, and the prefix finishes without
+# Mono and Gecko - which is the only outcome available on a machine
+# with nowhere to download them from.
+LIST="$(dirname "$0")/wine_prefix_modules.txt"
+find_pe() {
+    b=${1%.*}
+    for p in "$WINE_BUILD/dlls/$1/i386-windows/$1" \
+             "$WINE_BUILD/dlls/$b/i386-windows/$1" \
+             "$WINE_BUILD/programs/$b/i386-windows/$1"; do
+        [ -f "$p" ] && { echo "$p"; return 0; }
+    done
+    return 1
+}
+EXTRA_PE="hal.dll wineps.drv l3codecx.ax imaadp32.acm l3codeca.acm
+          msadp32.acm msg711.acm msgsm32.acm"
+for name in $(grep -v '^#' "$LIST" | grep -v '^[[:space:]]*$') $EXTRA_PE; do
+    [ -f "$PEDIR/$name" ] && continue
+    if src=$(find_pe "$name"); then
+        cp "$src" "$PEDIR/$name"
+    else
+        MISSING_DLLS="$MISSING_DLLS $name"
+    fi
+done
+for f in "$WINE_BUILD"/dlls/*.sys/i386-windows/*.sys; do
+    [ -f "$f" ] && cp "$f" "$PEDIR/$(basename "$f")"
+done
+# Every unix half the tree built, whichever module it belongs to: a PE
+# module with its unix half missing fails its process attach, which is
+# the c0000142 that ZwLoadDriver reported for mountmgr and nsiproxy on
+# the 64-bit side. They are small, and a list would be one more thing to
+# keep in step.
+for f in "$WINE_BUILD"/dlls/*/*.so; do
+    case $(basename "$f") in ntdll.so) continue ;; esac
+    cp "$f" "$UNIXDIR/$(basename "$f")"
 done
 
 # --- the display driver -------------------------------------------------
@@ -341,6 +427,17 @@ fi
 # init_locale walks sortdefault.nls without checking that it got it. A
 # missing table does not announce itself.
 cp "$WINE_BUILD"/nls/*.nls "$DATADIR/nls/"
+# The Windows Runtime metadata, which wine.inf's [WineSourceDirs] copies
+# into system32\winmetadata from <data dir>/winmd. A Wine built in its
+# own tree keeps them under include/, so nothing put them where the copy
+# looks - and the copy does not give up. rundll32 spent every run after
+# atl100.dll was staged statting windows.applicationmodel.winmd in a
+# loop, at full CPU, which is how a fresh prefix stopped finishing at
+# all. The 64-bit side found the same loop first (tools/stage_wine.sh).
+mkdir -p "$DATADIR/winmd"
+for f in "$WINE_BUILD"/include/*.winmd; do
+    [ -f "$f" ] && cp "$f" "$DATADIR/winmd/"
+done
 
 # --- the host's C library ----------------------------------------------
 #
