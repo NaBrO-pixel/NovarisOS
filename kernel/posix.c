@@ -587,7 +587,9 @@ static int map_file_range(uint32_t base, uint32_t bytes, vfs_node_t* node,
      * handled below. */
     uint32_t need = off + bytes;
     if (need > node->length) need = node->length;
-    if (!vfs_make_mappable(node, need)) return 0;
+    /* A shared mapping is the only kind through which a file is grown
+     * while mapped, so it is the only kind given room to grow. */
+    if (!vfs_make_mappable(node, need, !cow)) return 0;
 
     for (uint32_t p = 0; p < bytes; p += PAGE_SIZE) {
         /* MAP_FIXED over something this process already had: that frame

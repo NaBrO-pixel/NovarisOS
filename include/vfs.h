@@ -266,8 +266,10 @@ void vfs_node_unref(vfs_node_t* node);
  * That is the whole of MAP_SHARED here, and it is why there is no page
  * cache: the file's bytes and the mapping are the same memory, so there
  * is nothing to keep coherent. The cost is that growing a mapped file
- * moves it - see the note in ramfs.c. Returns 0 if memory ran out. */
-int vfs_make_mappable(vfs_node_t* node, uint32_t bytes);
+ * moves it - see the note in ramfs.c. `may_grow` is whether the mapping
+ * being made is a shared one, which is what earns a file growth room
+ * (VFS_MAPPING_RESERVE). Returns 0 if memory ran out. */
+int vfs_make_mappable(vfs_node_t* node, uint32_t bytes, int may_grow);
 
 /* How much work mapping files has actually cost: how many files were
  * copied into mappable storage and how many bytes that moved, and how
@@ -328,6 +330,9 @@ void ramfs_init(uint32_t initrd_addr, uint32_t initrd_size);
 /* How many nodes are in use, for the shell's `fsinfo`. */
 uint32_t vfs_node_count(void);
 uint32_t vfs_heap_bytes(void);
+
+/* Prints how much of the kernel heap file storage holds, and why. */
+void vfs_storage_report(void);
 
 /* A driver that allocates a node's storage itself says how much, so the
  * figure above stays the whole of what the filesystem is holding. */
