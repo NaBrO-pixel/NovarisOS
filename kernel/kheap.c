@@ -4,6 +4,7 @@
 #include "pmm.h"
 #include "console.h"
 #include "kstring.h"    /* ku32_to_dec, for the allocation counters below */
+#include "vfs.h"        /* vfs_storage_report, when the heap runs out */
 
 /* The heap lives in its own dedicated virtual range, well away from the
  * kernel image and the 0xC0000000-0xC0800000 low-memory alias set up by
@@ -117,6 +118,7 @@ void* kmalloc(size_t size) {
             terminal_writestring_color("[kheap] ", VGA_COLOR_LIGHT_RED);
             terminal_writestring("kernel heap exhausted (max is KHEAP_MAX_SIZE) - "
                                  "allocations fail from here\n");
+            vfs_storage_report();
         }
         return 0;   /* heap exhausted */
     }

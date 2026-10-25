@@ -496,7 +496,7 @@ void vfs_map_stats(uint32_t* calls, uint32_t* copied,
     if (mat_bytes) *mat_bytes = stat_materialize_bytes;
 }
 
-int vfs_make_mappable(vfs_node_t* n, uint32_t bytes) {
+int vfs_make_mappable(vfs_node_t* n, uint32_t bytes, int may_grow) {
     if (!n || (n->flags & VFS_DIRECTORY)) return 0;
     /* A disk file has to be read in before there is anything to align.
      * This is the one place where "no page cache" has a price: mapping a
@@ -531,8 +531,18 @@ int vfs_make_mappable(vfs_node_t* n, uint32_t bytes) {
      * file, then each segment), and what it read out of the second
      * mapping was the third one's memory: "wine: could not load ntdll.so:
      * eh\xdd\xdd\xdd: cannot open shared object file", a DT_NEEDED name
-     * read out of a freed heap block. */
-    if (!n->mappable && !n->ops && !n->from_initrd && cap < VFS_MAPPING_RESERVE) {
+     * read out of a freed heap block.
+     *
+     * And only for a file whose first mapping is shared. That is the
+     * session file's shape - the server creates it, maps it MAP_SHARED,
+     * and grows it - and it is not the shape of anything else Wine maps:
+     * a fresh prefix copies every builtin DLL into system32, and those
+     * copies are written once and mapped privately, as images. Giving
+     * each of them four megabytes was 81MB of a 192MB heap on a 32-bit
+     * wineboot, measured by vfs_storage_report() at the moment the heap
+     * ran out, and the prefix never finished. */
+    if (may_grow && !n->mappable && !n->ops && !n->from_initrd &&
+        cap < VFS_MAPPING_RESERVE) {
         cap = VFS_MAPPING_RESERVE;
     }
     if (n->mappable && n->capacity >= cap) return 1;
@@ -749,6 +759,40 @@ int32_t vfs_rename(const char* oldpath, const char* newpath) {
 }
 
 /* --- mounting ------------------------------------------------------------- */
+
+/* Where the heap went, for the moment it runs out.
+ *
+ * "kernel heap exhausted" alone says nothing about which of three very
+ * different things filled it: files written at runtime, the doubling
+ * slack ensure_capacity leaves behind them, or page-aligned copies made
+ * so a file could be mapped. Each has a different fix, so the exhaustion
+ * path asks this for the split rather than leaving it to be guessed. */
+void vfs_storage_report(void) {
+    uint32_t files = 0, len = 0, cap = 0, mapped = 0, mapped_cap = 0;
+    char num[12];
+    for (uint32_t b = 0; b < nblocks; b++) {
+        for (uint32_t i = 0; i < VFS_NODES_PER_BLOCK; i++) {
+            vfs_node_t* n = &blocks[b][i];
+            if (!n->in_use || (n->flags & VFS_DIRECTORY)) continue;
+            if (!n->data || n->from_initrd || n->ops) continue;
+            files++;
+            len += n->length;
+            cap += n->capacity;
+            if (n->mappable) { mapped++; mapped_cap += n->capacity; }
+        }
+    }
+    terminal_writestring("[kheap] file storage on the heap: ");
+    ku32_to_dec(files, num);        terminal_writestring(num);
+    terminal_writestring(" files, ");
+    ku32_to_dec(len >> 20, num);    terminal_writestring(num);
+    terminal_writestring("MB of content in ");
+    ku32_to_dec(cap >> 20, num);    terminal_writestring(num);
+    terminal_writestring("MB of buffers; ");
+    ku32_to_dec(mapped, num);       terminal_writestring(num);
+    terminal_writestring(" of them mappable copies (");
+    ku32_to_dec(mapped_cap >> 20, num); terminal_writestring(num);
+    terminal_writestring("MB)\n");
+}
 
 uint32_t vfs_node_count(void) { return nodes_used; }
 uint32_t vfs_heap_bytes(void) { return heap_bytes; }
