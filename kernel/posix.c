@@ -1805,6 +1805,16 @@ static int32_t fork_common(registers_t* regs, uint32_t child_stack, int vfork) {
 
     int tid = scheduler_fork_current(regs, child_pd, vfork ? "vfork" : "fork");
     if (tid < 0) {
+        /* posix_proc_clone() took a reference on every descriptor and
+         * mapping the child inherited; a child that never runs has to give
+         * them back, or each failed fork pins every pipe the parent had
+         * open - and a pipe pinned is one whose reader never sees EOF. */
+        for (int f = 0; f < MAX_FDS; f++) {
+            if (child->fds[f].kind == FD_SOCKET) socket_close(child->fds[f].sock);
+            if (child->fds[f].kind == FD_FILE) vfs_node_unref(child->fds[f].node);
+            child->fds[f].kind = FD_FREE;
+        }
+        posix_unpin_proc(child);
         posix_proc_reap(child);
         paging_destroy_address_space(child_pd);
         return -EAGAIN;
@@ -3391,13 +3401,31 @@ void posix_syscall(registers_t* regs) {
              * for, or a joiner waits for ever. exit_group takes the whole
              * program with it, so it does not. */
             posix_thread_exiting();
-            /* fall through */
-        case SYS_exit_group:
             /* The status is real since Milestone 29, and in Linux's
              * encoding rather than raw: a normal exit is the low byte of
              * the code shifted up eight, which is what WIFEXITED and
-             * WEXITSTATUS read. A parent in wait4 is woken by this. */
+             * WEXITSTATUS read. A parent in wait4 is woken by this. Ends
+             * the process only if this was its last thread. */
             posix_exit_status((int)((a & 0xFFu) << 8));
+            return; /* eax is not written: this task is finished */
+
+        case SYS_exit_group:
+            /* Every thread, not just this one. exit_group used to fall
+             * through to exit, which ended the calling thread and left the
+             * rest of the process running - and since process_teardown()
+             * only runs for a process's last thread, its descriptors were
+             * never closed either. Every Wine process has several threads
+             * and leaves through exit_group, so every one of them
+             * survived its own exit with its pipes and sockets open, and
+             * the wineserver, which learns of a death from the hang-up on
+             * those, never learnt of any. The process handle was never
+             * signalled, and on a first boot wineboot waited on one of
+             * those handles with every other task in the machine.
+             *
+             * A forked child, vfork included, has an address space of its
+             * own (fork_common copies it), so "every task in this address
+             * space" is exactly this process. */
+            posix_exit_process_group((int)((a & 0xFFu) << 8));
             return; /* eax is not written: this task is finished */
 
         default:
