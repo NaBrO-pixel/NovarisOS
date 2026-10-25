@@ -615,6 +615,22 @@ WINE64_NTDLL  ?= $(firstword $(wildcard \
     ../wine/dlls/ntdll/ntdll.so \
     ../../../../wine/dlls/ntdll/ntdll.so))
 
+# What the variables above asked for, as a file whose contents change
+# when they do. Without it `make WINE64_INSTALL=1 iso` after a plain
+# `make iso` finds an initrd newer than every prerequisite and keeps it -
+# so the ISO boots with no Wine in it, and the run says "no Wine
+# installation in the initrd" ten minutes later. The file is rewritten
+# only when its contents differ, so an unchanged configuration is still
+# an up-to-date initrd.
+INITRD_CONFIG = $(BUILD_DIR)/initrd64.config
+INITRD_CONFIG_TEXT = WINE64_INSTALL=$(WINE64_INSTALL) \
+    WINE64_LOADER=$(abspath $(WINE64_LOADER)) \
+    WINE64_NTDLL=$(abspath $(WINE64_NTDLL)) \
+    CHROMIUM64_DIR=$(CHROMIUM64_DIR) CHROMIUM64_FILES=$(CHROMIUM64_FILES)
+$(shell mkdir -p $(BUILD_DIR); \
+    [ "`cat $(INITRD_CONFIG) 2>/dev/null`" = "$(INITRD_CONFIG_TEXT)" ] \
+    || echo "$(INITRD_CONFIG_TEXT)" > $(INITRD_CONFIG))
+
 # tools/stage_wine.sh and its module list are prerequisites because they
 # decide what goes *into* the image. Without them here, editing the list
 # of staged modules leaves the initrd untouched and the next run tests
@@ -623,7 +639,8 @@ WINE64_NTDLL  ?= $(firstword $(wildcard \
 $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
            $(BUILD_DIR)/forkchild64.elf userland/mkinitrd.py \
            $(BUILD_DIR)/winegui64.exe $(BUILD_DIR)/chromeprobe64.exe \
-           tools/stage_wine.sh tools/wine_prefix_modules.txt
+           tools/stage_wine.sh tools/wine_prefix_modules.txt \
+           $(INITRD_CONFIG)
 	rm -rf $(INITRD_STAGE)
 	mkdir -p $(INITRD_STAGE)
 	cp $(BUILD_DIR)/dlllib64.dll $(INITRD_STAGE)/dlllib64.dll
