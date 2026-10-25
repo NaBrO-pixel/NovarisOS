@@ -10640,6 +10640,19 @@ much each would widen what runs:
    rebuilds the initrd by itself - `build64/initrd64.config` records
    what it was built with.
 
+   The 32-bit desktop ISO was verified against wine-11.0 the same day:
+   `test`, `test-qemu`, `test-wm`, `test-wine`, `test-wine-threads`,
+   `test-wine-gui`, `test-desktop`, `test-desktop-gui`,
+   `test-wine-prefix` and `test-winsock` all pass. Two things it took,
+   both now in the tools: `install_wine.sh` stages what win32u dlopens
+   from Wine's `config.h` (fontconfig with FreeType, not FreeType
+   alone), and `build_wine_driver.sh` raises win32u's ten-second wait
+   for explorer to two minutes, which an emulated machine needs. For
+   the 32-bit tree, `apt-get install libfreetype-dev:i386
+   libfontconfig-dev:i386` before configuring. `WINE_BUILD` is
+   remembered in `build/wine.config`, so `make WINE_BUILD=../wine32`
+   once and then the bare `make test-wine...` targets.
+
    `--with-freetype` is not optional if you want windows: without a font
    engine Wine's caption metrics are uninitialised stack, and the window
    frame is measured from them. `apt-get install libfreetype-dev:i386`
