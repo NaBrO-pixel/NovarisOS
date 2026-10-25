@@ -10619,6 +10619,27 @@ much each would widen what runs:
    make test-wine test-wine-threads test-wine-gui
    ```
 
+   The 64-bit kernel, which is where the Wine work is now, wants an
+   x86_64 Wine instead, configured in its own source tree beside this
+   one (`../wine` is one of the places `Makefile.amd64` looks):
+
+   ```bash
+   apt-get install autoconf libfreetype-dev libfontconfig-dev
+   git clone --depth 1 -b stable https://github.com/wine-mirror/wine
+   cd wine && ./configure --enable-archs=x86_64 --disable-tests \
+       --without-x --with-freetype --without-vulkan --without-opengl \
+       && make -j4
+   cd ../NovarisOS && sh tools/build_wine_driver.sh ../wine
+   make -f Makefile.amd64 WINE64_INSTALL=1 test
+   ```
+
+   That boots the ISO with Wine in it and runs `wine --version`,
+   wineboot (a 7/7 prefix, exit 0), `winegui64.exe` and
+   `chromeprobe64.exe` before `bring-up complete`; verified against
+   wine-11.0 at 26 PASS, 0 FAIL. Switching `WINE64_INSTALL` on or off
+   rebuilds the initrd by itself - `build64/initrd64.config` records
+   what it was built with.
+
    `--with-freetype` is not optional if you want windows: without a font
    engine Wine's caption metrics are uninitialised stack, and the window
    frame is measured from them. `apt-get install libfreetype-dev:i386`
