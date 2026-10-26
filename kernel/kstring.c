@@ -1,14 +1,20 @@
 #include "kstring.h"
 
-/* Four bytes at a time, then the tail. It was a byte loop, which is every
- * page fork copies and every file a mapping makes page-aligned - a
+/* A machine word at a time, then the tail - movsl or movsq, since this
+ * file is built for both kernels. It was a byte loop, which is every page
+ * the 32-bit fork copies and every file a mapping makes page-aligned: a
  * first wineboot moves hundreds of megabytes through here. */
 void kmemcpy(void* dst, const void* src, size_t n) {
-    size_t words = n >> 2, rest = n & 3;
-    __asm__ __volatile__("cld; rep movsl; mov %3, %%ecx; rep movsb"
-                         : "+D"(dst), "+S"(src), "+c"(words)
-                         : "r"(rest)
-                         : "memory");
+    size_t words = n / sizeof(long), rest = n % sizeof(long);
+#if defined(__x86_64__)
+    __asm__ __volatile__("cld; rep movsq"
+                         : "+D"(dst), "+S"(src), "+c"(words) : : "memory");
+#else
+    __asm__ __volatile__("cld; rep movsl"
+                         : "+D"(dst), "+S"(src), "+c"(words) : : "memory");
+#endif
+    __asm__ __volatile__("rep movsb"
+                         : "+D"(dst), "+S"(src), "+c"(rest) : : "memory");
 }
 
 void kmemmove(void* dst, const void* src, size_t n) {
