@@ -3,6 +3,8 @@
 #include "idt.h"
 #include "scheduler.h"   /* scheduler_dump_tasks, on F12 */
 #include "socket.h"      /* socket_dump_pending, likewise */
+#include "pit.h"         /* pit_dump_samples, with Shift */
+#include "syscall.h"     /* syscall_dump_profile, likewise */
 
 #define KBD_DATA_PORT 0x60
 
@@ -146,8 +148,15 @@ static void keyboard_handler(registers_t* regs) {
      * moment it is wanted is the moment nothing else in the system will
      * run to read a key. */
     if (!ext && sc == 0x58 && pressed) {
-        scheduler_dump_tasks();
-        socket_dump_pending();
+        /* Shift+F12 is the profile instead: tens of thousands of lines,
+         * which is not something to print by accident. */
+        if (mods & KEY_MOD_SHIFT) {
+            pit_dump_samples();
+            syscall_dump_profile();
+        } else {
+            scheduler_dump_tasks();
+            socket_dump_pending();
+        }
     }
 
     uint16_t special = special_key(sc, ext);

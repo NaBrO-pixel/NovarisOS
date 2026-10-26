@@ -8,6 +8,9 @@
  * scheduling, or "uptime" reporting later on. */
 void pit_install(uint32_t frequency_hz);
 
+/* Prints the timer's ring of interrupted addresses to COM1 - on F12. */
+void pit_dump_samples(void);
+
 /* Number of timer ticks since pit_install() was called. */
 uint32_t pit_get_ticks(void);
 
