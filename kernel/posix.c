@@ -1642,6 +1642,37 @@ static int32_t sys_unlink(const char* path, int want_dir) {
     return r;
 }
 
+/* link(2), answered the way Linux answers it on a filesystem that cannot
+ * give one file two names - FAT, for one - and for the same reason: a
+ * ramfs node *is* its directory entry, name, parent and all, so a second
+ * name would be a second node with its own bytes, and that is a copy, not
+ * a link. EPERM is the documented answer for exactly this, after the
+ * checks every caller is entitled to (the source exists, the target does
+ * not).
+ *
+ * It was ENOSYS, and printed as an unimplemented syscall on every call.
+ * fontconfig takes the lock on its cache by creating a file and link()ing
+ * it to a .LCK name, and falls back to a lock directory on EPERM - not on
+ * ENOSYS - so every Wine process that loaded win32u logged two of them,
+ * and test-wine, which rejects that line, failed on its first faster
+ * boot. Wine's own CreateHardLink reaches here too, and gets an honest
+ * "access denied". */
+static int32_t sys_link(const char* oldpath, const char* newpath) {
+    if (!oldpath || !newpath) return -EFAULT;
+    char joined[PATH_JOIN_MAX];
+    const char* p = abs_into(oldpath, joined, sizeof(joined));
+    const char* leaf = 0;
+    vfs_node_t* dir = vfs_resolve_parent(p, &leaf);
+    vfs_node_t* src = dir ? vfs_finddir(dir, leaf) : 0;
+    if (!src) return -ENOENT;
+    if (src->flags & VFS_DIRECTORY) return -EPERM;
+    p = abs_into(newpath, joined, sizeof(joined));
+    dir = vfs_resolve_parent(p, &leaf);
+    if (!dir) return -ENOENT;
+    if (vfs_finddir(dir, leaf)) return -EEXIST;
+    return -EPERM;
+}
+
 static int32_t sys_mkdir(const char* path, uint32_t mode) {
     if (!path) return -EFAULT;
     char joined[PATH_JOIN_MAX];
@@ -2474,6 +2505,9 @@ static const char* syscall_name(uint32_t n) {
         case SYS_faccessat2: return "faccessat2";
         case SYS_readlinkat: return "readlinkat";
         case SYS_symlink: return "symlink";
+        case SYS_link: return "link";
+        case SYS_fadvise64_64: return "fadvise64_64";
+        case SYS_linkat: return "linkat";
         case SYS_symlinkat: return "symlinkat";
         case SYS_getxattr: return "getxattr";
         case SYS_lgetxattr: return "lgetxattr";
@@ -3166,6 +3200,33 @@ void posix_syscall(registers_t* regs) {
             r = 0;
             break;
         }
+
+        case SYS_link:
+            r = sys_link((const char*)a, (const char*)b);
+            break;
+
+        case SYS_fadvise64_64: {
+            /* Advice, and there is nothing here to advise: no page cache,
+             * no readahead. Linux's checks and then success - which is
+             * what Linux itself returns for advice it ignores. fontconfig
+             * calls this on every cache file it opens, so every Wine
+             * process logged it as unimplemented. On i386 the 64-bit
+             * offset and length take two registers each, so the advice is
+             * the sixth argument. */
+            fd_entry_t* fe = fd_get((int)a);
+            int advice = (int)f;
+            if (!fe) r = -EBADF;
+            else if (fe->kind == FD_SOCKET) r = -ESPIPE;
+            else if (advice < 0 || advice > 5) r = -EINVAL;
+            else r = 0;
+            break;
+        }
+        case SYS_linkat:
+            /* (olddirfd, oldpath, newdirfd, newpath, flags): the dirfds
+             * are ignored as every other *at variant here ignores them -
+             * see SYS_symlinkat below. */
+            r = sys_link((const char*)b, (const char*)d);
+            break;
 
         case SYS_symlink:
             /* On since Milestone 32. Milestone 31 built symlinks and then

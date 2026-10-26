@@ -40,9 +40,9 @@ uint32_t pit_ticks_user, pit_ticks_kernel;
  * which it does at every int $0x80 and every invlpg, so a profile taken
  * that way put 99.6% of user time on one instruction - the syscall gate -
  * and inflated anything that flushes a TLB entry. The timer interrupt
- * arrives whatever the code is doing. 32768 samples is five and a half
- * minutes at 100Hz; the ring keeps the most recent. */
-#define PIT_SAMPLES 32768u
+ * arrives whatever the code is doing. 16384 samples is two and three
+ * quarter minutes at 100Hz; the ring keeps the most recent. */
+#define PIT_SAMPLES 16384u
 static uint32_t sample_eip[PIT_SAMPLES], sample_space[PIT_SAMPLES];
 /* eax too: at a syscall gate it is the call being made. */
 static uint32_t sample_eax[PIT_SAMPLES];

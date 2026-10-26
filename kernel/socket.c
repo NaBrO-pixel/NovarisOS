@@ -47,7 +47,13 @@
  *
  * The cost is small: the 16KB receive buffer is allocated per socket in
  * use, so an unused entry is about 250 bytes of table and nothing else. */
-#define MAX_SOCKETS   256
+/* 1024, from 256. A pipe is a pair of these, so 256 was 128 pipes for
+ * the whole machine, and every Wine thread holds three (request, reply,
+ * wait) plus its process's socket to the server. A first wineboot that
+ * runs to completion - which it did once the wineserver heard every
+ * client - has enough processes alive at once that pipe() failed with
+ * ENFILE in the middle of it, as "pipe: Too many open files in system". */
+#define MAX_SOCKETS   1024
 #define SOCK_BUF_SIZE 16384      /* per direction */
 #define MAX_BACKLOG   8
 #define MAX_PASSED_FDS 16
