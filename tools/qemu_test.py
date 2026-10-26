@@ -306,6 +306,23 @@ def run(iso, commands, boot_wait, key_delay, settle, timeout, keep_serial=None,
         # then runs its whole boot self-test before the shell prompts.
         time.sleep(boot_wait)
 
+        # And then until the shell has actually said it is listening, if
+        # it has not yet. boot_wait is a guess at how long that takes, and
+        # the guess goes stale: most of it is GRUB reading the initrd off
+        # the emulated CD, and the initrd grows with every module Wine is
+        # given - at 77MB the kernel printed its first line 25s in, and
+        # tools/posix_compare.py, which waits 22, typed its whole command
+        # into a machine that was still loading and got nothing back.
+        # Keys sent before the prompt are lost, so this is the condition
+        # that matters; boot_wait stays the minimum, for the tests that
+        # also need the desktop drawn.
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            if "Type 'help'" in read_transcript(serial_path):
+                break
+            time.sleep(0.5)
+        time.sleep(2.0)
+
         # Setup commands configure the machine before the run proper and
         # are not what is being measured, so they get a short fixed pause
         # rather than the settle the real commands need. Without the
