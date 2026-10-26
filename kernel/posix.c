@@ -469,7 +469,7 @@ uint32_t posix_unimplemented_count(void) {
 static int map_range(uint32_t base, uint32_t bytes, uint32_t flags) {
     for (uint32_t va = base; va < base + bytes; va += PAGE_SIZE) {
         uint32_t pte = paging_get_entry(va);
-        if ((pte & PAGE_PRESENT) && !(pte & PAGE_SHARED)) {
+        if ((pte & PAGE_PRESENT) && !(pte & PAGE_SHARED) && !(pte & PAGE_COW)) {
             /* Already mapped - which is the normal case for MAP_FIXED, and
              * exactly what a dynamic linker does: reserve the whole span
              * of a library with one PROT_NONE anonymous mapping, then map
@@ -492,8 +492,16 @@ static int map_range(uint32_t base, uint32_t bytes, uint32_t flags) {
          * tail over the end of it with MAP_FIXED|MAP_ANONYMOUS. Nothing
          * noticed while a private file mapping was a private copy;
          * Milestone 34 made those frames the file's, which is what turned
-         * this from a leak of somebody else's page into corruption of it. */
-        if (pte & PAGE_PRESENT) paging_unmap_page(va);
+         * this from a leak of somebody else's page into corruption of it.
+         *
+         * And a page a fork shares (PAGE_COW without PAGE_SHARED) for the
+         * same reason: its frame is the other process's too. This
+         * process's reference to it is released - pmm_free_frame() frees
+         * it only if nobody else holds it - and the page starts again. */
+        if (pte & PAGE_PRESENT) {
+            paging_unmap_page(va);
+            if (!(pte & PAGE_SHARED)) pmm_free_frame(pte & ~0xFFFu);
+        }
         uint32_t phys = pmm_alloc_frame();
         if (!phys) return 0;
         paging_map_page(va, phys, flags);

@@ -332,6 +332,10 @@ void kernel_main(uint32_t magic, multiboot_info_t* mbi) {
     terminal_writestring("Preemptive scheduler initialized (try 'multitask' in the shell)\n");
 
     process_install_fault_handler();
+    /* And only now that the hook is in place to catch what it causes:
+     * ring 0 honours read-only pages from here on, which is what lets a
+     * forked child share its parent's memory - see paging_wp_enable(). */
+    paging_wp_enable();
     win32_init();
     terminal_writestring_color("[OK] ", VGA_COLOR_LIGHT_GREEN);
     terminal_writestring("Win32 emulation layer installed (");

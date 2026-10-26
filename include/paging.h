@@ -273,6 +273,16 @@ int paging_reserve_page(uint32_t virt_addr);
  * as a fault. Safe to call on an address that is not page-aligned. */
 int paging_break_cow(uint32_t virt_addr);
 
+/* CR0.WP - ring 0 honouring read-only pages, which copy-on-write fork
+ * needs, since the kernel writes into user memory constantly and a page a
+ * fork shares is read-only. enable once at boot; suspend from the fault
+ * hook for a kernel write to a read-only page that is not copy-on-write
+ * (the old behaviour, for the rest of that trap); restore on every way
+ * out of the kernel. See handle_kernel_write_fault() in process.c. */
+void paging_wp_enable(void);
+void paging_wp_suspend(void);
+void paging_wp_restore(void);
+
 /* The highest address a program may map. Everything above is the
  * kernel's, shared by every address space, and a fixed mapping that
  * reached into it would hand the kernel's own memory to a program - or,

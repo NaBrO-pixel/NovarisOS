@@ -591,8 +591,44 @@ int process_run_pe(const uint8_t* image, uint32_t size, const char* name,
  * trap, and faults are the trap this kernel takes most of. */
 uint32_t user_fault_count;
 
+/* CR0.WP, which kernel_main sets once the fault hook is in. With it clear
+ * - as it was until copy-on-write fork - a write from ring 0 ignores a
+ * page's read-only bit, and the kernel writes into user memory all the
+ * time: a read() into a buffer, a stat, poll's revents, a futex word, a
+ * signal frame. After a fork those pages are shared read-only with
+ * another process, and every one of those writes would have gone into
+ * the other process's memory too. With WP set they fault instead, and
+ * this decides what each fault was:
+ *
+ *   - a page a fork or a private file mapping shares: broken here exactly
+ *     as a ring-3 write would break it, and the write retried;
+ *   - any other read-only user page: what the kernel always did with one
+ *     was write into it regardless. Not wrong enough to start failing
+ *     calls over, so WP is cleared for the rest of this trap and put back
+ *     on the way out (paging_wp_restore) - the old behaviour, exactly,
+ *     and no page's protection loosened to get it.
+ *
+ * Anything else the kernel faults on is still the kernel's own fault. */
+static int handle_kernel_write_fault(registers_t* regs) {
+    if (regs->int_no != 14 || (regs->cs & 3) == 3) return 0;
+    if ((regs->err_code & 0x7) != 0x3) return 0;   /* present, write, ring 0 */
+    uint32_t cr2;
+    __asm__ __volatile__("mov %%cr2, %0" : "=r"(cr2));
+    if (cr2 >= USER_SPACE_END) return 0;
+    uint32_t pte = paging_get_entry(cr2 & ~0xFFFu);
+    if (!(pte & PAGE_PRESENT) || !(pte & PAGE_USER)) return 0;
+    if ((pte & PAGE_COW) && paging_break_cow(cr2)) {
+        /* Writable now if the mapping is; if not, the retry faults again
+         * and lands below. */
+        return 1;
+    }
+    paging_wp_suspend();
+    return 1;
+}
+
 static int handle_user_fault(registers_t* regs) {
     user_fault_count++;
+    if (handle_kernel_write_fault(regs)) return 1;
     if (!user_active) return 0;
     if ((regs->cs & 3) != 3) return 0; /* the kernel itself faulted */
 

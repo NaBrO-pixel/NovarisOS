@@ -161,10 +161,43 @@ static uint32_t double_frees = 0;
 
 uint32_t pmm_double_frees(void) { return double_frees; }
 
+/* How many address spaces hold a frame *beyond the first* - so 0, the
+ * value every frame starts with, means "one owner, free it on release".
+ *
+ * Copy-on-write fork is what needs it. A forked child shares every
+ * private page with its parent until one of them writes, so a frame can
+ * have several owners, and whichever releases it first must not free it:
+ * pmm_free_frame() drops a reference while there are others and frees
+ * only the last. That is the whole of the change every teardown path
+ * needed - munmap, exit, execve and the reap all free through here.
+ *
+ * A byte per frame for the first gigabyte (256KB). A frame above it, or
+ * one already shared 255 times, simply cannot be shared, and fork copies
+ * it as it always did; pmm_frame_share() says which. */
+#define PMM_SHARE_FRAMES (0x40000000u / PMM_FRAME_SIZE)
+static uint8_t frame_refs[PMM_SHARE_FRAMES];
+
+int pmm_frame_share(uint32_t phys_addr) {
+    uint32_t frame = phys_addr / PMM_FRAME_SIZE;
+    if (frame >= PMM_SHARE_FRAMES || frame_refs[frame] == 0xFF) return 0;
+    if (!bitmap_test(frame)) return 0;          /* not allocated */
+    frame_refs[frame]++;
+    return 1;
+}
+
+uint32_t pmm_frame_sharers(uint32_t phys_addr) {
+    uint32_t frame = phys_addr / PMM_FRAME_SIZE;
+    return frame < PMM_SHARE_FRAMES ? frame_refs[frame] : 0;
+}
+
 void pmm_free_frame(uint32_t phys_addr) {
     uint32_t frame = phys_addr / PMM_FRAME_SIZE;
     if (frame < MAX_FRAMES) {
         if (!bitmap_test(frame)) { double_frees++; return; }
+        if (frame < PMM_SHARE_FRAMES && frame_refs[frame]) {
+            frame_refs[frame]--;            /* somebody else still has it */
+            return;
+        }
         bitmap_clear(frame);
         if (frame < search_from) search_from = frame;
     }
