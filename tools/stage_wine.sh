@@ -351,6 +351,21 @@ else
     echo "stage_wine: no fonts at $TREE/fonts" >&2
 fi
 
+# And fontconfig's configuration, naming those faces. Without one,
+# fontconfig prints "Cannot load default config file" once per process
+# that loads win32u, into the serial log the run is judged by - the same
+# reason tools/install_wine.sh stages it for the 32-bit side.
+mkdir -p "$DEST/etc/fonts"
+cat > "$DEST/etc/fonts/fonts.conf" <<'FONTSCONF'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <dir>/usr/share/wine/fonts</dir>
+  <cachedir>/tmp/fontconfig</cachedir>
+</fontconfig>
+FONTSCONF
+echo "stage_wine: /etc/fonts/fonts.conf"
+
 # The PE halves, from the measured list.
 found_pe=0
 missing=""

@@ -468,6 +468,25 @@ done | sort -u | while read -r lib; do
     cp "$HOST_LIB32/$lib" "$ROOT/lib32/$lib"
 done
 
+# --- fontconfig's configuration --------------------------------------
+#
+# win32u dlopens fontconfig (see the dlopen libraries above), and
+# fontconfig with no /etc/fonts/fonts.conf says so on stderr - "Cannot
+# load default config file" - once per process. Several processes share
+# the serial port, so that line lands in the middle of other programs'
+# output: test-wine-persist failed on "argv[Fontconfig error: ..." with
+# the program's own line cut in two. The fonts it should know about are
+# Wine's own, staged above, and its cache has nowhere persistent to go.
+mkdir -p "$ROOT/etc/fonts"
+cat > "$ROOT/etc/fonts/fonts.conf" <<'FONTSCONF'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <dir>/usr/share/wine/fonts</dir>
+  <cachedir>/tmp/fontconfig</cachedir>
+</fontconfig>
+FONTSCONF
+
 # --- the two files glibc's getpwuid() needs -----------------------------
 #
 # Wine dereferences its result without checking. Real paths now, so
