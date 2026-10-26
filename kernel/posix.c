@@ -99,7 +99,9 @@ void posix_request_block_multi(const uint32_t* addrs, int n, uint32_t deadline,
                                registers_t* regs) {
     if (n > PROC_WAIT_MAX) n = PROC_WAIT_MAX;
     if (n < 0) n = 0;
-    for (int i = 0; i < n; i++) block_addrs[i] = addrs[i];
+    if (addrs != block_addrs) {
+        for (int i = 0; i < n; i++) block_addrs[i] = addrs[i];
+    }
     block_count = n;
     block_deadline = deadline;
     posix_request_retry();
@@ -2144,7 +2146,10 @@ static int32_t sys_poll(k_pollfd_t* fds_u, uint32_t nfds, int timeout_ms,
     if (nfds > MAX_FDS * 2) return -EINVAL;
 
     int ready = 0;
-    uint32_t socks[PROC_WAIT_MAX];
+    /* The set is built straight into block_addrs rather than a local
+     * array: PROC_WAIT_MAX entries is a kilobyte, and this runs on an 8KB
+     * kernel stack. posix_request_block_multi() then has nothing to copy. */
+    uint32_t* socks = block_addrs;
     int nsocks = 0;
     int all_registered = 1;    /* every descriptor in the set is a socket
                                 * this task is now parked on */
@@ -2209,7 +2214,10 @@ static int32_t sys_select(int nfds, uint32_t* rd, uint32_t* wr, uint32_t* ex,
 
     uint32_t rout = 0, wout = 0, eout = 0;
     int ready = 0;
-    uint32_t socks[PROC_WAIT_MAX];
+    /* The set is built straight into block_addrs rather than a local
+     * array: PROC_WAIT_MAX entries is a kilobyte, and this runs on an 8KB
+     * kernel stack. posix_request_block_multi() then has nothing to copy. */
+    uint32_t* socks = block_addrs;
     int nsocks = 0;
     int all_registered = 1;
 
@@ -3450,7 +3458,12 @@ void posix_syscall(registers_t* regs) {
          * the retry loop finally using it. Waking must not overwrite eax,
          * which now holds the syscall number - see PROC_BLOCKED's
          * wait_retry in the scheduler. */
-        uint32_t waiting_on[PROC_WAIT_MAX];
+        /* Static rather than on the stack, for the same reason as
+         * sys_poll()'s set: PROC_WAIT_MAX entries is a kilobyte. One
+         * syscall is in this path at a time - nothing re-enters it from
+         * an interrupt - and the scheduler copies the set into the task
+         * before it switches away. */
+        static uint32_t waiting_on[PROC_WAIT_MAX];
         int waiting_n = block_count;
         for (int i = 0; i < waiting_n; i++) waiting_on[i] = block_addrs[i];
         uint32_t until = block_deadline;
