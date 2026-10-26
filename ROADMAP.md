@@ -10697,8 +10697,20 @@ much each would widen what runs:
 
    The 64-bit kernel parks `poll` on a shared key any wake releases, so
    it does not have the first bug; its wineboot is slower for reasons
-   not yet measured. The 32-bit fork is still an eager copy - the
-   64-bit side's copy-on-write fork is the next structural win there.
+   not yet measured.
+
+   **The 32-bit fork is copy-on-write now**, as the 64-bit side's has
+   been since Milestone 69: frames are reference-counted in the PMM, a
+   fork shares every private page read-only, and the first write breaks
+   it. It needed CR0.WP set - with it clear, ring 0 ignores read-only
+   pages, so every kernel write into user memory after a fork (getcwd,
+   stat, poll's revents, a signal frame) would have gone into both
+   processes; `fork_test.c` section 8 fails on a kernel without it.
+   Through a first wineboot fork shared 209,377 pages where it used to
+   copy 210,913 (824MB), and copied 244 when somebody wrote. Wall clock
+   did not move (46s either way) - the exec after each fork threw the
+   copies away - but forking a large process no longer needs the memory
+   to duplicate it.
 
    `--with-freetype` is not optional if you want windows: without a font
    engine Wine's caption metrics are uninitialised stack, and the window
