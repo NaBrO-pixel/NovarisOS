@@ -10653,6 +10653,30 @@ much each would widen what runs:
    remembered in `build/wine.config`, so `make WINE_BUILD=../wine32`
    once and then the bare `make test-wine...` targets.
 
+   **A first boot that finishes, on the 32-bit side.** Until then the
+   32-bit image staged too few modules for Wine's services - no
+   `rpcss.exe`, no `atl100.dll`, no `svchost`/`plugplay`/`winedevice` or
+   kernel drivers - so every first boot sat out Wine's five-minute
+   timeout with RpcSs unavailable. `install_wine.sh` now stages the
+   64-bit side's measured list as well, and staging it exposed four
+   kernel bugs, each of which ended in every task parked and the CPU
+   idle: `exit_group` ended only the calling thread; the task table was
+   32 append-only slots against the 82 tasks a prefix creates;
+   descriptors 0-2 were never closed whatever they held; and a failed
+   fork or an unreceived `SCM_RIGHTS` message leaked references. Plus
+   two staging ones: the winmd files (rundll32 looped looking for them)
+   and `appwiz.cpl`, whose Wine Mono dialog waits for a click. All of
+   it was found with F12, which now dumps every task and socket to
+   COM1, and with the staged image run in a chroot on the host, which
+   tells a missing file from a kernel bug in seconds.
+
+   The whole 32-bit suite passes, `test-posix` and `test-wine-persist`
+   included, and the 64-bit boot is 26/26. What remains is speed: on an
+   emulated CPU a complete first wineboot still outlasts Wine's
+   five-minute boot wait, so Wine starts the program while the prefix
+   finishes behind it. One `start_rpcss` line on a first boot is stock
+   Wine's own ordering and is gone on the second.
+
    `--with-freetype` is not optional if you want windows: without a font
    engine Wine's caption metrics are uninitialised stack, and the window
    frame is measured from them. `apt-get install libfreetype-dev:i386`
