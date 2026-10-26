@@ -967,7 +967,19 @@ void scheduler_dump_tasks(void) {
     dump_dec(pit_get_ticks());
     serial_writestring(", ");
     dump_dec((uint32_t)process_count);
-    serial_writestring(" slots\n");
+    serial_writestring(" slots, ");
+    dump_dec(pmm_free_frames());
+    serial_writestring(" frames free; cow: ");
+    {
+        extern uint32_t cow_fork_shared, cow_fork_copied, cow_break_copied,
+                        cow_break_reused, cow_wp_suspends;
+        dump_dec(cow_fork_shared);  serial_writestring(" shared at fork, ");
+        dump_dec(cow_fork_copied);  serial_writestring(" copied at fork, ");
+        dump_dec(cow_break_copied); serial_writestring(" copied on write, ");
+        dump_dec(cow_break_reused); serial_writestring(" reused on write, ");
+        dump_dec(cow_wp_suspends);  serial_writestring(" WP suspends");
+    }
+    serial_writestring("\n");
     for (int i = 0; i < process_count; i++) {
         process_t* p = &process_table[i];
         const char* st = "?";

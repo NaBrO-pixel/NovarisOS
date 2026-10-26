@@ -141,6 +141,10 @@ static int read_all(int fd, char* buf, int n) {
  * shared-address-space implementation would get wrong while passing every
  * other check in this file. */
 static char shared[32] = "parent";
+/* Four pages, page-aligned, for section 8 - so that each side's writes
+ * land on pages of their own and two stay untouched by both until the
+ * kernel writes into them. */
+static char cowbuf[4 * 4096] __attribute__((aligned(4096)));
 
 static int child_of_exec(void) {
     out("  [ok]   the exec'd image runs, and got its argument\n");
@@ -391,6 +395,70 @@ int main_(int argc, char** argv) {
         sc1(SYS_chdir, (long)"/");
         sc1(SYS_unlink, (long)(DIRPATH "/" FILENAME));
         sc1(SYS_rmdir, (long)DIRPATH);
+    }
+
+    /* 8. copy-on-write, from both sides and from the kernel -------------
+     *
+     * Section 1 shows a child's write staying in the child. A fork that
+     * shares pages until one side writes has two more ways to be wrong,
+     * and this is them: the *parent* writing while the child still has
+     * the page, and the *kernel* writing into a shared page on a
+     * process's behalf - a read() into a buffer - which on a CPU where
+     * ring 0 ignores read-only pages would go into both processes. */
+    out("\n8. copy-on-write\n");
+    {
+        int p2c[2], c2p[2];
+        cowbuf[0] = 'o';
+        cowbuf[4096] = 'o';
+        cowbuf[8192] = 'o'; cowbuf[8193] = 'r'; cowbuf[8194] = 'i';
+        cowbuf[8195] = 'g';
+        cowbuf[12288] = 'o';
+        sc1(SYS_pipe, (long)p2c);
+        sc1(SYS_pipe, (long)c2p);
+
+        long pid = sc0(SYS_fork);
+        if (pid == 0) {
+            char msg[4];
+            char go;
+            sc1(SYS_close, p2c[1]);
+            sc1(SYS_close, c2p[0]);
+            read_all(p2c[0], &go, 1);              /* the parent has written */
+            msg[0] = (cowbuf[0] == 'o' && cowbuf[4096] == 'o') ? 'y' : 'n';
+            /* Into the third page, which neither side has written since
+             * the fork - so it is still shared when the kernel writes. */
+            read_all(p2c[0], &cowbuf[8192], 4);
+            msg[1] = (cowbuf[8192] == 'K' && cowbuf[8195] == 'N') ? 'y' : 'n';
+            msg[2] = (cowbuf[0] == 'o') ? 'y' : 'n';
+            /* And a write the kernel makes with no help at all: read()
+             * goes out of its way to give a shared page its copy before
+             * writing, getcwd() just writes - so this one is the page
+             * table's protection, or nothing. */
+            sc2(SYS_getcwd, (long)&cowbuf[12288], 64);
+            msg[3] = (cowbuf[12288] == '/') ? 'y' : 'n';
+            sc3(SYS_write, c2p[1], (long)msg, 4);
+            sc1(SYS_exit, 0);
+        }
+        sc1(SYS_close, p2c[0]);
+        sc1(SYS_close, c2p[1]);
+        cowbuf[0] = 'P';
+        cowbuf[4096] = 'P';
+        sc3(SYS_write, p2c[1], (long)"g", 1);
+        sc3(SYS_write, p2c[1], (long)"KERN", 4);
+        int n = read_all(c2p[0], buf, 4);
+        sc3(SYS_waitpid, pid, (long)&status, 0);
+        check("the child reported back", n == 4);
+        check("the parent's writes after fork stayed in the parent",
+              buf[0] == 'y');
+        check("the parent sees its own writes", cowbuf[0] == 'P' &&
+                                                cowbuf[4096] == 'P');
+        check("a read() in the child landed in the child", buf[1] == 'y');
+        check("and not in the parent, which shared that page",
+              cowbuf[8192] == 'o' && cowbuf[8195] == 'g');
+        check("the child's view never changed under it", buf[2] == 'y');
+        check("getcwd() in the child wrote the child's page", buf[3] == 'y');
+        check("and left the parent's alone", cowbuf[12288] == 'o');
+        sc1(SYS_close, p2c[1]);
+        sc1(SYS_close, c2p[0]);
     }
 
     out("\nfork test done.\n");

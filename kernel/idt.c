@@ -1,4 +1,5 @@
 #include "idt.h"
+#include "paging.h"   /* paging_wp_restore */
 #include "pic.h"
 #include "console.h"
 #include "posix.h"
@@ -94,6 +95,10 @@ void isr_handler(registers_t* regs) {
          * physical allocator. Writing a signal frame onto it would fault
          * in the kernel. */
         if (!scheduler_next_esp) posix_deliver_pending(regs);
+        /* A syscall that wrote into a read-only user page ran the rest of
+         * itself with CR0.WP off (see paging_wp_suspend); this is its way
+         * out, so WP comes back before ring 3 runs. */
+        if ((regs->cs & 3) == 3) paging_wp_restore();
         return;
     }
 
@@ -103,6 +108,10 @@ void isr_handler(registers_t* regs) {
      * machine. The hook returns 0 (or isn't installed) for anything that
      * genuinely is the kernel's fault, which falls through below. */
     if (regs->int_no < 32 && user_fault_hook && user_fault_hook(regs)) {
+        /* Not for a fault the kernel took: the hook may just have
+         * suspended WP so that the faulting kernel write can be retried,
+         * and putting it back here would fault the retry again. */
+        if ((regs->cs & 3) == 3) paging_wp_restore();
         return;
     }
 
@@ -141,6 +150,7 @@ void irq_handler(registers_t* regs) {
      * run. The signal stays pending and arrives on the next return to
      * ring 3 instead. */
     if (!scheduler_next_esp) posix_deliver_pending(regs);
+    paging_wp_restore();
 }
 
 void register_interrupt_handler(uint8_t n, isr_handler_t handler) {

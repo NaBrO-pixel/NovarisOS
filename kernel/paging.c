@@ -469,6 +469,14 @@ static int pde_is_own(uint32_t i) {
     return (PAGE_DIRECTORY[i] & PAGE_PRESENT) != 0;
 }
 
+/* What copy-on-write fork did, for the F12 dump: pages shared rather
+ * than copied at fork, pages fork still had to copy (above the first
+ * gigabyte, or shared too often), breaks that copied and breaks that just
+ * handed the last owner its page back, and how often the kernel wrote
+ * into a read-only page that was not copy-on-write (paging_wp_suspend). */
+uint32_t cow_fork_shared, cow_fork_copied, cow_break_copied, cow_break_reused,
+         cow_wp_suspends;
+
 int paging_copy_user_space(uint32_t dest_pd) {
     if (!dest_pd || dest_pd == paging_current_address_space()) return 0;
 
@@ -480,6 +488,7 @@ int paging_copy_user_space(uint32_t dest_pd) {
      * ordinary mapping, which the window does not disturb. */
     foreign_attach(dest_pd);
     uint32_t* fpd = FOREIGN_PD;
+    int shared_any = 0;
 
     for (uint32_t i = 0; i < ENTRIES_PER_TABLE; i++) {
         if (!pde_is_own(i)) continue;
@@ -513,8 +522,38 @@ int paging_copy_user_space(uint32_t dest_pd) {
                 continue;
             }
 
+            /* Private memory is shared too, until somebody writes to it.
+             * Both sides get the same frame read-only and marked PAGE_COW,
+             * with PAGE_COW_RW saying the mapping itself is writable; the
+             * first write from either breaks it (paging_break_cow) and the
+             * frame's reference count decides whether that copies or just
+             * hands the last owner its page back writable.
+             *
+             * No PAGE_SHARED: that is what tells this kind of COW page from
+             * a private file mapping's, whose frames the file owns. These
+             * are owned jointly, and freed through pmm_free_frame() by
+             * whichever owner lets go last.
+             *
+             * This was a full copy, a byte at a time and then a word at a
+             * time, of every page of the parent - and Wine forks to start
+             * every process, so a first wineboot copied its Wine processes
+             * over and over only for the child to exec a moment later and
+             * throw the copy away. */
+            if (pmm_frame_share(pte & ~0xFFFu)) {
+                uint32_t rw = (pte & PAGE_RW) ||
+                              ((pte & PAGE_COW) && (pte & PAGE_COW_RW));
+                uint32_t cow = (pte & ~(PAGE_RW | PAGE_COW_RW)) | PAGE_COW |
+                               (rw ? PAGE_COW_RW : 0);
+                pt[j] = cow;
+                FOREIGN_TABLE(i)[j] = cow;
+                shared_any = 1;
+                cow_fork_shared++;
+                continue;
+            }
+
             uint32_t frame = pmm_alloc_frame();
             if (!frame) { foreign_detach(); return 0; }
+            cow_fork_copied++;
 
             /* The child's frame is mapped nowhere yet, so it gets the
              * scratch address for exactly as long as the copy takes. */
@@ -531,6 +570,14 @@ int paging_copy_user_space(uint32_t dest_pd) {
     }
 
     foreign_detach();
+
+    /* The parent's own entries were made read-only above, and its TLB may
+     * still hold them writable - which would let it write straight into a
+     * frame the child now shares. Reloading CR3 drops every user entry. */
+    if (shared_any) {
+        uint32_t cr3;
+        __asm__ __volatile__("mov %%cr3, %0; mov %0, %%cr3" : "=r"(cr3) :: "memory");
+    }
     return 1;
 }
 
@@ -568,8 +615,25 @@ int paging_break_cow(uint32_t virt_addr) {
 
     if (!(pte & PAGE_PRESENT) || !(pte & PAGE_COW)) return 0;
 
+    /* Writable afterwards only if the mapping is: a read-only private
+     * page gets its own copy and stays read-only, and a write the kernel
+     * makes into it is then handled as a write to any read-only page. */
+    uint32_t want_rw = (pte & PAGE_COW_RW) ? PAGE_RW : 0;
+
+    /* A page a fork shared, rather than a file's (no PAGE_SHARED). If no
+     * other address space holds the frame any more, the copy would be a
+     * copy of memory nobody else can see: the page is simply this
+     * process's again. */
+    if (!(pte & PAGE_SHARED) && pmm_frame_sharers(pte & ~0xFFFu) == 0) {
+        uint32_t flags = (pte & 0xFFFu) & ~(PAGE_COW | PAGE_COW_RW);
+        paging_map_page(va, pte & ~0xFFFu, flags | want_rw);
+        cow_break_reused++;
+        return 1;
+    }
+
     uint32_t frame = pmm_alloc_frame();
     if (!frame) return 0;
+    if (!(pte & PAGE_SHARED)) cow_break_copied++;
 
     /* One buffer, one copy at a time. A fault arrives through an interrupt
      * gate with interrupts already off, but this is also called from
@@ -588,10 +652,17 @@ int paging_break_cow(uint32_t virt_addr) {
      * faulting instruction is about to be retried against. */
     uint32_t flags = (pte & 0xFFFu);
     flags &= ~(PAGE_SHARED | PAGE_COW | PAGE_COW_RW);
-    flags |= PAGE_RW;
-    paging_map_page(va, frame, flags);
+    /* Writable while the bytes go back in, whatever it ends up as: CR0.WP
+     * is set, so the kernel's own write honours the bit too. */
+    paging_map_page(va, frame, flags | PAGE_RW);
 
     for (uint32_t i = 0; i < 4096; i++) ((uint8_t*)va)[i] = cow_staging[i];
+
+    if (!want_rw) paging_map_page(va, frame, flags);
+
+    /* A fork's page has one owner fewer now. A file's frame is the file's
+     * and is left alone. */
+    if (!(pte & PAGE_SHARED)) pmm_free_frame(pte & ~0xFFFu);
 
     __asm__ __volatile__("push %0; popf" :: "r"(flags_reg) : "memory", "cc");
     return 1;
@@ -640,4 +711,36 @@ uint32_t paging_get_entry_in(uint32_t pd_phys, uint32_t virt_addr) {
     }
     foreign_detach();
     return entry;
+}
+
+/* CR0.WP, bit 16: whether ring 0 honours a page's read-only bit. Set by
+ * paging_wp_enable() once the fault hook can handle what it causes, and
+ * suspended for the remainder of one trap by the hook when the kernel
+ * writes into a read-only user page that is not copy-on-write - see
+ * handle_kernel_write_fault() in process.c. */
+static volatile int wp_on, wp_suspended;
+
+static inline void set_wp(int on) {
+    uint32_t cr0;
+    __asm__ __volatile__("mov %%cr0, %0" : "=r"(cr0));
+    cr0 = on ? (cr0 | 0x10000u) : (cr0 & ~0x10000u);
+    __asm__ __volatile__("mov %0, %%cr0" :: "r"(cr0) : "memory");
+}
+
+void paging_wp_enable(void) {
+    wp_on = 1;
+    set_wp(1);
+}
+
+void paging_wp_suspend(void) {
+    cow_wp_suspends++;
+    wp_suspended = 1;
+    set_wp(0);
+}
+
+void paging_wp_restore(void) {
+    if (wp_suspended && wp_on) {
+        wp_suspended = 0;
+        set_wp(1);
+    }
 }

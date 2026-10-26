@@ -21,6 +21,15 @@ uint32_t pmm_alloc_frame(void);
 /* Marks a previously-allocated frame free again. */
 void pmm_free_frame(uint32_t phys_addr);
 
+/* Copy-on-write fork's reference counts (see pmm.c). pmm_frame_share()
+ * records one more owner of an allocated frame and returns 0 if it cannot
+ * (above the first gigabyte, or already at the limit) - the caller copies
+ * instead. pmm_frame_sharers() is how many owners it has beyond one: 0
+ * means the caller holding it is the only one. pmm_free_frame() releases
+ * one owner and frees the frame with the last. */
+int      pmm_frame_share(uint32_t phys_addr);
+uint32_t pmm_frame_sharers(uint32_t phys_addr);
+
 /* `count` frames that are physically adjacent, or 0 if no such run is
  * free. Milestone 38 needed it: a network card DMAs into a buffer the
  * *card* addresses, so the buffer has to be one physical run and the
