@@ -10671,11 +10671,34 @@ much each would widen what runs:
    tells a missing file from a kernel bug in seconds.
 
    The whole 32-bit suite passes, `test-posix` and `test-wine-persist`
-   included, and the 64-bit boot is 26/26. What remains is speed: on an
-   emulated CPU a complete first wineboot still outlasts Wine's
-   five-minute boot wait, so Wine starts the program while the prefix
-   finishes behind it. One `start_rpcss` line on a first boot is stock
-   Wine's own ordering and is gone on the second.
+   included, and the 64-bit boot is 26/26. One `start_rpcss` line on a
+   first boot is stock Wine's own ordering and is gone on the second.
+
+   **And then a first boot in fifty seconds.** A fresh `wine
+   hellowin.exe` ran 335s after the command, behind Wine's five-minute
+   boot timeout; it now runs 50s after it, with wineboot finished and no
+   timeout (`make test-wine`: 366s to 82s, boot included). Two causes,
+   both measured with Shift+F12, which prints a timer-sampled profile
+   and TSC cycles per syscall:
+
+   - **The wineserver missed most of its clients.** A task parked by
+     `poll` registered at most twelve wake addresses; the server polls
+     186 descriptors, so a client whose request pipe was not among the
+     twelve waited for the server's next timed re-test, and spun in
+     `read` meanwhile - 71 million retried reads in one boot.
+     `PROC_WAIT_MAX` is 256.
+   - **Frame allocation scanned from frame 0 every time**, 18% of all
+     CPU. It keeps a hint now; and `kmemcpy` and fork's page copy move
+     words, not bytes.
+
+   Finishing the boot reached three things a timed-out boot never did:
+   `link` (fontconfig's cache lock - EPERM, as on FAT), `fadvise64_64`,
+   and a 256-entry socket table that ran out of pipes (1024 now).
+
+   The 64-bit kernel parks `poll` on a shared key any wake releases, so
+   it does not have the first bug; its wineboot is slower for reasons
+   not yet measured. The 32-bit fork is still an eager copy - the
+   64-bit side's copy-on-write fork is the next structural win there.
 
    `--with-freetype` is not optional if you want windows: without a font
    engine Wine's caption metrics are uninitialised stack, and the window
