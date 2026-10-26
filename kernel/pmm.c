@@ -10,6 +10,8 @@
 
 static uint8_t frame_bitmap[BITMAP_BYTES];
 static uint32_t highest_frame = 0;     /* highest frame index we know about */
+/* No frame below this index is free - see pmm_alloc_frame(). */
+static uint32_t search_from = 0;
 
 static inline void bitmap_set(uint32_t bit) {
     frame_bitmap[bit / 8] |= (uint8_t)(1u << (bit % 8));
@@ -30,6 +32,7 @@ static void mark_region(uint32_t start_frame, uint32_t frame_count, int used) {
             bitmap_set(frame);
         } else {
             bitmap_clear(frame);
+            if (frame < search_from) search_from = frame;
         }
         if (frame > highest_frame) highest_frame = frame;
     }
@@ -94,13 +97,30 @@ void pmm_reserve_region(uint32_t start_addr, uint32_t end_addr) {
     }
 }
 
+/* From search_from rather than from 0. Every allocation used to scan the
+ * bitmap from frame 0, a bit at a time - and the bottom of memory is the
+ * part that fills first, so the scan walked the whole used prefix every
+ * time. With a Wine prefix being built that was 18% of all CPU time, more
+ * than any other single function in the kernel (sampled from the QEMU
+ * monitor through a first wineboot). The answer is the same lowest free
+ * frame as before; it is only found without re-reading what is known to
+ * be taken. */
 uint32_t pmm_alloc_frame(void) {
-    for (uint32_t frame = 0; frame <= highest_frame; frame++) {
+    uint32_t frame = search_from;
+    while (frame <= highest_frame) {
+        /* Eight frames at a time while they are all in use. */
+        if ((frame & 7u) == 0 && frame_bitmap[frame / 8] == 0xFF) {
+            frame += 8;
+            continue;
+        }
         if (!bitmap_test(frame)) {
             bitmap_set(frame);
+            search_from = frame + 1;
             return frame * PMM_FRAME_SIZE;
         }
+        frame++;
     }
+    search_from = highest_frame + 1;
     return 0; /* out of memory */
 }
 
@@ -146,6 +166,7 @@ void pmm_free_frame(uint32_t phys_addr) {
     if (frame < MAX_FRAMES) {
         if (!bitmap_test(frame)) { double_frees++; return; }
         bitmap_clear(frame);
+        if (frame < search_from) search_from = frame;
     }
 }
 

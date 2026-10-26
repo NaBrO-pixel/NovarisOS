@@ -1,4 +1,5 @@
 #include "paging.h"
+#include "kstring.h"
 #include "pmm.h"
 
 #define PAGE_SIZE          4096
@@ -519,7 +520,7 @@ int paging_copy_user_space(uint32_t dest_pd) {
              * scratch address for exactly as long as the copy takes. */
             uint8_t* dst = (uint8_t*)scratch_map(frame);
             const uint8_t* src = (const uint8_t*)((i << 22) | (j << 12));
-            for (uint32_t b = 0; b < PAGE_SIZE; b++) dst[b] = src[b];
+            kmemcpy(dst, src, PAGE_SIZE);
             scratch_unmap();
 
             /* Same protection bits as the parent's page, including a

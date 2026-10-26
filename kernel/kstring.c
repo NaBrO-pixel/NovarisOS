@@ -1,9 +1,14 @@
 #include "kstring.h"
 
+/* Four bytes at a time, then the tail. It was a byte loop, which is every
+ * page fork copies and every file a mapping makes page-aligned - a
+ * first wineboot moves hundreds of megabytes through here. */
 void kmemcpy(void* dst, const void* src, size_t n) {
-    uint8_t* d = (uint8_t*)dst;
-    const uint8_t* s = (const uint8_t*)src;
-    for (size_t i = 0; i < n; i++) d[i] = s[i];
+    size_t words = n >> 2, rest = n & 3;
+    __asm__ __volatile__("cld; rep movsl; mov %3, %%ecx; rep movsb"
+                         : "+D"(dst), "+S"(src), "+c"(words)
+                         : "r"(rest)
+                         : "memory");
 }
 
 void kmemmove(void* dst, const void* src, size_t n) {
