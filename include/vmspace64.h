@@ -81,6 +81,12 @@ int  vmspace64_break_cow(uint64_t va);
  * is recorded in PAGE64_COW_RW - which is precisely the bit break_cow
  * consults to tell a page it should copy from a page that is genuinely
  * read-only. */
+/* The first page in [va, end) of the current space that has a present
+ * PTE, or `end` if none does. Walks the tables rather than the pages, so
+ * a range with no tables behind it - a reservation, a hole - costs one
+ * test per missing table instead of one per page. */
+uint64_t vmspace64_next_mapped(uint64_t va, uint64_t end);
+
 int  vmspace64_set_writable(uint64_t va, int writable);
 
 void vmspace64_switch(const vmspace64_t* vs);

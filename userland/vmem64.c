@@ -100,6 +100,15 @@ static int write_faults(volatile unsigned char *p)
     return caught;
 }
 
+/* The same question for a read. */
+static int read_faults(volatile unsigned char *p)
+{
+    caught = 0;
+    if (sigsetjmp(jump, 1) == 0)
+        (void)*p;
+    return caught;
+}
+
 #define SPAN (16 * 4096)
 
 int main(void)
@@ -182,6 +191,51 @@ int main(void)
        mprotect(area, SPAN, PROT_READ | PROT_WRITE) == 0);
     ok("and the page really is writable again", !write_faults(area));
 
+    munmap(area, SPAN);
+
+    /* --- reservations ------------------------------------------------- *
+     *
+     * A PROT_NONE anonymous range is a list entry in the kernel, not page
+     * tables. Everything that used to be true because the pages were
+     * there - the range reads as taken, munmap gives it back - has to
+     * stay true without them, and the one thing that used to be wrong -
+     * touching it did not fault - should now be right. Wine commits
+     * memory by mprotecting pieces of a reservation, so that is tested
+     * on a piece from the middle, which splits the range in three. */
+
+    area = mmap(NULL, SPAN, PROT_NONE,
+                MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    ok("a PROT_NONE reservation", area != MAP_FAILED);
+    ok("reading a reserved page faults", read_faults(area + 4096));
+
+    errno = 0;
+    got = mmap(area + SPAN - 4096, 4096, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANON | MAP_FIXED_NOREPLACE, -1, 0);
+    ok("MAP_FIXED_NOREPLACE over a reservation is refused",
+       got == MAP_FAILED && errno == EEXIST);
+
+    ok("mprotect of its middle to read-write",
+       mprotect(area + 4 * 4096, 4 * 4096, PROT_READ | PROT_WRITE) == 0);
+    ok("and the committed pages read as zero",
+       all_bytes_are(area + 4 * 4096, 0, 4 * 4096));
+    ok("and take a write", !write_faults(area + 5 * 4096));
+    ok("while the pages either side are still reserved",
+       read_faults(area + 3 * 4096) && read_faults(area + 8 * 4096));
+
+    /* Decommitting is a fixed PROT_NONE mapping over committed pages,
+     * and what comes back on recommitting is zeros, not the old data. */
+    got = mmap(area + 5 * 4096, 4096, PROT_NONE,
+               MAP_PRIVATE | MAP_ANON | MAP_FIXED | MAP_NORESERVE, -1, 0);
+    ok("a fixed reservation over a committed page", got == area + 5 * 4096);
+    ok("and that page faults again", read_faults(area + 5 * 4096));
+    mprotect(area + 5 * 4096, 4096, PROT_READ | PROT_WRITE);
+    ok("and recommitted it reads as zero, not as what was written",
+       area[5 * 4096] == 0);
+
+    munmap(area, SPAN);
+    got = mmap(area, SPAN, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANON | MAP_FIXED_NOREPLACE, -1, 0);
+    ok("after munmap the whole range is free again", got == area);
     munmap(area, SPAN);
 
     printf("vmem64: %d failures\n", failures);

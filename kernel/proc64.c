@@ -117,6 +117,9 @@ int proc64_fork_from(int pid) {
     child->brk_base    = parent->brk_base;
     child->brk_current = parent->brk_current;
     child->mmap_next   = parent->mmap_next;
+    child->nresv       = parent->nresv;
+    for (uint32_t r = 0; r < parent->nresv; r++)
+        child->resv[r] = parent->resv[r];
     kstrlcpy(child->exe_path, parent->exe_path, PROC64_PATH_MAX);
     /* The name comes across too: Linux's child keeps the name its
      * parent had until something execs. Measured. */

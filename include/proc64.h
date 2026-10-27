@@ -44,6 +44,10 @@
  * to start explorer.exe. */
 #define PROC64_MAX     128
 
+/* Reserved ranges per process. A first wineboot's busiest process holds
+ * a few dozen at once; 512 is 8KB a slot. */
+#define PROC64_RESV_MAX 512
+
 /* 32 was the number a program that opens a few files needs, and the
  * wineserver is not that program. It holds a descriptor per client
  * thread - the socket, the reply pipe and the wait pipe, three each -
@@ -153,6 +157,14 @@ typedef struct {
     /* The heap and the mmap bump pointer: per process, because a fork
      * gives the child its own copy of both. */
     uint64_t    brk_base, brk_current, mmap_next;
+
+    /* The PROT_NONE reservations this process holds, as sorted,
+     * non-overlapping, non-adjacent [start, end) ranges with no page
+     * tables behind them - see uspace64.c. A reservation that does not
+     * fit here falls back to the shared zero page, so running out is
+     * slower rather than wrong. */
+    uint32_t    nresv;
+    struct { uint64_t start, end; } resv[PROC64_RESV_MAX];
 
     proc64_fd_t fds[PROC64_FD_MAX];
     char        exe_path[PROC64_PATH_MAX];

@@ -1747,6 +1747,7 @@ static uint64_t do_execve(const char* path, const char* const* argv,
     vfork_release(p);
     p->brk_base = p->brk_current = info.brk_start;
     p->mmap_next = USPACE64_MMAP_BASE;
+    p->nresv = 0;
     kstrlcpy(p->exe_path, kpath, PROC64_PATH_MAX);
 
     /* And the name, which execve resets to the new program's basename.
@@ -4975,8 +4976,12 @@ void syscall64_report_calls(void) {
         }
         serial64_puts("\n");
 
-        /* mmap and munmap by kind, as kind:calls:pages:cycles-per-page. */
-        serial64_puts("NOVARIS64: [maps]");
+        /* mmap and munmap by kind, as kind:calls:pages:cycles-per-page,
+         * then how the reservation list held up. */
+        serial64_puts("NOVARIS64: [maps] resv-peak ");
+        serial64_putdec(uspace64_resv_peak());
+        serial64_puts(" spilled ");
+        serial64_putdec(uspace64_resv_spilled());
         for (int k = 0; k < MAPK_N; k++) {
             if (!mapk_calls[k]) continue;
             serial64_puts(" ");

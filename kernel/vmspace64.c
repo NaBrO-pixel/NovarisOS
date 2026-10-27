@@ -341,6 +341,41 @@ int vmspace64_clone_cow(uint64_t src_pml4, vmspace64_t* dst) {
     return 1;
 }
 
+uint64_t vmspace64_next_mapped(uint64_t va, uint64_t end) {
+    uint64_t* pml4 = table_at(read_cr3() & ADDR_MASK);
+
+    va &= ~(PAGE64_SIZE - 1);
+    while (va < end) {
+        uint64_t e, *t;
+        uint64_t skip;
+
+        e = pml4[(va >> 39) & 511];
+        skip = 1ULL << 39;
+        if (!(e & PAGE64_PRESENT)) goto next;
+        t = table_at(e & ADDR_MASK);
+
+        e = t[(va >> 30) & 511];
+        skip = 1ULL << 30;
+        if (!(e & PAGE64_PRESENT)) goto next;
+        if (e & PAGE64_HUGE) return va;
+        t = table_at(e & ADDR_MASK);
+
+        e = t[(va >> 21) & 511];
+        skip = 1ULL << 21;
+        if (!(e & PAGE64_PRESENT)) goto next;
+        if (e & PAGE64_HUGE) return va;
+        t = table_at(e & ADDR_MASK);
+
+        skip = PAGE64_SIZE;
+        if (t[(va >> 12) & 511] & PAGE64_PRESENT) return va;
+    next:
+        /* To the start of the next table's span, not va + skip: va is
+         * not aligned to it after the first step down. */
+        va = (va & ~(skip - 1)) + skip;
+    }
+    return end;
+}
+
 /* A write to a shared page. Returns 1 if it dealt with it, 0 if this was
  * not a copy-on-write fault at all and the caller should treat it as the
  * real fault it is. */

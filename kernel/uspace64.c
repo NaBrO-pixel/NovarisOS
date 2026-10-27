@@ -79,6 +79,7 @@ void uspace64_reset(vmspace64_t* space, uint64_t brk_start) {
     p->brk_base    = brk_start;
     p->brk_current = brk_start;
     p->mmap_next   = USPACE64_MMAP_BASE;
+    p->nresv       = 0;
     pages_allocated = 0;
 }
 
@@ -91,15 +92,165 @@ static int fits_in_user_half(uint64_t start, uint64_t length) {
     return length <= USPACE64_LIMIT - start;
 }
 
-/* Is every page in [start, end) unmapped? Asked before a mapping that
- * must not disturb anything already there - which means asking about
- * the whole range and not just a page of it. */
-static int range_free(uint64_t start, uint64_t end) {
+/* --- reservations ----------------------------------------------------
+ *
+ * A PROT_NONE anonymous mapping is a claim on addresses and nothing
+ * else, and it is kept as one: a [start, end) range in the process's
+ * list, with no page tables behind it.
+ *
+ * It used to be kept in the page tables, every page pointing at the
+ * shared zero page, because the tables were the only record this kernel
+ * had of which addresses were taken. That was right about the record
+ * and expensive about the means. Wine reserves about 43GB over a first
+ * wineboot - 11.2 million pages, each a PTE written on the way in and
+ * walked again by munmap on the way out, and 88MB of page tables to
+ * hold them. Measured, reservations were 11% of wineboot and their
+ * munmaps another 7%.
+ *
+ * So now:
+ *   - mmap(PROT_NONE, anonymous) records a range and maps nothing.
+ *   - Anything mapped over part of one - MAP_FIXED, a shared or file
+ *     mapping, brk - carves that part out first.
+ *   - mprotect to anything but PROT_NONE materialises the pages it
+ *     covers and carves them out: that is how Wine commits memory.
+ *   - munmap carves, then frees whatever pages are really there.
+ *   - range_free asks the list as well as the tables.
+ *   - fork copies the list and exec empties it.
+ *
+ * A reserved page is now absent rather than a read-only page of zeros,
+ * so touching one faults - which is what PROT_NONE means on Linux, and
+ * the old mapping's comment owned up to not doing.
+ *
+ * If the list is full, the range is mapped to the shared zero page the
+ * old way, and every path still recognises that page. Slower, never
+ * wrong. */
+
+static uint64_t resv_spilled;      /* pages that fell back to the zero page */
+static uint32_t resv_peak;         /* most regions any process has held    */
+
+uint64_t uspace64_resv_spilled(void) { return resv_spilled; }
+uint32_t uspace64_resv_peak(void)    { return resv_peak; }
+
+/* The first region whose end is past `va` - the only one that can
+ * contain it, and where a scan for overlaps starts. */
+static uint32_t resv_first_after(const proc64_t* p, uint64_t va) {
+    uint32_t lo = 0, hi = p->nresv;
+    while (lo < hi) {
+        uint32_t mid = (lo + hi) / 2;
+        if (p->resv[mid].end <= va) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+}
+
+static int resv_overlaps(const proc64_t* p, uint64_t start, uint64_t end) {
+    uint32_t i = resv_first_after(p, start);
+    return i < p->nresv && p->resv[i].start < end;
+}
+
+static void resv_delete(proc64_t* p, uint32_t i) {
+    for (uint32_t k = i + 1; k < p->nresv; k++) p->resv[k - 1] = p->resv[k];
+    p->nresv--;
+}
+
+static int resv_insert(proc64_t* p, uint32_t i, uint64_t start, uint64_t end) {
+    if (p->nresv >= PROC64_RESV_MAX) return 0;
+    for (uint32_t k = p->nresv; k > i; k--) p->resv[k] = p->resv[k - 1];
+    p->resv[i].start = start;
+    p->resv[i].end   = end;
+    p->nresv++;
+    if (p->nresv > resv_peak) resv_peak = p->nresv;
+    return 1;
+}
+
+/* Points every page in [start, end) that is not already mapped at the
+ * zero page, read-only. Returns how many it mapped, or -1 on failure. */
+static int64_t map_zero_page(uint64_t start, uint64_t end) {
+    uint64_t z = get_zero_frame();
+    int64_t n = 0;
+    if (!z) return -1;
     for (uint64_t va = start; va < end; va += PAGE64_SIZE) {
-        uint64_t frame;
-        if (paging64_translate(va, &frame) == PAGING64_OK) return 0;
+        uint64_t had;
+        if (paging64_translate(va, &had) == PAGING64_OK) continue;
+        if (paging64_map(va, z, PAGE64_PRESENT | PAGE64_USER) != PAGING64_OK)
+            return -1;
+        n++;
+    }
+    return n;
+}
+
+/* The old representation, for a range the list has no room for. */
+static int spill_to_zero_page(uint64_t start, uint64_t end) {
+    int64_t n = map_zero_page(start, end);
+    if (n < 0) return 0;
+    resv_spilled += (uint64_t)n;
+    return 1;
+}
+
+/* Takes [start, end) out of the list. A region straddling the range is
+ * split, which needs a slot; if there is none, the piece above the range
+ * is spilled to the zero page, so it stays reserved either way. */
+static void resv_remove(proc64_t* p, uint64_t start, uint64_t end) {
+    uint32_t i = resv_first_after(p, start);
+
+    while (i < p->nresv && p->resv[i].start < end) {
+        uint64_t rs = p->resv[i].start, re = p->resv[i].end;
+
+        if (rs < start && re > end) {
+            p->resv[i].end = start;
+            if (!resv_insert(p, i + 1, end, re))
+                spill_to_zero_page(end, re);
+            return;
+        }
+        if (rs < start)    { p->resv[i].end = start; i++; continue; }
+        if (re > end)      { p->resv[i].start = end; return; }
+        resv_delete(p, i);
+    }
+}
+
+/* Records [start, end), which the caller has already cleared of pages
+ * and of other regions. Joined to a neighbour it touches, so that the
+ * pieces of a reservation that was carved up and given back become one
+ * region again. */
+static int resv_add(proc64_t* p, uint64_t start, uint64_t end) {
+    uint32_t i = resv_first_after(p, start);
+    int join_prev = i > 0 && p->resv[i - 1].end == start;
+    int join_next = i < p->nresv && p->resv[i].start == end;
+
+    if (join_prev && join_next) {
+        p->resv[i - 1].end = p->resv[i].end;
+        resv_delete(p, i);
+    } else if (join_prev) {
+        p->resv[i - 1].end = end;
+    } else if (join_next) {
+        p->resv[i].start = start;
+    } else if (!resv_insert(p, i, start, end)) {
+        return spill_to_zero_page(start, end);
     }
     return 1;
+}
+
+/* Frees every page really mapped in [start, end), skipping the stretches
+ * with no tables at all. Every reservation that spilled is standing on
+ * the zero page, which is never freed. */
+static void unmap_pages(uint64_t start, uint64_t end) {
+    uint64_t va = start;
+    while ((va = vmspace64_next_mapped(va, end)) < end) {
+        uint64_t frame;
+        if (paging64_translate(va, &frame) == PAGING64_OK) {
+            frame &= ~(PAGE64_SIZE - 1);
+            paging64_unmap(va);
+            if (frame != zero_frame) pmm64_free_frame(frame);
+        }
+        va += PAGE64_SIZE;
+    }
+}
+
+/* Is every page in [start, end) unmapped and unreserved? Asked before a
+ * mapping that must not disturb anything already there - which means
+ * asking about the whole range and not just a page of it. */
+static int range_free(uint64_t start, uint64_t end) {
+    if (resv_overlaps(cur(), start, end)) return 0;
+    return vmspace64_next_mapped(start, end) == end;
 }
 
 /* Maps [start, end) as anonymous zeroed user memory. Returns 0 on
@@ -113,6 +264,7 @@ static int range_free(uint64_t start, uint64_t end) {
  * from a program that never touched its stack. */
 static int map_anon(uint64_t start, uint64_t end, uint64_t flags,
                     int zero_existing) {
+    resv_remove(cur(), start, end);
     for (uint64_t va = start; va < end; va += PAGE64_SIZE) {
         uint64_t frame, existing;
 
@@ -301,18 +453,15 @@ uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     if (prot & 0x2) pflags |= PAGE64_WRITE;        /* PROT_WRITE */
 
     /* A reservation. Nothing may read or write it, so nothing needs a
-     * page of its own; they all point at the same zeros, and the
-     * mapping exists to record that the range is taken. */
+     * page at all: the range goes in the list and the page tables are
+     * not touched. */
     if (prot == 0 && (flags & MAP_ANONYMOUS)) {
-        uint64_t z = get_zero_frame();
-        if (!z) return (uint64_t)-12;
-        for (uint64_t va = start; va < end; va += PAGE64_SIZE) {
-            uint64_t had;
-            if (paging64_translate(va, &had) == PAGING64_OK) continue;
-            if (paging64_map(va, z, PAGE64_PRESENT | PAGE64_USER)
-                    != PAGING64_OK)
-                return (uint64_t)-12;
-        }
+        /* MAP_FIXED over pages that are there replaces them, as it does
+         * for any other fixed mapping on Linux: this is how Wine
+         * decommits, and what it gets back on recommitting is zeros. */
+        unmap_pages(start, end);
+        resv_remove(cur(), start, end);
+        if (!resv_add(cur(), start, end)) return (uint64_t)-12;
     } else if (!map_anon(start, end, pflags, 1)) {
         return (uint64_t)-12;                      /* -ENOMEM */
     }
@@ -367,6 +516,7 @@ static uint64_t map_frames(uint64_t addr, int fixed,
      * page inside that range, so the pages exist and belong to the
      * process. They are released rather than abandoned. */
     if (fixed) {
+        resv_remove(cur(), start, start + n * PAGE64_SIZE);
         for (uint64_t i = 0; i < n; i++) {
             uint64_t va = start + i * PAGE64_SIZE, old;
             if (paging64_translate(va, &old) != PAGING64_OK) continue;
@@ -502,9 +652,35 @@ uint64_t uspace64_map_phys(uint64_t length, uint64_t phys, uint64_t prot) {
 void uspace64_protect(uint64_t addr, uint64_t length, uint64_t prot) {
     uint64_t start = addr & ~(PAGE64_SIZE - 1);
     uint64_t end = start + ((length + PAGE64_SIZE - 1) & ~(PAGE64_SIZE - 1));
+    proc64_t* p = cur();
+    uint64_t va;
 
-    for (uint64_t va = start; va < end; va += PAGE64_SIZE)
+    /* Reserved pages made accessible become real ones - this is Wine
+     * committing memory it reserved. Readable-only ones go on the zero
+     * page, and set_writable gives each its own frame if it is later
+     * made writable; writable ones get their own frames now. */
+    if (prot != 0) {
+        uint32_t i;
+        while ((i = resv_first_after(p, start)) < p->nresv &&
+               p->resv[i].start < end) {
+            uint64_t s = p->resv[i].start < start ? start : p->resv[i].start;
+            uint64_t e = p->resv[i].end > end ? end : p->resv[i].end;
+            uint64_t flags = PAGE64_PRESENT | PAGE64_USER;
+
+            resv_remove(p, s, e);
+            if (prot & 0x2) {                         /* PROT_WRITE */
+                map_anon(s, e, flags | PAGE64_WRITE, 1);
+            } else {
+                map_zero_page(s, e);
+            }
+        }
+    }
+
+    va = start;
+    while ((va = vmspace64_next_mapped(va, end)) < end) {
         vmspace64_set_writable(va, (prot & 0x2) != 0);   /* PROT_WRITE */
+        va += PAGE64_SIZE;
+    }
 }
 
 uint64_t uspace64_munmap(uint64_t addr, uint64_t length) {
@@ -514,14 +690,8 @@ uint64_t uspace64_munmap(uint64_t addr, uint64_t length) {
     if (length == 0) return (uint64_t)-22;
     end = start + ((length + PAGE64_SIZE - 1) & ~(PAGE64_SIZE - 1));
 
-    for (uint64_t va = start; va < end; va += PAGE64_SIZE) {
-        uint64_t frame;
-        if (paging64_translate(va, &frame) != PAGING64_OK) continue;
-        frame &= ~(PAGE64_SIZE - 1);
-        paging64_unmap(va);
-        /* Every reservation in the system is standing on this one. */
-        if (frame != zero_frame) pmm64_free_frame(frame);
-    }
+    resv_remove(cur(), start, end);
+    unmap_pages(start, end);
     return 0;
 }
 
