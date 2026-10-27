@@ -293,6 +293,9 @@ typedef struct {
 #define CLONE_VFORK   0x00004000
 #define CLONE_THREAD  0x00010000
 #define CLONE_SETTLS  0x00080000
+#define CLONE_PARENT_SETTID  0x00100000
+#define CLONE_CHILD_CLEARTID 0x00200000
+#define CLONE_CHILD_SETTID   0x01000000
 
 /* One Novaris-private number, well above anything Linux uses, kept for
  * the bring-up test that has no way to print. */
