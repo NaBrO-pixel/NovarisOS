@@ -304,6 +304,64 @@ extern void enter_user_mode64_abort(void) __attribute__((noreturn));
 static uint64_t cow_breaks;
 static uint64_t segv_delivered;
 
+/* Which faults those SIGSEGVs are: a small open-addressed table of
+ * (rip, page, error code), so that millions of them can be told apart
+ * from millions of one. A sample that finds the table full is counted
+ * as "other". Reset with the syscall counts. */
+#define SEGV_SLOTS 64
+static struct { uint64_t rip, page, err, n; } segv_tab[SEGV_SLOTS];
+static uint64_t segv_other;
+
+static void segv_sample(uint64_t rip, uint64_t addr, uint64_t err) {
+    uint64_t page = addr & ~0xFFFULL;
+    uint64_t h = ((rip ^ (page >> 12) ^ err) * 0x9E3779B97F4A7C15ULL) >> 58;
+    for (int i = 0; i < SEGV_SLOTS; i++) {
+        int k = (int)((h + i) % SEGV_SLOTS);
+        if (segv_tab[k].n == 0) {
+            segv_tab[k].rip = rip; segv_tab[k].page = page;
+            segv_tab[k].err = err; segv_tab[k].n = 1;
+            return;
+        }
+        if (segv_tab[k].rip == rip && segv_tab[k].page == page &&
+            segv_tab[k].err == err) {
+            segv_tab[k].n++;
+            return;
+        }
+    }
+    segv_other++;
+}
+
+void kmain64_segv_reset(void) {
+    for (int i = 0; i < SEGV_SLOTS; i++) segv_tab[i].n = 0;
+    segv_other = 0;
+}
+
+/* The commonest few, as rip/page/err x count. */
+void kmain64_segv_report(void) {
+    static int took[SEGV_SLOTS];
+    for (int i = 0; i < SEGV_SLOTS; i++) took[i] = 0;
+    serial64_puts("NOVARIS64: [segv] commonest:");
+    for (int k = 0; k < 8; k++) {
+        int best = -1;
+        for (int i = 0; i < SEGV_SLOTS; i++)
+            if (!took[i] && segv_tab[i].n &&
+                (best < 0 || segv_tab[i].n > segv_tab[best].n)) best = i;
+        if (best < 0) break;
+        took[best] = 1;
+        serial64_puts(" ");
+        serial64_puthex(segv_tab[best].rip);
+        serial64_puts("/");
+        serial64_puthex(segv_tab[best].page);
+        serial64_puts("/");
+        serial64_puthex(segv_tab[best].err);
+        serial64_puts("x");
+        serial64_putdec(segv_tab[best].n);
+    }
+    serial64_puts(" other ");
+    serial64_putdec(segv_other);
+    serial64_putc('\n');
+}
+
 /* For the end-of-layer report in syscall64.c: every page fault, the
  * ones that were copy-on-write, and the ones handed to the program as
  * SIGSEGV. Time outside syscalls is partly time in here. */
@@ -342,7 +400,11 @@ static void page_fault_handler(registers64_t* r) {
      * not a kernel failure - it is how Wine turns a bad access into a
      * Windows exception. Tried before the diagnostic below, so that a
      * fault with no handler still reports rather than vanishing. */
-    if (signal64_deliver(SIG64_SEGV, r, pf_cr2)) { segv_delivered++; return; }
+    if (signal64_deliver(SIG64_SEGV, r, pf_cr2)) {
+        segv_delivered++;
+        segv_sample(r->rip, pf_cr2, pf_err);
+        return;
+    }
 
     if (pf_diagnose) {
         serial64_puts("\nNOVARIS64: *** page fault in the program\n");
