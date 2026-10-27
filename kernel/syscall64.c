@@ -1820,6 +1820,8 @@ static uint64_t calls_reset_tsc;
 static uint64_t faults_at_reset[3];
 
 void kmain64_fault_stats(uint64_t* faults, uint64_t* cow, uint64_t* segv);
+void kmain64_segv_reset(void);
+void kmain64_segv_report(void);
 
 /* mmap is several different operations behind one number, and they do
  * not cost the same: a PROT_NONE reservation maps the shared zero page,
@@ -4802,6 +4804,7 @@ void syscall64_reset_calls(void) {
     calls_reset_tsc = tsc64();
     kmain64_fault_stats(&faults_at_reset[0], &faults_at_reset[1],
                         &faults_at_reset[2]);
+    kmain64_segv_reset();
 }
 
 /* Who called, and what. Printed at the end of a layer rather than as it
@@ -5001,6 +5004,7 @@ void syscall64_report_calls(void) {
                 serial64_putdec(calls_by_nr[i]);
             }
             serial64_puts("\n");
+            kmain64_segv_report();
         }
 
         /* mmap and munmap by kind, as kind:calls:pages:cycles-per-page,
