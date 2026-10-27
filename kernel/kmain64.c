@@ -148,10 +148,18 @@ extern const unsigned long clock64_elf_len;
 /* Whether the Wine layers print every syscall to COM1 - the trace that
  * ends each line "[call pid N] nr(...) = r".
  *
- *   make -f Makefile.amd64 CFLAGS_EXTRA=-DWINE64_TRACE=0 ...
+ * Off unless asked for. Every line is a few dozen bytes through an
+ * emulated UART, and a first wineboot makes 1.3 million syscalls: with
+ * the trace on it wrote a 139MB log and ran out its 300-second budget
+ * without finishing, winegui took 56s instead of 4, and bring-up took
+ * 503s instead of 130. The per-process and per-syscall summary each
+ * layer prints at its end is always there; this is for when one call
+ * needs to be seen.
+ *
+ *   make -f Makefile.amd64 CFLAGS_EXTRA=-DWINE64_TRACE=1 ...
  */
 #ifndef WINE64_TRACE
-#define WINE64_TRACE 1
+#define WINE64_TRACE 0
 #endif
 
 extern const unsigned char kill64_elf[];
