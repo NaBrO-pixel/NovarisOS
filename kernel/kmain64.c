@@ -400,10 +400,14 @@ static void page_fault_handler(registers64_t* r) {
      * not a kernel failure - it is how Wine turns a bad access into a
      * Windows exception. Tried before the diagnostic below, so that a
      * fault with no handler still reports rather than vanishing. */
-    if (signal64_deliver(SIG64_SEGV, r, pf_cr2)) {
-        segv_delivered++;
-        segv_sample(r->rip, pf_cr2, pf_err);
-        return;
+    {
+        /* Taken before delivery, which points rip at the handler. */
+        uint64_t fault_rip = r->rip;
+        if (signal64_deliver(SIG64_SEGV, r, pf_cr2)) {
+            segv_delivered++;
+            segv_sample(fault_rip, pf_cr2, pf_err);
+            return;
+        }
     }
 
     if (pf_diagnose) {
