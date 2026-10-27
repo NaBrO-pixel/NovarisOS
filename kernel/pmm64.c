@@ -252,6 +252,11 @@ uint64_t pmm64_alloc_frame(void) {
         uint64_t start = pass == 0 ? alloc_hint : 0;
         uint64_t stop  = pass == 0 ? frame_count : alloc_hint;
         for (uint64_t f = start; f < stop; f++) {
+            /* A byte with every frame taken is passed in one test. */
+            if ((f & 7) == 0 && f + 8 <= stop && bitmap[f >> 3] == 0xFF) {
+                f += 7;
+                continue;
+            }
             if (!bitmap_test(f)) {
                 bitmap_set(f);
                 watch_report("ALLOCATED to a new owner", f);
@@ -286,6 +291,12 @@ uint64_t pmm64_alloc_high(void) {
         uint64_t start = pass == 0 ? high_hint : frame_count;
         uint64_t stop  = pass == 0 ? 0 : high_hint;
         for (uint64_t f = start; f-- > stop; ) {
+            /* Walking down: at the top bit of a full byte, skip to the
+             * byte below - one test for eight taken frames. */
+            if ((f & 7) == 7 && f >= stop + 7 && bitmap[f >> 3] == 0xFF) {
+                f -= 7;
+                continue;
+            }
             if (!bitmap_test(f)) {
                 bitmap_set(f);
                 watch_report("ALLOCATED to a new owner", f);
