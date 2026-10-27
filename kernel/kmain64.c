@@ -4556,6 +4556,7 @@ void kernel_main(uint32_t magic, void* mbi) {
                 serial64_puts(" frames before wineboot\n");
                 serial64_puts("NOVARIS64: --- wineboot ---\n");
                 pf_diagnose = 1;
+                syscall64_reset_calls();
                 syscall64_set_trace(WINE64_TRACE);
                 signal64_set_trace(WINE64_TRACE);
 
@@ -4590,6 +4591,10 @@ void kernel_main(uint32_t magic, void* mbi) {
                 signal64_set_trace(0);
                 pf_diagnose = 0;
                 serial64_puts("NOVARIS64: --- end ---\n");
+                /* Where wineboot's syscalls went, by process and by
+                 * number - the same report run_wine_program() gives the
+                 * layers after it, which this one never had. */
+                syscall64_report_calls();
             }
 
             /* What actually happened, reported rather than asserted.
