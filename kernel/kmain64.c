@@ -145,6 +145,15 @@ extern const unsigned long clock64_elf_len;
     "WINEDEBUG=err+all,fixme+all,trace-all,warn-all,warn+winstation"
 #endif
 
+/* Whether the Wine layers print every syscall to COM1 - the trace that
+ * ends each line "[call pid N] nr(...) = r".
+ *
+ *   make -f Makefile.amd64 CFLAGS_EXTRA=-DWINE64_TRACE=0 ...
+ */
+#ifndef WINE64_TRACE
+#define WINE64_TRACE 1
+#endif
+
 extern const unsigned char kill64_elf[];
 extern const unsigned long kill64_elf_len;
 extern const unsigned char wait64_elf[];
@@ -467,7 +476,7 @@ static void run_wine_program(const void* image, uint64_t len,
         syscall64_set_leader(pid);
         syscall64_set_run_ticks(budget);
         syscall64_reset_calls();
-        syscall64_set_trace(trace);
+        syscall64_set_trace(trace && WINE64_TRACE);
         register_interrupt_handler64(32, sched_timer_handler);
         idt64_irq_set_mask(0, 0);
 
@@ -4547,8 +4556,8 @@ void kernel_main(uint32_t magic, void* mbi) {
                 serial64_puts(" frames before wineboot\n");
                 serial64_puts("NOVARIS64: --- wineboot ---\n");
                 pf_diagnose = 1;
-                syscall64_set_trace(1);
-                signal64_set_trace(1);
+                syscall64_set_trace(WINE64_TRACE);
+                signal64_set_trace(WINE64_TRACE);
 
                 /* End the run when wineboot finishes, not when the last
                  * process does. wineboot starts the wineserver, and a
