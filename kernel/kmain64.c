@@ -404,9 +404,14 @@ static void page_fault_handler(registers64_t* r) {
         /* Taken before delivery, which points rip at the handler. */
         uint64_t fault_rip = r->rip, fault_rsp = r->rsp;
         uint64_t n = segv_delivered;
-        /* The first few in full, then one in half a million: enough to
-         * say which process, and whether its thread pointer is sane. */
-        if (n < 4 || n % 500000 == 0) {
+        static uint8_t seen_by_pid[512];
+        int cpid = proc64_current_pid();
+        int first = cpid >= 0 && seen_by_pid[cpid & 511] < 3;
+        if (first) seen_by_pid[cpid & 511]++;
+        /* Each process's first three in full, then one in half a
+         * million: enough to say which process, how its run of faults
+         * began, and whether its thread pointer is sane. */
+        if (first || n % 500000 == 0) {
             uint32_t lo, hi, glo, ghi;
             __asm__ __volatile__("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000100u));
             __asm__ __volatile__("rdmsr" : "=a"(glo), "=d"(ghi) : "c"(0xC0000101u));
@@ -419,6 +424,12 @@ static void page_fault_handler(registers64_t* r) {
             serial64_puts(" rsp=");   serial64_puthex(fault_rsp);
             serial64_puts(" fs=");    serial64_puthex(((uint64_t)hi << 32) | lo);
             serial64_puts(" gs=");    serial64_puthex(((uint64_t)ghi << 32) | glo);
+            serial64_puts(" err=");   serial64_puthex(pf_err);
+            serial64_puts(" exe=");
+            {
+                proc64_t* me = proc64_current();
+                serial64_puts(me ? me->exe_path : "?");
+            }
             serial64_putc('\n');
         }
         if (signal64_deliver(SIG64_SEGV, r, pf_cr2)) {
