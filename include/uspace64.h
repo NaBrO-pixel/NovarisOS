@@ -45,6 +45,12 @@ uint64_t uspace64_brk(uint64_t addr);
  * or make it writable has to recognise it - see uspace64.c. */
 uint64_t uspace64_zero_frame(void);
 
+/* Reservation bookkeeping, for the end-of-layer report: pages that went
+ * to the zero page because a process's region list was full (should be
+ * 0), and the most regions any one process has held. */
+uint64_t uspace64_resv_spilled(void);
+uint32_t uspace64_resv_peak(void);
+
 /* Maps frames belonging to somebody else - a file's - into this
  * process, taking a reference on each so that unmapping releases the
  * reference rather than the frame. This is what makes a MAP_SHARED file
