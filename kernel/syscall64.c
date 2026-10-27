@@ -2776,7 +2776,23 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
      * semantic. With one address space per process and no shared memory
      * here, private and shared behave identically. */
     case SYS64_FUTEX: {
-        uint32_t op = (uint32_t)a2 & ~(uint32_t)FUTEX_PRIVATE_FLAG;
+        uint32_t op = (uint32_t)a2 & ~(uint32_t)(FUTEX_PRIVATE_FLAG |
+                                                 FUTEX_CLOCK_REALTIME);
+        /* The bitset forms, which are what glibc's pthread_join and its
+         * clock-based waits use. With every bit set - the only mask
+         * anything here passes - a bitset wait is a plain wait whose
+         * deadline is absolute rather than relative, on CLOCK_MONOTONIC
+         * or, with FUTEX_CLOCK_REALTIME, CLOCK_REALTIME; and a bitset
+         * wake is a plain wake. A narrower mask is treated as all of
+         * them, which can only wake too much, never too little.
+         *
+         * Unreachable until clone set pd->tid: pthread_join had never
+         * had a non-zero tid to wait on. The first join that did got
+         * -ENOSYS and glibc aborted with "The futex facility returned an
+         * unexpected error code". */
+        int absolute = 0;
+        if (op == FUTEX_WAIT_BITSET) { op = FUTEX_WAIT; absolute = 1; }
+        if (op == FUTEX_WAKE_BITSET) op = FUTEX_WAKE;
 
         if (op == FUTEX_WAIT) {
             registers64_t self, next;
@@ -2850,8 +2866,20 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
 
                 if (!user_range_ok(args->a4, sizeof(*ts)))
                     return (uint64_t)-14;          /* -EFAULT */
-                want = ts->sec * CLOCK64_HZ
-                     + ts->nsec / (1000000000ull / CLOCK64_HZ);
+                if (absolute) {
+                    /* Made relative against the clock it names; a
+                     * deadline already gone is a zero timeout. */
+                    uint64_t ns_s, ns_n, at, now;
+                    clock64_read(((uint32_t)a2 & FUTEX_CLOCK_REALTIME)
+                                     ? 0 : 1, &ns_s, &ns_n);
+                    at  = ts->sec * 1000000000ull + ts->nsec;
+                    now = ns_s * 1000000000ull + ns_n;
+                    want = at > now
+                         ? (at - now) / (1000000000ull / CLOCK64_HZ) : 0;
+                } else {
+                    want = ts->sec * CLOCK64_HZ
+                         + ts->nsec / (1000000000ull / CLOCK64_HZ);
+                }
                 /* A deadline already past still gets one turn, so that
                  * a zero timeout polls once rather than reporting a
                  * timeout for a word it never looked at. */
