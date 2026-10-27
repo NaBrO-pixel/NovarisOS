@@ -302,6 +302,16 @@ static volatile uint64_t pf_killed;
 extern void enter_user_mode64_abort(void) __attribute__((noreturn));
 
 static uint64_t cow_breaks;
+static uint64_t segv_delivered;
+
+/* For the end-of-layer report in syscall64.c: every page fault, the
+ * ones that were copy-on-write, and the ones handed to the program as
+ * SIGSEGV. Time outside syscalls is partly time in here. */
+void kmain64_fault_stats(uint64_t* faults, uint64_t* cow, uint64_t* segv) {
+    *faults = (uint64_t)pf_hits;
+    *cow    = cow_breaks;
+    *segv   = segv_delivered;
+}
 
 static void page_fault_handler(registers64_t* r) {
     pf_hits++;
@@ -332,7 +342,7 @@ static void page_fault_handler(registers64_t* r) {
      * not a kernel failure - it is how Wine turns a bad access into a
      * Windows exception. Tried before the diagnostic below, so that a
      * fault with no handler still reports rather than vanishing. */
-    if (signal64_deliver(SIG64_SEGV, r, pf_cr2)) return;
+    if (signal64_deliver(SIG64_SEGV, r, pf_cr2)) { segv_delivered++; return; }
 
     if (pf_diagnose) {
         serial64_puts("\nNOVARIS64: *** page fault in the program\n");

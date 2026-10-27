@@ -1817,6 +1817,9 @@ static uint64_t dispatch_body(syscall64_args_t* args);
  * small, and the time it then waits is not the kernel's anyway. */
 static uint64_t cycles_by_nr[512];
 static uint64_t calls_reset_tsc;
+static uint64_t faults_at_reset[3];
+
+void kmain64_fault_stats(uint64_t* faults, uint64_t* cow, uint64_t* segv);
 
 /* mmap is several different operations behind one number, and they do
  * not cost the same: a PROT_NONE reservation maps the shared zero page,
@@ -4797,6 +4800,8 @@ void syscall64_reset_calls(void) {
     for (int i = 0; i < 512; i++) { calls_by_nr[i] = 0; cycles_by_nr[i] = 0; }
     for (int i = 0; i < MAPK_N; i++) mapk_cycles[i] = mapk_calls[i] = mapk_pages[i] = 0;
     calls_reset_tsc = tsc64();
+    kmain64_fault_stats(&faults_at_reset[0], &faults_at_reset[1],
+                        &faults_at_reset[2]);
 }
 
 /* Who called, and what. Printed at the end of a layer rather than as it
@@ -4975,6 +4980,28 @@ void syscall64_report_calls(void) {
             serial64_puts("%)");
         }
         serial64_puts("\n");
+
+        /* Faults taken during the layer, and every syscall made at least
+         * 5,000 times rather than only the top few. */
+        {
+            uint64_t f, c, g;
+            kmain64_fault_stats(&f, &c, &g);
+            serial64_puts("NOVARIS64: [faults] ");
+            serial64_putdec((uint32_t)f - (uint32_t)faults_at_reset[0]);
+            serial64_puts(" page faults, ");
+            serial64_putdec(c - faults_at_reset[1]);
+            serial64_puts(" copy-on-write, ");
+            serial64_putdec(g - faults_at_reset[2]);
+            serial64_puts(" SIGSEGV; calls >= 5000:");
+            for (int i = 0; i < 512; i++) {
+                if (calls_by_nr[i] < 5000) continue;
+                serial64_puts(" ");
+                serial64_putdec((uint64_t)i);
+                serial64_puts("x");
+                serial64_putdec(calls_by_nr[i]);
+            }
+            serial64_puts("\n");
+        }
 
         /* mmap and munmap by kind, as kind:calls:pages:cycles-per-page,
          * then how the reservation list held up. */
