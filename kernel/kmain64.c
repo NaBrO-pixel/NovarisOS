@@ -402,7 +402,25 @@ static void page_fault_handler(registers64_t* r) {
      * fault with no handler still reports rather than vanishing. */
     {
         /* Taken before delivery, which points rip at the handler. */
-        uint64_t fault_rip = r->rip;
+        uint64_t fault_rip = r->rip, fault_rsp = r->rsp;
+        uint64_t n = segv_delivered;
+        /* The first few in full, then one in half a million: enough to
+         * say which process, and whether its thread pointer is sane. */
+        if (n < 4 || n % 500000 == 0) {
+            uint32_t lo, hi, glo, ghi;
+            __asm__ __volatile__("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000100u));
+            __asm__ __volatile__("rdmsr" : "=a"(glo), "=d"(ghi) : "c"(0xC0000101u));
+            serial64_puts("NOVARIS64: [segv#");
+            serial64_putdec(n);
+            serial64_puts("] pid ");
+            serial64_putdec((uint64_t)proc64_current_pid());
+            serial64_puts(" rip=");   serial64_puthex(fault_rip);
+            serial64_puts(" cr2=");   serial64_puthex(pf_cr2);
+            serial64_puts(" rsp=");   serial64_puthex(fault_rsp);
+            serial64_puts(" fs=");    serial64_puthex(((uint64_t)hi << 32) | lo);
+            serial64_puts(" gs=");    serial64_puthex(((uint64_t)ghi << 32) | glo);
+            serial64_putc('\n');
+        }
         if (signal64_deliver(SIG64_SEGV, r, pf_cr2)) {
             segv_delivered++;
             segv_sample(fault_rip, pf_cr2, pf_err);
