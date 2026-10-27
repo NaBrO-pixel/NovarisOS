@@ -365,12 +365,27 @@ void pmm64_free_frame(uint64_t phys) {
 
 uint64_t pmm64_total_frames(void) { return ready ? frame_count : 0; }
 
+/* Counted rather than tracked, as before, so it cannot drift from the
+ * bitmap - but a byte at a time instead of a bit at a time. A bit at a
+ * time over half a million frames was 9.6 million cycles a call, and
+ * statfs answers with it: Wine asks how much room a drive has every time
+ * it looks at one, 4,606 times in a first wineboot, which made fstatfs
+ * 12% of the whole boot. A used byte - the common case at the bottom of
+ * memory - costs one test, and the rest a table lookup. */
 uint64_t pmm64_free_frames(void) {
-    uint64_t n = 0;
+    static const uint8_t used_bits[16] = {
+        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4
+    };
+    uint64_t used = 0, whole = frame_count / 8;
     if (!ready) return 0;
-    for (uint64_t f = 0; f < frame_count; f++)
-        if (!bitmap_test(f)) n++;
-    return n;
+    for (uint64_t b = 0; b < whole; b++) {
+        uint8_t v = bitmap[b];
+        if (v == 0xFF) { used += 8; continue; }
+        used += used_bits[v & 0xF] + used_bits[v >> 4];
+    }
+    for (uint64_t f = whole * 8; f < frame_count; f++)
+        if (bitmap_test(f)) used++;
+    return frame_count - used;
 }
 
 uint64_t pmm64_used_frames(void) {

@@ -1803,7 +1803,57 @@ static uint64_t do_execve(const char* path, const char* const* argv,
     return 0;
 }
 
+static uint64_t dispatch_body(syscall64_args_t* args);
+
+/* What each syscall number costs the kernel in TSC cycles, beside how
+ * often it is made - printed with the counts by syscall64_report_calls().
+ *
+ * Counted around the dispatch because nothing else can see it: syscall
+ * enters with interrupts masked, so a timer tick during kernel work is
+ * delivered on the way back to ring 3 and charged to the program. A call
+ * that parks its task switches away inside and does not come back
+ * through here; what it spent before parking goes uncounted, which is
+ * small, and the time it then waits is not the kernel's anyway. */
+static uint64_t cycles_by_nr[512];
+static uint64_t calls_reset_tsc;
+
+/* mmap is several different operations behind one number, and they do
+ * not cost the same: a PROT_NONE reservation maps the shared zero page,
+ * an anonymous mapping allocates and zeroes every page up front, and a
+ * private file mapping at an offset copies the file in. So its cycles
+ * are split by which of them a call was, along with how many pages it
+ * asked for - which is what each of them scales with. */
+enum { MAPK_RESERVE, MAPK_ANON, MAPK_DEVICE, MAPK_SHARED, MAPK_FILE_COW,
+       MAPK_FILE_COPY, MAPK_UNMAP, MAPK_N };
+static const char* const mapk_name[MAPK_N] = {
+    "reserve", "anon", "device", "shared", "file-cow", "file-copy", "munmap"
+};
+static int mmap_kind;
+static uint64_t mapk_cycles[MAPK_N], mapk_calls[MAPK_N], mapk_pages[MAPK_N];
+
+static inline uint64_t tsc64(void) {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
 static uint64_t dispatch(syscall64_args_t* args) {
+    uint64_t nr = args->nr;
+    uint64_t t0 = tsc64();
+    uint64_t r;
+    mmap_kind = -1;
+    r = dispatch_body(args);
+    if (nr < 512) cycles_by_nr[nr] += tsc64() - t0;
+    if ((nr == SYS64_MMAP || nr == SYS64_MUNMAP) && mmap_kind >= 0) {
+        int k = nr == SYS64_MUNMAP ? MAPK_UNMAP : mmap_kind;
+        mapk_cycles[k] += tsc64() - t0;
+        mapk_calls[k]++;
+        mapk_pages[k] += (args->a2 + PAGE64_SIZE - 1) / PAGE64_SIZE;
+    }
+    return r;
+}
+
+static uint64_t dispatch_body(syscall64_args_t* args) {
     uint64_t nr = args->nr;
     uint64_t a1 = args->a1, a2 = args->a2, a3 = args->a3;
 
@@ -1894,12 +1944,15 @@ static uint64_t dispatch(syscall64_args_t* args) {
         uint64_t mapped;
         int node;
 
-        if (flags & MAP_ANONYMOUS)
+        if (flags & MAP_ANONYMOUS) {
+            mmap_kind = a3 == 0 ? MAPK_RESERVE : MAPK_ANON;
             return uspace64_mmap(a1, a2, a3, flags);
+        }
 
         if (fd < 3 || fd >= FD_MAX || !fds[fd].used) return (uint64_t)-9;
         if (off & (PAGE64_SIZE - 1)) return (uint64_t)-22;  /* -EINVAL */
         node = fds[fd].node;
+        mmap_kind = MAPK_DEVICE;
 
         /* /dev/fb0, decided before the rule below rather than after.
          *
@@ -1986,6 +2039,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
             want = (a2 + PAGE64_SIZE - 1) / PAGE64_SIZE;
             if (nframes > want) nframes = want;
             shared_maps++;
+            mmap_kind = MAPK_SHARED;
             /* The frame behind KUSER_SHARED_DATA, named by what actually
              * backs it rather than by a constant: which frame ramfs
              * hands out depends on everything allocated before it, so
@@ -2092,6 +2146,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
                                  (flags & MAP_FIXED) != 0,
                                  frames, want, a3);
                 if ((int64_t)r > 0) {
+                    mmap_kind = MAPK_FILE_COW;
                     file_maps++;
                     return r;
                 }
@@ -2100,6 +2155,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
 
         /* Mapped writable whatever the caller asked for, because the
          * kernel is about to write the file's contents into it. */
+        mmap_kind = MAPK_FILE_COPY;
         mapped = uspace64_mmap(a1, a2, PROT_READ | PROT_WRITE,
                                flags | MAP_ANONYMOUS);
         if ((int64_t)mapped < 0) return mapped;
@@ -2154,6 +2210,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
     }
 
     case SYS64_MUNMAP:
+        mmap_kind = MAPK_UNMAP;
         return uspace64_munmap(a1, a2);
 
     case SYS64_MPROTECT:
@@ -4736,7 +4793,9 @@ uint64_t syscall64_count(void)     { return call_count; }
 
 void syscall64_reset_calls(void) {
     for (int i = 0; i < PROC64_MAX; i++) { calls_by_slot[i] = 0; pid_of_slot[i] = 0; }
-    for (int i = 0; i < 512; i++) calls_by_nr[i] = 0;
+    for (int i = 0; i < 512; i++) { calls_by_nr[i] = 0; cycles_by_nr[i] = 0; }
+    for (int i = 0; i < MAPK_N; i++) mapk_cycles[i] = mapk_calls[i] = mapk_pages[i] = 0;
+    calls_reset_tsc = tsc64();
 }
 
 /* Who called, and what. Printed at the end of a layer rather than as it
@@ -4878,6 +4937,62 @@ void syscall64_report_calls(void) {
         serial64_putdec(bestn);
     }
     serial64_puts("\n");
+
+    /* And where the kernel's time went: the share of the layer spent
+     * inside syscalls, then the costliest numbers by total cycles, each
+     * as nr:calls:cycles-per-call. The rest of the layer is the
+     * programs' own work, page faults, and waiting. */
+    {
+        uint64_t elapsed = tsc64() - calls_reset_tsc, in_sys = 0;
+        for (int i = 0; i < 512; i++) in_sys += cycles_by_nr[i];
+        serial64_puts("NOVARIS64: [cycles] ");
+        serial64_putdec(elapsed / 1000000u);
+        serial64_puts("M elapsed, ");
+        serial64_putdec(in_sys / 1000000u);
+        serial64_puts("M in syscalls (");
+        serial64_putdec(elapsed ? in_sys * 100 / elapsed : 0);
+        serial64_puts("%); costliest:");
+        static int took[512];
+        for (int i = 0; i < 512; i++) took[i] = 0;
+        for (int k = 0; k < 6; k++) {
+            int best = -1;
+            uint64_t bestc = 0;
+            for (int i = 0; i < 512; i++) {
+                if (took[i] || cycles_by_nr[i] <= bestc) continue;
+                bestc = cycles_by_nr[i]; best = i;
+            }
+            if (best < 0) break;
+            took[best] = 1;
+            serial64_puts(" ");
+            serial64_putdec((uint64_t)best);
+            serial64_puts(":");
+            serial64_putdec(calls_by_nr[best]);
+            serial64_puts(":");
+            serial64_putdec(calls_by_nr[best] ? bestc / calls_by_nr[best] : 0);
+            serial64_puts("(");
+            serial64_putdec(elapsed ? bestc * 100 / elapsed : 0);
+            serial64_puts("%)");
+        }
+        serial64_puts("\n");
+
+        /* mmap and munmap by kind, as kind:calls:pages:cycles-per-page. */
+        serial64_puts("NOVARIS64: [maps]");
+        for (int k = 0; k < MAPK_N; k++) {
+            if (!mapk_calls[k]) continue;
+            serial64_puts(" ");
+            serial64_puts(mapk_name[k]);
+            serial64_puts(":");
+            serial64_putdec(mapk_calls[k]);
+            serial64_puts(":");
+            serial64_putdec(mapk_pages[k]);
+            serial64_puts(":");
+            serial64_putdec(mapk_pages[k] ? mapk_cycles[k] / mapk_pages[k] : 0);
+            serial64_puts("(");
+            serial64_putdec(elapsed ? mapk_cycles[k] * 100 / elapsed : 0);
+            serial64_puts("%)");
+        }
+        serial64_puts("\n");
+    }
 }
 uint64_t syscall64_last_arg(void)  { return last_arg; }
 uint64_t syscall64_exit_code(void) { return exit_code; }
