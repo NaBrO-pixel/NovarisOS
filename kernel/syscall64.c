@@ -492,8 +492,29 @@ static int wait_started(void) { return wait_pending[wait_slot()]; }
  * sleep 400ms and exited immediately, and the kill differential's
  * child ran through five hundred sleeps without pausing long enough
  * for a signal to reach it. */
+/* Each thread's clear_child_tid: the word the kernel zeroes and
+ * futex-wakes when the thread is gone, set by clone(CLONE_CHILD_CLEARTID)
+ * or set_tid_address. 0 for none.
+ *
+ * This is what pthread_join waits on - it sleeps until the thread's
+ * pd->tid reads 0 - and it must be the kernel that writes it, after the
+ * thread has left ring 3 for good, because the thread is still running
+ * on the stack the joiner is about to free. Wine frees each exited
+ * thread's stack and TEB as soon as pthread_join returns.
+ *
+ * Neither half existed. clone ignored CLONE_PARENT_SETTID too, so pd->tid
+ * was 0 from the start and every pthread_join returned at once: Wine
+ * freed a thread's stack while it was still unwinding in pthread_exit,
+ * the thread faulted on its own stack, and Wine's SIGSEGV handler -
+ * which reaches the TEB through that thread's now-missing thread block -
+ * faulted in turn, forever. Measured: 5.8 million SIGSEGVs in one
+ * process over one first wineboot, most of the time the run spent
+ * outside syscalls. */
+static uint64_t clear_child_tid[SCHED64_MAX_TASKS];
+
 static void wait_slot_reset(int t) {
     if (t < 0 || t >= SCHED64_MAX_TASKS) return;
+    clear_child_tid[t] = 0;
     wait_pending[t]  = 0;
     wait_deadline[t] = 0;
     wait_call[t]     = 0;
@@ -1748,6 +1769,10 @@ static uint64_t do_execve(const char* path, const char* const* argv,
     p->brk_base = p->brk_current = info.brk_start;
     p->mmap_next = USPACE64_MMAP_BASE;
     p->nresv = 0;
+    {
+        int t = sched64_current();
+        if (t >= 0 && t < SCHED64_MAX_TASKS) clear_child_tid[t] = 0;
+    }
     kstrlcpy(p->exe_path, kpath, PROC64_PATH_MAX);
 
     /* And the name, which execve resets to the new program's basename.
@@ -2422,6 +2447,16 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         if (tid < 0) return (uint64_t)-11;              /* -EAGAIN */
         wait_slot_reset(tid);
 
+        /* The three tid words. glibc passes &pd->tid as both pointers,
+         * and the first is how pthread_create learns the tid at all. A
+         * thread shares its parent's memory, so "in the child" and "in
+         * the parent" are the same store. */
+        if ((a1 & CLONE_PARENT_SETTID) && user_range_ok(a3, 4))
+            *(volatile uint32_t*)a3 = (uint32_t)(tid + 1);
+        if ((a1 & CLONE_CHILD_SETTID) && user_range_ok(args->a4, 4))
+            *(volatile uint32_t*)args->a4 = (uint32_t)(tid + 1);
+        if (a1 & CLONE_CHILD_CLEARTID) clear_child_tid[tid] = args->a4;
+
         /* The parent gets the child's tid; the child gets 0 above. */
         return (uint64_t)tid + 1;
     }
@@ -2573,8 +2608,11 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
     case SYS64_GETTID:
         return (uint64_t)sched64_current() + 1;
 
-    case SYS64_SET_TID_ADDRESS:
-        return (uint64_t)sched64_current() + 1;
+    case SYS64_SET_TID_ADDRESS: {
+        int t = sched64_current();
+        if (t >= 0 && t < SCHED64_MAX_TASKS) clear_child_tid[t] = a1;
+        return (uint64_t)t + 1;
+    }
 
     case SYS64_SET_ROBUST_LIST:
         return 0;
@@ -4590,6 +4628,21 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         uint64_t next_fs;
 
         thread_exits++;
+
+        /* clear_child_tid, now that this thread will never run in ring 3
+         * again: zero the word and wake whoever is joining. Linux does
+         * it in mm_release, at the same point and for the same reason. */
+        {
+            int t = sched64_current();
+            if (t >= 0 && t < SCHED64_MAX_TASKS && clear_child_tid[t]) {
+                uint64_t w = clear_child_tid[t];
+                clear_child_tid[t] = 0;
+                if (user_range_ok(w, 4)) {
+                    *(volatile uint32_t*)w = 0;
+                    futex_wakes += (uint64_t)sched64_wake(w, 1);
+                }
+            }
+        }
 
         /* Whether this is a thread ending or a process ending, asked of
          * the one table that knows.
