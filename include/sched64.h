@@ -95,6 +95,9 @@ int  sched64_pid_tasks(int pid);
 
 int  sched64_space_in_use(uint64_t pml4_phys);
 
+/* Removes every task of `pid` without switching; see sched64.c. */
+int sched64_remove_pid(int pid);
+
 int  sched64_exit_process(int pid, registers64_t* out_regs,
                           vmspace64_t* out_space, uint64_t* out_fs_base);
 

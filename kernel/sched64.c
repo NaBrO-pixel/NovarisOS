@@ -403,6 +403,21 @@ int sched64_exit_current(registers64_t* out_regs, vmspace64_t* out_space,
     return 1;
 }
 
+/* Every task of `pid` out of the table, without choosing a successor:
+ * for a process ending when there is nothing to hand the CPU to - the
+ * leader of a run, whose ending ends the run. Returns how many went. */
+int sched64_remove_pid(int pid) {
+    int n = 0;
+    for (int i = 0; i < SCHED64_MAX_TASKS; i++) {
+        if (!tasks[i].used || tasks[i].pid != pid) continue;
+        tasks[i].used = 0;
+        if (task_total > 0) task_total--;
+        if (i == current) current = -1;
+        n++;
+    }
+    return n;
+}
+
 int sched64_exit_process(int pid, registers64_t* out_regs,
                          vmspace64_t* out_space, uint64_t* out_fs_base) {
     int next;
