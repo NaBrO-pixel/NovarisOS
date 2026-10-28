@@ -207,6 +207,7 @@ int       proc64_fork_from(int pid);
 
 proc64_t* proc64_get(int pid);
 proc64_t* proc64_current(void);
+int       proc64_release_orphans(void);
 void      proc64_set_current(int pid);
 int       proc64_current_pid(void);
 

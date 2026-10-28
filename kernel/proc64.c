@@ -169,6 +169,31 @@ int proc64_reap_child_pid(int parent, int want, int* status) {
     return -1;
 }
 
+/* Releases every exited process nobody is left to reap: one whose
+ * parent is 0 - a bring-up layer's own program - or whose parent's slot
+ * is gone. Repeats until nothing changes, because releasing a parent
+ * orphans its exited children. Returns how many slots it freed.
+ *
+ * Their address spaces are not this file's business; by the time a
+ * process is exited, the kernel has destroyed its space or will sweep
+ * it. */
+int proc64_release_orphans(void) {
+    int n = 0, changed = 1;
+    while (changed) {
+        changed = 0;
+        for (int i = 0; i < PROC64_MAX; i++) {
+            proc64_t* par;
+            if (!procs[i].used || !procs[i].exited) continue;
+            par = procs[i].parent ? slot_for(procs[i].parent) : 0;
+            if (par) continue;
+            procs[i].used = 0;
+            n++;
+            changed = 1;
+        }
+    }
+    return n;
+}
+
 int proc64_reap_child(int parent, int* status) {
     return proc64_reap_child_pid(parent, -1, status);
 }

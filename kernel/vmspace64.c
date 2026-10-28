@@ -36,6 +36,45 @@ void vmspace64_switch(const vmspace64_t* vs) {
     write_cr3(vs->pml4_phys);
 }
 
+/* Every space vmspace64_create has handed out and vmspace64_destroy has
+ * not yet taken back, by PML4.
+ *
+ * A space is described by a vmspace64_t that is copied freely - into the
+ * process, the scheduler, a layer's local variable - and destroying one
+ * copy leaves the others holding the address of a PML4 that has gone
+ * back to the allocator. execve destroys the image it replaces through a
+ * copy, and so does exit_group; the descriptor the test layer that
+ * started the program holds still names it. Destroying that one too
+ * would free the frame twice, and the second free would be of whatever
+ * the frame had become in between.
+ *
+ * So destroy asks here first, and a PML4 that is not live is not freed
+ * again. And the layer sweep below asks here which spaces exist at all,
+ * which no other table in the kernel could answer.
+ *
+ * A space created past the end of this table is not tracked; destroy then
+ * refuses it, which leaks it rather than risking a double free. */
+#define LIVE_MAX 1024
+static uint64_t live[LIVE_MAX];
+static int      nlive;
+static uint64_t live_untracked;
+
+static void live_add(uint64_t pml4) {
+    if (nlive < LIVE_MAX) live[nlive++] = pml4;
+    else live_untracked++;
+}
+
+static int live_remove(uint64_t pml4) {
+    for (int i = 0; i < nlive; i++) {
+        if (live[i] != pml4) continue;
+        live[i] = live[--nlive];
+        return 1;
+    }
+    return 0;
+}
+
+int vmspace64_live_count(void) { return nlive; }
+
 int vmspace64_create(vmspace64_t* vs) {
     /* Low on purpose, unlike the pages this space will hold: a PML4 is a
      * kernel structure, and keeping page tables out of the high pool
@@ -69,6 +108,7 @@ int vmspace64_create(vmspace64_t* vs) {
 
     paging64_unmap(SCRATCH_VA);
     vs->pml4_phys = frame;
+    live_add(frame);
     return 1;
 }
 
@@ -341,6 +381,24 @@ int vmspace64_clone_cow(uint64_t src_pml4, vmspace64_t* dst) {
     return 1;
 }
 
+/* Destroys every live space that `in_use` says nothing is standing in,
+ * other than the one loaded now. Returns how many went. For the start of
+ * a bring-up layer, when whatever the previous layers left behind - the
+ * program each one ran, which ended the layer by ending - is no longer
+ * anybody's. */
+int vmspace64_reclaim_unused(int (*in_use)(uint64_t pml4_phys)) {
+    uint64_t cur = read_cr3() & ADDR_MASK;
+    int n = 0;
+
+    for (int i = 0; i < nlive; ) {
+        vmspace64_t vs = { live[i] };
+        if (vs.pml4_phys == cur || in_use(vs.pml4_phys)) { i++; continue; }
+        vmspace64_destroy(&vs);           /* removes live[i]; do not step */
+        n++;
+    }
+    return n;
+}
+
 uint64_t vmspace64_next_mapped(uint64_t va, uint64_t end) {
     uint64_t* pml4 = table_at(read_cr3() & ADDR_MASK);
 
@@ -540,6 +598,13 @@ void vmspace64_destroy(vmspace64_t* vs) {
     /* Destroying the space you are standing in would unmap the tables
      * being walked partway through walking them. */
     if ((saved & ADDR_MASK) == vs->pml4_phys) return;
+
+    /* Already destroyed through another copy of this descriptor, or
+     * never ours to destroy: forget it rather than free it again. */
+    if (!live_remove(vs->pml4_phys)) {
+        vs->pml4_phys = 0;
+        return;
+    }
 
     write_cr3(vs->pml4_phys);
     free_low_half_tables();
