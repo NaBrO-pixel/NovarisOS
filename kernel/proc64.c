@@ -184,6 +184,11 @@ int proc64_release_orphans(void) {
         for (int i = 0; i < PROC64_MAX; i++) {
             proc64_t* par;
             if (!procs[i].used || !procs[i].exited) continue;
+            /* Never the current process, exited or not: the early
+             * bring-up layers run one program after another as the same
+             * process, and each one's exit marks it exited while the next
+             * layer goes on using its descriptors. */
+            if (procs[i].pid == current_pid) continue;
             par = procs[i].parent ? slot_for(procs[i].parent) : 0;
             if (par) continue;
             procs[i].used = 0;
