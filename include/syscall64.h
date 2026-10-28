@@ -245,6 +245,7 @@ typedef struct {
 #define SYS64_RT_SIGACTION    13
 #define SYS64_RT_SIGPROCMASK  14
 #define SYS64_RT_SIGRETURN    15
+#define SYS64_RT_SIGPENDING   127
 #define SYS64_IOCTL           16
 #define SYS64_WRITEV          20
 #define SYS64_READV           19
@@ -462,5 +463,10 @@ int  syscall64_run_expired(void);
  * after a timed-out run is whatever the last process to exit happened to
  * return - a number that looks like an answer and is not. */
 int  syscall64_leader_exited(void);
+
+/* An uncaught ring-3 fault in a run of several processes: ends the
+ * faulting process (not the leader) by the signal and does not return.
+ * Returns 0 when that does not apply, and the caller ends the run. */
+int syscall64_fault_kill(int sig, uint64_t rip, uint64_t addr);
 
 #endif

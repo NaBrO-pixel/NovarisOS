@@ -35,6 +35,13 @@
 #define SA_SIGINFO   0x00000004
 #define SA_ONSTACK   0x08000000
 #define SA_RESTORER  0x04000000
+#define SA_NODEFER   0x40000000
+#define SA_RESETHAND 0x80000000
+
+/* rt_sigprocmask's `how`. */
+#define SIG64_BLOCK   0
+#define SIG64_UNBLOCK 1
+#define SIG64_SETMASK 2
 
 /* sigaltstack(2)'s stack_t, in Linux's layout. */
 typedef struct {
@@ -162,6 +169,19 @@ int  signal64_has_pending(int pid);
  * 0 when there is none. Lowest-first because that is the order Linux
  * delivers in, and it puts SIGKILL ahead of most things. */
 int  signal64_take_pending(int pid);
+
+/* Signal masks, per thread. The has/take/pending_set calls above answer
+ * for the calling thread and leave out what it blocks.
+ *
+ * sigprocmask takes and returns user sigset_t words; sigpending is the
+ * caller's pending-and-blocked set in the same form. task_start gives a
+ * new task its creator's mask (from_tid < 0: an empty one) and nothing
+ * pending. */
+int      signal64_sigprocmask(int how, const uint64_t* set, uint64_t* oldset,
+                              uint64_t setsize);
+uint64_t signal64_sigpending(void);
+uint64_t signal64_blocked(int tid);
+void     signal64_task_start(int tid, int from_tid);
 
 /* What this process would do with `sig` as things stand. The caller
  * cannot work this out from signal64_deliver's return value, because

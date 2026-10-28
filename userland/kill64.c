@@ -61,6 +61,48 @@ static void on_usr1(int s) { (void)s; got_usr1++; }
 static void on_usr2(int s) { (void)s; got_usr2++; }
 static void on_term(int s) { (void)s; got_term++; }
 
+/* For the signal-mask tests: what the mask looked like from inside a
+ * handler. */
+static volatile sig_atomic_t inside_usr1, inside_usr2, mask_handler_ran;
+
+static void on_usr1_look(int s)
+{
+    sigset_t cur;
+    (void)s;
+    sigprocmask(SIG_BLOCK, NULL, &cur);
+    inside_usr1 = sigismember(&cur, SIGUSR1);
+    inside_usr2 = sigismember(&cur, SIGUSR2);
+    mask_handler_ran++;
+}
+
+/* A SIGSEGV handler that faults itself. On Linux the second fault finds
+ * SIGSEGV blocked - the handler is running - and the process dies of
+ * it; it is not delivered again. */
+static void on_segv_fault_again(int s)
+{
+    (void)s;
+    *(volatile int *)0 = 2;
+}
+
+static int is_blocked(int sig)
+{
+    sigset_t cur;
+    sigprocmask(SIG_BLOCK, NULL, &cur);
+    return sigismember(&cur, sig);
+}
+
+static int is_pending(int sig)
+{
+    sigset_t p;
+    sigpending(&p);
+    return sigismember(&p, sig);
+}
+
+static int tgkill_self(int sig)
+{
+    return (int)syscall(SYS_tgkill, getpid(), (int)syscall(SYS_gettid), sig);
+}
+
 /* A pid that exists on neither machine. Linux's pid_max is 4194304 at
  * the very most, and this is above it. */
 #define NO_SUCH_PID 4194305
@@ -274,6 +316,104 @@ int main(void)
                WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
             close(pipefd[0]);
         }
+    }
+
+    /* --- signal masks ---------------------------------------------- *
+     *
+     * rt_sigprocmask used to be accepted and ignored. Every answer here
+     * is Linux's; the last one is the case that made it matter - a fault
+     * inside a SIGSEGV handler, which this kernel delivered again
+     * forever instead of ending the process. */
+    {
+        sigset_t set, none;
+        int before;
+
+        sigemptyset(&none);
+        sigprocmask(SIG_SETMASK, &none, NULL);
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_usr1;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGUSR1, &sa, NULL);
+
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        ok("sigprocmask(SIG_BLOCK, SIGUSR1) returns 0",
+           sigprocmask(SIG_BLOCK, &set, NULL) == 0);
+        ok("and reads back as blocked", is_blocked(SIGUSR1));
+
+        before = got_usr1;
+        ok("tgkill(self, SIGUSR1) while blocked returns 0",
+           tgkill_self(SIGUSR1) == 0);
+        ok("and the handler has not run", got_usr1 == before);
+        ok("and sigpending shows it", is_pending(SIGUSR1));
+
+        sigprocmask(SIG_UNBLOCK, &set, NULL);
+        ok("unblocking runs it before sigprocmask returns",
+           got_usr1 == before + 1);
+        ok("and it is no longer pending", !is_pending(SIGUSR1));
+
+        /* The process-directed form takes the same path. */
+        sigprocmask(SIG_BLOCK, &set, NULL);
+        before = got_usr1;
+        ok("kill(self, SIGUSR1) while blocked returns 0",
+           sys_kill(getpid(), SIGUSR1) == 0);
+        ok("and the handler has not run either", got_usr1 == before);
+        sigprocmask(SIG_UNBLOCK, &set, NULL);
+        ok("until it is unblocked", got_usr1 == before + 1);
+
+        /* Inside a handler: the signal itself and sa_mask are blocked,
+         * and the mask from before is back afterwards. */
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_usr1_look;
+        sigemptyset(&sa.sa_mask);
+        sigaddset(&sa.sa_mask, SIGUSR2);
+        sigaction(SIGUSR1, &sa, NULL);
+        mask_handler_ran = 0;
+        tgkill_self(SIGUSR1);
+        ok("a handler ran", mask_handler_ran == 1);
+        ok("with its own signal blocked", inside_usr1);
+        ok("and what sa_mask named", inside_usr2);
+        ok("and after it returned neither is blocked",
+           !is_blocked(SIGUSR1) && !is_blocked(SIGUSR2));
+
+        sa.sa_flags = SA_NODEFER;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGUSR1, &sa, NULL);
+        tgkill_self(SIGUSR1);
+        ok("with SA_NODEFER its own signal is not blocked", !inside_usr1);
+
+        sigfillset(&set);
+        sigprocmask(SIG_SETMASK, &set, NULL);
+        ok("SIGKILL cannot be blocked", !is_blocked(SIGKILL));
+        ok("nor SIGSTOP", !is_blocked(SIGSTOP));
+        ok("though everything else can", is_blocked(SIGTERM));
+        sigprocmask(SIG_SETMASK, &none, NULL);
+
+        /* fork(2) hands the child its parent's mask. */
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR2);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+        child = fork();
+        if (child == 0)
+            _exit(is_blocked(SIGUSR2) ? 0 : 1);
+        waitpid(child, &status, 0);
+        ok("a forked child inherits the mask",
+           WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        sigprocmask(SIG_SETMASK, &none, NULL);
+
+        /* A fault in a SIGSEGV handler ends the process. */
+        child = fork();
+        if (child == 0) {
+            memset(&sa, 0, sizeof(sa));
+            sa.sa_handler = on_segv_fault_again;
+            sigemptyset(&sa.sa_mask);
+            sigaction(SIGSEGV, &sa, NULL);
+            *(volatile int *)0 = 1;
+            _exit(3);                       /* not reached on Linux */
+        }
+        waitpid(child, &status, 0);
+        ok("a fault inside a SIGSEGV handler kills the process",
+           WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV);
     }
 
     printf("kill64: %d failures\n", failures);

@@ -520,8 +520,10 @@ static void wait_slot_reset(int t) {
     wait_call[t]     = 0;
     /* And anything tgkill(2) addressed to whoever held this slot
      * before. A new thread inheriting a dead one's pending SIGUSR1
-     * would stop on a suspend nobody asked it for. */
-    signal64_clear_task(t);
+     * would stop on a suspend nobody asked it for. Its signal mask is
+     * the creating thread's, which is what clone and fork give on
+     * Linux - the caller here is always that thread. */
+    signal64_task_start(t, sched64_current());
 }
 static void wait_done(void)   { wait_pending[wait_slot()] = 0; }
 
@@ -1308,6 +1310,43 @@ static uint64_t syscall64_dispatch_inner(syscall64_args_t* args);
  * of here resumes somebody else and never comes back. Shared by tgkill,
  * which is a process asking for this about itself, and by kill(2)
  * delivery, where another process asked for it. */
+static void die_by_signal(int sig);
+static void reclaim_report(const char* why, uint64_t before);
+
+/* Takes whatever the calling thread has pending and does not block, and
+ * acts on it with `self` as the interrupted frame: ignored ones are
+ * dropped, the first one with a handler is entered (and this does not
+ * return), and one whose default is to end the process ends it.
+ * Returns when nothing deliverable was left.
+ *
+ * Shared by the end of every syscall and by rt_sigreturn, which resumes
+ * directly rather than through the end of a syscall - and which is the
+ * moment a signal blocked for the handler's duration becomes
+ * deliverable again. */
+static void deliver_pending(registers64_t* self) {
+    int me = proc64_current_pid();
+    int sig;
+
+    if (me < 0) return;
+    while ((sig = signal64_take_pending_task(sched64_current())) > 0 ||
+           (sig = signal64_take_pending(me)) > 0) {
+        int disp = signal64_disposition(me, sig);
+
+        if (disp == SIG64_DISP_IGNORE) continue;
+
+        if (disp == SIG64_DISP_HANDLER) {
+            if (signal64_deliver(sig, self, 0))
+                sched64_resume(self);                  /* never returns */
+            /* Fell through: a handler is installed but no frame could
+             * be built for it. Treated as uncaught, which is what
+             * signal64_deliver returning 0 means. */
+        }
+
+        die_by_signal(sig);
+        return;
+    }
+}
+
 static void die_by_signal(int sig) {
     exit_code = 128 + sig;
     vfork_release(proc64_current());
@@ -1315,19 +1354,73 @@ static void die_by_signal(int sig) {
     /* Recorded as a death rather than as an exit, so the parent's
      * wait(2) can say WIFSIGNALED. 128+sig stays the exit_status for
      * everything that only reads that. */
-    proc64_exit_signalled(proc64_current_pid(), sig);
-    if (leader_pid >= 0 && proc64_current_pid() == leader_pid) {
-        leader_exited = 1;
-        enter_user_mode64_abort();                     /* never returns */
+    {
+        proc64_t* me = proc64_current();
+        int parent = me ? me->parent : 0;
+
+        proc64_exit_signalled(proc64_current_pid(), sig);
+        if (leader_pid >= 0 && proc64_current_pid() == leader_pid) {
+            leader_exited = 1;
+            enter_user_mode64_abort();                 /* never returns */
+        }
+        /* The parent may be parked in wait4 for exactly this; exit_group
+         * wakes it and a death by signal is no less an ending. */
+        if (parent) sched64_wake(PROC64_WAIT_KEY(parent), SCHED64_MAX_TASKS);
     }
+    /* Every thread of the process, not just this one: a signal's default
+     * action ends the process. Ending only the calling thread left its
+     * siblings running in a process already recorded as dead - and the
+     * address space with them, so it was never given back. */
     {
         registers64_t next; vmspace64_t ns; uint64_t nfs;
-        if (sched64_exit_current(&next, &ns, &nfs)) {
+        if (sched64_exit_process(proc64_current_pid(), &next, &ns, &nfs)) {
+            vmspace64_t dying = { vmspace64_current_phys() };
             vmspace64_switch(&ns);
             write_msr(0xC0000100u, nfs);
+            if (!sched64_space_in_use(dying.pml4_phys)) {
+                uint64_t before = pmm64_free_frames();
+                vmspace64_destroy(&dying);
+                reclaim_report("signal", before);
+            }
             sched64_resume(&next);                     /* never returns */
         }
     }
+}
+
+/* A fault ring 3 did not handle, in a run of several processes.
+ *
+ * The fault handlers' answer to an uncaught fault is to end the run,
+ * which is right for the bring-up tests - one program, whose death is
+ * the result - and wrong for a Wine prefix, where it is one process of
+ * dozens and Linux would end that process and nothing else. So in a run
+ * with a leader, a process other than the leader dies of the signal the
+ * way kill(2)'s default action would end it, and the rest carry on.
+ *
+ * This became reachable rather than theoretical with signal masks: a
+ * fault inside a SIGSEGV handler now finds SIGSEGV blocked and is not
+ * delivered, where it used to be delivered again forever.
+ *
+ * Returns 0 when it does not apply - no leader, or the leader itself -
+ * and the caller ends the run as before. Otherwise does not return. */
+int syscall64_fault_kill(int sig, uint64_t rip, uint64_t addr) {
+    int me = proc64_current_pid();
+
+    if (leader_pid < 0 || me < 0 || me == leader_pid) return 0;
+
+    serial64_puts("NOVARIS64: [fatal signal ");
+    serial64_putdec((uint64_t)sig);
+    serial64_puts(" pid ");
+    serial64_putdec((uint64_t)me);
+    serial64_puts("] rip=");
+    serial64_puthex(rip);
+    serial64_puts(" addr=");
+    serial64_puthex(addr);
+    serial64_putc('\n');
+
+    die_by_signal(sig);
+    /* Nothing else to run. Ending the run is all that is left. */
+    enter_user_mode64_abort();                         /* never returns */
+    return 1;
 }
 
 uint64_t syscall64_dispatch(syscall64_args_t* args) {
@@ -1369,31 +1462,13 @@ uint64_t syscall64_dispatch(syscall64_args_t* args) {
         if (me >= 0 && p && !p->exited &&
             (signal64_has_pending_task(sched64_current()) ||
              signal64_has_pending(me))) {
-            int sig;
+            registers64_t self;
 
-            while ((sig = signal64_take_pending_task(sched64_current())) > 0 ||
-                   (sig = signal64_take_pending(me)) > 0) {
-                int disp = signal64_disposition(me, sig);
-
-                if (disp == SIG64_DISP_IGNORE) continue;
-
-                if (disp == SIG64_DISP_HANDLER) {
-                    registers64_t self;
-
-                    /* rax = r, so a handler that returns lands after the
-                     * syscall with the value the syscall produced. The
-                     * signal interrupted the return, not the call. */
-                    frame_from_args(args, r, &self);
-                    if (signal64_deliver(sig, &self, 0))
-                        sched64_resume(&self);         /* never returns */
-                    /* Fell through: a handler is installed but no frame
-                     * could be built for it. Treated as uncaught, which
-                     * is what signal64_deliver returning 0 means. */
-                }
-
-                die_by_signal(sig);
-                break;
-            }
+            /* rax = r, so a handler that returns lands after the
+             * syscall with the value the syscall produced. The signal
+             * interrupted the return, not the call. */
+            frame_from_args(args, r, &self);
+            deliver_pending(&self);
         }
     }
 
@@ -2939,16 +3014,37 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
          * handler is returning from. Resuming it is the same trick as
          * futex: this syscall does not return, the thread does. */
         signal64_sigreturn(saved_user_rsp, &resumed);
+        /* The handler's mask is gone and the old one is back, so a
+         * signal that arrived while it ran - blocked then - is taken
+         * now, before the interrupted code runs another instruction. */
+        deliver_pending(&resumed);
         /* The scheduler's saved copy for this task is stale now, and
          * harmlessly so: the next timer tick overwrites it from the
          * live frame before anything switches away. */
         sched64_resume(&resumed);                 /* never returns */
     }
 
-    case SYS64_RT_SIGPROCMASK:
-        /* Still accepted and ignored. Masking matters for asynchronous
-         * signals; a fault is delivered to the thread that caused it
-         * whether or not it wanted to hear about it. */
+    /* rt_sigprocmask(how, set, oldset, sigsetsize). Real now - see the
+     * blocked sets in signal64.c. Unblocking something pending needs no
+     * more than returning: the end of this syscall delivers it. */
+    case SYS64_RT_SIGPROCMASK: {
+        uint64_t set, old;
+        int rc;
+
+        if (a2 && !user_range_ok(a2, 8)) return (uint64_t)-14;  /* -EFAULT */
+        if (a3 && !user_range_ok(a3, 8)) return (uint64_t)-14;
+        if (a2) set = *(const uint64_t*)a2;
+        rc = signal64_sigprocmask((int)a1, a2 ? &set : 0,
+                                  a3 ? &old : 0, args->a4);
+        if (rc) return (uint64_t)(int64_t)rc;
+        if (a3) *(uint64_t*)a3 = old;
+        return 0;
+    }
+
+    case SYS64_RT_SIGPENDING:
+        if (a2 != 8) return (uint64_t)-22;                       /* -EINVAL */
+        if (!user_range_ok(a1, 8)) return (uint64_t)-14;         /* -EFAULT */
+        *(uint64_t*)a1 = signal64_sigpending();
         return 0;
 
     /* --- files ---------------------------------------------------- */
@@ -4167,6 +4263,16 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
          * above are the whole of its work. */
         if (sig == 0) return 0;
 
+        /* To itself and blocked: pending, like any other blocked
+         * signal, until the mask lets it through. */
+        if (pid == proc64_current_pid() &&
+            (signal64_blocked(sched64_current()) & (1ull << sig))) {
+            int rc = signal64_raise(pid, sig);
+            /* A sibling that does not block it may take it. */
+            if (rc == 0) sched64_wake_pid(pid);
+            return (uint64_t)(int64_t)rc;
+        }
+
         if (pid == proc64_current_pid()) {
             frame_from_args(args, 0, &self);
             if (signal64_deliver(sig, &self, 0))
@@ -4244,6 +4350,11 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         if (nr == SYS64_TGKILL && tpid != tgid) return (uint64_t)-3;
 
         if (sig == 0) return 0;                  /* the existence check */
+
+        if (slot == sched64_current() &&
+            (signal64_blocked(slot) & (1ull << sig))) {
+            return (uint64_t)(int64_t)signal64_raise_task(slot, sig);
+        }
 
         if (slot == sched64_current()) {
             /* Entered as if the signal had arrived on the way out of

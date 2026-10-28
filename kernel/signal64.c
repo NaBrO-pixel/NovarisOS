@@ -69,6 +69,85 @@ static uint64_t pending_by_slot[PROC64_MAX];
  * would be the wrong thread's and the suspended one would never stop. */
 static uint64_t pending_by_task[SCHED64_MAX_TASKS];
 
+/* Each thread's blocked set, in the same encoding as the pending sets -
+ * bit `sig`, where a user sigset_t has bit sig-1 - and per thread
+ * because that is what a signal mask is on Linux.
+ *
+ * rt_sigprocmask was accepted and ignored, on the reasoning that masking
+ * only matters for asynchronous signals. It matters as much for a fault
+ * in a handler: Linux blocks the signal being handled, so a second
+ * SIGSEGV inside a SIGSEGV handler finds it blocked and kills the
+ * process, where this kernel delivered it again - and again. That is how
+ * one Wine thread whose stack had been freed under it took 5.8 million
+ * SIGSEGVs and spun through the rest of the run instead of dying.
+ *
+ * And Wine leans on masks everywhere else: it blocks its server signals
+ * around every call to the wineserver, and a SIGUSR1 suspend arriving
+ * inside one of those calls has to wait for it to finish. */
+static uint64_t blocked_by_task[SCHED64_MAX_TASKS];
+
+/* SIGKILL and SIGSTOP cannot be blocked; Linux drops them from any mask
+ * it is given rather than refusing the call. */
+#define UNBLOCKABLE ((1ull << SIG64_KILLSIG) | (1ull << SIG64_STOP))
+
+static uint64_t* my_blocked(void) {
+    int t = sched64_current();
+    static uint64_t none;
+    if (t < 0 || t >= SCHED64_MAX_TASKS) { none = 0; return &none; }
+    return &blocked_by_task[t];
+}
+
+/* A user sigset_t's first word and the kernel's encoding, both ways. */
+static uint64_t from_user_set(uint64_t u) { return (u << 1) & ~UNBLOCKABLE; }
+static uint64_t to_user_set(uint64_t k)   { return k >> 1; }
+
+uint64_t signal64_blocked(int tid) {
+    if (tid < 0 || tid >= SCHED64_MAX_TASKS) return 0;
+    return blocked_by_task[tid];
+}
+
+int signal64_sigprocmask(int how, const uint64_t* set, uint64_t* oldset,
+                         uint64_t setsize) {
+    uint64_t* b = my_blocked();
+    uint64_t was = *b;
+
+    /* Linux insists on its own sigset_t size, eight bytes, and glibc
+     * always passes it. */
+    if (setsize != 8) return -22;                       /* -EINVAL */
+
+    if (set) {
+        uint64_t k = from_user_set(*set);
+        switch (how) {
+        case SIG64_BLOCK:   *b = was | k;  break;
+        case SIG64_UNBLOCK: *b = was & ~k; break;
+        case SIG64_SETMASK: *b = k;        break;
+        default:            return -22;                 /* -EINVAL */
+        }
+    }
+    if (oldset) *oldset = to_user_set(was);
+    return 0;
+}
+
+/* What is pending for the calling thread, blocked or not - which is the
+ * question rt_sigpending asks. */
+uint64_t signal64_sigpending(void) {
+    int t = sched64_current();
+    int slot = proc64_current_slot();
+    uint64_t k = 0;
+    if (t >= 0 && t < SCHED64_MAX_TASKS) k |= pending_by_task[t];
+    if (slot >= 0 && slot < PROC64_MAX)  k |= pending_by_slot[slot];
+    return to_user_set(k) & *my_blocked() >> 1;
+}
+
+/* A new task's mask: its creator's, as clone and fork give it on Linux,
+ * or empty for a task with no creator - the first one of a run. */
+void signal64_task_start(int tid, int from_tid) {
+    if (tid < 0 || tid >= SCHED64_MAX_TASKS) return;
+    pending_by_task[tid] = 0;
+    blocked_by_task[tid] = (from_tid >= 0 && from_tid < SCHED64_MAX_TASKS)
+                         ? blocked_by_task[from_tid] : 0;
+}
+
 /* Whether the default action for a signal is to ignore it.
  *
  * The rest end the process, and getting this list wrong is not a
@@ -123,10 +202,13 @@ int signal64_raise(int pid, int sig) {
     return 0;
 }
 
+/* These, and their _task forms below, answer for the calling thread:
+ * what it blocks is not pending as far as it is concerned, and stays
+ * set for a thread that does not block it, or for later. */
 int signal64_has_pending(int pid) {
     int slot = proc64_slot_of(pid);
     if (slot < 0 || slot >= PROC64_MAX) return 0;
-    return pending_by_slot[slot] != 0;
+    return (pending_by_slot[slot] & ~*my_blocked()) != 0;
 }
 
 int signal64_take_pending(int pid) {
@@ -134,7 +216,7 @@ int signal64_take_pending(int pid) {
     uint64_t set;
 
     if (slot < 0 || slot >= PROC64_MAX) return 0;
-    set = pending_by_slot[slot];
+    set = pending_by_slot[slot] & ~*my_blocked();
     if (!set) return 0;
 
     for (int sig = 1; sig < NSIG; sig++) {
@@ -157,14 +239,14 @@ int signal64_raise_task(int tid, int sig) {
 
 int signal64_has_pending_task(int tid) {
     if (tid < 0 || tid >= SCHED64_MAX_TASKS) return 0;
-    return pending_by_task[tid] != 0;
+    return (pending_by_task[tid] & ~blocked_by_task[tid]) != 0;
 }
 
 int signal64_take_pending_task(int tid) {
     uint64_t set;
 
     if (tid < 0 || tid >= SCHED64_MAX_TASKS) return 0;
-    set = pending_by_task[tid];
+    set = pending_by_task[tid] & ~blocked_by_task[tid];
     if (!set) return 0;
 
     for (int sig = 1; sig < NSIG; sig++) {
@@ -188,12 +270,12 @@ void signal64_clear_task(int tid) {
 uint64_t signal64_pending_set(int pid) {
     int slot = proc64_slot_of(pid);
     if (slot < 0 || slot >= PROC64_MAX) return 0;
-    return pending_by_slot[slot];
+    return pending_by_slot[slot] & ~*my_blocked();
 }
 
 uint64_t signal64_pending_set_task(int tid) {
     if (tid < 0 || tid >= SCHED64_MAX_TASKS) return 0;
-    return pending_by_task[tid];
+    return pending_by_task[tid] & ~blocked_by_task[tid];
 }
 
 uint64_t signal64_raised(void) { return raised; }
@@ -211,7 +293,10 @@ void signal64_reset(void) {
      * bit set means the next process to land in that slot inherits a
      * SIGTERM nobody sent it. */
     for (int i = 0; i < PROC64_MAX; i++) pending_by_slot[i] = 0;
-    for (int i = 0; i < SCHED64_MAX_TASKS; i++) pending_by_task[i] = 0;
+    for (int i = 0; i < SCHED64_MAX_TASKS; i++) {
+        pending_by_task[i] = 0;
+        blocked_by_task[i] = 0;
+    }
 
     delivered = 0;
     returns = 0;
@@ -353,6 +438,18 @@ int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
     uint64_t sp;
 
     if (sig <= 0 || sig >= NSIG) return 0;
+
+    /* Blocked. Every asynchronous caller has already left blocked
+     * signals pending rather than come here, so this is a fault - a
+     * SIGSEGV or SIGTRAP the thread itself caused - and Linux's answer
+     * to a fault the thread is blocking is to kill it (force_sig takes
+     * the block off and resets the handler, and the default ends the
+     * process). Saying "not handled" gives the caller exactly that.
+     *
+     * This is the case that used to loop: a SIGSEGV handler that
+     * faults, with SIGSEGV blocked because the handler is running. */
+    if (*my_blocked() & (1ull << sig)) return 0;
+
     sa = &handlers[sig];
     if (!sa->handler) return 0;
     /* SIG_IGN is the value 1, not an address. Without this the check
@@ -487,6 +584,11 @@ int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
     frame->uc.uc_mcontext.trapno = r->int_no;
     frame->uc.uc_mcontext.cr2    = fault_addr;
 
+    /* The mask to go back to, where rt_sigreturn will look for it - and
+     * where a handler that wants to change it on return can. */
+    frame->uc.uc_sigmask[0]        = to_user_set(*my_blocked());
+    frame->uc.uc_mcontext.oldmask  = frame->uc.uc_sigmask[0];
+
     /* siginfo: si_signo, si_errno, si_code, then si_addr for a fault.
      * Written as words rather than through a struct because only these
      * four fields are filled and the rest of siginfo_t is a union. */
@@ -506,6 +608,21 @@ int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
      * and traps off so a single-stepping debugger does not fire inside
      * the handler's first instruction. */
     r->rflags &= ~((uint64_t)(1 << 10) | (uint64_t)(1 << 8));
+
+    /* For the handler's duration: what sigaction asked to block, and
+     * the signal itself unless SA_NODEFER said otherwise. */
+    *my_blocked() |= from_user_set(sa->mask);
+    if (!(sa->flags & SA_NODEFER)) *my_blocked() |= 1ull << sig;
+    *my_blocked() &= ~UNBLOCKABLE;
+
+    /* SA_RESETHAND: one delivery, then back to the default. */
+    if (sa->flags & SA_RESETHAND) {
+        ksigaction64_t* h = &handlers[sig];
+        h->handler = 0;
+        h->flags = 0;
+        h->restorer = 0;
+        h->mask = 0;
+    }
 
     delivered++;
     return 1;
@@ -546,6 +663,10 @@ int signal64_sigreturn(uint64_t user_rsp, registers64_t* out) {
     out->cs     = 0x23;
     out->ss     = 0x1B;
     out->rflags = (sc->eflags & 0x0CD5ULL) | 0x202ULL;
+
+    /* The mask from before the handler ran - or whatever the handler
+     * wrote there, which is a documented way to change it on return. */
+    *my_blocked() = from_user_set(uc->uc_sigmask[0]);
 
     returns++;
     return 1;
