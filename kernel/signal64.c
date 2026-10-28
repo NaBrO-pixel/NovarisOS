@@ -103,6 +103,15 @@ static uint8_t  has_saved_by_task[SCHED64_MAX_TASKS];
  * it is given rather than refusing the call. */
 #define UNBLOCKABLE ((1ull << SIG64_KILLSIG) | (1ull << SIG64_STOP))
 
+/* Each thread's alternate signal stack - see on_altstack below. */
+static uint64_t sas_sp_by_task[SCHED64_MAX_TASKS];
+static uint64_t sas_size_by_task[SCHED64_MAX_TASKS];
+
+static int my_task(void) {
+    int t = sched64_current();
+    return (t >= 0 && t < SCHED64_MAX_TASKS) ? t : -1;
+}
+
 static uint64_t* my_blocked(void) {
     int t = sched64_current();
     static uint64_t none;
@@ -186,6 +195,9 @@ void signal64_task_start(int tid, int from_tid) {
      * clone is never called from inside one, so the creator's own
      * blocked set is its real mask. */
     has_saved_by_task[tid] = 0;
+    /* And no alternate stack: a new thread's is wherever it registers
+     * one. fork copies the creator's afterwards - see below. */
+    sas_sp_by_task[tid] = sas_size_by_task[tid] = 0;
 }
 
 /* Whether the default action for a signal is to ignore it.
@@ -337,6 +349,7 @@ void signal64_reset(void) {
         pending_by_task[i] = 0;
         blocked_by_task[i] = 0;
         has_saved_by_task[i] = 0;
+        sas_sp_by_task[i] = sas_size_by_task[i] = 0;
     }
 
     delivered = 0;
@@ -373,6 +386,10 @@ void signal64_fork(int parent_pid, int child_pid) {
  * entitled to keep not caring. */
 void signal64_exec(void) {
     ksigaction64_t* h = handlers_of(proc64_current_slot());
+    int t = my_task();
+
+    /* The alternate stack was an address in the old image. */
+    if (t >= 0) sas_sp_by_task[t] = sas_size_by_task[t] = 0;
     for (int i = 0; i < NSIG; i++) {
         if (h[i].handler == SIG64_IGN) continue;
         h[i].handler  = 0;
@@ -411,43 +428,68 @@ static inline uint64_t read_msr_base(uint32_t msr) {
 static int signal_trace;
 void signal64_set_trace(int on) { signal_trace = on; }
 
-/* Is `sp` inside the alternate stack? A handler that faults again while
- * already running on the alternate stack must not be given a second
+/* The alternate signal stack, per thread - which is what it is on
+ * Linux, and what Wine assumes: every thread it starts registers its own,
+ * inside its own TEB block.
+ *
+ * It was per process, and before that global; the per-process comment
+ * said plainly that this was wrong for multithreaded programs and would
+ * be wrong "in the same direction as before". It was, and this is what it
+ * looked like: winedevice.exe crashing during every first wineboot, at a
+ * different place each run. Each new thread's sigaltstack replaced the
+ * process's, so every thread's signals were delivered onto the last
+ * thread's stack. Two threads taking signals at once wrote their frames
+ * over each other, and rt_sigreturn then restored somebody else's half-
+ * written context: rip 0 in one thread, and rip 0x001b000000000023 - the
+ * ss and cs words of a sigcontext - in another.
+ *
+ * ss_size 0 means none set. */
+/* (sas_sp_by_task and sas_size_by_task are declared with the blocked
+ * sets at the top of the file.) */
+
+/* Is `sp` inside the calling thread's alternate stack? A handler that
+ * faults again while already running on it must not be given a second
  * frame at the same place - Linux keeps delivering on the current stack
  * in that case, and so does this. */
-/* The alternate stack lives on the process, not on this file: three
- * processes register one in a single prefix run, and a global would
- * deliver one process's signal onto another's stack. ss_size 0 means
- * none set. */
 static int on_altstack(uint64_t sp) {
-    proc64_t* p = proc64_current();
-    return p && p->sas_size &&
-           sp >= p->sas_sp && sp < p->sas_sp + p->sas_size;
+    int t = my_task();
+    return t >= 0 && sas_size_by_task[t] &&
+           sp >= sas_sp_by_task[t] && sp < sas_sp_by_task[t] + sas_size_by_task[t];
+}
+
+/* fork and vfork: the child is a copy of the calling thread, alternate
+ * stack included. Called after signal64_task_start, which clears it -
+ * the right answer for a new thread, whose stack is somewhere else. */
+void signal64_task_inherit_altstack(int tid, int from_tid) {
+    if (tid < 0 || tid >= SCHED64_MAX_TASKS) return;
+    if (from_tid < 0 || from_tid >= SCHED64_MAX_TASKS) return;
+    sas_sp_by_task[tid]   = sas_sp_by_task[from_tid];
+    sas_size_by_task[tid] = sas_size_by_task[from_tid];
 }
 
 int signal64_sigaltstack(const altstack64_t* ss, altstack64_t* oss,
                          uint64_t cur_rsp) {
-    proc64_t* p = proc64_current();
+    int t = my_task();
 
-    if (!p) return -22;                                /* -EINVAL */
+    if (t < 0) return -22;                             /* -EINVAL */
     if (oss) {
-        oss->ss_sp    = p->sas_sp;
-        oss->ss_size  = p->sas_size;
+        oss->ss_sp    = sas_sp_by_task[t];
+        oss->ss_size  = sas_size_by_task[t];
         oss->ss_flags = on_altstack(cur_rsp) ? SS_ONSTACK
-                      : (p->sas_size ? 0 : SS_DISABLE);
+                      : (sas_size_by_task[t] ? 0 : SS_DISABLE);
         oss->__pad    = 0;
     }
     if (ss) {
         /* Changing it while running on it is what Linux refuses, and
          * for the obvious reason: the frame under the caller's feet
          * would move. */
-        if (on_altstack(cur_rsp)) return -16;          /* -EPERM/-EBUSY */
+        if (on_altstack(cur_rsp)) return -1;           /* -EPERM */
         if (ss->ss_flags & SS_DISABLE) {
-            p->sas_sp = p->sas_size = 0;
+            sas_sp_by_task[t] = sas_size_by_task[t] = 0;
         } else {
             if (ss->ss_size < 2048) return -12;        /* -ENOMEM */
-            p->sas_sp   = ss->ss_sp;
-            p->sas_size = ss->ss_size;
+            sas_sp_by_task[t]   = ss->ss_sp;
+            sas_size_by_task[t] = ss->ss_size;
         }
     }
     return 0;
@@ -516,10 +558,10 @@ int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
      * corrupt the interrupted function's locals. The alternate stack
      * has no such caller to protect, so the frame starts at its top. */
     {
-        proc64_t* me = proc64_current();
-        if ((sa->flags & SA_ONSTACK) && me && me->sas_size &&
+        int t = my_task();
+        if ((sa->flags & SA_ONSTACK) && t >= 0 && sas_size_by_task[t] &&
             !on_altstack(r->rsp))
-            sp = me->sas_sp + me->sas_size;
+            sp = sas_sp_by_task[t] + sas_size_by_task[t];
         else
             sp = r->rsp - 128;
     }

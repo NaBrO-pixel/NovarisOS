@@ -182,6 +182,7 @@ int      signal64_sigprocmask(int how, const uint64_t* set, uint64_t* oldset,
 uint64_t signal64_sigpending(void);
 uint64_t signal64_blocked(int tid);
 void     signal64_task_start(int tid, int from_tid);
+void     signal64_task_inherit_altstack(int tid, int from_tid);
 
 /* rt_sigsuspend and ppoll: replace the calling thread's mask for the
  * length of a call (push; idempotent across the call's restarts), and
