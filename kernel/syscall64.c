@@ -1313,6 +1313,27 @@ static uint64_t syscall64_dispatch_inner(syscall64_args_t* args);
  * of here resumes somebody else and never comes back. Shared by tgkill,
  * which is a process asking for this about itself, and by kill(2)
  * delivery, where another process asked for it. */
+/* The run's leader has ended, and the layer is about to end with it.
+ *
+ * Every other ending of a process takes its threads out of the scheduler
+ * on the way to resuming somebody else. The leader's ending did not: it
+ * went straight back to the layer, so its tasks - the very thread that
+ * called exit_group among them - stayed in the table, runnable, with the
+ * frame the last timer tick had saved for each. The next layer's
+ * scheduler then resumed them: a process with every descriptor already
+ * closed, picking up from somewhere before its own exit.
+ *
+ * That was the crash at the start of every chromeprobe run. winegui64.exe
+ * had exited, and its main thread came back in the next layer, wrote to
+ * a wineserver socket that close_all_files had closed ("wine client
+ * error: write: Bad file descriptor"), and died on the way out at rip 0.
+ *
+ * Taken out here, not resumed: the layer is ending and there is nothing
+ * to switch to. */
+static void leader_leaves_scheduler(void) {
+    sched64_remove_pid(proc64_current_pid());
+}
+
 static void die_by_signal(int sig);
 static void reclaim_report(const char* why, uint64_t before);
 
@@ -1364,6 +1385,7 @@ static void die_by_signal(int sig) {
         proc64_exit_signalled(proc64_current_pid(), sig);
         if (leader_pid >= 0 && proc64_current_pid() == leader_pid) {
             leader_exited = 1;
+            leader_leaves_scheduler();
             enter_user_mode64_abort();                 /* never returns */
         }
         /* The parent may be parked in wait4 for exactly this; exit_group
@@ -4901,6 +4923,7 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
              * though it were neither. */
             if (leader_pid >= 0 && proc64_current_pid() == leader_pid) {
                 leader_exited = 1;
+                leader_leaves_scheduler();
                 enter_user_mode64_abort();             /* never returns */
             }
             if (parent) sched64_wake(PROC64_WAIT_KEY(parent),
@@ -4945,6 +4968,7 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
             if (leader_pid >= 0 && proc64_current_pid() == leader_pid) {
                 exit_code     = a1;
                 leader_exited = 1;
+                leader_leaves_scheduler();
                 enter_user_mode64_abort();             /* never returns */
             }
             /* A parent blocked in wait4 is waiting on exactly this. */
