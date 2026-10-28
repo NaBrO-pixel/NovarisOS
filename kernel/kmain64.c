@@ -497,6 +497,42 @@ static void page_fault_handler(registers64_t* r) {
     r->rip = pf_resume_rip;
 }
 
+/* The address space of a run's leader that has exited, given back, and
+ * its process slot with it.
+ *
+ * Every other process's space goes when it ends - exit_group and a fatal
+ * signal destroy it on the way to resuming somebody else. The leader's
+ * ending ends the run instead, straight back to the layer, so nothing
+ * did: each Wine layer kept its program's whole space until the machine
+ * stopped. And its slot: a leader has no parent to reap it, so the slot
+ * stayed in use as a zombie for good.
+ *
+ * Only for a leader that really exited. One that ran out of budget is
+ * still running in that space. And only if no task still stands in it -
+ * a vfork child shares its parent's space until it execs. Called with
+ * the kernel's own space loaded, which vmspace64_destroy insists on. */
+static void reclaim_leader(int pid) {
+    proc64_t* lp = proc64_get(pid);
+    uint64_t before, pml4;
+
+    if (!syscall64_leader_exited() || !lp || !lp->exited) return;
+    pml4 = lp->space.pml4_phys;
+    if (!pml4 || sched64_space_in_use(pml4)) return;
+
+    before = pmm64_free_frames();
+    vmspace64_destroy(&lp->space);
+    serial64_puts("NOVARIS64: [reclaim leader] pid ");
+    serial64_putdec((uint64_t)pid);
+    serial64_puts(" gave back ");
+    serial64_putdec(pmm64_free_frames() - before);
+    serial64_puts(" frames, free=");
+    serial64_putdec(pmm64_free_frames());
+    serial64_putc('\n');
+
+    /* Parent 0 is what a leader has; reaping by it frees the slot. */
+    proc64_reap_child_pid(0, pid, 0);
+}
+
 /* Run one Windows program under the Wine this layer has already started.
  *
  * Milestone 89 ran winegui64.exe as a one-off; Milestone 90 wanted
@@ -625,6 +661,7 @@ static void run_wine_program(const void* image, uint64_t len,
         syscall64_set_trace(0);
         syscall64_set_run_ticks(0);
         syscall64_set_leader(-1);
+        reclaim_leader(pid);
     }
 
     syscall64_report_calls();
@@ -4731,6 +4768,7 @@ void kernel_main(uint32_t magic, void* mbi) {
                 syscall64_set_run_ticks(0);
                 syscall64_set_trace(0);
                 signal64_set_trace(0);
+                reclaim_leader(pid);
                 pf_diagnose = 0;
                 serial64_puts("NOVARIS64: --- end ---\n");
                 /* Where wineboot's syscalls went, by process and by
