@@ -30,6 +30,7 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <poll.h>
 
 static int failures;
 
@@ -96,6 +97,13 @@ static int is_pending(int sig)
     sigset_t p;
     sigpending(&p);
     return sigismember(&p, sig);
+}
+
+static long ms_since(const struct timespec *t0)
+{
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (t1.tv_sec - t0->tv_sec) * 1000 + (t1.tv_nsec - t0->tv_nsec) / 1000000;
 }
 
 static int tgkill_self(int sig)
@@ -414,6 +422,109 @@ int main(void)
         waitpid(child, &status, 0);
         ok("a fault inside a SIGSEGV handler kills the process",
            WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV);
+    }
+
+    /* --- rt_sigsuspend and ppoll ------------------------------------ *
+     *
+     * Both replace the mask for exactly the length of a wait. The
+     * handler that ends the wait runs under the temporary mask, and the
+     * old one is back when it returns. */
+    {
+        sigset_t usr1, empty, only_usr2;
+        struct timespec t0, tmo;
+        struct pollfd pf;
+        int pipefd[2], r, e;
+        pid_t parent = getpid();
+
+        sigemptyset(&empty);
+        sigemptyset(&usr1);
+        sigaddset(&usr1, SIGUSR1);
+        sigemptyset(&only_usr2);
+        sigaddset(&only_usr2, SIGUSR2);
+
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_usr1_look;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGUSR1, &sa, NULL);
+
+        /* Woken by another process. */
+        sigprocmask(SIG_SETMASK, &usr1, NULL);
+        mask_handler_ran = 0;
+        child = fork();
+        if (child == 0) {
+            nap(50);
+            sys_kill(parent, SIGUSR1);
+            _exit(0);
+        }
+        errno = 0;
+        r = sigsuspend(&only_usr2);
+        e = errno;
+        ok("sigsuspend returns -1", r == -1);
+        ok("with EINTR", e == EINTR);
+        ok("once the handler has run", mask_handler_ran == 1);
+        ok("which ran under the temporary mask", inside_usr2);
+        ok("and the old mask is back", is_blocked(SIGUSR1) && !is_blocked(SIGUSR2));
+        waitpid(child, &status, 0);
+
+        /* Already pending when it is called. */
+        mask_handler_ran = 0;
+        tgkill_self(SIGUSR1);
+        ok("a blocked signal waits", mask_handler_ran == 0);
+        r = sigsuspend(&empty);
+        ok("sigsuspend takes one already pending at once",
+           r == -1 && mask_handler_ran == 1);
+        ok("and the mask is back", is_blocked(SIGUSR1));
+
+        /* ppoll's timeout. */
+        tmo.tv_sec = 0;
+        tmo.tv_nsec = 50 * 1000000L;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        r = ppoll(NULL, 0, &tmo, NULL);
+        ok("ppoll with nothing to wait for times out with 0", r == 0);
+        ok("and not before its timeout", ms_since(&t0) >= 45);
+
+        ok("a pipe for ppoll", pipe(pipefd) == 0);
+        pf.fd = pipefd[0];
+        pf.events = POLLIN;
+
+        /* Ready, and the mask is left as it was. */
+        ok("a byte in it", write(pipefd[1], "x", 1) == 1);
+        r = ppoll(&pf, 1, &tmo, &empty);
+        ok("ppoll on a ready pipe returns 1", r == 1 && (pf.revents & POLLIN));
+        ok("and leaves the mask as it found it", is_blocked(SIGUSR1));
+        {
+            char c;
+            ok("and the byte read back out", read(pipefd[0], &c, 1) == 1);
+        }
+
+        /* A signal the temporary mask lets through ends the wait. */
+        mask_handler_ran = 0;
+        tgkill_self(SIGUSR1);
+        tmo.tv_sec = 1;
+        tmo.tv_nsec = 0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        errno = 0;
+        r = ppoll(&pf, 1, &tmo, &empty);
+        e = errno;
+        ok("ppoll is interrupted by a signal its mask unblocks",
+           r == -1 && e == EINTR);
+        ok("at once, not after its timeout", ms_since(&t0) < 500);
+        ok("and the handler ran", mask_handler_ran == 1);
+        ok("and the old mask is back after it", is_blocked(SIGUSR1));
+
+        /* One the temporary mask still blocks does not. */
+        mask_handler_ran = 0;
+        tgkill_self(SIGUSR1);
+        tmo.tv_sec = 0;
+        tmo.tv_nsec = 50 * 1000000L;
+        r = ppoll(&pf, 1, &tmo, &usr1);
+        ok("ppoll whose mask blocks the signal times out", r == 0);
+        ok("without running the handler", mask_handler_ran == 0);
+        sigprocmask(SIG_SETMASK, &empty, NULL);
+        ok("which runs when it is unblocked", mask_handler_ran == 1);
+
+        close(pipefd[0]);
+        close(pipefd[1]);
     }
 
     printf("kill64: %d failures\n", failures);

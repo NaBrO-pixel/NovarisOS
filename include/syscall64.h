@@ -246,6 +246,8 @@ typedef struct {
 #define SYS64_RT_SIGPROCMASK  14
 #define SYS64_RT_SIGRETURN    15
 #define SYS64_RT_SIGPENDING   127
+#define SYS64_RT_SIGSUSPEND   130
+#define SYS64_PPOLL           271
 #define SYS64_IOCTL           16
 #define SYS64_WRITEV          20
 #define SYS64_READV           19

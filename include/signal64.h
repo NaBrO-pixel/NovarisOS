@@ -183,6 +183,13 @@ uint64_t signal64_sigpending(void);
 uint64_t signal64_blocked(int tid);
 void     signal64_task_start(int tid, int from_tid);
 
+/* rt_sigsuspend and ppoll: replace the calling thread's mask for the
+ * length of a call (push; idempotent across the call's restarts), and
+ * put it back (pop; returns 0 if nothing was pushed). A handler entered
+ * in between takes the saved mask into its frame instead. */
+void     signal64_push_mask(uint64_t user_set);
+int      signal64_pop_mask(void);
+
 /* What this process would do with `sig` as things stand. The caller
  * cannot work this out from signal64_deliver's return value, because
  * that answers 0 both for "nothing is installed" and for "SIG_IGN" -

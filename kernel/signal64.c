@@ -86,6 +86,19 @@ static uint64_t pending_by_task[SCHED64_MAX_TASKS];
  * inside one of those calls has to wait for it to finish. */
 static uint64_t blocked_by_task[SCHED64_MAX_TASKS];
 
+/* The mask a thread had before rt_sigsuspend or ppoll replaced it for
+ * the length of the call, and whether there is one. Linux's
+ * saved_sigmask.
+ *
+ * It is what the call's caller gets back, but not necessarily when the
+ * call returns: if the call ends because a handler is about to run, the
+ * handler runs under the temporary mask (plus its own) and the saved one
+ * goes into the frame, so it comes back at rt_sigreturn. That is the
+ * whole point of sigsuspend - the window in which the signal may arrive
+ * is exactly the call, and nothing between the unblock and the sleep. */
+static uint64_t saved_by_task[SCHED64_MAX_TASKS];
+static uint8_t  has_saved_by_task[SCHED64_MAX_TASKS];
+
 /* SIGKILL and SIGSTOP cannot be blocked; Linux drops them from any mask
  * it is given rather than refusing the call. */
 #define UNBLOCKABLE ((1ull << SIG64_KILLSIG) | (1ull << SIG64_STOP))
@@ -100,6 +113,29 @@ static uint64_t* my_blocked(void) {
 /* A user sigset_t's first word and the kernel's encoding, both ways. */
 static uint64_t from_user_set(uint64_t u) { return (u << 1) & ~UNBLOCKABLE; }
 static uint64_t to_user_set(uint64_t k)   { return k >> 1; }
+
+/* Replaces the calling thread's mask with `user_set` for the length of
+ * a call. A call that parks is re-issued from the start when it wakes,
+ * so this is reached again on every turn; only the first saves, or the
+ * second would save the temporary mask as the one to go back to. */
+void signal64_push_mask(uint64_t user_set) {
+    int t = sched64_current();
+    if (t < 0 || t >= SCHED64_MAX_TASKS) return;
+    if (!has_saved_by_task[t]) {
+        saved_by_task[t] = blocked_by_task[t];
+        has_saved_by_task[t] = 1;
+    }
+    blocked_by_task[t] = from_user_set(user_set);
+}
+
+/* Puts the saved mask back, if there is one. Returns 1 if there was. */
+int signal64_pop_mask(void) {
+    int t = sched64_current();
+    if (t < 0 || t >= SCHED64_MAX_TASKS || !has_saved_by_task[t]) return 0;
+    blocked_by_task[t] = saved_by_task[t];
+    has_saved_by_task[t] = 0;
+    return 1;
+}
 
 uint64_t signal64_blocked(int tid) {
     if (tid < 0 || tid >= SCHED64_MAX_TASKS) return 0;
@@ -146,6 +182,10 @@ void signal64_task_start(int tid, int from_tid) {
     pending_by_task[tid] = 0;
     blocked_by_task[tid] = (from_tid >= 0 && from_tid < SCHED64_MAX_TASKS)
                          ? blocked_by_task[from_tid] : 0;
+    /* Inside a sigsuspend is not something a new thread can be. And
+     * clone is never called from inside one, so the creator's own
+     * blocked set is its real mask. */
+    has_saved_by_task[tid] = 0;
 }
 
 /* Whether the default action for a signal is to ignore it.
@@ -296,6 +336,7 @@ void signal64_reset(void) {
     for (int i = 0; i < SCHED64_MAX_TASKS; i++) {
         pending_by_task[i] = 0;
         blocked_by_task[i] = 0;
+        has_saved_by_task[i] = 0;
     }
 
     delivered = 0;
@@ -586,8 +627,19 @@ int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
 
     /* The mask to go back to, where rt_sigreturn will look for it - and
      * where a handler that wants to change it on return can. */
-    frame->uc.uc_sigmask[0]        = to_user_set(*my_blocked());
-    frame->uc.uc_mcontext.oldmask  = frame->uc.uc_sigmask[0];
+    {
+        /* Inside rt_sigsuspend or ppoll, the mask to return to is the
+         * one the call replaced, not the temporary one - and the call is
+         * over, so it is no longer saved anywhere else. */
+        int t = sched64_current();
+        uint64_t back = *my_blocked();
+        if (t >= 0 && t < SCHED64_MAX_TASKS && has_saved_by_task[t]) {
+            back = saved_by_task[t];
+            has_saved_by_task[t] = 0;
+        }
+        frame->uc.uc_sigmask[0]       = to_user_set(back);
+        frame->uc.uc_mcontext.oldmask = frame->uc.uc_sigmask[0];
+    }
 
     /* siginfo: si_signo, si_errno, si_code, then si_addr for a fault.
      * Written as words rather than through a struct because only these
