@@ -222,6 +222,7 @@ static void protection_fault_handler(registers64_t* r) {
     if ((r->cs & 3) == 3) {
         int sig = (r->int_no == 6) ? 4 /* SIGILL */ : SIG64_SEGV;
         if (signal64_deliver(sig, r, r->rip)) return;
+        syscall64_fault_kill(sig, r->rip, r->rip);   /* one process, if it can */
 
         /* Nobody caught it. The run ends the way an uncaught page fault
          * already ends it - reported, with the shell's code for a fatal
@@ -439,6 +440,10 @@ static void page_fault_handler(registers64_t* r) {
         }
     }
 
+    /* Not handled, by a process that is one of several: it alone ends,
+     * as Linux would end it. */
+    if ((r->cs & 3) == 3) syscall64_fault_kill(SIG64_SEGV, r->rip, pf_cr2);
+
     if (pf_diagnose) {
         serial64_puts("\nNOVARIS64: *** page fault in the program\n");
         serial64_puts("NOVARIS64:   cr2=");  serial64_puthex(pf_cr2);
@@ -584,6 +589,9 @@ static void run_wine_program(const void* image, uint64_t len,
          * the scheduler that slot 0 is current would resume one of them
          * here. */
         slot = sched64_add_frame_for(&first, &p->space, 0, pid);
+        /* A run's first task is nobody's thread: nothing blocked, and
+         * nothing left over from whatever had this slot before. */
+        if (slot >= 0) signal64_task_start(slot, -1);
         if (slot >= 0) sched64_set_current(slot);
 
         syscall64_set_leader(pid);
@@ -4205,9 +4213,14 @@ void kernel_main(uint32_t magic, void* mbi) {
         register_interrupt_handler64(32, sched_timer_handler);
         idt64_irq_set_mask(0, 0);
 
+        /* A leader, so that a child dying of a fault it did not handle
+         * ends the child and not the layer - the mask tests below make
+         * one on purpose. */
+        syscall64_set_leader(pid);
         vmspace64_switch(&p->space);
         enter_user_mode64(info.entry, rsp, 0);
         vmspace64_switch(&kspace);
+        syscall64_set_leader(-1);
 
         idt64_irq_set_mask(0, 1);
         pf_diagnose = 0;
