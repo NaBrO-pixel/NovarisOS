@@ -430,6 +430,22 @@ static void page_fault_handler(registers64_t* r) {
             {
                 proc64_t* me = proc64_current();
                 serial64_puts(me ? me->exe_path : "?");
+                serial64_puts(" comm=");
+                serial64_puts(me ? me->comm : "?");
+            }
+            /* The top of the stack, for the first faults of a process
+             * only: after a call through a null pointer - rip 0 - the
+             * word at rsp is the return address, which is the only
+             * thing left that says who made the call. */
+            if (first) {
+                serial64_puts("\nNOVARIS64:   stack:");
+                for (int w = 0; w < 8; w++) {
+                    uint64_t va = fault_rsp + (uint64_t)w * 8, phys;
+                    if (paging64_translate(va & ~0xFFFULL, &phys) != PAGING64_OK)
+                        break;
+                    serial64_putc(' ');
+                    serial64_puthex(*(volatile uint64_t*)va);
+                }
             }
             serial64_putc('\n');
         }
