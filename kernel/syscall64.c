@@ -1069,6 +1069,9 @@ static uint64_t do_fork_common(const syscall64_args_t* args,
             return (uint64_t)-11;
         }
         wait_slot_reset(slot);
+        /* A fork's only thread is a copy of the calling one, alternate
+         * signal stack and all; a new thread's is not. */
+        signal64_task_inherit_altstack(slot, sched64_current());
     }
     forks++;
     {

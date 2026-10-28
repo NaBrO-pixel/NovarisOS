@@ -31,6 +31,9 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <poll.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdlib.h>
 
 static int failures;
 
@@ -104,6 +107,50 @@ static long ms_since(const struct timespec *t0)
     struct timespec t1;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     return (t1.tv_sec - t0->tv_sec) * 1000 + (t1.tv_nsec - t0->tv_nsec) / 1000000;
+}
+
+/* For the alternate-stack test: each thread's own alternate stack, and
+ * where its handler's locals actually were. */
+#define ALT_SIZE (64 * 1024)
+static char *alt_stack[2];
+static volatile uintptr_t handler_sp[2];
+static __thread int thread_idx;
+static pthread_barrier_t alt_barrier;
+
+static void on_usr1_where(int s)
+{
+    volatile int local;
+    (void)s;
+    handler_sp[thread_idx] = (uintptr_t)&local;
+}
+
+static int tgkill_self(int sig);
+
+static void *alt_thread(void *arg)
+{
+    stack_t ss;
+
+    thread_idx = (int)(intptr_t)arg;
+    ss.ss_sp = alt_stack[thread_idx];
+    ss.ss_size = ALT_SIZE;
+    ss.ss_flags = 0;
+    sigaltstack(&ss, NULL);
+
+    /* Both threads have registered before either takes a signal: one
+     * alternate stack per process would put both on the second's. */
+    pthread_barrier_wait(&alt_barrier);
+    if (thread_idx == 1)
+        pthread_barrier_wait(&alt_barrier);     /* let thread 0 go first */
+    tgkill_self(SIGUSR1);
+    if (thread_idx == 0)
+        pthread_barrier_wait(&alt_barrier);
+    return NULL;
+}
+
+static int on_alt(int i)
+{
+    uintptr_t lo = (uintptr_t)alt_stack[i];
+    return handler_sp[i] >= lo && handler_sp[i] < lo + ALT_SIZE;
 }
 
 static int tgkill_self(int sig)
@@ -525,6 +572,41 @@ int main(void)
 
         close(pipefd[0]);
         close(pipefd[1]);
+    }
+
+    /* --- sigaltstack is per thread --------------------------------- *
+     *
+     * Wine gives every thread its own signal stack. One per process put
+     * every thread's signals on whichever registered last, and two
+     * threads taking signals at once overwrote each other's frames:
+     * winedevice.exe died of it in every first wineboot. */
+    {
+        pthread_t th[2];
+
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_usr1_where;
+        sa.sa_flags = SA_ONSTACK;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGUSR1, &sa, NULL);
+        sigprocmask(SIG_SETMASK, &(sigset_t){0}, NULL);
+
+        alt_stack[0] = malloc(ALT_SIZE);
+        alt_stack[1] = malloc(ALT_SIZE);
+        pthread_barrier_init(&alt_barrier, NULL, 2);
+        ok("two threads with alternate stacks of their own",
+           pthread_create(&th[0], NULL, alt_thread, (void *)0) == 0 &&
+           pthread_create(&th[1], NULL, alt_thread, (void *)1) == 0);
+        pthread_join(th[0], NULL);
+        pthread_join(th[1], NULL);
+        ok("the first thread's handler ran on its own alternate stack",
+           on_alt(0));
+        ok("and the second's on its own", on_alt(1));
+        {
+            stack_t cur;
+            sigaltstack(NULL, &cur);
+            ok("and the main thread still has none",
+               (cur.ss_flags & SS_DISABLE) != 0);
+        }
     }
 
     printf("kill64: %d failures\n", failures);
