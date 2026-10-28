@@ -1470,6 +1470,19 @@ uint64_t syscall64_dispatch(syscall64_args_t* args) {
             frame_from_args(args, r, &self);
             deliver_pending(&self);
         }
+
+        /* A call that replaced the mask and is ending with no handler to
+         * carry the old one in its frame gives it back here. Then
+         * anything the old mask allows and the temporary one did not -
+         * none, for every caller there is today, but cheap to be right
+         * about. */
+        if (me >= 0 && p && !p->exited && signal64_pop_mask() &&
+            (signal64_has_pending_task(sched64_current()) ||
+             signal64_has_pending(me))) {
+            registers64_t self;
+            frame_from_args(args, r, &self);
+            deliver_pending(&self);
+        }
     }
 
     return r;
@@ -1957,6 +1970,62 @@ static uint64_t dispatch(syscall64_args_t* args) {
         mapk_pages[k] += (args->a2 + PAGE64_SIZE - 1) / PAGE64_SIZE;
     }
     return r;
+}
+
+/* poll(2)'s body, shared with ppoll(2): checks the descriptors, and if
+ * none is ready parks the caller until something might have changed or
+ * `timeout` milliseconds have gone - negative for no limit, 0 for not at
+ * all. A parked call is re-issued from the start when it wakes, so this
+ * is re-entered with the same arguments and finds its deadline in the
+ * wait bookkeeping. */
+struct pollfd64 { int fd; short events; short revents; };
+
+static uint64_t do_poll(const syscall64_args_t* args, uint64_t nr,
+                        struct pollfd64* pfds, uint64_t n, int64_t timeout) {
+    uint64_t ready = 0;
+
+    if (n > FD_MAX * 2) return (uint64_t)-22;      /* -EINVAL */
+
+    for (uint64_t i = 0; i < n; i++) {
+        int fd = pfds[i].fd;
+        short want = pfds[i].events, got = 0;
+
+        pfds[i].revents = 0;
+        if (fd < 0) continue;
+        if (fd >= FD_MAX || !fds[fd].used) { pfds[i].revents = POLL64_NVAL;
+                                             ready++; continue; }
+
+        if (fds[fd].kind == FD64_SOCKET && fds[fd].sock >= 0 &&
+            sock64_state(fds[fd].sock) == SOCK64_LISTENING) {
+            /* A listening socket is readable when somebody is
+             * waiting to be accepted. That is the event the whole
+             * server loop turns on. */
+            if (sock64_pending(fds[fd].sock)) got |= POLL64_IN;
+        } else if (fd_is_stream(fd)) {
+            int rx = fds[fd].rx, tx = fds[fd].tx;
+            if (rx >= 0 && (pipe64_available(rx) > 0 ||
+                            pipe64_writers(rx) == 0)) got |= POLL64_IN;
+            if (tx >= 0 && pipe64_space(tx) > 0)      got |= POLL64_OUT;
+            if (tx >= 0 && pipe64_readers(tx) == 0)   got |= POLL64_HUP;
+        } else {
+            /* A file is always ready, which is what Linux says too. */
+            got |= POLL64_IN | POLL64_OUT;
+        }
+
+        got &= (short)(want | POLL64_HUP | POLL64_NVAL);
+        if (got) { pfds[i].revents = got; ready++; }
+    }
+
+    if (ready) { wait_done(); return ready; }
+    if (timeout == 0) return 0;
+
+    if (wait_started()) {
+        if (wait_expired()) { wait_done(); return 0; }
+        return wait_restart(args, nr, wait_deadline[wait_slot()]);
+    }
+    return wait_restart(args, nr,
+                        timeout < 0 ? 0    /* forever */
+                                    : clock64_ticks() + (uint64_t)timeout);
 }
 
 static uint64_t dispatch_body(syscall64_args_t* args) {
@@ -3956,68 +4025,71 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
      * and hung up. POLLIN on a stream is "there is a byte, or there will
      * never be one again" - end of file has to report readable, or a
      * server waiting on a client that has gone never notices. */
-    case SYS64_POLL: {
-        struct pollfd64 { int fd; short events; short revents; }* pfds =
-            (void*)a1;
-        uint64_t n = a2;
-        int64_t  timeout = (int64_t)(int32_t)a3;
-        uint64_t ready = 0;
+    case SYS64_POLL:
+        return do_poll(args, nr, (struct pollfd64*)a1, a2,
+                       (int64_t)(int32_t)a3);
 
-        if (n > FD_MAX * 2) return (uint64_t)-22;      /* -EINVAL */
+    /* ppoll(fds, nfds, timeout, sigmask, sigsetsize): poll with a
+     * timespec, and with the thread's signal mask replaced by `sigmask`
+     * for exactly the length of the wait.
+     *
+     * That second part is the reason it exists. A program that wants to
+     * sleep until a descriptor is ready *or* a signal arrives cannot do
+     * it with sigprocmask and poll: a signal landing between the unblock
+     * and the poll is handled before the poll starts, and the poll then
+     * sleeps through it. ppoll makes the swap and the sleep one step.
+     *
+     * Interrupted by a signal, it returns -EINTR and the handler runs
+     * under the temporary mask, with the old one saved in its frame.
+     * Any other return puts the old mask back first, as Linux does, so
+     * a signal the temporary mask let through but the real one blocks
+     * is not delivered on the way out.
+     *
+     * The remaining time is not written back to *timeout; glibc does
+     * not read it. */
+    case SYS64_PPOLL: {
+        int64_t timeout = -1;
+        uint64_t r;
 
-        for (uint64_t i = 0; i < n; i++) {
-            int fd = pfds[i].fd;
-            short want = pfds[i].events, got = 0;
-
-            pfds[i].revents = 0;
-            if (fd < 0) continue;
-            if (fd >= FD_MAX || !fds[fd].used) { pfds[i].revents = POLL64_NVAL;
-                                                 ready++; continue; }
-
-            if (fds[fd].kind == FD64_SOCKET && fds[fd].sock >= 0 &&
-                sock64_state(fds[fd].sock) == SOCK64_LISTENING) {
-                /* A listening socket is readable when somebody is
-                 * waiting to be accepted. That is the event the whole
-                 * server loop turns on. */
-                if (sock64_pending(fds[fd].sock)) got |= POLL64_IN;
-            } else if (fd_is_stream(fd)) {
-                int rx = fds[fd].rx, tx = fds[fd].tx;
-                if (rx >= 0 && (pipe64_available(rx) > 0 ||
-                                pipe64_writers(rx) == 0)) got |= POLL64_IN;
-                if (tx >= 0 && pipe64_space(tx) > 0)      got |= POLL64_OUT;
-                if (tx >= 0 && pipe64_readers(tx) == 0)   got |= POLL64_HUP;
-            } else {
-                /* A file is always ready, which is what Linux says too. */
-                got |= POLL64_IN | POLL64_OUT;
-            }
-
-            got &= (short)(want | POLL64_HUP | POLL64_NVAL);
-            if (got) { pfds[i].revents = got; ready++; }
+        if (a3) {
+            const struct { int64_t sec, nsec; }* ts = (const void*)a3;
+            if (!user_range_ok(a3, sizeof(*ts))) return (uint64_t)-14;
+            if (ts->sec < 0 || ts->nsec < 0 || ts->nsec >= 1000000000)
+                return (uint64_t)-22;                  /* -EINVAL */
+            /* Rounded up, as Linux rounds: a timeout is a minimum. */
+            timeout = ts->sec * (int64_t)CLOCK64_HZ
+                    + (ts->nsec + (1000000000 / CLOCK64_HZ) - 1)
+                      / (1000000000 / CLOCK64_HZ);
+        }
+        if (args->a4) {
+            if (args->a5 != 8) return (uint64_t)-22;
+            if (!user_range_ok(args->a4, 8)) return (uint64_t)-14;
+            signal64_push_mask(*(const uint64_t*)args->a4);
         }
 
-        if (ready) { wait_done(); return ready; }
-        if (timeout == 0) return 0;
-
-        if (wait_started()) {
-            if (wait_expired()) { wait_done(); return 0; }
-            return wait_restart(args, nr, wait_deadline[wait_slot()]);
-        }
-        return wait_restart(args, nr,
-                            timeout < 0 ? 0    /* forever */
-                                        : clock64_ticks() + (uint64_t)timeout);
+        r = do_poll(args, nr, (struct pollfd64*)a1, a2, timeout);
+        if (r != (uint64_t)-4) signal64_pop_mask();     /* not -EINTR */
+        return r;
     }
 
-    /* socketpair(domain, type, protocol, int sv[2]).
+    /* rt_sigsuspend(mask, sigsetsize): replace the mask and sleep until
+     * a signal is taken. It only ever returns -EINTR, and only once a
+     * handler is about to run - an ignored signal does not end it, and
+     * one whose default is to end the process ends the process. The
+     * handler runs under `mask` and puts the old one back when it
+     * returns.
      *
-     * Two pipes, crossed. Only AF_UNIX/SOCK_STREAM is answered, because
-     * that is the only thing a socketpair can be that this kernel could
-     * honestly serve - there is no network stack behind it, and a
-     * SOCK_DGRAM that silently behaved like a stream would lose message
-     * boundaries a caller was relying on.
-     *
-     * This is how every Wine process talks to the wineserver. The type
-     * argument carries SOCK_CLOEXEC and SOCK_NONBLOCK in its high bits,
-     * which are the same values as O_CLOEXEC and O_NONBLOCK. */
+     * glibc's sigsuspend and sigwaitinfo-free waiting loops are built
+     * on this; so is the classic "block, check, sigsuspend" idiom,
+     * which is the only race-free way to wait for a signal at all. */
+    case SYS64_RT_SIGSUSPEND:
+        if (a2 != 8) return (uint64_t)-22;                     /* -EINVAL */
+        if (!user_range_ok(a1, 8)) return (uint64_t)-14;       /* -EFAULT */
+        signal64_push_mask(*(const uint64_t*)a1);
+        /* Parked until something wakes it, then re-issued; returns
+         * -EINTR as soon as a signal is deliverable under `mask`. */
+        return wait_restart(args, nr, 0);
+
     case SYS64_SOCKETPAIR: {
         int* sv = (int*)args->a4;
         int type = (int)(a2 & 0xFF);
