@@ -497,6 +497,49 @@ static void page_fault_handler(registers64_t* r) {
     r->rip = pf_resume_rip;
 }
 
+/* The start of a bring-up layer, and the end of whatever the layers
+ * before it left behind.
+ *
+ * Each layer runs a program and checks what it did, and nothing took the
+ * program's address space back afterwards: the layer's own descriptor
+ * went out of scope, and an exit that ended the run had gone straight
+ * back to the layer rather than through the teardown every other exit
+ * takes. So every program the bring-up ran stayed in memory until the
+ * machine stopped, and its process slot with it.
+ *
+ * Swept here rather than at the end of each layer because a layer's
+ * checks may still look at its program's memory after it returns; by the
+ * next layer's start nothing can. The sweep frees every space no task is
+ * standing in (vmspace64 knows which exist and refuses to free one
+ * twice), and every exited process nobody is left to reap. */
+static void reclaim_finished(const char* when) {
+    uint64_t before = pmm64_free_frames();
+    int spaces = vmspace64_reclaim_unused(sched64_space_in_use);
+    int slots  = proc64_release_orphans();
+
+    if (!spaces && !slots) return;
+    serial64_puts("NOVARIS64: [reclaim ");
+    serial64_puts(when);
+    serial64_puts("] ");
+    serial64_putdec((uint64_t)spaces);
+    serial64_puts(" spaces, ");
+    serial64_putdec(pmm64_free_frames() - before);
+    serial64_puts(" frames, ");
+    serial64_putdec((uint64_t)slots);
+    serial64_puts(" process slots; free=");
+    serial64_putdec(pmm64_free_frames());
+    serial64_puts(", spaces left ");
+    serial64_putdec((uint64_t)vmspace64_live_count());
+    serial64_putc('\n');
+}
+
+static void layer(const char* name) {
+    reclaim_finished("layer");
+    serial64_puts("NOVARIS64: -- ");
+    serial64_puts(name);
+    serial64_puts(" --\n");
+}
+
 /* The address space of a run's leader that has exited, given back, and
  * its process slot with it.
  *
@@ -1429,7 +1472,7 @@ void kernel_main(uint32_t magic, void* mbi) {
     }
 
     /* --- layer 10: ring 3, and a syscall that comes back ------------ */
-    serial64_puts("NOVARIS64: -- ring 3 --\n");
+    layer("ring 3");
     {
         /* PML4 slot 224. Not one of the low addresses: slot 0 is still
          * the boot identity map, built from 2MB pages, so anything under
@@ -1498,7 +1541,7 @@ void kernel_main(uint32_t magic, void* mbi) {
     }
 
     /* --- layer 11: two address spaces ------------------------------- */
-    serial64_puts("NOVARIS64: -- address spaces --\n");
+    layer("address spaces");
     {
         /* PML4 slot 192: the low half, so it belongs to the space rather
          * than to the kernel, which is the whole point of the test. */
@@ -1579,7 +1622,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * This is both at once, which is what a process actually is - user
      * pages that exist only in its own low half, kernel reachable from
      * inside it because the high half is shared. */
-    serial64_puts("NOVARIS64: -- a program in its own space --\n");
+    layer("a program in its own space");
     {
         const uint64_t UCODE_VA  = 0x0000700000000000ULL;
         const uint64_t USTACK_VA = 0x0000700000010000ULL;
@@ -1630,7 +1673,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * on one property of the interrupt path: by the time a handler runs,
      * the whole user-visible state of the interrupted task is already a
      * registers64_t in memory, so switching tasks is copying structs. */
-    serial64_puts("NOVARIS64: -- preemption --\n");
+    layer("preemption");
     {
         const uint64_t UCODE_VA  = 0x0000700000000000ULL;
         const uint64_t USTACK_VA = 0x0000700000010000ULL;
@@ -1735,7 +1778,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * what this kernel implements is Linux's ABI rather than a private
      * convention shaped like it. That property is the whole reason the
      * 32-bit tree can run real glibc and real Wine. */
-    serial64_puts("NOVARIS64: -- a real Linux binary --\n");
+    layer("a real Linux binary");
     {
         /* Slot 255: the top of the low half, well clear of wherever ld
          * decided to put the program. */
@@ -1815,7 +1858,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * a buffered stdio stream. Every one of those is a demand on this
      * kernel's ABI, and glibc was compiled long before Novaris existed,
      * so none of them are negotiable. */
-    serial64_puts("NOVARIS64: -- real glibc --\n");
+    layer("real glibc");
     {
         /* 64KB of stack: glibc's startup uses far more of it than a
          * hand-written program does. */
@@ -1897,7 +1940,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * kernel32, linked at a Windows image base, and never told what it
      * would run on - the same relationship the glibc binary above has
      * with Linux. */
-    serial64_puts("NOVARIS64: -- a 64-bit Windows PE --\n");
+    layer("a 64-bit Windows PE");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 8;
@@ -1980,7 +2023,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * library beside it. Two things get proved here that layer 16 could
      * not - resolving an import against a real export table, and moving
      * an image away from the base it was linked at. */
-    serial64_puts("NOVARIS64: -- a PE with its own DLL --\n");
+    layer("a PE with its own DLL");
     {
         /* Forced, not incidental. Loading the DLL where it asked would
          * leave the relocation code untested, and the first image that
@@ -2059,7 +2102,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * file, gets back a module, and finds a function in it - which is
      * what LoadLibrary is, and the shape chrome.exe depends on:
      * chrome_elf.dll *loads* chrome.dll rather than importing it. */
-    serial64_puts("NOVARIS64: -- LoadLibrary from a file --\n");
+    layer("LoadLibrary from a file");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 8;
@@ -2137,7 +2180,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * threads in ONE address space, which is what makes it different
      * from Milestone 49's two tasks: those had a space each and could
      * not have shared a variable if they wanted to. */
-    serial64_puts("NOVARIS64: -- threads --\n");
+    layer("threads");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 16;
@@ -2222,7 +2265,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * matters: a kernel implementing FUTEX_WAIT as "return 0" would
      * still pass that test - the parent would loop again - and cannot
      * pass this one, because there is no loop to fall back into. */
-    serial64_puts("NOVARIS64: -- futex --\n");
+    layer("futex");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 16;
@@ -2297,7 +2340,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * saved registers out of the ucontext, write RIP back, carry on.
      * Every layer before this treated a ring-3 fault as the end of the
      * program. */
-    serial64_puts("NOVARIS64: -- signals --\n");
+    layer("signals");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 16;
@@ -2357,7 +2400,7 @@ void kernel_main(uint32_t magic, void* mbi) {
     /* Milestone 54's initrd could be read. This one can be written to,
      * which is the difference that matters: a Wine prefix is thousands
      * of files Wine *creates*. */
-    serial64_puts("NOVARIS64: -- a writable filesystem --\n");
+    layer("a writable filesystem");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 16;
@@ -2473,7 +2516,7 @@ void kernel_main(uint32_t magic, void* mbi) {
     /* How a loader loads. ld.so maps an ELF's segments and Wine maps a
      * PE's; every image this kernel has run so far was copied in by the
      * kernel rather than mapped by the program. */
-    serial64_puts("NOVARIS64: -- file-backed mmap --\n");
+    layer("file-backed mmap");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 16;
@@ -2535,7 +2578,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * at its smallest: load a dynamic program, hand control to its
      * interpreter, and see how far it gets. Tracing is ON - what this
      * layer is for is finding out what ld.so asks for. */
-    serial64_puts("NOVARIS64: -- the dynamic loader --\n");
+    layer("the dynamic loader");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         /* 512KB. ld.so uses far more stack than a hand-written program:
@@ -2667,7 +2710,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * Milestone 62 made runnable; whether it gets anywhere is a
      * different question, and this layer exists to read the answer
      * rather than to assert one. Tracing is ON. */
-    serial64_puts("NOVARIS64: -- Wine's loader --\n");
+    layer("Wine's loader");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 128;
@@ -2781,7 +2824,7 @@ void kernel_main(uint32_t magic, void* mbi) {
     /* The shape every shell has, and the one Wine's architecture is
      * built on: a process copies itself, the copy becomes a different
      * program, and the original waits to be told how it went. */
-    serial64_puts("NOVARIS64: -- fork and execve --\n");
+    layer("fork and execve");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 32;
@@ -2875,7 +2918,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * children, and rmdir refusing a directory that still holds
      * something. A Wine prefix is a deep tree Wine walks, so this is
      * the difference between a simplification and a lie. */
-    serial64_puts("NOVARIS64: -- a directory tree --\n");
+    layer("a directory tree");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 32;
@@ -2968,7 +3011,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * questions before mapping it and drawing - which is the shape of
      * every display driver that would ever sit above this kernel,
      * Wine's included. */
-    serial64_puts("NOVARIS64: -- a process draws --\n");
+    layer("a process draws");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 32;
@@ -3066,7 +3109,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * AT_REMOVEDIR, newfstatat) and this kernel answers whichever it
      * picks. The host runs the same file, and the two outputs are
      * compared byte for byte. */
-    serial64_puts("NOVARIS64: -- a working directory --\n");
+    layer("a working directory");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 32;
@@ -3243,7 +3286,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * both produce exactly its output, which is the point: correctness
      * is what it checks. The difference is a cost, and a cost is only
      * visible from here, by counting frames across the fork itself. */
-    serial64_puts("NOVARIS64: -- fork that shares --\n");
+    layer("fork that shares");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 64;
@@ -3371,7 +3414,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * tools/inputtest.py does that part, with real keystrokes from the
      * QEMU monitor, and it is the one that would catch a driver that
      * decoded perfectly and never received anything. */
-    serial64_puts("NOVARIS64: -- keyboard and mouse --\n");
+    layer("keyboard and mouse");
     {
         input64_event_t evs[8];
         uint64_t got;
@@ -3538,7 +3581,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * write fault on memory the program just asked to be made writable.
      * That distance is the reason this layer exists rather than a
      * comment saying the calls are handled. */
-    serial64_puts("NOVARIS64: -- the address space --\n");
+    layer("the address space");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 64;
@@ -3616,7 +3659,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      *
      * The program below execs /tmp/forkchild64, which the initrd already
      * stages for the fork/exec layer. */
-    serial64_puts("NOVARIS64: -- starting another program --\n");
+    layer("starting another program");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 64;
@@ -3708,7 +3751,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * getting -EPIPE; get the reference counting wrong - across dup, and
      * across fork, which duplicates every descriptor - and neither side
      * ever finds out. That failure is a hang, not an error. */
-    serial64_puts("NOVARIS64: -- pipes and socketpairs --\n");
+    layer("pipes and socketpairs");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 64;
@@ -3812,7 +3855,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * moment there were two. The program below connects twice and
      * asserts that what one client sends does *not* arrive on the other
      * connection. */
-    serial64_puts("NOVARIS64: -- a socket with a name --\n");
+    layer("a socket with a name");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 64;
@@ -3913,7 +3956,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * the assertions are about identity rather than arrival. A test that
      * only checked "a descriptor appeared" would pass on an
      * implementation that sent the integer. */
-    serial64_puts("NOVARIS64: -- passing a descriptor --\n");
+    layer("passing a descriptor");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 64;
@@ -4036,7 +4079,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * map is how a program gets anonymous shared memory out of a
      * filesystem, and it is what Wine does for every shared mapping it
      * makes; neither half is any use without the other. */
-    serial64_puts("NOVARIS64: -- shared memory --\n");
+    layer("shared memory");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 64;
@@ -4124,7 +4167,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * full run makes zero of them - which is exactly why it is tested
      * here rather than left to be found by the first caller that needs
      * it. */
-    serial64_puts("NOVARIS64: -- the clocks --\n");
+    layer("the clocks");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 64;
@@ -4210,7 +4253,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * against Linux's. It needs the timer for the same reason the clock
      * layer does: the child waits in nanosleep, and a sleep ends when
      * the tick counter says so. */
-    serial64_puts("NOVARIS64: -- kill --\n");
+    layer("kill");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 64;
@@ -4295,7 +4338,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      *
      * Needs the timer, because every assertion below is about a child
      * that has or has not finished yet, and "yet" is the tick counter. */
-    serial64_puts("NOVARIS64: -- wait4 --\n");
+    layer("wait4");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 64;
@@ -4368,7 +4411,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * chrome.exe asked for prctl three times and got -ENOSYS each time.
      * Two of Wine's three call sites are PR_SET_NAME, and the preloader
      * is the one that checks the answer. */
-    serial64_puts("NOVARIS64: -- prctl --\n");
+    layer("prctl");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 64;
@@ -4454,7 +4497,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      *
      * Needs the timer: the second thread sleeps in read(2) and the
      * point of the layer is that a signal reaches it there. */
-    serial64_puts("NOVARIS64: -- tgkill --\n");
+    layer("tgkill");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 64;
@@ -4554,7 +4597,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * prefix was measured to load 93 of them (tools/wine_prefix_modules
      * .txt), which is 174MB in the build tree and 58MB stripped.
      */
-    serial64_puts("NOVARIS64: -- a Wine prefix --\n");
+    layer("a Wine prefix");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 128;
@@ -4948,6 +4991,7 @@ void kernel_main(uint32_t magic, void* mbi) {
         }
     }
 
+    reclaim_finished("end");
     serial64_puts("NOVARIS64: ---- bring-up complete ----\n");
 
     /* --- the input watch (Milestone 70) ------------------------------

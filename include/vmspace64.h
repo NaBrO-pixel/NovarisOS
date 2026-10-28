@@ -40,6 +40,11 @@ int  vmspace64_create(vmspace64_t* vs);
  * ownership stays with whoever mapped them. */
 void vmspace64_destroy(vmspace64_t* vs);
 
+/* How many spaces exist now, and the sweep that gives back every one no
+ * task is standing in (in_use is sched64_space_in_use); see vmspace64.c. */
+int  vmspace64_live_count(void);
+int  vmspace64_reclaim_unused(int (*in_use)(uint64_t pml4_phys));
+
 /* Copies the CURRENT address space's low half into `dst`, which must be
  * a space fresh from vmspace64_create.
  *
