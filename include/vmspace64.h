@@ -92,6 +92,10 @@ int  vmspace64_break_cow(uint64_t va);
  * test per missing table instead of one per page. */
 uint64_t vmspace64_next_mapped(uint64_t va, uint64_t end);
 
+/* A store into a space that need not be loaded, breaking copy-on-write
+ * for it as the space's own write would; see vmspace64.c. */
+int  vmspace64_write_u32(vmspace64_t* vs, uint64_t va, uint32_t value);
+
 int  vmspace64_set_writable(uint64_t va, int writable);
 
 void vmspace64_switch(const vmspace64_t* vs);
