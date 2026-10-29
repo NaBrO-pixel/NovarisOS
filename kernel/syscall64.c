@@ -512,6 +512,8 @@ static int wait_started(void) { return wait_pending[wait_slot()]; }
  * outside syscalls. */
 static uint64_t clear_child_tid[SCHED64_MAX_TASKS];
 
+static int user_range_ok(uint64_t addr, uint64_t len);
+
 static void wait_slot_reset(int t) {
     if (t < 0 || t >= SCHED64_MAX_TASKS) return;
     clear_child_tid[t] = 0;
@@ -1072,6 +1074,28 @@ static uint64_t do_fork_common(const syscall64_args_t* args,
         /* A fork's only thread is a copy of the calling one, alternate
          * signal stack and all; a new thread's is not. */
         signal64_task_inherit_altstack(slot, sched64_current());
+
+        /* The tid words, which glibc's fork asks for - it is
+         * clone(CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID|SIGCHLD) with
+         * &THREAD_SELF->tid - and which were ignored. The child then
+         * carried its parent's tid in pd->tid, so raise() in a forked
+         * child - tgkill(getpid(), pd->tid) - named a thread of another
+         * process and got -ESRCH. SYS_fork itself has no flags.
+         *
+         * The child's word is in the child's copy of the parent's
+         * memory, shared copy-on-write, so it is written through the
+         * child's page tables and breaks the share for the child. */
+        {
+            uint64_t cflags = args->nr == SYS64_CLONE ? args->a1 : 0;
+            uint32_t ctid = (uint32_t)(slot + 1);
+
+            if (cflags & CLONE_CHILD_SETTID)
+                vmspace64_write_u32(&cp->space, args->a4, ctid);
+            if ((cflags & CLONE_PARENT_SETTID) && user_range_ok(args->a3, 4))
+                *(volatile uint32_t*)args->a3 = ctid;
+            if (cflags & CLONE_CHILD_CLEARTID)
+                clear_child_tid[slot] = args->a4;
+        }
     }
     forks++;
     {

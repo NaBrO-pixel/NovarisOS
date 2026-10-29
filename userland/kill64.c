@@ -609,6 +609,56 @@ int main(void)
         }
     }
 
+    /* --- a forked child knows its own tid --------------------------- *
+     *
+     * glibc's fork asks the kernel to write the child's tid into the
+     * child's thread descriptor (CLONE_CHILD_SETTID). A kernel that
+     * ignores the flag leaves the parent's tid there. raise() cannot see
+     * the difference - glibc asks gettid() when a thread signals itself -
+     * but anything that records an owner does: a robust mutex's lock word
+     * is the owner's tid as glibc has it, so in the child it must be the
+     * child's gettid() and not the parent's. */
+    {
+        pthread_mutexattr_t ma;
+        pthread_mutex_t m;
+        int parent_tid = (int)syscall(SYS_gettid);
+
+        pthread_mutexattr_init(&ma);
+        pthread_mutexattr_setrobust(&ma, PTHREAD_MUTEX_ROBUST);
+        pthread_mutex_init(&m, &ma);
+
+        pthread_mutex_lock(&m);
+        ok("a robust mutex records its owner's tid",
+           (m.__data.__lock & 0x3fffffff) == parent_tid);
+        pthread_mutex_unlock(&m);
+
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_usr1;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGUSR1, &sa, NULL);
+        sigprocmask(SIG_SETMASK, &(sigset_t){0}, NULL);
+
+        child = fork();
+        if (child == 0) {
+            int before = got_usr1, bad = 0;
+            int me = (int)syscall(SYS_gettid);
+            pthread_mutex_lock(&m);
+            if ((m.__data.__lock & 0x3fffffff) != me) bad |= 1;
+            if (me == parent_tid) bad |= 1;
+            pthread_mutex_unlock(&m);
+            if (raise(SIGUSR1) != 0) bad |= 2;
+            if (got_usr1 != before + 1) bad |= 4;
+            _exit(bad);
+        }
+        waitpid(child, &status, 0);
+        ok("in a forked child it records the child's tid, not the parent's",
+           WIFEXITED(status) && !(WEXITSTATUS(status) & 1));
+        ok("and the child's raise() returns 0",
+           WIFEXITED(status) && !(WEXITSTATUS(status) & 2));
+        ok("and runs its handler",
+           WIFEXITED(status) && !(WEXITSTATUS(status) & 4));
+    }
+
     printf("kill64: %d failures\n", failures);
     return failures ? 1 : 127;
 }

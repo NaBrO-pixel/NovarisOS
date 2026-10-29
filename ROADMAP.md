@@ -10778,10 +10778,16 @@ much each would widen what runs:
    asks a responder `tools/qemu_test.py --dns` runs on the build machine
    (every name is 192.0.2.1).
 
+   A forked child is told its own tid too: fork honours
+   `CLONE_CHILD_SETTID` (written through the child's page tables,
+   breaking copy-on-write for it), `CLONE_PARENT_SETTID` and
+   `CLONE_CHILD_CLEARTID`. Before, the child's `pd->tid` was its
+   parent's - invisible to `raise()`, which asks `gettid`, but not to
+   anything that records an owner, such as a robust mutex.
+
    Still open on the 64-bit side: `ppoll` does not write back the time
-   remaining; a forked child is not told its own tid; a narrower futex
-   bitset is treated as all bits; and `rt_sigtimedwait`, `pselect6` and
-   `signalfd` do not exist yet.
+   remaining; a narrower futex bitset is treated as all bits; and
+   `rt_sigtimedwait`, `pselect6` and `signalfd` do not exist yet.
 
    `--with-freetype` is not optional if you want windows: without a font
    engine Wine's caption metrics are uninitialised stack, and the window
