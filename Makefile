@@ -1070,11 +1070,16 @@ run-disk: $(ISO) disk
 # cache that did not survive.
 # Milestone 41. The one test that has to be run rather than reasoned
 # about: a ring-3 process opening a TCP connection, and then asking a
-# real nameserver a real question over UDP. 10.0.2.3 is QEMU's own DNS
-# forwarder, so the second half needs a working resolver on this machine
-# and nothing more.
+# nameserver a real question over UDP.
 #
-# The server is this machine. tools/qemu_test.py serves --http-dir from
+# The nameserver is this machine too (--dns), not QEMU's 10.0.2.3: that
+# one relays to this machine's resolver, and the test then failed on
+# every machine that could not reach the internet - including the ones
+# whose only way out is an HTTP proxy - although nothing in the guest was
+# wrong. The guest still builds the query, sends it from a ring-3 UDP
+# socket and parses the answer; what it no longer needs is the internet.
+#
+# The web server is this machine. tools/qemu_test.py serves --http-dir from
 # the build host, which QEMU's user-mode stack presents to the guest as
 # 10.0.2.2 - both its default gateway and us - so the test needs nothing
 # from the outside world and cannot fail because the outside world is
@@ -1086,13 +1091,13 @@ run-disk: $(ISO) disk
 test-inet: $(ISO)
 	python3 tools/qemu_test.py --iso $(ISO) --memory 768 \
 	    --boot-wait 40 --settle 60 --timeout 260 \
-	    --http-dir $(BUILD_DIR)/test/www \
+	    --http-dir $(BUILD_DIR)/test/www --dns \
 	    --setup "net up" \
-	    --cmd 'run inettest.elf 10.0.2.2 $$HTTP 10.0.2.3 example.com' \
+	    --cmd 'run inettest.elf 10.0.2.2 $$HTTP 10.0.2.2:$$DNS example.com' \
 	    --expect "\\[ok\\] connect" \
 	    --expect "\\[ok\\] HTTP/1.0 200 OK" \
 	    --expect "\\[ok\\] udp socket" \
-	    --expect "answer\\(s\\)" \
+	    --expect "with 1 answer\\(s\\)" \
 	    --expect "a process opened a TCP connection" \
 	    --reject "KERNEL PANIC" \
 	    --stop-when-matched

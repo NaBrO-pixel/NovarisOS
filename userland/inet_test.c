@@ -15,7 +15,11 @@
  * It speaks HTTP/1.0 by hand, because a request is one line and the
  * point is the socket underneath it rather than the protocol on top.
  *
- * Usage: inet_test.elf <dotted-quad> <port>
+ * Usage: inet_test.elf <dotted-quad> <port> [<resolver>[:<port>] [<name>]]
+ *
+ * The resolver's port is 53 unless given. The test harness gives one: it
+ * answers DNS itself, on a port of its own, so the test does not depend
+ * on whether the machine running it can reach a real resolver.
  *
  * See ROADMAP.md Milestone 41.
  */
@@ -158,7 +162,8 @@ static unsigned encode_name(const char* name, unsigned char* out) {
     return w;
 }
 
-static int dns_query(unsigned server_ip, const char* name) {
+static int dns_query(unsigned server_ip, unsigned server_port,
+                     const char* name) {
     long a[6];
 
     a[0] = AF_INET; a[1] = SOCK_DGRAM; a[2] = 0;
@@ -181,7 +186,7 @@ static int dns_query(unsigned server_ip, const char* name) {
     struct sockaddr_in to;
     for (unsigned i = 0; i < sizeof(to.sin_zero); i++) to.sin_zero[i] = 0;
     to.sin_family = AF_INET;
-    to.sin_port = hton16(53);
+    to.sin_port = hton16(server_port);
     to.sin_addr = hton32(server_ip);
 
     a[0] = fd; a[1] = (long)dnsbuf; a[2] = w; a[3] = 0;
@@ -420,12 +425,24 @@ int main(int argc, char** argv) {
      * rather than failed when there is no third argument, so the TCP
      * half stays usable on its own. */
     if (argc > 3) {
-        unsigned dns_ip = parse_ip(argv[3]);
-        if (!dns_ip) {
-            out("[--] third argument is not a dotted quad\n");
+        /* "a.b.c.d" or "a.b.c.d:port". */
+        char ipbuf[16];
+        unsigned dns_port = 53, n = 0;
+        const char* arg = argv[3];
+        while (arg[n] && arg[n] != ':' && n < sizeof(ipbuf) - 1) {
+            ipbuf[n] = arg[n];
+            n++;
+        }
+        ipbuf[n] = 0;
+        if (arg[n] == ':') dns_port = parse_uint(arg + n + 1);
+
+        unsigned dns_ip = parse_ip(ipbuf);
+        if (!dns_ip || !dns_port || dns_port > 65535) {
+            out("[--] third argument is not a dotted quad, or quad:port\n");
             return 1;
         }
-        if (dns_query(dns_ip, argc > 4 ? argv[4] : "example.com") != 0) return 1;
+        if (dns_query(dns_ip, dns_port, argc > 4 ? argv[4] : "example.com") != 0)
+            return 1;
     }
 
     out("inet_test: a process opened a TCP connection\n");
