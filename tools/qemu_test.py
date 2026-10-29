@@ -35,6 +35,61 @@ import tempfile
 import threading
 import time
 
+# The address every name resolves to under --dns: 192.0.2.1, from the
+# range RFC 5737 sets aside for documentation, so it can never be mistaken
+# for a real answer.
+DNS_ANSWER = bytes([192, 0, 2, 1])
+
+
+def dns_reply(query):
+    """The reply to one DNS query: the same id and question, flagged as a
+    recursive answer, with one A record for whatever was asked. Anything
+    that is not a single standard query gets no reply at all."""
+    if len(query) < 12:
+        return None
+    qdcount = (query[4] << 8) | query[5]
+    if query[2] & 0x80 or qdcount != 1:        # a response, or not one question
+        return None
+    # Walk the question's name to find where the question ends.
+    i = 12
+    while i < len(query) and query[i]:
+        if query[i] & 0xC0:                     # compression in a question: no
+            return None
+        i += 1 + query[i]
+    end = i + 1 + 4                             # the 0 byte, QTYPE, QCLASS
+    if end > len(query):
+        return None
+    question = query[12:end]
+    header = (query[0:2]
+              + bytes([0x81, 0x80])             # QR, RD copied, RA
+              + bytes([0, 1, 0, 1, 0, 0, 0, 0]))  # 1 question, 1 answer
+    answer = (bytes([0xC0, 12])                 # the name: a pointer back
+              + bytes([0, 1, 0, 1])             # A, IN
+              + bytes([0, 0, 0, 60])            # TTL
+              + bytes([0, 4]) + DNS_ANSWER)
+    return header + question + answer
+
+
+def serve_dns(port):
+    """A DNS responder on this machine, for the guest to ask instead of
+    the real network. Returns the socket; closing it stops the thread."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", port))
+
+    def loop():
+        while True:
+            try:
+                query, peer = sock.recvfrom(512)
+            except OSError:
+                return                          # closed
+            reply = dns_reply(query)
+            if reply:
+                sock.sendto(reply, peer)
+
+    threading.Thread(target=loop, daemon=True).start()
+    return sock
+
+
 # Character -> QEMU monitor key name(s). Anything needing shift is sent as
 # a "shift-x" combo, which QEMU understands as a single sendkey argument.
 KEYMAP = {
@@ -510,6 +565,15 @@ def main():
                          "route to the outside world here, and a test that "
                          "needed one would fail when the outside world did - "
                          "so the server it fetches from is this machine.")
+    ap.add_argument("--dns", action="store_true",
+                    help="answer DNS on this machine: every A question gets "
+                         "one answer, 192.0.2.1. The port is chosen per run "
+                         "and substituted for $DNS in every --cmd, so a "
+                         "test points the guest at 10.0.2.2:$DNS. QEMU's "
+                         "own 10.0.2.3 relays to this machine's resolver, "
+                         "and a test that went through it would fail "
+                         "wherever that resolver cannot reach the internet "
+                         "- which is not what the test is about.")
     ap.add_argument("--http-port", type=int,
                     help="serve --http-dir on this port rather than one "
                          "picked from the pid. For a test whose URLs are "
@@ -550,6 +614,14 @@ def main():
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.5)
 
+    # The resolver the guest asks, if the test asked for one. Next to the
+    # HTTP port rather than on it, so the two never collide.
+    dns_sock = None
+    dns_port = None
+    if args.dns:
+        dns_port = 54000 + (os.getpid() % 10000)
+        dns_sock = serve_dns(dns_port)
+
     # "8080:80" - this machine's loopback port, then the guest's.
     hostfwd = None
     if args.hostfwd:
@@ -566,6 +638,10 @@ def main():
         commands = [c.replace("$HTTP", str(http_forward)) for c in commands]
         args.post_cmd = [c.replace("$HTTP", str(http_forward))
                          for c in args.post_cmd]
+    if dns_port:
+        commands = [c.replace("$DNS", str(dns_port)) for c in commands]
+        args.post_cmd = [c.replace("$DNS", str(dns_port))
+                         for c in args.post_cmd]
 
     transcript = run(args.iso, commands, args.boot_wait, args.key_delay,
                      args.settle, args.timeout, args.serial_log, args.memory,
@@ -578,6 +654,8 @@ def main():
     if http_proc:
         http_proc.terminate()
         http_proc.wait()
+    if dns_sock:
+        dns_sock.close()
 
     sys.stdout.write(transcript)
 
