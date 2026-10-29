@@ -10696,8 +10696,8 @@ much each would widen what runs:
    and a 256-entry socket table that ran out of pipes (1024 now).
 
    The 64-bit kernel parks `poll` on a shared key any wake releases, so
-   it does not have the first bug; its wineboot is slower for reasons
-   not yet measured.
+   it does not have the first bug. Why its wineboot was slow anyway was
+   measured later - see "The 64-bit wineboot, measured" below.
 
    **The 32-bit fork is copy-on-write now**, as the 64-bit side's has
    been since Milestone 69: frames are reference-counted in the PMM, a
@@ -10711,6 +10711,77 @@ much each would widen what runs:
    did not move (46s either way) - the exec after each fork threw the
    copies away - but forking a large process no longer needs the memory
    to duplicate it.
+
+   **The 64-bit wineboot, measured.** Each layer's report now says where
+   the time went: `[cycles]` (TSC cycles in syscalls, costliest numbers
+   first), `[maps]` (mmap and munmap split by kind, per page), `[faults]`
+   (page faults, copy-on-write breaks, SIGSEGVs, and every syscall made
+   5,000 times or more) and `[segv]` (the commonest faulting rip/page,
+   with each process's first faults logged in full - name, registers and
+   the top of the stack). In order of what they found:
+
+   - **The syscall trace was the largest cost.** With it on, wineboot
+     ran out its 300s budget unfinished and bring-up took 503s against
+     189s. `WINE64_TRACE` now defaults to 0; `-DWINE64_TRACE=1` turns it
+     back on.
+   - **fstatfs recounted free memory a bit at a time** (9.6M cycles a
+     call, 12% of wineboot); a byte at a time now. **kmemset zeroed a
+     byte at a time** - every fresh page Wine maps, 350K cycles each and
+     a quarter of wineboot; `rep stos` now, shared with the 32-bit side.
+   - **PROT_NONE reservations are regions, not page-table entries.**
+     Wine reserves about 43GB - 11.2 million PTEs on the zero page and
+     88MB of page tables. Each process keeps a sorted list of up to 512
+     ranges; mprotect commits from it, munmap and MAP_FIXED carve it,
+     fork copies it. A reserved page now faults, as PROT_NONE should.
+   - **clone ignored its tid words.** No `CLONE_PARENT_SETTID`, so
+     glibc's `pd->tid` stayed 0 and every `pthread_join` returned at
+     once; Wine then freed exited threads' stacks under them, and each
+     such thread faulted forever inside its own SIGSEGV handler - 5.8
+     million SIGSEGVs, most of the time spent outside syscalls. The tid
+     words, `CLONE_CHILD_CLEARTID` with a futex wake at thread exit, and
+     the `FUTEX_WAIT_BITSET` that a real join then needs are all in.
+     Wineboot went from 307G to 189G cycles on the same host.
+
+   Bring-up went from 503s, through 189s and 130s, to 108s on the same
+   host; a later, faster host runs it in 54-90s.
+
+   **Signals, done properly on the 64-bit side.** Per-thread signal
+   masks (`rt_sigprocmask`, `rt_sigpending`, `sa_mask`, `SA_NODEFER`,
+   `SA_RESETHAND`, the mask restored by `rt_sigreturn`), `rt_sigsuspend`
+   and `ppoll` with Linux's saved-mask rule, and a fault the thread is
+   blocking kills the process rather than looping. An uncaught fault in
+   a run with several processes now ends that process, not the run, and
+   a death by signal ends every thread of it and frees its space.
+
+   **Two crashes that were the kernel's.** winedevice.exe died in every
+   first wineboot, somewhere different each time: the alternate signal
+   stack was per process, Wine registers one per thread, and two
+   threads' signal frames were written over each other (rip
+   `0x001b000000000023` is cs and ss out of a sigcontext). It is per
+   thread now. And a SIGSEGV at the start of every chromeprobe layer was
+   winegui64.exe's main thread, resumed from a stale frame after it had
+   exited: a run's leader ended the layer without leaving the
+   scheduler. Wineboot, winegui and chromeprobe now run with 0 SIGSEGVs.
+
+   **Memory is given back between layers.** A Wine layer's leader frees
+   its space and slot when its layer ends (9,259, 8,412 and 4,712
+   frames), and every bring-up layer starts by sweeping the spaces no
+   task stands in and the exited processes nobody can reap - about 73MB
+   more free by the time the prefix starts. vmspace64 tracks which
+   spaces are live and refuses to destroy one twice, because exec and
+   exit destroy through copies of a descriptor the layer still holds.
+
+   With all of that, `make -f Makefile.amd64 WINE64_INSTALL=1 test` is
+   26/26 PASS and every 32-bit target passes, `test-inet` included: it
+   used to ask QEMU's 10.0.2.3, which relays to the build machine's
+   resolver and failed wherever that cannot reach the internet, and now
+   asks a responder `tools/qemu_test.py --dns` runs on the build machine
+   (every name is 192.0.2.1).
+
+   Still open on the 64-bit side: `ppoll` does not write back the time
+   remaining; a forked child is not told its own tid; a narrower futex
+   bitset is treated as all bits; and `rt_sigtimedwait`, `pselect6` and
+   `signalfd` do not exist yet.
 
    `--with-freetype` is not optional if you want windows: without a font
    engine Wine's caption metrics are uninitialised stack, and the window
