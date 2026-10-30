@@ -10785,9 +10785,14 @@ much each would widen what runs:
    parent's - invisible to `raise()`, which asks `gettid`, but not to
    anything that records an owner, such as a robust mutex.
 
-   Still open on the 64-bit side: `ppoll` does not write back the time
-   remaining; a narrower futex bitset is treated as all bits; and
-   `rt_sigtimedwait`, `pselect6` and `signalfd` do not exist yet.
+   `ppoll` writes the time left back into its timeout, as Linux does,
+   whether it returns ready, timed out (zero) or interrupted - only
+   visible through the raw syscall, since glibc's `ppoll()` copies the
+   timeout to a local first.
+
+   Still open on the 64-bit side: a narrower futex bitset is treated as
+   all bits, and `rt_sigtimedwait`, `pselect6` and `signalfd` do not
+   exist yet.
 
    `--with-freetype` is not optional if you want windows: without a font
    engine Wine's caption metrics are uninitialised stack, and the window
