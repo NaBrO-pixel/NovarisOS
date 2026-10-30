@@ -659,6 +659,69 @@ int main(void)
            WIFEXITED(status) && !(WEXITSTATUS(status) & 4));
     }
 
+    /* --- ppoll writes back the time left ---------------------------- *
+     *
+     * Through the raw syscall: glibc's ppoll() copies the timeout to a
+     * local, so the write-back is only visible here. */
+    {
+        struct pollfd pf;
+        struct timespec t;
+        int pipefd[2], e;
+        long r;
+        sigset_t empty;
+        pid_t parent = getpid();
+
+        sigemptyset(&empty);
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_usr1;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGUSR1, &sa, NULL);
+        sigprocmask(SIG_SETMASK, &empty, NULL);
+
+        ok("a pipe for the ppoll write-back", pipe(pipefd) == 0);
+        pf.fd = pipefd[0];
+        pf.events = POLLIN;
+
+        ok("a byte to make it ready", write(pipefd[1], "x", 1) == 1);
+        t.tv_sec = 1;
+        t.tv_nsec = 0;
+        r = syscall(SYS_ppoll, &pf, 1, &t, NULL, 8);
+        ok("ppoll on a ready pipe leaves most of a second",
+           r == 1 && t.tv_sec == 0 ? t.tv_nsec > 900000000L
+                                   : (r == 1 && t.tv_sec == 1 && t.tv_nsec == 0));
+        {
+            char c;
+            ok("and the byte comes back out", read(pipefd[0], &c, 1) == 1);
+        }
+
+        t.tv_sec = 0;
+        t.tv_nsec = 50 * 1000000L;
+        r = syscall(SYS_ppoll, &pf, 1, &t, NULL, 8);
+        ok("ppoll that times out leaves nothing",
+           r == 0 && t.tv_sec == 0 && t.tv_nsec == 0);
+
+        child = fork();
+        if (child == 0) {
+            nap(100);
+            sys_kill(parent, SIGUSR1);
+            _exit(0);
+        }
+        t.tv_sec = 2;
+        t.tv_nsec = 0;
+        errno = 0;
+        r = syscall(SYS_ppoll, &pf, 1, &t, &empty, 8);
+        e = errno;
+        ok("ppoll interrupted by a signal returns EINTR", r == -1 && e == EINTR);
+        ok("and leaves less than it was given",
+           t.tv_sec < 2 && t.tv_sec >= 0 && t.tv_nsec >= 0 &&
+           t.tv_nsec < 1000000000L);
+        ok("but more than nothing", t.tv_sec >= 1 || t.tv_nsec > 0);
+        waitpid(child, &status, 0);
+
+        close(pipefd[0]);
+        close(pipefd[1]);
+    }
+
     printf("kill64: %d failures\n", failures);
     return failures ? 1 : 127;
 }

@@ -4094,11 +4094,20 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
      * a signal the temporary mask let through but the real one blocks
      * is not delivered on the way out.
      *
-     * The remaining time is not written back to *timeout; glibc does
-     * not read it. */
+     * And it writes the time left back into *timeout, however it ends -
+     * ready, timed out (zero), or interrupted - which is what Linux does
+     * and what a caller that loops on EINTR uses to keep its total wait
+     * the same. glibc's own ppoll() hides it, copying the timeout to a
+     * local first; the raw syscall sees it.
+     *
+     * Only a call that actually waited has anything to subtract. One
+     * that returns on its first pass leaves *timeout as it was, which is
+     * Linux's answer to within the microseconds this clock cannot see. */
     case SYS64_PPOLL: {
         int64_t timeout = -1;
         uint64_t r;
+        int waited = wait_started();
+        uint64_t deadline = waited ? wait_deadline[wait_slot()] : 0;
 
         if (a3) {
             const struct { int64_t sec, nsec; }* ts = (const void*)a3;
@@ -4118,6 +4127,15 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
 
         r = do_poll(args, nr, (struct pollfd64*)a1, a2, timeout);
         if (r != (uint64_t)-4) signal64_pop_mask();     /* not -EINTR */
+
+        if (a3 && waited && deadline) {
+            struct { int64_t sec, nsec; }* ts = (void*)a3;
+            uint64_t now = clock64_ticks();
+            uint64_t left = deadline > now ? deadline - now : 0;
+            ts->sec  = (int64_t)(left / CLOCK64_HZ);
+            ts->nsec = (int64_t)(left % CLOCK64_HZ)
+                     * (1000000000 / CLOCK64_HZ);
+        }
         return r;
     }
 
