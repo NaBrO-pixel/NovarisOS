@@ -31,6 +31,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <poll.h>
+#include <sys/select.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -826,6 +827,150 @@ int main(void)
         ok("with the signal it took", got == SIGUSR2);
 
         sigprocmask(SIG_SETMASK, &empty, NULL);
+    }
+
+    /* --- select and pselect ----------------------------------------- *
+     *
+     * Both are pselect6 on x86-64: glibc's select() calls it too. */
+    {
+        int pa[2], pb[2], r, e;
+        fd_set rs, ws;
+        struct timeval tv;
+        struct timespec t0, ts;
+        sigset_t usr1, empty;
+        pid_t parent = getpid();
+        (void)parent;
+
+        sigemptyset(&empty);
+        sigemptyset(&usr1);
+        sigaddset(&usr1, SIGUSR1);
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_usr1;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGUSR1, &sa, NULL);
+        sigprocmask(SIG_SETMASK, &empty, NULL);
+
+        ok("two pipes for select", pipe(pa) == 0 && pipe(pb) == 0);
+
+        /* Readable. */
+        ok("a byte in the first", write(pa[1], "x", 1) == 1);
+        FD_ZERO(&rs);
+        FD_SET(pa[0], &rs);
+        FD_SET(pb[0], &rs);
+        tv.tv_sec = 1; tv.tv_usec = 0;
+        r = select((pa[0] > pb[0] ? pa[0] : pb[0]) + 1, &rs, NULL, NULL, &tv);
+        ok("select finds the readable pipe", r == 1 && FD_ISSET(pa[0], &rs));
+        ok("and clears the one that is not", !FD_ISSET(pb[0], &rs));
+
+        /* Writable, and readable at once: two bits, counted as two. */
+        FD_ZERO(&rs);
+        FD_ZERO(&ws);
+        FD_SET(pa[0], &rs);
+        FD_SET(pa[1], &ws);
+        tv.tv_sec = 1; tv.tv_usec = 0;
+        r = select((pa[0] > pa[1] ? pa[0] : pa[1]) + 1, &rs, &ws, NULL, &tv);
+        ok("a readable and a writable end count as two",
+           r == 2 && FD_ISSET(pa[0], &rs) && FD_ISSET(pa[1], &ws));
+        {
+            char c;
+            ok("and the byte reads back", read(pa[0], &c, 1) == 1);
+        }
+
+        /* Nothing ready: a timeout, the set cleared, no time left. */
+        FD_ZERO(&rs);
+        FD_SET(pb[0], &rs);
+        tv.tv_sec = 0; tv.tv_usec = 50000;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        r = select(pb[0] + 1, &rs, NULL, NULL, &tv);
+        ok("select on an empty pipe times out with 0", r == 0);
+        ok("not before its timeout", ms_since(&t0) >= 45);
+        ok("with the set cleared", !FD_ISSET(pb[0], &rs));
+        ok("and no time left in the timeval",
+           tv.tv_sec == 0 && tv.tv_usec == 0);
+
+        /* No descriptors at all: a sleep. */
+        tv.tv_sec = 0; tv.tv_usec = 50000;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        r = select(0, NULL, NULL, NULL, &tv);
+        ok("select with no descriptors sleeps its timeout",
+           r == 0 && ms_since(&t0) >= 45);
+
+        /* A closed descriptor. */
+        {
+            int dead = dup(pb[0]);
+            close(dead);
+            FD_ZERO(&rs);
+            FD_SET(dead, &rs);
+            tv.tv_sec = 0; tv.tv_usec = 0;
+            errno = 0;
+            r = select(dead + 1, &rs, NULL, NULL, &tv);
+            e = errno;
+            ok("a closed descriptor is EBADF", r == -1 && e == EBADF);
+        }
+
+        /* Woken by another process's write. */
+        child = fork();
+        if (child == 0) {
+            nap(100);
+            if (write(pb[1], "y", 1) != 1) _exit(1);
+            _exit(0);
+        }
+        FD_ZERO(&rs);
+        FD_SET(pb[0], &rs);
+        tv.tv_sec = 2; tv.tv_usec = 0;
+        r = select(pb[0] + 1, &rs, NULL, NULL, &tv);
+        ok("select is woken by another process's write",
+           r == 1 && FD_ISSET(pb[0], &rs));
+        ok("and leaves some of its two seconds",
+           tv.tv_sec < 2 && (tv.tv_sec > 0 || tv.tv_usec > 0));
+        waitpid(child, &status, 0);
+        {
+            char c;
+            ok("and that byte reads back", read(pb[0], &c, 1) == 1);
+        }
+
+        /* End of file is readable. */
+        close(pb[1]);
+        FD_ZERO(&rs);
+        FD_SET(pb[0], &rs);
+        tv.tv_sec = 1; tv.tv_usec = 0;
+        r = select(pb[0] + 1, &rs, NULL, NULL, &tv);
+        ok("a pipe with no writer left is readable (end of file)",
+           r == 1 && FD_ISSET(pb[0], &rs));
+
+        /* pselect's mask: a pending signal it unblocks ends the wait. */
+        sigprocmask(SIG_SETMASK, &usr1, NULL);
+        {
+            int before = got_usr1;
+            tgkill_self(SIGUSR1);
+            FD_ZERO(&rs);
+            FD_SET(pa[0], &rs);
+            ts.tv_sec = 1; ts.tv_nsec = 0;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            errno = 0;
+            r = pselect(pa[0] + 1, &rs, NULL, NULL, &ts, &empty);
+            e = errno;
+            ok("pselect is interrupted by a signal its mask unblocks",
+               r == -1 && e == EINTR && ms_since(&t0) < 500);
+            ok("and the handler ran", got_usr1 == before + 1);
+            ok("and the old mask is back", is_blocked(SIGUSR1));
+
+            /* One it keeps blocked does not. */
+            before = got_usr1;
+            tgkill_self(SIGUSR1);
+            FD_ZERO(&rs);
+            FD_SET(pa[0], &rs);
+            ts.tv_sec = 0; ts.tv_nsec = 50 * 1000000L;
+            r = pselect(pa[0] + 1, &rs, NULL, NULL, &ts, &usr1);
+            ok("pselect whose mask blocks the signal times out", r == 0);
+            ok("without running the handler", got_usr1 == before);
+            sigprocmask(SIG_SETMASK, &empty, NULL);
+            ok("which runs once it is unblocked", got_usr1 == before + 1);
+        }
+
+        close(pa[0]);
+        close(pa[1]);
+        close(pb[0]);
     }
 
     printf("kill64: %d failures\n", failures);

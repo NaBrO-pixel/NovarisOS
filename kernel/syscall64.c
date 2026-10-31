@@ -4139,6 +4139,121 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         return r;
     }
 
+    /* pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask):
+     * select(2) with a timespec and a temporary signal mask - and, on
+     * x86-64, select(2) itself, because that is what glibc's select()
+     * calls (measured with strace on the host).
+     *
+     * Built on poll rather than beside it. The three sets become one
+     * list for do_poll, so readiness and parking are poll's exactly; the
+     * user's sets are rewritten only when the call really returns,
+     * because a call that parks is re-issued with the same arguments and
+     * must find them as they were. The list is a static scratch array:
+     * a syscall runs to completion or parks with nothing left in it, and
+     * the re-issue builds it again.
+     *
+     * Readable is POLLIN or a hangup, which is what makes end of file
+     * readable; writable is POLLOUT, or a hangup on a descriptor asked
+     * about for writing, which is Linux's POLLERR on a pipe with no
+     * reader - select says yes so that the write fails at once. Nothing
+     * here has out-of-band data, so exceptfds always comes back empty.
+     *
+     * The sixth argument is not a sigset but a pointer to { sigset*,
+     * size }, and either half may be absent. The mask and the time left
+     * in *timeout are handled exactly as ppoll's. */
+    case SYS64_PSELECT6: {
+        static struct pollfd64 sel[FD_MAX];
+        int nfds = (int)(int64_t)a1;
+        uint64_t rd = a2, wr = a3, ex = args->a4, tsp = args->a5,
+                 smarg = args->a6;
+        uint64_t setbytes, count = 0, r, n = 0, deadline;
+        int64_t timeout = -1;
+        int waited = wait_started();
+
+        deadline = waited ? wait_deadline[wait_slot()] : 0;
+        if (nfds < 0 || nfds > 1024) return (uint64_t)-22;     /* -EINVAL */
+        setbytes = (uint64_t)((nfds + 63) / 64) * 8;
+        if ((rd && setbytes && !user_range_ok(rd, setbytes)) ||
+            (wr && setbytes && !user_range_ok(wr, setbytes)) ||
+            (ex && setbytes && !user_range_ok(ex, setbytes)))
+            return (uint64_t)-14;                              /* -EFAULT */
+
+        if (tsp) {
+            const struct { int64_t sec, nsec; }* ts = (const void*)tsp;
+            if (!user_range_ok(tsp, sizeof(*ts))) return (uint64_t)-14;
+            if (ts->sec < 0 || ts->nsec < 0 || ts->nsec >= 1000000000)
+                return (uint64_t)-22;
+            timeout = ts->sec * (int64_t)CLOCK64_HZ
+                    + (ts->nsec + (1000000000 / CLOCK64_HZ) - 1)
+                      / (1000000000 / CLOCK64_HZ);
+        }
+
+        /* The descriptors asked about, checked before anything waits:
+         * one that is not open is -EBADF, as on Linux. */
+        for (int fd = 0; fd < nfds; fd++) {
+            uint64_t bit = 1ull << (fd % 64), w = (uint64_t)(fd / 64) * 8;
+            short ev = 0;
+            if (rd && (*(const uint64_t*)(rd + w) & bit)) ev |= POLL64_IN;
+            if (wr && (*(const uint64_t*)(wr + w) & bit)) ev |= POLL64_OUT;
+            if (ex && (*(const uint64_t*)(ex + w) & bit)) ev |= 0x002;  /* POLLPRI */
+            if (!ev) continue;
+            if (fd >= FD_MAX || !fds[fd].used) return (uint64_t)-9; /* -EBADF */
+            sel[n].fd = fd;
+            sel[n].events = ev;
+            sel[n].revents = 0;
+            n++;
+        }
+
+        if (smarg) {
+            uint64_t ss, len;
+            if (!user_range_ok(smarg, 16)) return (uint64_t)-14;
+            ss  = *(const uint64_t*)smarg;
+            len = *(const uint64_t*)(smarg + 8);
+            if (ss) {
+                if (len != 8) return (uint64_t)-22;
+                if (!user_range_ok(ss, 8)) return (uint64_t)-14;
+                signal64_push_mask(*(const uint64_t*)ss);
+            }
+        }
+
+        r = do_poll(args, nr, sel, n, timeout);
+
+        if (tsp && waited && deadline) {
+            struct { int64_t sec, nsec; }* ts = (void*)tsp;
+            uint64_t now = clock64_ticks();
+            uint64_t left = deadline > now ? deadline - now : 0;
+            ts->sec  = (int64_t)(left / CLOCK64_HZ);
+            ts->nsec = (int64_t)(left % CLOCK64_HZ)
+                     * (1000000000 / CLOCK64_HZ);
+        }
+        if ((int64_t)r < 0) {
+            if (r != (uint64_t)-4) signal64_pop_mask();
+            return r;              /* -EINTR keeps the mask for delivery */
+        }
+        signal64_pop_mask();
+
+        /* The answer, written over the question. */
+        for (uint64_t w = 0; w < setbytes; w += 8) {
+            if (rd) *(uint64_t*)(rd + w) = 0;
+            if (wr) *(uint64_t*)(wr + w) = 0;
+            if (ex) *(uint64_t*)(ex + w) = 0;
+        }
+        for (uint64_t i = 0; i < n; i++) {
+            int fd = sel[i].fd;
+            uint64_t bit = 1ull << (fd % 64), w = (uint64_t)(fd / 64) * 8;
+            short got = sel[i].revents, want = sel[i].events;
+            if ((want & POLL64_IN) && (got & (POLL64_IN | POLL64_HUP))) {
+                *(uint64_t*)(rd + w) |= bit;
+                count++;
+            }
+            if ((want & POLL64_OUT) && (got & (POLL64_OUT | POLL64_HUP))) {
+                *(uint64_t*)(wr + w) |= bit;
+                count++;
+            }
+        }
+        return count;
+    }
+
     /* rt_sigtimedwait(set, info, timeout, sigsetsize): wait for one of
      * the signals in `set` and take it, rather than have it delivered.
      *
