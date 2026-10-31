@@ -10797,8 +10797,15 @@ much each would widen what runs:
    timeout ends it with EAGAIN. The siginfo carries SI_TKILL or SI_USER
    and the sender's pid, which the pending sets now record.
 
+   `pselect6` is in, which on x86-64 is `select()` too - glibc's
+   select calls it. The three fd sets become one list for `do_poll`, so
+   readiness and parking are poll's; the sets are rewritten only when
+   the call really returns, a closed descriptor is EBADF, end of file is
+   readable, and the mask and the time left work as `ppoll`'s.
+   exceptfds always comes back empty: nothing here has out-of-band data.
+
    Still open on the 64-bit side: a narrower futex bitset is treated as
-   all bits, and `pselect6` and `signalfd` do not exist yet.
+   all bits, and `signalfd` does not exist yet.
 
    `--with-freetype` is not optional if you want windows: without a font
    engine Wine's caption metrics are uninitialised stack, and the window
