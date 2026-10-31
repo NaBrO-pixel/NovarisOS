@@ -764,6 +764,7 @@ static int64_t fd_write_bytes(uint64_t fd, const char* buf, uint64_t n) {
         if (fd >= FD_MAX || !fds[fd].used) return -9;  /* -EBADF */
         if (fd_is_stream((int)fd)) return do_pipe_write((int)fd, buf, n);
         if (fds[fd].kind == FD64_SOCKET) return -107;  /* -ENOTCONN */
+        if (fds[fd].kind == FD64_SIGNALFD) return -22; /* -EINVAL, as Linux */
         /* /dev/null takes everything and keeps none of it; the console
          * is the serial port, which is where this kernel's idea of
          * stdout has always gone. */
@@ -789,6 +790,38 @@ static int64_t fd_write_bytes(uint64_t fd, const char* buf, uint64_t n) {
 
 /* And reading from one. `nr` is the call to restart as if this blocks -
  * see do_pipe_read. */
+/* read(2) on a signalfd: one struct signalfd_siginfo, 128 bytes, per
+ * signal in its mask that is pending for the reader - the thread's own
+ * first, then its process's - taken off the pending set, as many as fit.
+ * Nothing pending parks the reader until a kill or tgkill wakes it, or
+ * is -EAGAIN on a non-blocking descriptor. A buffer too small for one
+ * record is -EINVAL, as on Linux.
+ *
+ * The reader's signals, not the creator's: a signalfd inherited across
+ * fork reads the child's, which is Linux's rule too. */
+static int64_t signalfd_read(const syscall64_args_t* args, uint64_t nr,
+                             int fd, void* buf, uint64_t n) {
+    uint8_t* out = (uint8_t*)buf;
+    uint64_t done = 0;
+
+    if (n < 128) return -22;                           /* -EINVAL */
+    if (!user_range_ok((uint64_t)buf, n)) return -14;  /* -EFAULT */
+
+    while (done + 128 <= n) {
+        int to_thread = 0, sender = 0;
+        int sig = signal64_take_in_set(fds[fd].sigmask, &to_thread, &sender);
+        if (!sig) break;
+        for (int i = 0; i < 128; i++) out[done + i] = 0;
+        *(uint32_t*)(out + done + 0)  = (uint32_t)sig;          /* ssi_signo */
+        *(int32_t*)(out + done + 8)   = to_thread ? -6 : 0;     /* ssi_code  */
+        *(uint32_t*)(out + done + 12) = (uint32_t)sender;       /* ssi_pid   */
+        done += 128;
+    }
+    if (done) { wait_done(); return (int64_t)done; }
+    if (fds[fd].nonblock) return -11;                  /* -EAGAIN */
+    return (int64_t)wait_restart(args, nr, 0);
+}
+
 static int64_t fd_read_bytes(const syscall64_args_t* args, uint64_t nr,
                              uint64_t fd, void* buf, uint64_t n) {
     int64_t r;
@@ -800,6 +833,8 @@ static int64_t fd_read_bytes(const syscall64_args_t* args, uint64_t nr,
     if (fd_is_stream((int)fd))
         return do_pipe_read(args, nr, (int)fd, buf, n);
     if (fds[fd].kind == FD64_SOCKET) return -107;      /* -ENOTCONN */
+    if (fds[fd].kind == FD64_SIGNALFD)
+        return signalfd_read(args, nr, (int)fd, buf, n);
 
     dev = ramfs64_device(fds[fd].node);
     if (dev == RAMFS64_DEV_NULL) return 0;             /* end of file */
@@ -2044,7 +2079,11 @@ static uint64_t do_poll(const syscall64_args_t* args, uint64_t nr,
         if (fd >= FD_MAX || !fds[fd].used) { pfds[i].revents = POLL64_NVAL;
                                              ready++; continue; }
 
-        if (fds[fd].kind == FD64_SOCKET && fds[fd].sock >= 0 &&
+        if (fds[fd].kind == FD64_SIGNALFD) {
+            /* Readable while a signal it reports is pending for the
+             * poller; never writable. */
+            if (signal64_pending_in_set(fds[fd].sigmask)) got |= POLL64_IN;
+        } else if (fds[fd].kind == FD64_SOCKET && fds[fd].sock >= 0 &&
             sock64_state(fds[fd].sock) == SOCK64_LISTENING) {
             /* A listening socket is readable when somebody is
              * waiting to be accepted. That is the event the whole
@@ -4137,6 +4176,50 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                      * (1000000000 / CLOCK64_HZ);
         }
         return r;
+    }
+
+    /* signalfd(fd, mask, size) and signalfd4(fd, mask, size, flags): a
+     * descriptor that reads signals. -1 makes a new one; an existing
+     * signalfd has its mask replaced; anything else is -EINVAL. The mask
+     * does not block anything - the caller blocks the signals itself,
+     * or they are delivered as usual before a read can see them - and
+     * SIGKILL and SIGSTOP are dropped from it, as Linux drops them.
+     *
+     * A signalfd is how a program that waits on descriptors waits on
+     * signals in the same loop: systemd and every event library built
+     * on epoll or poll use it. */
+    case SYS64_SIGNALFD:
+    case SYS64_SIGNALFD4: {
+        int fd = (int)(int64_t)a1;
+        uint64_t flags = nr == SYS64_SIGNALFD4 ? args->a4 : 0;
+        uint64_t mask;
+
+        if (a3 != 8) return (uint64_t)-22;                     /* -EINVAL */
+        if (flags & ~(uint64_t)(O_NONBLOCK | O_CLOEXEC)) return (uint64_t)-22;
+        if (!user_range_ok(a2, 8)) return (uint64_t)-14;       /* -EFAULT */
+        mask = *(const uint64_t*)a2
+             & ~((1ull << (SIG64_KILLSIG - 1)) | (1ull << (SIG64_STOP - 1)));
+
+        if (fd != -1) {
+            if (fd < 0 || fd >= FD_MAX || !fds[fd].used) return (uint64_t)-9;
+            if (fds[fd].kind != FD64_SIGNALFD) return (uint64_t)-22;
+            fds[fd].sigmask = mask;
+            return (uint64_t)fd;
+        }
+
+        fd = fd_alloc(3);
+        if (fd < 0) return (uint64_t)-24;                      /* -EMFILE */
+        fds[fd].kind     = FD64_SIGNALFD;
+        fds[fd].node     = -1;
+        fds[fd].pos      = 0;
+        fds[fd].rx       = -1;
+        fds[fd].tx       = -1;
+        fds[fd].sock     = -1;
+        fds[fd].sigmask  = mask;
+        fds[fd].nonblock = (flags & O_NONBLOCK) != 0;
+        fds[fd].cloexec  = (flags & O_CLOEXEC) != 0;
+        fds[fd].used     = 1;
+        return (uint64_t)fd;
     }
 
     /* pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask):

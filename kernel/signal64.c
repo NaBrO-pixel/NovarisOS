@@ -349,6 +349,17 @@ int signal64_take_in_set(uint64_t user_set, int* to_thread, int* sender) {
     return 0;
 }
 
+/* Is anything in `user_set` pending for the calling thread, blocked or
+ * not? What poll asks of a signalfd. */
+int signal64_pending_in_set(uint64_t user_set) {
+    uint64_t want = from_user_set(user_set), have = 0;
+    int t = sched64_current();
+    int slot = proc64_current_slot();
+    if (t >= 0 && t < SCHED64_MAX_TASKS) have |= pending_by_task[t];
+    if (slot >= 0 && slot < PROC64_MAX)  have |= pending_by_slot[slot];
+    return (have & want) != 0;
+}
+
 /* Task slots are recycled, so a new thread must not inherit what was
  * addressed to the one that used to live in its slot. clone(2) and
  * fork(2) call this for the slot they were given. */

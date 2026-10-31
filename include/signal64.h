@@ -194,6 +194,7 @@ void     signal64_push_mask(uint64_t user_set);
  * `user_set` (a user sigset_t word) for the calling thread, blocked or
  * not, and says whether it was thread-directed and who sent it. */
 int      signal64_take_in_set(uint64_t user_set, int* to_thread, int* sender);
+int      signal64_pending_in_set(uint64_t user_set);
 int      signal64_pop_mask(void);
 
 /* What this process would do with `sig` as things stand. The caller
