@@ -722,6 +722,112 @@ int main(void)
         close(pipefd[1]);
     }
 
+    /* --- rt_sigtimedwait ------------------------------------------- *
+     *
+     * Taking a signal as a return value instead of through a handler:
+     * sigwait, sigwaitinfo and sigtimedwait are all this call. */
+    {
+        sigset_t usr1, usr2, empty;
+        siginfo_t si;
+        struct timespec t0, zero = {0, 0}, fifty = {0, 50 * 1000000L},
+                        second = {1, 0};
+        int r, e, before, got;
+        pid_t parent = getpid();
+
+        sigemptyset(&empty);
+        sigemptyset(&usr1);
+        sigaddset(&usr1, SIGUSR1);
+        sigemptyset(&usr2);
+        sigaddset(&usr2, SIGUSR2);
+
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_usr1;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGUSR1, &sa, NULL);
+
+        /* Pending already, sent to the thread. */
+        sigprocmask(SIG_SETMASK, &usr1, NULL);
+        before = got_usr1;
+        tgkill_self(SIGUSR1);
+        memset(&si, 0, sizeof(si));
+        r = sigtimedwait(&usr1, &si, &zero);
+        ok("sigtimedwait takes a pending blocked signal", r == SIGUSR1);
+        ok("and says which", si.si_signo == SIGUSR1);
+        /* SI_USER through glibc, which rewrites SI_TKILL from the
+         * caller's own process to SI_USER; the raw call below shows what
+         * the kernel said. */
+        ok("and glibc reports it as SI_USER", si.si_code == SI_USER);
+        ok("and by whom", si.si_pid == getpid());
+        ok("without running the handler", got_usr1 == before);
+        ok("and it is no longer pending", !is_pending(SIGUSR1));
+
+        tgkill_self(SIGUSR1);
+        memset(&si, 0, sizeof(si));
+        r = (int)syscall(SYS_rt_sigtimedwait, &usr1, &si, &zero, 8);
+        ok("the raw call says the kernel sent it to the thread (SI_TKILL)",
+           r == SIGUSR1 && si.si_code == SI_TKILL);
+
+        /* Sent to the process. */
+        sys_kill(getpid(), SIGUSR1);
+        memset(&si, 0, sizeof(si));
+        r = sigtimedwait(&usr1, &si, &zero);
+        ok("one sent with kill is taken too, as SI_USER",
+           r == SIGUSR1 && si.si_code == SI_USER && si.si_pid == getpid());
+
+        /* Nothing there. */
+        errno = 0;
+        r = sigtimedwait(&usr1, NULL, &zero);
+        e = errno;
+        ok("a zero timeout with nothing pending is EAGAIN",
+           r == -1 && e == EAGAIN);
+
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        errno = 0;
+        r = sigtimedwait(&usr1, NULL, &fifty);
+        e = errno;
+        ok("a timeout that runs out is EAGAIN", r == -1 && e == EAGAIN);
+        ok("and not before it", ms_since(&t0) >= 45);
+
+        /* Woken by another process. */
+        sigprocmask(SIG_SETMASK, &usr2, NULL);
+        child = fork();
+        if (child == 0) {
+            nap(100);
+            sys_kill(parent, SIGUSR2);
+            _exit(0);
+        }
+        memset(&si, 0, sizeof(si));
+        r = sigwaitinfo(&usr2, &si);
+        ok("sigwaitinfo is woken by a signal from another process",
+           r == SIGUSR2);
+        ok("and names the process that sent it", si.si_pid == child);
+        waitpid(child, &status, 0);
+
+        /* Ended by a signal it was not waiting for. */
+        before = got_usr1;
+        child = fork();
+        if (child == 0) {
+            nap(100);
+            sys_kill(parent, SIGUSR1);
+            _exit(0);
+        }
+        errno = 0;
+        r = sigtimedwait(&usr2, NULL, &second);
+        e = errno;
+        ok("a signal outside the set ends the wait with EINTR",
+           r == -1 && e == EINTR);
+        ok("and its handler runs", got_usr1 == before + 1);
+        waitpid(child, &status, 0);
+
+        /* sigwait, the POSIX spelling. */
+        tgkill_self(SIGUSR2);
+        got = 0;
+        ok("sigwait returns 0", sigwait(&usr2, &got) == 0);
+        ok("with the signal it took", got == SIGUSR2);
+
+        sigprocmask(SIG_SETMASK, &empty, NULL);
+    }
+
     printf("kill64: %d failures\n", failures);
     return failures ? 1 : 127;
 }

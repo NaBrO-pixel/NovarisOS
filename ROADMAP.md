@@ -10790,9 +10790,15 @@ much each would widen what runs:
    visible through the raw syscall, since glibc's `ppoll()` copies the
    timeout to a local first.
 
+   `rt_sigtimedwait` takes a signal as a return value instead of through
+   a handler - glibc's `sigwait`, `sigwaitinfo` and `sigtimedwait`: a
+   pending one in the set at once, blocked or not; otherwise it parks
+   until one arrives, a signal outside the set ends it with EINTR, and a
+   timeout ends it with EAGAIN. The siginfo carries SI_TKILL or SI_USER
+   and the sender's pid, which the pending sets now record.
+
    Still open on the 64-bit side: a narrower futex bitset is treated as
-   all bits, and `rt_sigtimedwait`, `pselect6` and `signalfd` do not
-   exist yet.
+   all bits, and `pselect6` and `signalfd` do not exist yet.
 
    `--with-freetype` is not optional if you want windows: without a font
    engine Wine's caption metrics are uninitialised stack, and the window
