@@ -4139,6 +4139,70 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         return r;
     }
 
+    /* rt_sigtimedwait(set, info, timeout, sigsetsize): wait for one of
+     * the signals in `set` and take it, rather than have it delivered.
+     *
+     * This is the other way to receive a signal - synchronously, as a
+     * return value, with no handler - and the usual one for a thread
+     * that blocks a set of signals and then sits waiting for them:
+     * glibc's sigwait, sigwaitinfo and sigtimedwait are all this call.
+     *
+     * A signal in `set` that is already pending is taken at once,
+     * whether or not it is blocked. Otherwise the call parks; each wake
+     * re-issues it and looks again. Linux unblocks `set` for the length
+     * of the wait so its members can wake the thread; here every kill
+     * and tgkill wakes its target anyway, and the members are taken
+     * here before delivery could see them. A signal not in `set` that
+     * the thread does not block ends the wait with -EINTR and is
+     * delivered on the way out. A timeout of zero is a poll, and one
+     * that runs out is -EAGAIN.
+     *
+     * The siginfo says what this kernel knows: the signal, SI_TKILL or
+     * SI_USER for whether it was sent to the thread or the process, and
+     * the sender's pid. uid is 0, which is the only uid there is. */
+    case SYS64_RT_SIGTIMEDWAIT: {
+        uint64_t uset;
+        int64_t timeout = -1;
+        int sig, to_thread = 0, sender = 0;
+
+        if (args->a4 != 8) return (uint64_t)-22;               /* -EINVAL */
+        if (!user_range_ok(a1, 8)) return (uint64_t)-14;       /* -EFAULT */
+        if (a2 && !user_range_ok(a2, 128)) return (uint64_t)-14;
+        uset = *(const uint64_t*)a1;
+        if (a3) {
+            const struct { int64_t sec, nsec; }* ts = (const void*)a3;
+            if (!user_range_ok(a3, sizeof(*ts))) return (uint64_t)-14;
+            if (ts->sec < 0 || ts->nsec < 0 || ts->nsec >= 1000000000)
+                return (uint64_t)-22;
+            timeout = ts->sec * (int64_t)CLOCK64_HZ
+                    + (ts->nsec + (1000000000 / CLOCK64_HZ) - 1)
+                      / (1000000000 / CLOCK64_HZ);
+        }
+
+        sig = signal64_take_in_set(uset, &to_thread, &sender);
+        if (sig) {
+            wait_done();
+            if (a2) {
+                uint8_t* info = (uint8_t*)a2;
+                for (int i = 0; i < 128; i++) info[i] = 0;
+                *(int32_t*)(info + 0)  = sig;                  /* si_signo */
+                *(int32_t*)(info + 8)  = to_thread ? -6 : 0;   /* SI_TKILL / SI_USER */
+                *(int32_t*)(info + 16) = sender;               /* si_pid */
+                *(uint32_t*)(info + 20) = 0;                   /* si_uid */
+            }
+            return (uint64_t)sig;
+        }
+
+        if (timeout == 0) return (uint64_t)-11;                /* -EAGAIN */
+        if (wait_started()) {
+            if (wait_expired()) { wait_done(); return (uint64_t)-11; }
+            return wait_restart(args, nr, wait_deadline[wait_slot()]);
+        }
+        return wait_restart(args, nr,
+                            timeout < 0 ? 0
+                                        : clock64_ticks() + (uint64_t)timeout);
+    }
+
     /* rt_sigsuspend(mask, sigsetsize): replace the mask and sleep until
      * a signal is taken. It only ever returns -EINTR, and only once a
      * handler is about to run - an ignored signal does not end it, and

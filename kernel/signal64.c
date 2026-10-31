@@ -69,6 +69,13 @@ static uint64_t pending_by_slot[PROC64_MAX];
  * would be the wrong thread's and the suspended one would never stop. */
 static uint64_t pending_by_task[SCHED64_MAX_TASKS];
 
+/* Who raised each pending signal, for the siginfo rt_sigtimedwait hands
+ * back: the pid of the process that called kill or tgkill. One per
+ * signal, like the pending bits - a second raise before the first is
+ * taken overwrites it, as Linux's non-realtime signals coalesce. */
+static int sender_by_slot[PROC64_MAX][NSIG];
+static int sender_by_task[SCHED64_MAX_TASKS][NSIG];
+
 /* Each thread's blocked set, in the same encoding as the pending sets -
  * bit `sig`, where a user sigset_t has bit sig-1 - and per thread
  * because that is what a signal mask is on Linux.
@@ -250,6 +257,7 @@ int signal64_raise(int pid, int sig) {
     if (slot < 0 || slot >= PROC64_MAX) return -3;     /* -ESRCH  */
 
     pending_by_slot[slot] |= 1ull << sig;
+    sender_by_slot[slot][sig] = proc64_current_pid();
     raised++;
     return 0;
 }
@@ -285,6 +293,7 @@ int signal64_raise_task(int tid, int sig) {
     if (sched64_task_pid(tid) < 0)           return -3;  /* -ESRCH  */
 
     pending_by_task[tid] |= 1ull << sig;
+    sender_by_task[tid][sig] = proc64_current_pid();
     raised++;
     return 0;
 }
@@ -305,6 +314,37 @@ int signal64_take_pending_task(int tid) {
         if (!(set & (1ull << sig))) continue;
         pending_by_task[tid] &= ~(1ull << sig);
         return sig;
+    }
+    return 0;
+}
+
+/* rt_sigtimedwait's dequeue: the lowest signal in `user_set` that is
+ * pending for the calling thread, blocked or not - the thread's own
+ * first, then its process's, as delivery takes them. Taken off the
+ * pending set, and described: whether it was sent to the thread
+ * (tgkill) or the process (kill), and by whom. 0 if none. */
+int signal64_take_in_set(uint64_t user_set, int* to_thread, int* sender) {
+    uint64_t want = from_user_set(user_set);
+    int t = sched64_current();
+    int slot = proc64_current_slot();
+
+    for (int pass = 0; pass < 2; pass++) {
+        uint64_t* set;
+        if (pass == 0) {
+            if (t < 0 || t >= SCHED64_MAX_TASKS) continue;
+            set = &pending_by_task[t];
+        } else {
+            if (slot < 0 || slot >= PROC64_MAX) continue;
+            set = &pending_by_slot[slot];
+        }
+        for (int sig = 1; sig < NSIG; sig++) {
+            if (!(*set & want & (1ull << sig))) continue;
+            *set &= ~(1ull << sig);
+            if (to_thread) *to_thread = pass == 0;
+            if (sender) *sender = pass == 0 ? sender_by_task[t][sig]
+                                            : sender_by_slot[slot][sig];
+            return sig;
+        }
     }
     return 0;
 }

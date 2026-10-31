@@ -189,6 +189,11 @@ void     signal64_task_inherit_altstack(int tid, int from_tid);
  * put it back (pop; returns 0 if nothing was pushed). A handler entered
  * in between takes the saved mask into its frame instead. */
 void     signal64_push_mask(uint64_t user_set);
+
+/* rt_sigtimedwait's dequeue: takes the lowest pending signal in
+ * `user_set` (a user sigset_t word) for the calling thread, blocked or
+ * not, and says whether it was thread-directed and who sent it. */
+int      signal64_take_in_set(uint64_t user_set, int* to_thread, int* sender);
 int      signal64_pop_mask(void);
 
 /* What this process would do with `sig` as things stand. The caller
