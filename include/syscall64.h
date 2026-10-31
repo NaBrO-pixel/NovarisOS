@@ -249,6 +249,8 @@ typedef struct {
 #define SYS64_RT_SIGTIMEDWAIT 128
 #define SYS64_RT_SIGSUSPEND   130
 #define SYS64_PSELECT6        270
+#define SYS64_SIGNALFD        282
+#define SYS64_SIGNALFD4       289
 #define SYS64_PPOLL           271
 #define SYS64_IOCTL           16
 #define SYS64_WRITEV          20

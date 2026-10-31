@@ -32,6 +32,7 @@
 #include <time.h>
 #include <poll.h>
 #include <sys/select.h>
+#include <sys/signalfd.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -971,6 +972,146 @@ int main(void)
         close(pa[0]);
         close(pa[1]);
         close(pb[0]);
+    }
+
+    /* --- signalfd --------------------------------------------------- *
+     *
+     * Signals as a descriptor: each read takes pending signals from the
+     * mask, a record each, and poll says when there is one. */
+    {
+        sigset_t usr1, both, empty;
+        struct signalfd_siginfo si[2];
+        struct pollfd pf;
+        int sfd, bfd, r, e, before;
+        pid_t parent = getpid();
+
+        sigemptyset(&empty);
+        sigemptyset(&usr1);
+        sigaddset(&usr1, SIGUSR1);
+        sigemptyset(&both);
+        sigaddset(&both, SIGUSR1);
+        sigaddset(&both, SIGUSR2);
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_usr1;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGUSR1, &sa, NULL);
+        sigprocmask(SIG_SETMASK, &both, NULL);
+
+        sfd = signalfd(-1, &usr1, SFD_NONBLOCK | SFD_CLOEXEC);
+        ok("signalfd makes a descriptor", sfd >= 0);
+
+        errno = 0;
+        r = (int)read(sfd, si, sizeof(si[0]));
+        e = errno;
+        ok("with nothing pending, a non-blocking read is EAGAIN",
+           r == -1 && e == EAGAIN);
+
+        pf.fd = sfd;
+        pf.events = POLLIN;
+        ok("and poll says it is not readable", poll(&pf, 1, 0) == 0);
+
+        before = got_usr1;
+        tgkill_self(SIGUSR1);
+        ok("a pending signal makes it readable",
+           poll(&pf, 1, 0) == 1 && (pf.revents & POLLIN));
+        memset(si, 0, sizeof(si));
+        r = (int)read(sfd, si, sizeof(si[0]));
+        ok("a read returns one record", r == (int)sizeof(si[0]));
+        ok("for that signal", si[0].ssi_signo == SIGUSR1);
+        ok("sent to the thread", si[0].ssi_code == SI_TKILL);
+        ok("by this process", si[0].ssi_pid == (uint32_t)getpid());
+        ok("without running the handler", got_usr1 == before);
+        ok("and takes it", !is_pending(SIGUSR1) && poll(&pf, 1, 0) == 0);
+
+        /* A new mask on the same descriptor, and two records in a read. */
+        ok("signalfd on an existing one replaces its mask and returns it",
+           signalfd(sfd, &both, 0) == sfd);
+        tgkill_self(SIGUSR2);
+        tgkill_self(SIGUSR1);
+        memset(si, 0, sizeof(si));
+        r = (int)read(sfd, si, sizeof(si));
+        ok("a read with room for two takes two",
+           r == (int)sizeof(si));
+        ok("lowest first", si[0].ssi_signo == SIGUSR1 &&
+                           si[1].ssi_signo == SIGUSR2);
+
+        /* Refusals. */
+        {
+            char small[64];
+            int pp[2];
+            tgkill_self(SIGUSR1);
+            errno = 0;
+            r = (int)read(sfd, small, sizeof(small));
+            e = errno;
+            ok("a buffer smaller than a record is EINVAL",
+               r == -1 && e == EINVAL);
+            ok("and takes nothing", is_pending(SIGUSR1));
+            ok("which a full-sized read then takes",
+               read(sfd, si, sizeof(si[0])) == (ssize_t)sizeof(si[0]));
+            errno = 0;
+            r = (int)write(sfd, "x", 1);
+            e = errno;
+            ok("a write is EINVAL", r == -1 && e == EINVAL);
+            ok("a pipe for the next refusal", pipe(pp) == 0);
+            errno = 0;
+            r = signalfd(pp[0], &usr1, 0);
+            e = errno;
+            ok("signalfd on a descriptor that is not one is EINVAL",
+               r == -1 && e == EINVAL);
+            close(pp[0]);
+            close(pp[1]);
+        }
+
+        /* A blocking read woken by another process. */
+        bfd = signalfd(-1, &usr1, 0);
+        child = fork();
+        if (child == 0) {
+            nap(100);
+            sys_kill(parent, SIGUSR1);
+            _exit(0);
+        }
+        memset(si, 0, sizeof(si));
+        r = (int)read(bfd, si, sizeof(si[0]));
+        ok("a blocking read is woken by a signal from another process",
+           r == (int)sizeof(si[0]) && si[0].ssi_signo == SIGUSR1);
+        ok("which it names, as SI_USER",
+           si[0].ssi_pid == (uint32_t)child && si[0].ssi_code == SI_USER);
+        waitpid(child, &status, 0);
+
+        /* select sees it too. */
+        {
+            fd_set rs;
+            struct timeval tv = {1, 0};
+            tgkill_self(SIGUSR1);
+            FD_ZERO(&rs);
+            FD_SET(bfd, &rs);
+            ok("select sees a signalfd with a signal pending",
+               select(bfd + 1, &rs, NULL, NULL, &tv) == 1 &&
+               FD_ISSET(bfd, &rs));
+            ok("and a read then takes it",
+               read(bfd, si, sizeof(si[0])) == (ssize_t)sizeof(si[0]));
+        }
+
+        /* A forked child reads its own signals through the same one. */
+        child = fork();
+        if (child == 0) {
+            struct signalfd_siginfo c;
+            tgkill_self(SIGUSR1);
+            if (read(sfd, &c, sizeof(c)) != (ssize_t)sizeof(c)) _exit(1);
+            if (c.ssi_pid != (uint32_t)getpid()) _exit(2);
+            _exit(0);
+        }
+        waitpid(child, &status, 0);
+        ok("a forked child reads its own signals through the inherited one",
+           WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        errno = 0;
+        r = (int)read(sfd, si, sizeof(si[0]));
+        e = errno;
+        ok("and not the parent's", r == -1 && e == EAGAIN);
+
+        close(sfd);
+        close(bfd);
+        sigprocmask(SIG_SETMASK, &empty, NULL);
     }
 
     printf("kill64: %d failures\n", failures);

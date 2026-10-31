@@ -10804,8 +10804,14 @@ much each would widen what runs:
    readable, and the mask and the time left work as `ppoll`'s.
    exceptfds always comes back empty: nothing here has out-of-band data.
 
+   And `signalfd`/`signalfd4`: a descriptor kind of its own whose reads
+   take the reader's pending signals in its mask, 128-byte records as
+   many as fit, and which poll and select see as readable while one is
+   pending. Blocking or not, mask replaceable in place, and inherited
+   across fork reading the child's own signals - Linux's rules.
+
    Still open on the 64-bit side: a narrower futex bitset is treated as
-   all bits, and `signalfd` does not exist yet.
+   all bits.
 
    `--with-freetype` is not optional if you want windows: without a font
    engine Wine's caption metrics are uninitialised stack, and the window

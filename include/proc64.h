@@ -96,9 +96,15 @@
 #define FD64_FILE   0
 #define FD64_PIPE   1
 #define FD64_SOCKET 2
+#define FD64_SIGNALFD 3   /* signalfd(2): reads the reader's own signals */
 
 typedef struct {
-    int      kind;      /* FD64_FILE or FD64_PIPE */
+    int      kind;      /* FD64_FILE, FD64_PIPE, FD64_SOCKET, FD64_SIGNALFD */
+
+    /* FD64_SIGNALFD: the signals it reports, as a user sigset_t word.
+     * Its node, rx, tx and sock are all -1, so every reference count the
+     * other kinds keep passes over it. */
+    uint64_t sigmask;
     int      node;      /* FD64_FILE: the ramfs node */
     uint64_t pos;
 
