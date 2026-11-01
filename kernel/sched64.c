@@ -22,6 +22,17 @@ typedef struct {
      * re-executed `syscall` invokes whatever call 0 happens to be. */
     uint64_t      wake_rax;
 
+    /* What rax becomes when the deadline below ends the wait instead -
+     * which futex needs to tell apart from being woken (-ETIMEDOUT
+     * against 0). Everything else that sleeps is re-issued on waking
+     * and asks the clock itself, so for it the two are the same. */
+    uint64_t      timeout_rax;
+
+    /* FUTEX_WAIT_BITSET's mask: a FUTEX_WAKE_BITSET releases this
+     * thread only if the two masks share a bit. All ones for every
+     * other kind of wait, which any wake matches. */
+    uint32_t      wait_bits;
+
     /* The tick this thread stops waiting at, or 0 for "no deadline".
      *
      * Without it a wait that has a timeout cannot sleep: it has to
@@ -495,7 +506,7 @@ static void expire_deadlines(void) {
         tasks[i].blocked   = 0;
         tasks[i].wait_addr = 0;
         tasks[i].deadline  = 0;
-        tasks[i].regs.rax  = tasks[i].wake_rax;
+        tasks[i].regs.rax  = tasks[i].timeout_rax;
     }
 }
 
@@ -543,6 +554,16 @@ int sched64_block_until(const registers64_t* regs, uint64_t addr,
                         uint64_t wake_rax, uint64_t deadline,
                         registers64_t* out_regs, vmspace64_t* out_space,
                         uint64_t* out_fs_base) {
+    return sched64_block_until_ex(regs, addr, wake_rax, wake_rax, deadline,
+                                  0xFFFFFFFFu, out_regs, out_space,
+                                  out_fs_base);
+}
+
+int sched64_block_until_ex(const registers64_t* regs, uint64_t addr,
+                           uint64_t wake_rax, uint64_t timeout_rax,
+                           uint64_t deadline, uint32_t bits,
+                           registers64_t* out_regs, vmspace64_t* out_space,
+                           uint64_t* out_fs_base) {
     int next;
 
     if (current < 0 || !tasks[current].used) return 0;
@@ -562,9 +583,11 @@ int sched64_block_until(const registers64_t* regs, uint64_t addr,
     tasks[current].fs_base   = read_fs_base();
     tasks[current].regs      = *regs;
     tasks[current].blocked   = 1;
-    tasks[current].wait_addr = addr;
-    tasks[current].wake_rax  = wake_rax;
-    tasks[current].deadline  = deadline;
+    tasks[current].wait_addr   = addr;
+    tasks[current].wake_rax    = wake_rax;
+    tasks[current].timeout_rax = timeout_rax;
+    tasks[current].wait_bits   = bits;
+    tasks[current].deadline    = deadline;
 
     next = next_task(current);
     if (next == current || tasks[next].blocked) {
@@ -693,11 +716,16 @@ int sched64_wake_tid(int tid) {
 }
 
 int sched64_wake(uint64_t addr, int max) {
+    return sched64_wake_bits(addr, max, 0xFFFFFFFFu);
+}
+
+int sched64_wake_bits(uint64_t addr, int max, uint32_t bits) {
     int woken = 0;
 
     for (int i = 0; i < SCHED64_MAX_TASKS && woken < max; i++) {
         if (!tasks[i].used || !tasks[i].blocked) continue;
         if (tasks[i].wait_addr != addr) continue;
+        if (!(tasks[i].wait_bits & bits)) continue;   /* a different bitset */
         tasks[i].blocked   = 0;
         tasks[i].wait_addr = 0;
         /* futex(2) returns 0 to a waiter that was woken. The value goes

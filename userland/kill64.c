@@ -33,6 +33,8 @@
 #include <poll.h>
 #include <sys/select.h>
 #include <sys/signalfd.h>
+#include <linux/futex.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -153,6 +155,54 @@ static int on_alt(int i)
 {
     uintptr_t lo = (uintptr_t)alt_stack[i];
     return handler_sp[i] >= lo && handler_sp[i] < lo + ALT_SIZE;
+}
+
+/* For the futex bitset tests: one word, and a waiter per thread that
+ * records when it came back and with what. */
+static volatile int fword;
+struct fwaiter { unsigned bits; volatile int done; long ret; int err; };
+
+static long futex_call(volatile int *w, int op, int val,
+                       const struct timespec *t, unsigned bits)
+{
+    return syscall(SYS_futex, w, op | FUTEX_PRIVATE_FLAG, val, t, NULL, bits);
+}
+
+static void *bitset_waiter(void *arg)
+{
+    struct fwaiter *fw = arg;
+    errno = 0;
+    fw->ret = futex_call(&fword, FUTEX_WAIT_BITSET, 0, NULL, fw->bits);
+    fw->err = errno;
+    fw->done = 1;
+    return NULL;
+}
+
+static void *timed_waiter(void *arg)
+{
+    struct fwaiter *fw = arg;
+    struct timespec two = {2, 0};
+    errno = 0;
+    fw->ret = futex_call(&fword, FUTEX_WAIT, 0, &two, 0);
+    fw->err = errno;
+    fw->done = 1;
+    return NULL;
+}
+
+/* Wakes with `bits` until it releases one waiter, or two seconds pass -
+ * the waiters have to have parked first, and on an emulated machine
+ * "started" is not "parked". Returns what the last wake returned. */
+static long wake_one(unsigned bits, int plain)
+{
+    struct timespec t0;
+    long n = 0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    while ((n = plain ? futex_call(&fword, FUTEX_WAKE, 1, NULL, 0)
+                      : futex_call(&fword, FUTEX_WAKE_BITSET, INT_MAX,
+                                   NULL, bits)) == 0 &&
+           ms_since(&t0) < 2000)
+        nap(5);
+    return n;
 }
 
 static int tgkill_self(int sig)
@@ -1112,6 +1162,67 @@ int main(void)
         close(sfd);
         close(bfd);
         sigprocmask(SIG_SETMASK, &empty, NULL);
+    }
+
+    /* --- futex bitsets ---------------------------------------------- *
+     *
+     * A wake releases a waiter only if their bitsets share a bit. And a
+     * timed wait sleeps on its word: woken, it returns 0 at once rather
+     * than at its timeout, even when the word did not change. */
+    {
+        pthread_t ta, tb;
+        struct fwaiter a = {1, 0, 0, 0}, b = {2, 0, 0, 0}, c = {4, 0, 0, 0};
+        struct timespec t0, fifty = {0, 50 * 1000000L};
+        long r;
+        int e;
+
+        fword = 0;
+        pthread_create(&ta, NULL, bitset_waiter, &a);
+        pthread_create(&tb, NULL, bitset_waiter, &b);
+        r = wake_one(2, 0);
+        ok("FUTEX_WAKE_BITSET wakes the one waiter whose bits match", r == 1);
+        nap(50);
+        ok("that one came back with 0", b.done && b.ret == 0);
+        ok("and the other is still asleep", !a.done);
+        r = wake_one(1, 0);
+        ok("and is woken by its own bits", r == 1);
+        pthread_join(ta, NULL);
+        pthread_join(tb, NULL);
+        ok("returning 0 too", a.done && a.ret == 0);
+
+        pthread_create(&ta, NULL, bitset_waiter, &c);
+        r = wake_one(0, 1);
+        ok("a plain FUTEX_WAKE wakes a bitset waiter", r == 1);
+        pthread_join(ta, NULL);
+        ok("which returns 0", c.done && c.ret == 0);
+
+        errno = 0;
+        r = futex_call(&fword, FUTEX_WAIT_BITSET, 0, NULL, 0);
+        e = errno;
+        ok("a zero bitset is EINVAL for a wait", r == -1 && e == EINVAL);
+        errno = 0;
+        r = futex_call(&fword, FUTEX_WAKE_BITSET, 1, NULL, 0);
+        e = errno;
+        ok("and for a wake", r == -1 && e == EINVAL);
+
+        /* Timed, woken without the word changing. */
+        a.done = 0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        pthread_create(&ta, NULL, timed_waiter, &a);
+        r = wake_one(0, 1);
+        pthread_join(ta, NULL);
+        ok("a timed FUTEX_WAIT is woken by a FUTEX_WAKE", r == 1);
+        ok("returns 0", a.ret == 0);
+        ok("and does not sleep out its two seconds", ms_since(&t0) < 1500);
+
+        /* And one that is not woken times out. */
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        errno = 0;
+        r = futex_call(&fword, FUTEX_WAIT, 0, &fifty, 0);
+        e = errno;
+        ok("a timed FUTEX_WAIT nobody wakes is ETIMEDOUT",
+           r == -1 && e == ETIMEDOUT);
+        ok("and not before its timeout", ms_since(&t0) >= 45);
     }
 
     printf("kill64: %d failures\n", failures);

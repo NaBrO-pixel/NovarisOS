@@ -10810,8 +10810,17 @@ much each would widen what runs:
    pending. Blocking or not, mask replaceable in place, and inherited
    across fork reading the child's own signals - Linux's rules.
 
-   Still open on the 64-bit side: a narrower futex bitset is treated as
-   all bits.
+   Futex bitsets are honoured: each waiter records its mask, and a
+   `FUTEX_WAKE_BITSET` releases only waiters whose masks share a bit
+   with it (a zero mask is EINVAL). Getting there fixed a missed wake: a
+   timed `FUTEX_WAIT` parked on the shared poll key and re-checked its
+   word on every wake anywhere, so a `FUTEX_WAKE` that left the word
+   unchanged was lost and the waiter slept out its timeout. Timed waits
+   now sleep on the word with a deadline, and the scheduler keeps what
+   an expired deadline returns (`ETIMEDOUT`) apart from what a wake
+   returns (0).
+
+   Nothing is left on the 64-bit open list from this round.
 
    `--with-freetype` is not optional if you want windows: without a font
    engine Wine's caption metrics are uninitialised stack, and the window

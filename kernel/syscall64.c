@@ -3023,6 +3023,16 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
          * -ENOSYS and glibc aborted with "The futex facility returned an
          * unexpected error code". */
         int absolute = 0;
+        /* The bitset: val3 for the _BITSET forms, every bit for the
+         * plain ones. A wake releases a waiter only if their masks share
+         * a bit - which is what lets one futex word carry two kinds of
+         * waiter, readers and writers say, and wake only one kind. 0
+         * matches nothing and Linux refuses it. */
+        uint32_t bits = 0xFFFFFFFFu;
+        if (op == FUTEX_WAIT_BITSET || op == FUTEX_WAKE_BITSET) {
+            bits = (uint32_t)args->a6;
+            if (!bits) return (uint64_t)-22;           /* -EINVAL */
+        }
         if (op == FUTEX_WAIT_BITSET) { op = FUTEX_WAIT; absolute = 1; }
         if (op == FUTEX_WAKE_BITSET) op = FUTEX_WAKE;
 
@@ -3116,6 +3126,30 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                  * a zero timeout polls once rather than reporting a
                  * timeout for a word it never looked at. */
                 futex_waits++;
+
+                /* Asleep on the word itself, with the deadline - so a
+                 * wake releases exactly the waiters it names, and the
+                 * clock ending the wait reads as -ETIMEDOUT rather than
+                 * as a wake.
+                 *
+                 * It used to park on the shared poll key and re-check
+                 * the word on every wake anywhere. That cannot honour a
+                 * bitset, and it lost a FUTEX_WAKE that left the word
+                 * unchanged: the waiter re-checked, saw the same value,
+                 * and went back to sleep until its timeout. The old way
+                 * stays as the fallback for when sleeping is refused -
+                 * the timer masked, as in some bring-up layers. */
+                if (signal_interrupts_wait())
+                    return (uint64_t)-4;           /* -EINTR */
+                frame_from_args(args, 0, &self);
+                if (sched64_block_until_ex(&self, a1, 0, (uint64_t)-110,
+                                           clock64_ticks() + (want ? want : 1),
+                                           bits, &next, &next_space,
+                                           &next_fs)) {
+                    vmspace64_switch(&next_space);
+                    write_msr(0xC0000100u, next_fs);
+                    sched64_resume(&next);         /* never returns */
+                }
                 return wait_restart(args, nr,
                                     clock64_ticks() + (want ? want : 1));
             }
@@ -3125,8 +3159,8 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
 
             futex_waits++;
             frame_from_args(args, 0, &self);
-            if (!sched64_block_current(&self, a1, 0, &next, &next_space,
-                                       &next_fs))
+            if (!sched64_block_until_ex(&self, a1, 0, 0, 0, bits,
+                                        &next, &next_space, &next_fs))
                 return (uint64_t)-35;              /* -EDEADLK */
 
             vmspace64_switch(&next_space);
@@ -3135,7 +3169,7 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         }
 
         if (op == FUTEX_WAKE) {
-            int n = sched64_wake(a1, (int)(uint32_t)a3);
+            int n = sched64_wake_bits(a1, (int)(uint32_t)a3, bits);
             futex_wakes += (uint64_t)n;
             return (uint64_t)n;
         }

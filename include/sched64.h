@@ -143,6 +143,10 @@ int sched64_yield_current(const registers64_t* regs, registers64_t* out_regs,
 
 int sched64_wake(uint64_t addr, int max);
 
+/* The same, releasing only waiters whose FUTEX_WAIT_BITSET mask shares a
+ * bit with `bits`. sched64_wake is this with every bit set. */
+int sched64_wake_bits(uint64_t addr, int max, uint32_t bits);
+
 /* The address threads park on when what they wait for cannot be named
  * by one address - a poll(2) over several descriptors, or a wait that
  * has only a deadline. Never a user virtual address and never a futex
@@ -161,6 +165,15 @@ int sched64_block_until(const registers64_t* regs, uint64_t addr,
                         uint64_t wake_rax, uint64_t deadline,
                         registers64_t* out_regs, vmspace64_t* out_space,
                         uint64_t* out_fs_base);
+
+/* block_until with what a deadline returns kept apart from what a wake
+ * returns, and a FUTEX_WAIT_BITSET mask. block_until is this with
+ * timeout_rax = wake_rax and every bit set. */
+int sched64_block_until_ex(const registers64_t* regs, uint64_t addr,
+                           uint64_t wake_rax, uint64_t timeout_rax,
+                           uint64_t deadline, uint32_t bits,
+                           registers64_t* out_regs, vmspace64_t* out_space,
+                           uint64_t* out_fs_base);
 
 /* Wake every blocked thread of a process, whatever it waits on - what a
  * signal does to a wait, so that a sleeping target can reach the point
