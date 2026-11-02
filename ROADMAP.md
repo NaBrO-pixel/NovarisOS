@@ -10771,12 +10771,11 @@ much each would widen what runs:
    spaces are live and refuses to destroy one twice, because exec and
    exit destroy through copies of a descriptor the layer still holds.
 
-   With all of that, `make -f Makefile.amd64 WINE64_INSTALL=1 test` is
-   26/26 PASS and every 32-bit target passes, `test-inet` included: it
-   used to ask QEMU's 10.0.2.3, which relays to the build machine's
-   resolver and failed wherever that cannot reach the internet, and now
-   asks a responder `tools/qemu_test.py --dns` runs on the build machine
-   (every name is 192.0.2.1).
+   `test-inet` no longer needs the internet: it used to ask QEMU's
+   10.0.2.3, which relays to the build machine's resolver and failed
+   wherever that cannot reach out - a sandbox behind an HTTP proxy, for
+   one - and now asks a responder `tools/qemu_test.py --dns` runs on the
+   build machine (every name is 192.0.2.1).
 
    A forked child is told its own tid too: fork honours
    `CLONE_CHILD_SETTID` (written through the child's page tables,
@@ -10821,6 +10820,27 @@ much each would widen what runs:
    returns (0).
 
    Nothing is left on the 64-bit open list from this round.
+
+   **Where it stands, verified at `674c22a`:**
+   `make -f Makefile.amd64 WINE64_INSTALL=1 test` is 26/26 PASS; the
+   bring-up's own checks are 855 `ok` and no `FAIL`, with wineboot,
+   winegui and chromeprobe exiting 0 and 0 SIGSEGVs between them; and
+   all fifteen 32-bit targets pass (`test`, `test-posix`, `test-wm`,
+   `test-qemu`, `test-wine`, `test-wine-threads`, `test-inet`,
+   `test-listen`, `test-winsock`, `test-qemu-disk`, `test-wine-persist`,
+   `test-desktop`, `test-wine-gui`, `test-desktop-gui`,
+   `test-wine-prefix`) in about an hour. Every new syscall above was
+   checked against the Linux host first - `userland/kill64.c` carries
+   the expectations, 162 of them, and runs unchanged on both.
+
+   Two habits that paid for themselves here, worth keeping. A new test
+   is booted once against a kernel with the fix taken out, to see it
+   fail: the first version of the forked-child tid test passed either
+   way, because glibc's `raise()` asks `gettid` rather than reading
+   `pd->tid`. And a regression that only shows as wall clock is compared
+   against the previous commit booted the same way on the same host -
+   the reservation change looked like a slowdown until the old kernel,
+   booted after a host restart, turned out to be just as slow.
 
    `--with-freetype` is not optional if you want windows: without a font
    engine Wine's caption metrics are uninitialised stack, and the window
