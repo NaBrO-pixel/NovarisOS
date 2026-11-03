@@ -3233,6 +3233,7 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                 if (signal_interrupts_wait())
                     return (uint64_t)-4;           /* -EINTR */
                 frame_from_args(args, 0, &self);
+                sched64_signal_restart(nr);
                 if (sched64_block_until_ex(&self, a1, 0, (uint64_t)-110,
                                            clock64_ticks() + (want ? want : 1),
                                            bits, &next, &next_space,
@@ -3250,6 +3251,7 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
 
             futex_waits++;
             frame_from_args(args, 0, &self);
+            sched64_signal_restart(nr);
             if (!sched64_block_until_ex(&self, a1, 0, 0, 0, bits,
                                         &next, &next_space, &next_fs))
                 return (uint64_t)-35;              /* -EDEADLK */

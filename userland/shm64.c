@@ -33,7 +33,7 @@
 #include <sys/uio.h>
 #include <sys/syscall.h>
 #include <signal.h>
-#include <time.h>
+#include <sched.h>
 
 #define NAME "/tmp/shm64-file"
 #define SPAN 4096
@@ -285,7 +285,6 @@ int main(void)
         char c;
         long n;
         pid_t kid;
-        struct timespec pause = { 0, 50 * 1000 * 1000 };
 
         ok("a pipe to hear the child start", pipe(p) == 0);
         kid = fork();
@@ -299,12 +298,12 @@ int main(void)
         }
         close(p[1]);
         ok("the child is about to wait", read(p[0], &c, 1) == 1);
-        for (int i = 0; i < 4; i++) nanosleep(&pause, NULL);
+        for (int i = 0; i < 200; i++) sched_yield();
 
         /* FUTEX_WAKE | FUTEX_PRIVATE_FLAG on this process's own word. */
         n = syscall(SYS_futex, &word, 1 | 128, 1, NULL, NULL, 0);
         ok("a private wake finds no waiter in another process", n == 0);
-        for (int i = 0; i < 4; i++) nanosleep(&pause, NULL);
+        for (int i = 0; i < 200; i++) sched_yield();
         ok("and the child is still asleep",
            waitpid(kid, &status, WNOHANG) == 0);
         kill(kid, SIGKILL);

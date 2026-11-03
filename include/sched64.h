@@ -192,6 +192,10 @@ int sched64_block_until_ex(const registers64_t* regs, uint64_t addr,
  * where a pending signal is taken. Returns how many were woken. */
 int sched64_wake_pid(int pid);
 
+/* The next block by this thread resumes past its syscall; if a signal
+ * ends it, re-run syscall `nr` instead so the signal is delivered. */
+void sched64_signal_restart(uint64_t nr);
+
 /* The pid a task slot belongs to, or -1 if the slot is not in use.
  *
  * clone(2) gives a new thread a slot of its own and its creator's pid,

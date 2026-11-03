@@ -43,6 +43,12 @@ typedef struct {
      * out. */
     uint64_t      deadline;
 
+    /* For a wait that resumes past its syscall rather than re-running it
+     * - futex, whose wake is a return value - the syscall number to
+     * re-run it with if a *signal* is what ends the wait. 0 for the
+     * waits that are re-run anyway. See sched64_signal_restart. */
+    uint64_t      signal_restart;
+
     int           pid;       /* the process this thread belongs to      */
     int           blocked;
     int           used;
@@ -559,6 +565,33 @@ int sched64_block_until(const registers64_t* regs, uint64_t addr,
                                   out_fs_base);
 }
 
+static uint64_t next_signal_restart;
+
+void sched64_signal_restart(uint64_t nr) { next_signal_restart = nr; }
+
+/* A thread woken by a signal, rather than by what it waited for.
+ *
+ * Most waits resume by re-running their syscall, and the re-run sees the
+ * signal and returns -EINTR, with the delivery at the end of the call.
+ * A futex wait cannot work that way - a wake that leaves the word
+ * unchanged has to return 0, not sleep again - so it resumes past the
+ * syscall, and a signal that woke it went straight back to ring 3 with
+ * nothing delivering it. The thread ran on to its next syscall, and a
+ * SIGKILL'd child calling _exit() exited with its own status instead of
+ * dying. Pointed back at its syscall instead, the re-run is what takes
+ * the signal. */
+static void woken_by_signal(int i) {
+    tasks[i].blocked   = 0;
+    tasks[i].wait_addr = 0;
+    if (tasks[i].signal_restart) {
+        tasks[i].regs.rip -= 2;                 /* the syscall instruction */
+        tasks[i].regs.rax  = tasks[i].signal_restart;
+        tasks[i].signal_restart = 0;
+    } else {
+        tasks[i].regs.rax = tasks[i].wake_rax;
+    }
+}
+
 int sched64_block_until_ex(const registers64_t* regs, uint64_t addr,
                            uint64_t wake_rax, uint64_t timeout_rax,
                            uint64_t deadline, uint32_t bits,
@@ -588,6 +621,8 @@ int sched64_block_until_ex(const registers64_t* regs, uint64_t addr,
     tasks[current].timeout_rax = timeout_rax;
     tasks[current].wait_bits   = bits;
     tasks[current].deadline    = deadline;
+    tasks[current].signal_restart = next_signal_restart;
+    next_signal_restart = 0;
 
     next = next_task(current);
     if (next == current || tasks[next].blocked) {
@@ -692,9 +727,7 @@ int sched64_wake_pid(int pid) {
     for (int i = 0; i < SCHED64_MAX_TASKS; i++) {
         if (!tasks[i].used || !tasks[i].blocked) continue;
         if (tasks[i].pid != pid) continue;
-        tasks[i].blocked   = 0;
-        tasks[i].wait_addr = 0;
-        tasks[i].regs.rax  = tasks[i].wake_rax;
+        woken_by_signal(i);
         woken++;
     }
     return woken;
@@ -709,9 +742,7 @@ int sched64_task_pid(int tid) {
 int sched64_wake_tid(int tid) {
     if (tid < 0 || tid >= SCHED64_MAX_TASKS) return 0;
     if (!tasks[tid].used || !tasks[tid].blocked) return 0;
-    tasks[tid].blocked   = 0;
-    tasks[tid].wait_addr = 0;
-    tasks[tid].regs.rax  = tasks[tid].wake_rax;
+    woken_by_signal(tid);
     return 1;
 }
 
