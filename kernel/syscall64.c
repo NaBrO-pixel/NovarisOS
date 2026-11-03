@@ -1945,6 +1945,20 @@ void syscall64_report_leader_stacks(void) {
     }
 }
 
+/* One process traced, by name, while a measured run is going: what
+ * winedevice.exe did with the requests a stuck program sent it is a few
+ * hundred calls, and the whole machine's trace buries them under the
+ * program's own hundreds of thousands. Build with
+ * -DTRACE64_COMM='"winedevice.exe"'. */
+static int trace_this_process(void) {
+#ifdef TRACE64_COMM
+    proc64_t* p = proc64_current();
+    return leader_pid >= 0 && p && kstrcmp(p->comm, TRACE64_COMM) == 0;
+#else
+    return 0;
+#endif
+}
+
 static uint64_t syscall64_dispatch_inner(syscall64_args_t* args) {
     uint64_t r;
 
@@ -1958,7 +1972,7 @@ static uint64_t syscall64_dispatch_inner(syscall64_args_t* args) {
         enter_user_mode64_abort();                     /* never returns */
     }
 
-    if (!trace) {
+    if (!trace && !trace_this_process()) {
         r = dispatch(args);
         note_module(args, r);
         return r;
