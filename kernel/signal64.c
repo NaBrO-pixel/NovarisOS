@@ -573,7 +573,7 @@ static int range_present(uint64_t addr, uint64_t len) {
 int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
     const ksigaction64_t* sa;
     rt_sigframe64_t* frame;
-    uint64_t sp;
+    uint64_t sp, fpsp;
 
     if (sig <= 0 || sig >= NSIG) return 0;
 
@@ -620,6 +620,13 @@ int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
         else
             sp = r->rsp - 128;
     }
+    /* The x87/SSE state, in the FXSAVE layout Linux uses, above the
+     * frame and 64-byte aligned. A handler that touches an xmm register
+     * or MXCSR would otherwise hand its leftovers to the code it
+     * interrupted, and Wine - which reads a thread's floating-point
+     * context out of here as uc_mcontext.fpregs - found NULL. */
+    sp = (sp - 512) & ~63ULL;
+    fpsp = sp;
     sp -= sizeof(rt_sigframe64_t);
 
     /* Aligned the way a `call` leaves the stack, not the way a 16-byte
@@ -655,7 +662,7 @@ int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
      * back the fault it was trying to deliver, which reports and halts
      * the machine - the same outcome, minus a kernel-mode page fault
      * on the way to it, and with the original address still in cr2. */
-    if (!range_present(sp, sizeof(rt_sigframe64_t))) return 0;
+    if (!range_present(sp, fpsp + 512 - sp)) return 0;
 
     frame = (rt_sigframe64_t*)sp;
 
@@ -721,6 +728,10 @@ int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
     frame->uc.uc_mcontext.err    = r->err_code;
     frame->uc.uc_mcontext.trapno = r->int_no;
     frame->uc.uc_mcontext.cr2    = fault_addr;
+    /* The kernel is built without SSE, so the registers are still the
+     * interrupted thread's own. */
+    __asm__ __volatile__("fxsave64 (%0)" :: "r"(fpsp) : "memory");
+    frame->uc.uc_mcontext.fpstate = fpsp;
 
     /* The mask to go back to, where rt_sigreturn will look for it - and
      * where a handler that wants to change it on return can. */
@@ -816,6 +827,19 @@ int signal64_sigreturn(uint64_t user_rsp, registers64_t* out) {
     /* The mask from before the handler ran - or whatever the handler
      * wrote there, which is a documented way to change it on return. */
     *my_blocked() = from_user_set(uc->uc_sigmask[0]);
+
+    /* And the floating-point state the handler may have changed - or
+     * that it changed on purpose, through fpregs, as Wine does when it
+     * resumes a thread in a different context. Copied in and checked
+     * first: FXRSTOR faults in the kernel on an MXCSR with reserved bits
+     * set, and those bits are whatever ring 3 left there. */
+    if (sc->fpstate && !(sc->fpstate & 15) && range_present(sc->fpstate, 512)) {
+        static uint8_t fx[512] __attribute__((aligned(16)));
+        const uint8_t* src = (const uint8_t*)sc->fpstate;
+        for (int i = 0; i < 512; i++) fx[i] = src[i];
+        *(uint32_t*)(fx + 24) &= 0xFFFFu;               /* MXCSR */
+        __asm__ __volatile__("fxrstor64 (%0)" :: "r"(fx) : "memory");
+    }
 
     returns++;
     return 1;

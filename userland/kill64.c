@@ -38,6 +38,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <ucontext.h>
 
 static int failures;
 
@@ -213,6 +214,19 @@ static int tgkill_self(int sig)
 /* A pid that exists on neither machine. Linux's pid_max is 4194304 at
  * the very most, and this is above it. */
 #define NO_SUCH_PID 4194305
+
+/* A handler that wrecks the floating-point state it was handed: xmm6
+ * and MXCSR's rounding mode. If the kernel restores both on the way back,
+ * the interrupted code never knows. */
+static volatile int fp_seen_fpregs;
+static void fp_wrecker(int sig, siginfo_t *si, void *uc)
+{
+    unsigned int round_up = 0x1f80 | (2u << 13);
+    (void)sig; (void)si;
+    fp_seen_fpregs = ((ucontext_t *)uc)->uc_mcontext.fpregs != NULL;
+    __asm__ __volatile__("pcmpeqd %%xmm6, %%xmm6\n\tldmxcsr %0"
+                         :: "m"(round_up) : "xmm6");
+}
 
 int main(void)
 {
@@ -1223,6 +1237,48 @@ int main(void)
         ok("a timed FUTEX_WAIT nobody wakes is ETIMEDOUT",
            r == -1 && e == ETIMEDOUT);
         ok("and not before its timeout", ms_since(&t0) >= 45);
+    }
+
+    /* --- the floating-point state survives a handler ------------------ *
+     *
+     * A signal frame carries the x87/SSE registers and rt_sigreturn puts
+     * them back. This kernel built the frame with general registers only,
+     * so a handler's use of xmm or MXCSR leaked into whatever it
+     * interrupted, and Wine, reading fpregs to build a thread's context,
+     * found NULL. The signal is raised by a bare syscall instruction so
+     * that nothing between the load and the check is allowed to touch
+     * xmm6. */
+    {
+        struct sigaction sa, old;
+        static const uint64_t pattern[2] = { 0x0123456789abcdefULL,
+                                             0xfedcba9876543210ULL };
+        uint64_t back[2] = { 0, 0 };
+        unsigned int mx_before = 0, mx_after = 0;
+        long tid = syscall(SYS_gettid), pid = getpid();
+
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = fp_wrecker;
+        sa.sa_flags = SA_SIGINFO;
+        sigaction(SIGUSR2, &sa, &old);
+        __asm__ __volatile__(
+            "stmxcsr %[mb]\n\t"
+            "movdqu %[pat], %%xmm6\n\t"
+            "mov %[nr], %%eax\n\t"
+            "mov %[pid], %%rdi\n\t"
+            "mov %[tid], %%rsi\n\t"
+            "mov %[sig], %%edx\n\t"
+            "syscall\n\t"
+            "movdqu %%xmm6, %[back]\n\t"
+            "stmxcsr %[ma]"
+            : [back] "=m"(back), [mb] "=m"(mx_before), [ma] "=m"(mx_after)
+            : [pat] "m"(pattern), [nr] "i"(SYS_tgkill), [pid] "r"(pid),
+              [tid] "r"(tid), [sig] "i"(SIGUSR2)
+            : "rax", "rdi", "rsi", "rdx", "rcx", "r11", "xmm6", "memory");
+        sigaction(SIGUSR2, &old, NULL);
+        ok("a handler is given the floating-point state", fp_seen_fpregs);
+        ok("and xmm6 is the interrupted code's again after it",
+           back[0] == pattern[0] && back[1] == pattern[1]);
+        ok("and so is MXCSR", mx_after == mx_before);
     }
 
     printf("kill64: %d failures\n", failures);
