@@ -2386,31 +2386,38 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
          * be registered, no desktop window, and a mapping that reported
          * success throughout.
          *
-         * Only from the start of the file, because ramfs64_frames
-         * counts from there and an offset would mean mapping from the
-         * middle of the list. Every caller that needs this maps from
-         * zero; a PE section mapped at an offset still takes the copy
-         * below, which is wasteful and correct, because a module file
-         * does not change under its reader. */
+         * At any page-aligned offset, from that page of the file's
+         * frame list. It used to be from the start of the file only, and
+         * a PE section mapped at an offset took the copy below instead -
+         * "wasteful and correct", this comment said, because a module
+         * does not change under its reader. Wasteful turned out to be
+         * the whole machine: Wine maps every section of chrome.dll at
+         * its file offset, so each Chromium process copied ~330MB of
+         * code it would never write - 200,000 pages a process, measured
+         * by sampling first-touch faults, all of them kernel writes into
+         * the DLL's range - and five of them ran 3GB out of memory. Now
+         * the code is shared with the file and every other process that
+         * maps it, and only a page somebody writes is copied. */
         /* A writable private mapping belongs here too, and is in fact
          * the case that matters: Wine maps the session PROT_READ |
          * PROT_WRITE and then only reads it. Copy-on-write is exactly
          * that bargain - the permission is real, and the copy is taken
          * when it is used rather than before. PAGE64_COW_RW carries the
          * permission so break_cow can tell that write from a fault. */
-        if (off == 0) {
+        {
             uint64_t nframes = 0;
-            const uint64_t* frames = ramfs64_frames(node, a2, &nframes);
+            uint64_t first = off / PAGE64_SIZE;
+            const uint64_t* frames = ramfs64_frames(node, off + a2, &nframes);
             uint64_t want = (a2 + PAGE64_SIZE - 1) / PAGE64_SIZE;
 
             /* All of it, or none of it. A mapping that runs past the end
              * of the file needs zero pages for the tail, and mixing the
              * two here would leave a half-built mapping to unpick on
              * failure. */
-            if (frames && nframes >= want) {
+            if (frames && nframes >= first + want) {
                 uint64_t r = uspace64_map_frames_cow(a1,
                                  (flags & MAP_FIXED) != 0,
-                                 frames, want, a3);
+                                 frames + first, want, a3);
                 if ((int64_t)r > 0) {
                     mmap_kind = MAPK_FILE_COW;
                     file_maps++;
