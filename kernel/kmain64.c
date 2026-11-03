@@ -4976,22 +4976,21 @@ void kernel_main(uint32_t magic, void* mbi) {
 
         /* How long chrome.exe is given, in seconds.
  *
- * 300 is what a full `make test` can afford: the boot reaches this
- * layer about ten minutes in, and the budget is wall clock on top of
- * that. It is not enough for chrome.exe to finish Chromium's startup -
- * it gets about 42,000 syscalls done and stops in the same place every
- * time, in locale setup, without reaching main_dll_loader_win.cc.
+ * A finished run - the page printed, Chromium exited 0 - takes about 210
+ * seconds of guest time from exec to exit under TCG, against 22 on the
+ * Linux host. 300 was the budget while every run stopped short for some
+ * other reason, and it leaves too little room now that one finishes: 900
+ * is the difference between a slow run and a failed one.
  *
- * That number did not move when the wineserver's poll spin went away
- * (13,975,980 syscalls in a run down to 152,353, and chrome's own count
- * unchanged at ~42,000), which is how we know chrome is limited by how
- * fast it runs and not by what it is competing with. Raise this to find
- * out how much it actually needs:
- *
- *   make -f Makefile.amd64 CFLAGS_EXTRA=-DCHROME64_BUDGET_SECS=1800u ...
- */
+ * What it took to get here, each found by a run that stopped and fixed
+ * in the kernel rather than worked around: futex wakes that crossed
+ * processes, no NETLINK_ROUTE socket (winedevice crashed holding the
+ * adapter-list lock), pipe writes over 64KB returning short, MAP_SHARED
+ * refusing an offset, and mmap handing out ranges Wine had already
+ * mapped. See ROADMAP.md. A guest needs 12G for it - Makefile.amd64
+ * says why. */
 #ifndef CHROME64_BUDGET_SECS
-#define CHROME64_BUDGET_SECS 300u
+#define CHROME64_BUDGET_SECS 900u
 #endif
 
 /* What chrome.exe is asked to do: render one page headless and print its

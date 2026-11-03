@@ -769,7 +769,13 @@ iso: $(KERNEL) $(INITRD)
 # preference: Milestone 66's whole claim is that a frame above the 1GB
 # boot window is usable, and with 128MB there is no such frame - the test
 # would report SKIP and prove nothing.
-QEMU_RAM ?= 2G
+# A headless Chromium is the one thing here that needs more. Measured on
+# the Linux host under the same Wine, each renderer peaks at 740-790MB
+# resident - its own copy of chrome.dll's 320MB of code, which Wine cannot
+# map, and the page tables of a 1.5TB address-space reservation - and a
+# run has four or five of them beside a 450MB browser. In 6G the page's
+# renderer was the one that ran out; 12G finishes with 6.7GB free.
+QEMU_RAM ?= $(if $(CHROMIUM64_DIR),12G,2G)
 
 run: iso
 	qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -serial stdio
