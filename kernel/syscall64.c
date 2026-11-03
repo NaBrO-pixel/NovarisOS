@@ -1950,6 +1950,23 @@ static uint64_t do_execve(const char* path, const char* const* argv,
     }
     kstrlcpy(p->exe_path, kpath, PROC64_PATH_MAX);
 
+    /* In a run of several processes, what each one became: its command
+     * line, which for a Wine process names the Windows program and, for
+     * Chromium, the --type= of the child. Paired with the [exit] line
+     * below, it says which child of a program went away, and how. */
+    if (leader_pid >= 0) {
+        int total = 0;
+        serial64_puts("NOVARIS64: [exec] pid ");
+        serial64_putdec((uint64_t)proc64_current_pid());
+        serial64_puts(":");
+        for (int i = 0; kargv[i] && total < 300; i++) {
+            serial64_putc(' ');
+            for (const char* c = kargv[i]; *c && total < 300; c++, total++)
+                serial64_putc(*c);
+        }
+        serial64_putc('\n');
+    }
+
     /* And the name, which execve resets to the new program's basename.
      * Measured on the host: a process that called PR_SET_NAME and then
      * exec'd reads back the name of what it became, not what it chose.
@@ -5426,6 +5443,13 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         uint64_t next_fs;
 
         exit_code = a1;
+        if (leader_pid >= 0) {
+            serial64_puts("NOVARIS64: [exit] pid ");
+            serial64_putdec((uint64_t)proc64_current_pid());
+            serial64_puts(" status ");
+            serial64_putdec(a1 & 0xFF);
+            serial64_putc('\n');
+        }
         {
             proc64_t* me = proc64_current();
             int parent = me ? me->parent : 0;
