@@ -377,6 +377,15 @@ static void page_fault_handler(registers64_t* r) {
     pf_cr2 = read_cr2();
     pf_err = r->err_code;
 
+    /* Anonymous memory touched for the first time: a page that is not
+     * there (bit 0 clear), in a range the process holds, gets a frame of
+     * its own and the instruction runs again. Before everything else,
+     * and for either ring - a syscall writing into a buffer the program
+     * never touched is the same first touch. Bit 1 is "it was a write". */
+    if (!(r->err_code & 0x1) &&
+        uspace64_fault(pf_cr2, (r->err_code & 0x2) != 0))
+        return;
+
     /* A write to a page fork shared (Milestone 69). First, and before
      * the diagnostic and the signal both: this is not an error, it is
      * the mechanism, and it happens on perfectly ordinary writes to

@@ -1740,8 +1740,11 @@ static int user_range_ok(uint64_t addr, uint64_t len) {
      * like as a pointer - lands there. */
     if (addr >= 0x0000800000000000ULL) return 0;
     if (addr + len < addr) return 0;                   /* wrapped */
+    /* A page not there yet may be anonymous memory never touched: back
+     * it now, so the caller can use the range as it stands. */
     for (p = addr & ~0xFFFULL; p < addr + len; p += 0x1000)
-        if (paging64_translate(p, &phys) != 0) return 0;
+        if (paging64_translate(p, &phys) != 0 && !uspace64_fault(p, 0))
+            return 0;
     return 1;
 }
 
@@ -5642,6 +5645,8 @@ void syscall64_report_calls(void) {
         serial64_putdec(uspace64_resv_peak());
         serial64_puts(" spilled ");
         serial64_putdec(uspace64_resv_spilled());
+        serial64_puts(" first-touch ");
+        serial64_putdec(uspace64_lazy_faults());
         for (int k = 0; k < MAPK_N; k++) {
             if (!mapk_calls[k]) continue;
             serial64_puts(" ");

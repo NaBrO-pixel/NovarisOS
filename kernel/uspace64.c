@@ -152,11 +152,13 @@ static void resv_delete(proc64_t* p, uint32_t i) {
     p->nresv--;
 }
 
-static int resv_insert(proc64_t* p, uint32_t i, uint64_t start, uint64_t end) {
+static int resv_insert(proc64_t* p, uint32_t i, uint64_t start, uint64_t end,
+                       uint64_t flags) {
     if (p->nresv >= PROC64_RESV_MAX) return 0;
     for (uint32_t k = p->nresv; k > i; k--) p->resv[k] = p->resv[k - 1];
     p->resv[i].start = start;
     p->resv[i].end   = end;
+    p->resv[i].flags = flags;
     p->nresv++;
     if (p->nresv > resv_peak) resv_peak = p->nresv;
     return 1;
@@ -186,6 +188,45 @@ static int spill_to_zero_page(uint64_t start, uint64_t end) {
     return 1;
 }
 
+static uint64_t lazy_faults;       /* pages backed on first touch          */
+uint64_t uspace64_lazy_faults(void) { return lazy_faults; }
+
+/* One fresh zeroed page at `va`, mapped with `flags`. 0 if memory ran
+ * out, which is said once per page, with the numbers. */
+static int back_page(uint64_t va, uint64_t flags) {
+    uint64_t frame = pmm64_alloc_high();
+    if (!frame) {
+        serial64_puts("NOVARIS64: [oom] backing ");
+        serial64_puthex(va);
+        serial64_puts(" free=");
+        serial64_putdec(pmm64_free_frames());
+        serial64_puts("/");
+        serial64_putdec(pmm64_total_frames());
+        serial64_putc('\n');
+        return 0;
+    }
+    kmemset(phys64_to_virt(frame), 0, PAGE64_SIZE);
+    if (paging64_map(va, frame, flags) != PAGING64_OK) {
+        pmm64_free_frame(frame);
+        return 0;
+    }
+    pages_allocated++;
+    return 1;
+}
+
+/* A range the list has no room for, backed now instead: a reservation
+ * on the shared zero page, anything else with pages of its own. */
+static int spill_range(uint64_t start, uint64_t end, uint64_t flags) {
+    if (!flags) return spill_to_zero_page(start, end);
+    for (uint64_t va = start; va < end; va += PAGE64_SIZE) {
+        uint64_t had;
+        if (paging64_translate(va, &had) == PAGING64_OK) continue;
+        if (!back_page(va, flags)) return 0;
+        resv_spilled++;
+    }
+    return 1;
+}
+
 /* Takes [start, end) out of the list. A region straddling the range is
  * split, which needs a slot; if there is none, the piece above the range
  * is spilled to the zero page, so it stays reserved either way. */
@@ -196,9 +237,10 @@ static void resv_remove(proc64_t* p, uint64_t start, uint64_t end) {
         uint64_t rs = p->resv[i].start, re = p->resv[i].end;
 
         if (rs < start && re > end) {
+            uint64_t fl = p->resv[i].flags;
             p->resv[i].end = start;
-            if (!resv_insert(p, i + 1, end, re))
-                spill_to_zero_page(end, re);
+            if (!resv_insert(p, i + 1, end, re, fl))
+                spill_range(end, re, fl);
             return;
         }
         if (rs < start)    { p->resv[i].end = start; i++; continue; }
@@ -211,10 +253,13 @@ static void resv_remove(proc64_t* p, uint64_t start, uint64_t end) {
  * and of other regions. Joined to a neighbour it touches, so that the
  * pieces of a reservation that was carved up and given back become one
  * region again. */
-static int resv_add(proc64_t* p, uint64_t start, uint64_t end) {
+static int resv_add(proc64_t* p, uint64_t start, uint64_t end,
+                    uint64_t flags) {
     uint32_t i = resv_first_after(p, start);
-    int join_prev = i > 0 && p->resv[i - 1].end == start;
-    int join_next = i < p->nresv && p->resv[i].start == end;
+    int join_prev = i > 0 && p->resv[i - 1].end == start &&
+                    p->resv[i - 1].flags == flags;
+    int join_next = i < p->nresv && p->resv[i].start == end &&
+                    p->resv[i].flags == flags;
 
     if (join_prev && join_next) {
         p->resv[i - 1].end = p->resv[i].end;
@@ -223,9 +268,37 @@ static int resv_add(proc64_t* p, uint64_t start, uint64_t end) {
         p->resv[i - 1].end = end;
     } else if (join_next) {
         p->resv[i].start = start;
-    } else if (!resv_insert(p, i, start, end)) {
-        return spill_to_zero_page(start, end);
+    } else if (!resv_insert(p, i, start, end, flags)) {
+        return spill_range(start, end, flags);
     }
+    return 1;
+}
+
+/* A page fault on a page that is not there. If it lies in anonymous
+ * memory this process holds and the access is one that memory allows,
+ * this is the first touch: the page gets a frame of its own now and the
+ * faulting instruction runs again. Returns 0 for every other fault - a
+ * reservation, a write to read-only memory, an address nothing owns -
+ * and the caller treats it as the fault it is.
+ *
+ * Kernel-mode faults come here too: a syscall writing into a buffer the
+ * program has never touched (read() into fresh malloc memory, a signal
+ * frame on a new alternate stack) is the same first touch. */
+int uspace64_fault(uint64_t va, int write) {
+    proc64_t* p = cur();
+    uint32_t i;
+    uint64_t flags, had;
+
+    if (!p || va >= USPACE64_LIMIT) return 0;
+    va &= ~(PAGE64_SIZE - 1);
+    i = resv_first_after(p, va);
+    if (i >= p->nresv || p->resv[i].start > va) return 0;
+    flags = p->resv[i].flags;
+    if (!flags) return 0;                          /* reserved */
+    if (write && !(flags & PAGE64_WRITE)) return 0;
+    if (paging64_translate(va, &had) == PAGING64_OK) return 0;
+    if (!back_page(va, flags)) return 0;
+    lazy_faults++;
     return 1;
 }
 
@@ -264,111 +337,40 @@ static int range_free(uint64_t start, uint64_t end) {
  * from a program that never touched its stack. */
 static int map_anon(uint64_t start, uint64_t end, uint64_t flags,
                     int zero_existing) {
+    uint64_t va = start;
+
+    /* Backed on first touch, not now.
+     *
+     * Every page of every anonymous mapping used to get a frame, zeroed,
+     * the moment it was asked for - and that is not what a program
+     * pays on Linux, where an untouched page costs nothing. Wine and the
+     * programs it runs ask for far more than they touch: a headless
+     * Chromium's processes ran a 3GB machine out of memory while
+     * starting, where the same run on the Linux host is comfortable.
+     * Now the range is written down and each page is backed by the
+     * fault that first touches it (uspace64_fault).
+     *
+     * Pages already there are dealt with as before. brk keeps its own:
+     * it grows the heap from an unaligned break, and the page holding
+     * the break is full of live heap. A fresh mapping does not - an
+     * anonymous mapping reads as zeros, so a page left from an earlier
+     * mapping is dropped and comes back zero on first touch - and the
+     * shared zero page under a reservation is never anybody's to keep. */
     resv_remove(cur(), start, end);
-    for (uint64_t va = start; va < end; va += PAGE64_SIZE) {
-        uint64_t frame, existing;
-
+    while ((va = vmspace64_next_mapped(va, end)) < end) {
+        uint64_t existing;
         if (paging64_translate(va, &existing) == PAGING64_OK) {
-            /* Already mapped - keep the page, but adopt the NEW
-             * permissions. A loader reserves a library's whole range
-             * read-only and then maps each segment over it with
-             * MAP_FIXED and the permissions that segment needs; leaving
-             * the reservation's flags in place makes the data segment
-             * read-only, and what that looks like is ld.so faulting on
-             * its own relocations.
-             *
-             * And zero it. An anonymous mapping reads as zeros - that is
-             * the whole of what "anonymous" promises - and a page being
-             * recycled from an earlier mapping is exactly the case where
-             * that is easy to get wrong. A loader maps a library's whole
-             * span from the file, then maps the .bss over the tail of it
-             * with MAP_ANONYMOUS|MAP_FIXED; skip the zeroing and the
-             * .bss contains whatever the file had at that offset. What
-             * that looks like is a NULL list terminator that is not
-             * NULL, in a library whose relocations all applied fine. */
             existing &= ~(PAGE64_SIZE - 1);
-
-            /* Unless it is the page every reservation shares. Keeping it
-             * would give this mapping somebody else's memory - and
-             * zeroing it would zero *theirs* - so the page a reservation
-             * was standing on is replaced with one of this mapping's
-             * own. This is the case that makes sharing the zero page
-             * safe, and it is exactly the case Wine produces: it
-             * reserves a range PROT_NONE and later maps over pieces of
-             * it. */
-            if (existing != zero_frame) {
-                /* brk keeps the page: it grows the heap from an
-                 * unaligned break, and the page holding the break is
-                 * full of live heap that only this process can see. */
-                if (!zero_existing) {
-                    paging64_map(va, existing, flags);
-                    continue;
-                }
-
-                /* A fresh anonymous mapping replaces the page instead of
-                 * adopting it.
-                 *
-                 * Adopting and zeroing produces the right bytes at this
-                 * address and the wrong ones everywhere else, because
-                 * the page underneath need not belong to this mapping
-                 * alone. The zero page above is one way that happens and
-                 * was already handled; a shared file mapping is the
-                 * other, and was not.
-                 *
-                 * Wine maps KUSER_SHARED_DATA writable, stores
-                 * SystemCall = 1 - the byte every Windows syscall stub
-                 * tests to choose between Wine's dispatcher and a real
-                 * `syscall` instruction - and then, without unmapping
-                 * it, reserves a 0x144000-byte range with
-                 * MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED starting at that
-                 * same address. Adopting the page zeroed the frame all
-                 * four processes had mapped at 0x7ffe0000, so every Nt
-                 * call in the prefix run took the `syscall` branch and
-                 * arrived in this kernel as whatever Linux number it
-                 * happened to collide with. Traced: the byte went 1 -> 0
-                 * inside that one mmap, and the frame was never freed or
-                 * reallocated while it happened.
-                 *
-                 * Linux replaces here, which is why none of this is
-                 * visible on the host: MAP_FIXED tears down what it
-                 * covers and the caller gets new anonymous pages, while
-                 * the file's own pages are untouched. Replacing costs a
-                 * frame per page over a range that already had some;
-                 * that is the price of the mapping meaning what it
-                 * says. */
+            if (existing != zero_frame && !zero_existing) {
+                paging64_map(va, existing, flags);
+            } else {
                 paging64_unmap(va);
-                pmm64_free_frame(existing);
+                if (existing != zero_frame) pmm64_free_frame(existing);
             }
         }
-
-        frame = pmm64_alloc_high();
-        if (!frame) {
-            /* Says whether this is the machine running out of RAM or the
-             * allocator refusing a frame it has. Replacing a fixed
-             * mapping instead of adopting its pages costs a frame per
-             * page, so the question is now worth asking by number
-             * rather than by argument. */
-            serial64_puts("NOVARIS64: [oom] map_anon at ");
-            serial64_puthex(va);
-            serial64_puts(" free=");
-            serial64_putdec(pmm64_free_frames());
-            serial64_puts("/");
-            serial64_putdec(pmm64_total_frames());
-            serial64_putc('\n');
-            return 0;
-        }
-        /* Zeroed through the direct map, which reaches all of RAM since
-         * Milestone 66 - so a frame's address no longer decides whether
-         * a process is allowed to have it. */
-        kmemset(phys64_to_virt(frame), 0, PAGE64_SIZE);
-
-        if (paging64_map(va, frame, flags) != PAGING64_OK) {
-            pmm64_free_frame(frame);
-            return 0;
-        }
-        pages_allocated++;
+        va += PAGE64_SIZE;
     }
-    return 1;
+    return resv_add(cur(), start, end, flags);
 }
 
 uint64_t uspace64_brk(uint64_t addr) {
@@ -461,7 +463,7 @@ uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
          * decommits, and what it gets back on recommitting is zeros. */
         unmap_pages(start, end);
         resv_remove(cur(), start, end);
-        if (!resv_add(cur(), start, end)) return (uint64_t)-12;
+        if (!resv_add(cur(), start, end, 0)) return (uint64_t)-12;
     } else if (!map_anon(start, end, pflags, 1)) {
         return (uint64_t)-12;                      /* -ENOMEM */
     }
@@ -655,24 +657,27 @@ void uspace64_protect(uint64_t addr, uint64_t length, uint64_t prot) {
     proc64_t* p = cur();
     uint64_t va;
 
-    /* Reserved pages made accessible become real ones - this is Wine
-     * committing memory it reserved. Readable-only ones go on the zero
-     * page, and set_writable gives each its own frame if it is later
-     * made writable; writable ones get their own frames now. */
-    if (prot != 0) {
-        uint32_t i;
-        while ((i = resv_first_after(p, start)) < p->nresv &&
-               p->resv[i].start < end) {
-            uint64_t s = p->resv[i].start < start ? start : p->resv[i].start;
-            uint64_t e = p->resv[i].end > end ? end : p->resv[i].end;
-            uint64_t flags = PAGE64_PRESENT | PAGE64_USER;
-
-            resv_remove(p, s, e);
-            if (prot & 0x2) {                         /* PROT_WRITE */
-                map_anon(s, e, flags | PAGE64_WRITE, 1);
-            } else {
-                map_zero_page(s, e);
+    /* The ranges with no pages yet take the new protection, and are
+     * still backed only when touched. This is how Wine commits memory it
+     * reserved - mprotect from PROT_NONE - and it used to back every
+     * page of it at once; and how it makes a guard page, which now
+     * faults when touched, as on Linux. */
+    {
+        uint64_t nf = prot == 0 ? 0
+                    : PAGE64_PRESENT | PAGE64_USER
+                      | ((prot & 0x2) ? PAGE64_WRITE : 0);
+        uint64_t at = start;
+        while (at < end) {
+            uint32_t i = resv_first_after(p, at);
+            uint64_t s, e;
+            if (i >= p->nresv || p->resv[i].start >= end) break;
+            s = p->resv[i].start < at ? at : p->resv[i].start;
+            e = p->resv[i].end > end ? end : p->resv[i].end;
+            if (p->resv[i].flags != nf) {
+                resv_remove(p, s, e);
+                resv_add(p, s, e, nf);
             }
+            at = e;
         }
     }
 

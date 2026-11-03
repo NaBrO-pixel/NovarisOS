@@ -51,6 +51,14 @@ uint64_t uspace64_zero_frame(void);
 uint64_t uspace64_resv_spilled(void);
 uint32_t uspace64_resv_peak(void);
 
+/* A fault on a page that is not there: backs it if it is the first touch
+ * of anonymous memory the process holds and the access is allowed, and
+ * returns 1; returns 0 for any other fault. From the page-fault handler,
+ * in either ring, and from anything in the kernel about to touch user
+ * memory it has checked page by page. */
+int      uspace64_fault(uint64_t va, int write);
+uint64_t uspace64_lazy_faults(void);
+
 /* Maps frames belonging to somebody else - a file's - into this
  * process, taking a reference on each so that unmapping releases the
  * reference rather than the frame. This is what makes a MAP_SHARED file

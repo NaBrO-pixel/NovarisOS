@@ -6,6 +6,7 @@
 #include "proc64.h"
 #include "sched64.h"
 #include "paging64.h"
+#include "uspace64.h"
 
 #define NSIG 64
 
@@ -561,8 +562,11 @@ int signal64_sigaltstack(const altstack64_t* ss, altstack64_t* oss,
  * had just run out, on behalf of the fault that said so. */
 static int range_present(uint64_t addr, uint64_t len) {
     uint64_t p, phys;
+    /* A signal stack nobody has written to yet is not there until the
+     * frame is written onto it: back it first. */
     for (p = addr & ~0xFFFULL; p < addr + len; p += 0x1000)
-        if (paging64_translate(p, &phys) != 0) return 0;
+        if (paging64_translate(p, &phys) != 0 && !uspace64_fault(p, 1))
+            return 0;
     return 1;
 }
 

@@ -44,9 +44,11 @@
  * to start explorer.exe. */
 #define PROC64_MAX     128
 
-/* Reserved ranges per process. A first wineboot's busiest process holds
- * a few dozen at once; 512 is 8KB a slot. */
-#define PROC64_RESV_MAX 512
+/* Ranges per process. A first wineboot's busiest process holds a few
+ * dozen reservations; once anonymous memory is backed on demand too,
+ * every mapping that does not merge with a neighbour is one more. 1024
+ * is 24KB a slot. */
+#define PROC64_RESV_MAX 1024
 
 /* 32 was the number a program that opens a few files needs, and the
  * wineserver is not that program. It holds a descriptor per client
@@ -164,13 +166,15 @@ typedef struct {
      * gives the child its own copy of both. */
     uint64_t    brk_base, brk_current, mmap_next;
 
-    /* The PROT_NONE reservations this process holds, as sorted,
-     * non-overlapping, non-adjacent [start, end) ranges with no page
-     * tables behind them - see uspace64.c. A reservation that does not
-     * fit here falls back to the shared zero page, so running out is
-     * slower rather than wrong. */
+    /* The anonymous memory this process holds that has no pages behind
+     * it yet, as sorted, non-overlapping [start, end) ranges - see
+     * uspace64.c. `flags` is what a page is mapped with when it is first
+     * touched; 0 is a PROT_NONE reservation, which nothing may touch.
+     * A range that does not fit here falls back to being backed at once
+     * (a reservation: the shared zero page), so running out is slower
+     * rather than wrong. */
     uint32_t    nresv;
-    struct { uint64_t start, end; } resv[PROC64_RESV_MAX];
+    struct { uint64_t start, end, flags; } resv[PROC64_RESV_MAX];
 
     proc64_fd_t fds[PROC64_FD_MAX];
     char        exe_path[PROC64_PATH_MAX];
