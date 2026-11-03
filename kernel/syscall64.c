@@ -3196,7 +3196,9 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         }
 
         if (op == FUTEX_WAKE) {
-            int n = sched64_wake_bits(a1, (int)(uint32_t)a3, bits);
+            int n = sched64_wake_futex(a1, (int)(uint32_t)a3, bits,
+                        ((uint32_t)a2 & (uint32_t)FUTEX_PRIVATE_FLAG)
+                            ? proc64_current_pid() : -1);
             futex_wakes += (uint64_t)n;
             return (uint64_t)n;
         }
@@ -5375,7 +5377,8 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                 clear_child_tid[t] = 0;
                 if (user_range_ok(w, 4)) {
                     *(volatile uint32_t*)w = 0;
-                    futex_wakes += (uint64_t)sched64_wake(w, 1);
+                    futex_wakes += (uint64_t)sched64_wake_futex(
+                                       w, 1, 0xFFFFFFFFu, proc64_current_pid());
                 }
             }
         }

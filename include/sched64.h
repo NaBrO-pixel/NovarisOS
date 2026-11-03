@@ -155,6 +155,10 @@ int sched64_wake(uint64_t addr, int max);
  * bit with `bits`. sched64_wake is this with every bit set. */
 int sched64_wake_bits(uint64_t addr, int max, uint32_t bits);
 
+/* The same, and if `pid` is not -1 only among that process's threads -
+ * what a private futex's address means. Shared futexes pass -1. */
+int sched64_wake_futex(uint64_t addr, int max, uint32_t bits, int pid);
+
 /* The address threads park on when what they wait for cannot be named
  * by one address - a poll(2) over several descriptors, or a wait that
  * has only a deadline. Never a user virtual address and never a futex

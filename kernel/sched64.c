@@ -720,11 +720,23 @@ int sched64_wake(uint64_t addr, int max) {
 }
 
 int sched64_wake_bits(uint64_t addr, int max, uint32_t bits) {
+    return sched64_wake_futex(addr, max, bits, -1);
+}
+
+int sched64_wake_futex(uint64_t addr, int max, uint32_t bits, int pid) {
     int woken = 0;
 
     for (int i = 0; i < SCHED64_MAX_TASKS && woken < max; i++) {
         if (!tasks[i].used || !tasks[i].blocked) continue;
         if (tasks[i].wait_addr != addr) continue;
+        /* A private futex is an address in one process, and the same
+         * number in another process is a different word. Without this a
+         * FUTEX_WAKE(addr, 1) could spend its one wake on a thread of
+         * some other process parked at the same address - which Wine
+         * makes common, since ntdll sits at the same place in every Wine
+         * process - and that thread re-checks its own word, sleeps
+         * again, and the waiter the wake was for never hears of it. */
+        if (pid >= 0 && tasks[i].pid != pid) continue;
         if (!(tasks[i].wait_bits & bits)) continue;   /* a different bitset */
         tasks[i].blocked   = 0;
         tasks[i].wait_addr = 0;

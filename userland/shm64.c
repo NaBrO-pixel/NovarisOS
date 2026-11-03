@@ -32,6 +32,8 @@
 #include <sys/wait.h>
 #include <sys/uio.h>
 #include <sys/syscall.h>
+#include <signal.h>
+#include <time.h>
 
 #define NAME "/tmp/shm64-file"
 #define SPAN 4096
@@ -266,6 +268,49 @@ int main(void)
         ok("on a closed descriptor it is EBADF",
            fsync(fd) == -1 && errno == EBADF);
         unlink("/tmp/shm64-sync");
+    }
+
+    /* --- private futexes stay in their process ---------------------- *
+     *
+     * After a fork both processes have a word at the same address, and
+     * as private futexes they are two different words. The kernel used
+     * to match a wake on the address alone, so a FUTEX_WAKE(addr, 1) in
+     * one process could be spent on a thread of another sleeping at the
+     * same address. Wine puts ntdll at one address in every process, and
+     * a headless Chromium's browser thread slept forever on a wake that
+     * had gone to a renderer. */
+    {
+        static volatile int word;
+        int p[2], status = 0;
+        char c;
+        long n;
+        pid_t kid;
+        struct timespec pause = { 0, 50 * 1000 * 1000 };
+
+        ok("a pipe to hear the child start", pipe(p) == 0);
+        kid = fork();
+        if (kid == 0) {
+            close(p[0]);
+            word = 0;
+            if (write(p[1], "w", 1) != 1) _exit(4);
+            /* FUTEX_WAIT | FUTEX_PRIVATE_FLAG, forever. */
+            syscall(SYS_futex, &word, 0 | 128, 0, NULL, NULL, 0);
+            _exit(3);   /* only a wake meant for someone else gets here */
+        }
+        close(p[1]);
+        ok("the child is about to wait", read(p[0], &c, 1) == 1);
+        for (int i = 0; i < 4; i++) nanosleep(&pause, NULL);
+
+        /* FUTEX_WAKE | FUTEX_PRIVATE_FLAG on this process's own word. */
+        n = syscall(SYS_futex, &word, 1 | 128, 1, NULL, NULL, 0);
+        ok("a private wake finds no waiter in another process", n == 0);
+        for (int i = 0; i < 4; i++) nanosleep(&pause, NULL);
+        ok("and the child is still asleep",
+           waitpid(kid, &status, WNOHANG) == 0);
+        kill(kid, SIGKILL);
+        ok("until it is killed",
+           waitpid(kid, &status, 0) == kid && WIFSIGNALED(status));
+        close(p[0]);
     }
 
     printf("shm64: %d failures\n", failures);
