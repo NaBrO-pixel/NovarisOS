@@ -569,6 +569,8 @@ static uint64_t map_frames(uint64_t addr, int fixed,
         pflags &= ~PAGE64_WRITE;
         pflags |= PAGE64_COW;
         if (prot & 0x2) pflags |= PAGE64_COW_RW;
+    } else {
+        pflags |= PAGE64_SHARED;
     }
 
     /* Each mapping is an owner.

@@ -4190,8 +4190,10 @@ void kernel_main(uint32_t magic, void* mbi) {
         serial64_puts("NOVARIS64: shared  = ");
         serial64_putdec(syscall64_shared_maps() - shared_before);
         serial64_puts(" mappings\n");
-        check("three shared mappings were made",
-              syscall64_shared_maps() - shared_before == 3);
+        /* Five: those three, and the whole file and the view from its
+         * second page. */
+        check("five shared mappings were made",
+              syscall64_shared_maps() - shared_before == 5);
     }
 
     /* --- layer 37b: the clocks (Milestone 86) ------------------------ */

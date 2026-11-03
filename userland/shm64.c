@@ -270,6 +270,43 @@ int main(void)
         unlink("/tmp/shm64-sync");
     }
 
+    /* --- a shared view from the middle of a file ---------------------- *
+     *
+     * Wine maps a view of a section at an offset with MAP_SHARED, and
+     * Chromium's IPC is views of shared sections. This kernel refused any
+     * offset, so Wine fell back to reading the bytes into private memory -
+     * a copy that never saw the other side's writes - and a headless
+     * Chromium's children rejected their messages and quit. */
+    {
+        int fd = open("/tmp/shm64-view", O_CREAT | O_RDWR | O_TRUNC, 0600);
+        char *whole, *view;
+        int status = 0;
+        pid_t kid;
+
+        ok("a three-page file", fd >= 0 && ftruncate(fd, 3 * 4096) == 0);
+        whole = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        view  = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 4096);
+        ok("maps whole and from its second page",
+           whole != MAP_FAILED && view != MAP_FAILED);
+        if (whole != MAP_FAILED && view != MAP_FAILED) {
+            strcpy(view, "through the view");
+            ok("a write through the view lands at the offset",
+               !strcmp(whole + 4096, "through the view"));
+            kid = fork();
+            if (kid == 0) {
+                strcpy(whole + 4096 + 100, "from the child");
+                _exit(0);
+            }
+            ok("and the child's write shows through the parent's view",
+               waitpid(kid, &status, 0) == kid &&
+               !strcmp(view + 100, "from the child"));
+            munmap(whole, 3 * 4096);
+            munmap(view, 4096);
+        }
+        close(fd);
+        unlink("/tmp/shm64-view");
+    }
+
     /* --- private futexes stay in their process ---------------------- *
      *
      * After a fork both processes have a word at the same address, and

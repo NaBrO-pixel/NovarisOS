@@ -351,6 +351,13 @@ int vmspace64_clone_cow(uint64_t src_pml4, vmspace64_t* dst) {
                         continue;
                     }
 
+                    /* A MAP_SHARED page stays shared: one more owner,
+                     * and the same page table entry on both sides. */
+                    if ((pte & PAGE64_SHARED) && pmm64_ref_frame(frame)) {
+                        *dpte = pte;
+                        continue;
+                    }
+
                     if (pmm64_ref_frame(frame)) {
                         uint64_t shared = share_flags(pte);
                         /* Both sides, because a parent that kept its

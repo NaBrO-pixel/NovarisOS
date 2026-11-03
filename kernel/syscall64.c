@@ -2786,15 +2786,23 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
          * refusing to produce again. */
         if (flags & MAP_SHARED) {
             const uint64_t* frames;
-            uint64_t nframes = 0, want;
+            uint64_t nframes = 0, want, skip = off / PAGE64_SIZE;
 
-            /* An offset would mean mapping from the middle of the frame
-             * list, which is a small change and has no caller: refused
-             * rather than half-answered. */
-            if (off) return (uint64_t)-22;             /* -EINVAL */
-
-            frames = ramfs64_frames(node, a2, &nframes);
+            /* From the middle of the file: the same frames, starting
+             * further in. Refused until a caller turned up, and the
+             * caller was the one that mattered - Wine maps a view of a
+             * section at an offset this way, and Chromium's IPC is built
+             * on views of shared sections. -EINVAL sent Wine to its
+             * fallback, which reads the bytes into private memory: a
+             * snapshot that never sees the other side's later writes.
+             * The renderers and the storage service rejected what came
+             * through as VALIDATION_ERROR_ILLEGAL_MEMORY_RANGE and quit,
+             * and a headless Chromium kept starting new ones. */
+            frames = ramfs64_frames(node, off + a2, &nframes);
             if (!frames) return (uint64_t)-12;         /* -ENOMEM */
+            if (nframes <= skip) return (uint64_t)-22; /* past the end */
+            frames  += skip;
+            nframes -= skip;
 
             want = (a2 + PAGE64_SIZE - 1) / PAGE64_SIZE;
             if (nframes > want) nframes = want;
