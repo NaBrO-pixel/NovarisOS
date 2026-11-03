@@ -1237,6 +1237,67 @@ void syscall64_set_exit_code(uint64_t code) { exit_code = code; }
 static uint64_t futex_timed, futex_shared;
 static uint64_t futex_waits, futex_wakes;
 
+/* The last futex calls, for the deadline report.
+ *
+ * A thread asleep in futex at the deadline says only that nobody woke
+ * it, and that has two very different explanations: a wake was issued
+ * and went somewhere else (the kernel's bug), or nobody ever issued one
+ * (the program's deadlock, or something upstream of it). This ring
+ * says which: for each such thread, the waits and wakes on its own
+ * word, by whom and with what result. */
+#define FTRACE_N 4096
+static struct {
+    uint64_t tick, addr;
+    uint32_t val;
+    int16_t  pid, slot;
+    char     op;          /* 'W' blocked, 'A' -EAGAIN, 'K' wake */
+    int16_t  n;
+} ftrace[FTRACE_N];
+static uint32_t ftrace_next;
+
+static void ftrace_note(char op, uint64_t addr, uint32_t val, int n) {
+    uint32_t i = ftrace_next++ % FTRACE_N;
+    ftrace[i].tick = clock64_ticks();
+    ftrace[i].addr = addr;
+    ftrace[i].val  = val;
+    ftrace[i].pid  = (int16_t)proc64_current_pid();
+    ftrace[i].slot = (int16_t)sched64_current();
+    ftrace[i].op   = op;
+    ftrace[i].n    = (int16_t)n;
+}
+
+void syscall64_report_futex_waits(void) {
+    for (int t = 0; t < SCHED64_MAX_TASKS; t++) {
+        uint64_t key = sched64_blocked_on(t);
+        int pid = sched64_blocked_pid(t), shown = 0;
+        if (!key || key >= 0x1000000000000000ULL) continue;
+        serial64_puts("NOVARIS64: [futex] slot ");
+        serial64_putdec((uint64_t)t);
+        serial64_puts(" pid ");
+        serial64_putdec((uint64_t)pid);
+        serial64_puts(" asleep on ");
+        serial64_puthex(key);
+        serial64_puts(", latest calls on that word:\n");
+        for (uint32_t k = 1; k <= FTRACE_N && k <= ftrace_next && shown < 8; k++) {
+            uint32_t i = (ftrace_next - k) % FTRACE_N;
+            if (ftrace[i].addr != key || ftrace[i].pid != pid) continue;
+            shown++;
+            serial64_puts("NOVARIS64: [futex]   tick ");
+            serial64_putdec(ftrace[i].tick);
+            serial64_puts(" slot ");
+            serial64_putdec((uint64_t)(int64_t)ftrace[i].slot);
+            serial64_putc(' ');
+            serial64_putc(ftrace[i].op);
+            serial64_puts(" val ");
+            serial64_putdec(ftrace[i].val);
+            serial64_puts(" n ");
+            serial64_putdec((uint64_t)(int64_t)ftrace[i].n);
+            serial64_putc('\n');
+        }
+        if (!shown) serial64_puts("NOVARIS64: [futex]   (none in the last 4096)\n");
+    }
+}
+
 /* File-backed mappings made. Counted for the same reason the futex
  * counters are: a program can be handed a correct-looking pointer by
  * the anonymous path and never notice the file was not involved. */
@@ -3125,8 +3186,11 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
              * it is why futex has no race: between the caller deciding
              * to sleep and this check, the waker may already have run
              * and changed the value. If it has, do not sleep. */
-            if (*(volatile uint32_t*)a1 != (uint32_t)a3)
+            if (*(volatile uint32_t*)a1 != (uint32_t)a3) {
+                ftrace_note('A', a1, (uint32_t)a3, 0);
                 return (uint64_t)-11;              /* -EAGAIN */
+            }
+            ftrace_note('W', a1, (uint32_t)a3, args->a4 ? 1 : 0);
 
             if (args->a4) {
                 const struct { uint64_t sec, nsec; }* ts =
@@ -3200,6 +3264,8 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                         ((uint32_t)a2 & (uint32_t)FUTEX_PRIVATE_FLAG)
                             ? proc64_current_pid() : -1);
             futex_wakes += (uint64_t)n;
+            ftrace_note('K', a1, user_range_ok(a1, 4)
+                                     ? *(volatile uint32_t*)a1 : 0, n);
             return (uint64_t)n;
         }
 

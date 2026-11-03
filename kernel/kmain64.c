@@ -758,6 +758,7 @@ static void run_wine_program(const void* image, uint64_t len,
      * something, and the wait address says on what. */
     if (!syscall64_leader_exited() && syscall64_run_expired()) {
         sched64_dump_blocked();
+        syscall64_report_futex_waits();
         syscall64_report_pipe_waits();
         syscall64_report_unread_pipes();
     }

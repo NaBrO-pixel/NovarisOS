@@ -376,6 +376,7 @@ void     syscall64_report_calls(void);
  * already there - which separates "nobody wrote" from "somebody wrote
  * and this thread was never woken". */
 void     syscall64_report_pipe_waits(void);
+void     syscall64_report_futex_waits(void);
 
 /* Every pipe holding bytes nobody has taken, and whether any thread is
  * parked on it - which separates "a wakeup is owed" from "somebody who
