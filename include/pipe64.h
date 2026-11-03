@@ -47,7 +47,10 @@
  * objects, so PROC64_MAX of 128 wants 256 for connections alone and
  * leaves nothing for the pipes a process makes for itself. 512, at 3.2KB
  * of in-flight table apiece and buffers still allocated per live pipe. */
-#define PIPE64_MAX 512
+/* And 2048 since a headless Chromium: the wineserver alone held 328.
+ * Buffers are still allocated per live pipe, 64KB each from a heap
+ * capped at 256MB, so 2048 in use at once is half of it. */
+#define PIPE64_MAX 2048
 #define PIPE64_BUF 65536
 
 /* Descriptors in flight (Milestone 76).

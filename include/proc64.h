@@ -44,6 +44,7 @@
  * to start explorer.exe. */
 #define PROC64_MAX     128
 
+
 /* Ranges per process. A first wineboot's busiest process holds a few
  * dozen reservations; once anonymous memory is backed on demand too,
  * every mapping that does not merge with a neighbour is one more - 625
@@ -89,7 +90,13 @@
  * Which makes this arithmetic rather than a guess. PROC64_MAX is 128, so
  * a wineserver serving all of them holds 256 descriptors for connections
  * alone, before the hundred-odd files it has open at once. 512. */
-#define PROC64_FD_MAX  512
+/* And then a headless Chromium, which ran the wineserver out of 512:
+ * 182 files and 328 pipes, because the server also holds a descriptor
+ * for every file it opens on a process's behalf, and a pipe pair for
+ * every thread of every client - and Chromium is many processes with
+ * many threads. NtCreateFile said "Too many open files" and Chromium's
+ * network service could not open its cache. 2048 is 115KB a slot. */
+#define PROC64_FD_MAX  2048
 
 /* 128 was under the 170 characters a real prefix's deepest path needs -
  * measured, see ramfs64.h. */

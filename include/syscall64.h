@@ -252,6 +252,7 @@ typedef struct {
 #define SYS64_TIMES           100
 #define SYS64_PROCESS_VM_READV  310
 #define SYS64_PROCESS_VM_WRITEV 311
+#define SYS64_GETCPU          309
 #define SYS64_RT_SIGSUSPEND   130
 #define SYS64_PSELECT6        270
 #define SYS64_SIGNALFD        282

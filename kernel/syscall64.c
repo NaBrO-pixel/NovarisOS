@@ -4215,6 +4215,16 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         return r;
     }
 
+    /* getcpu(cpu, node, cache): one CPU and one node, both 0. Chromium
+     * asks it in a loop, from its thread pool, to spread work across
+     * processors; -ENOSYS is not an answer it expects. */
+    case SYS64_GETCPU:
+        if (a1) { if (!user_range_ok(a1, 4)) return (uint64_t)-14;
+                  *(uint32_t*)a1 = 0; }
+        if (a2) { if (!user_range_ok(a2, 4)) return (uint64_t)-14;
+                  *(uint32_t*)a2 = 0; }
+        return 0;
+
     /* fsync(fd) and fdatasync(fd): the file is in memory and stays
      * there, so there is nothing to make durable and the answer is that
      * it is done.
