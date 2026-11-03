@@ -46,8 +46,16 @@
  * 128, sized against the host: the same wineboot -u under strace peaks
  * at 99 threads and processes alive at once. The table is walked in
  * order on every switch, which is O(n) and fine at this size, and it
- * costs about 250 bytes a task. */
-#define SCHED64_MAX_TASKS 128
+ * costs about 250 bytes a task.
+ *
+ * And then a headless Chromium filled all 128 - "8 runnable, 120
+ * blocked" - and its next CreateThread failed, which Chromium reports as
+ * running out of memory: two processes died with exception 0xe0000008,
+ * base's OOM code, on a machine with 3GB free. Chromium is a dozen
+ * threads in each of several processes, beside the wineserver and the
+ * prefix's services. 1024 is under a megabyte of table (a task is ~800
+ * bytes with its FPU state), and the walk stays cheap beside a switch. */
+#define SCHED64_MAX_TASKS 1024
 
 void sched64_init(void);
 
