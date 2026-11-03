@@ -4239,6 +4239,14 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         return r;
     }
 
+    /* msync(addr, len, flags): a shared mapping here is the file's own
+     * frames, so there is nothing between the mapping and the file to
+     * write back, and it is already done. Wine's NtFlushVirtualMemory -
+     * FlushViewOfFile - is this, and Chromium's browser asks for it. */
+    case SYS64_MSYNC:
+        if (a1 & (PAGE64_SIZE - 1)) return (uint64_t)-22;   /* -EINVAL */
+        return 0;
+
     /* madvise(addr, len, advice). DONTNEED (4) and FREE (8) give the
      * anonymous pages in the range back; every other piece of advice is
      * about how memory will be used, which this kernel does not act on,

@@ -254,6 +254,7 @@ typedef struct {
 #define SYS64_PROCESS_VM_WRITEV 311
 #define SYS64_GETCPU          309
 #define SYS64_MADVISE         28
+#define SYS64_MSYNC           26
 #define SYS64_RT_SIGSUSPEND   130
 #define SYS64_PSELECT6        270
 #define SYS64_SIGNALFD        282

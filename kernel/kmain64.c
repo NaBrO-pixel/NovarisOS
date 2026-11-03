@@ -5013,6 +5013,12 @@ static const char* const chrome_args[] = {
      * them: Chromium itself fails a CHECK with it. */
     "--in-process-gpu", "--enable-features=NetworkServiceInProcess2",
     "--disable-breakpad",
+#ifdef CHROME64_VERBOSE
+    /* Chromium's own account of itself, children included: 616 lines
+     * for a whole successful run on the Linux host, so the serial port
+     * can carry it, and it can be read against that run line by line. */
+    "--enable-logging=stderr", "--v=1",
+#endif
     "--dump-dom", CHROME64_URL, 0
 };
 
