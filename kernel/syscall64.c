@@ -992,6 +992,7 @@ static int leader_pid = -1;
 /* The last leader, which the deadline report still needs after the
  * layer has disarmed leader_pid. */
 static int report_pid = -1;
+static void mods_forget(int pid);
 
 /* A wall-clock bound on a run, in timer ticks, or 0. See
  * syscall64_set_run_ticks. */
@@ -1637,25 +1638,28 @@ uint64_t syscall64_dispatch(syscall64_args_t* args) {
     return r;
 }
 
-/* Where the leader's modules are, for reading its stacks at the deadline.
+/* Where each process's modules are, for reading stacks at the deadline.
  *
  * A return address is a number until it is known what was mapped
- * there. The leader's file mappings at offset 0 give every ELF and PE
+ * there. A process's file mappings at offset 0 give every ELF and PE
  * module's base, and a page-aligned pread from offset 0 gives the ones
  * Wine reads rather than maps - chrome.dll among them, whose sections
- * the kernel cannot map. A later entry over the same address wins. */
-#define MODS_MAX 512
-static struct { uint64_t va, size; char path[80]; } mods[MODS_MAX];
+ * the kernel cannot map. A later entry over the same address wins, and
+ * execve forgets a process's earlier ones. Kept for every process
+ * because the thread a stuck program waits on is often in another one:
+ * a browser asking winedevice.exe for the network adapters. */
+#define MODS_MAX 8192
+static struct { uint64_t va, size; int pid; char path[76]; } mods[MODS_MAX];
 static int nmods;
+
+static void mods_forget(int pid) {
+    for (int i = 0; i < nmods; i++) if (mods[i].pid == pid) mods[i].pid = -1;
+}
 
 static void note_module(const syscall64_args_t* a, uint64_t r) {
     int node;
     uint64_t va;
 
-    static int mods_for = -1;
-
-    if (leader_pid < 0 || proc64_current_pid() != leader_pid) return;
-    if (mods_for != leader_pid) { nmods = 0; mods_for = leader_pid; }
     if ((int64_t)r < 0 && (int64_t)r > -4096) return;
     if (a->nr == SYS64_MMAP && !(a->a4 & MAP_ANONYMOUS) && a->a6 == 0) {
         int64_t fd = (int64_t)a->a5;
@@ -1671,17 +1675,26 @@ static void note_module(const syscall64_args_t* a, uint64_t r) {
     } else {
         return;
     }
-    if (nmods >= MODS_MAX) return;
+    if (nmods >= MODS_MAX) {
+        /* Full: squeeze out what execve and exit have orphaned. */
+        int j = 0;
+        for (int i = 0; i < nmods; i++)
+            if (mods[i].pid >= 0 && proc64_get(mods[i].pid)) mods[j++] = mods[i];
+        nmods = j;
+        if (nmods >= MODS_MAX) return;
+    }
     mods[nmods].va   = va;
     mods[nmods].size = ramfs64_size(node);
+    mods[nmods].pid  = proc64_current_pid();
     if (ramfs64_path(node, mods[nmods].path, sizeof(mods[nmods].path)) < 0)
         mods[nmods].path[0] = 0;
     nmods++;
 }
 
-static int module_of(uint64_t v) {
+static int module_of(int pid, uint64_t v) {
     for (int i = nmods - 1; i >= 0; i--)
-        if (v >= mods[i].va && v < mods[i].va + mods[i].size) return i;
+        if (mods[i].pid == pid && v >= mods[i].va && v < mods[i].va + mods[i].size)
+            return i;
     return -1;
 }
 
@@ -1695,47 +1708,38 @@ static int peek_u64(vmspace64_t* vs, uint64_t va, uint64_t* out) {
     return 1;
 }
 
-static void put_code(uint64_t v) {
-    int m = module_of(v);
-    serial64_puthex(v);
-    if (m >= 0) {
-        serial64_puts(" m");
-        serial64_putdec((uint64_t)m);
-        serial64_puts("+");
-        serial64_puthex(v - mods[m].va);
-    }
-}
-
-/* Every thread of the leader, with its Wine syscall frame - the
+/* Every thread of one process, with its Wine syscall frame - the
  * Windows-side return address and stack of the call it is in - and the
- * return addresses into known modules found above that stack pointer.
- * Then the modules, so the numbers can be read. */
-void syscall64_report_leader_stacks(void) {
+ * values above each stack pointer that land in one of its modules. Then
+ * the modules those were in, so the numbers can be read. */
+static void report_stacks_of(int which) {
     static uint8_t used_mod[MODS_MAX];
 
-    if (report_pid < 0) return;
-    for (int i = 0; i < MODS_MAX; i++) used_mod[i] = 0;
+    for (int i = 0; i < nmods; i++) used_mod[i] = 0;
     for (int t = 0; t < SCHED64_MAX_TASKS; t++) {
-        int pid, hits = 0;
+        int pid, hits;
         uint64_t wait, gs, rsp, fp = 0, rip = 0, ursp = 0, id = 0;
         vmspace64_t vs;
 
         if (!sched64_task_peek(t, &pid, &wait, &gs, &rsp, &vs)) continue;
-        if (pid != report_pid) continue;
+        if (pid != which) continue;
         serial64_puts("NOVARIS64: [stack] slot ");
         serial64_putdec((uint64_t)t);
+        serial64_puts(" pid ");
+        serial64_putdec((uint64_t)pid);
         serial64_puts(" on ");
         serial64_puthex(wait);
         serial64_puts(" teb ");
         serial64_puthex(gs);
         if (gs && peek_u64(&vs, gs + 0x378, &fp) && fp &&
             peek_u64(&vs, fp + 0x70, &rip) && peek_u64(&vs, fp + 0x88, &ursp)) {
+            int m = module_of(pid, rip);
             peek_u64(&vs, fp + 0xb0, &id);
             serial64_puts(" syscall ");
             serial64_puthex(id & 0xffffffffu);
             serial64_puts(" from ");
-            put_code(rip);
-            if (module_of(rip) >= 0) used_mod[module_of(rip)] = 1;
+            serial64_puthex(rip);
+            if (m >= 0) used_mod[m] = 1;
         }
         serial64_putc('\n');
         /* The Windows stack above the call, then the Unix one. */
@@ -1743,17 +1747,17 @@ void syscall64_report_leader_stacks(void) {
             uint64_t base = pass ? rsp : ursp;
             hits = 0;
             if (!base) continue;
-            for (uint64_t a = base & ~7ULL; a < (base & ~7ULL) + 0x4000 && hits < 24;
-                 a += 8) {
+            for (uint64_t a = base & ~7ULL;
+                 a < (base & ~7ULL) + 0x4000 && hits < 32; a += 8) {
                 uint64_t v;
                 int m;
                 if (!peek_u64(&vs, a, &v)) break;
-                m = module_of(v);
+                m = module_of(pid, v);
                 if (m < 0) continue;
                 used_mod[m] = 1;
                 serial64_puts(pass ? "NOVARIS64: [stack]   u " :
                                      "NOVARIS64: [stack]   w ");
-                put_code(v);
+                serial64_puthex(v);
                 serial64_putc('\n');
                 hits++;
             }
@@ -1761,13 +1765,34 @@ void syscall64_report_leader_stacks(void) {
     }
     for (int i = 0; i < nmods; i++) {
         if (!used_mod[i]) continue;
-        serial64_puts("NOVARIS64: [stack] m");
-        serial64_putdec((uint64_t)i);
-        serial64_putc(' ');
+        serial64_puts("NOVARIS64: [stack] pid ");
+        serial64_putdec((uint64_t)which);
+        serial64_puts(" m ");
         serial64_puthex(mods[i].va);
         serial64_putc(' ');
         serial64_puts(mods[i].path);
         serial64_putc('\n');
+    }
+}
+
+/* The leader, and every other process with a thread asleep in futex -
+ * the waits a server round trip cannot explain. */
+void syscall64_report_leader_stacks(void) {
+    static uint8_t done[PROC64_MAX];
+
+    for (int i = 0; i < PROC64_MAX; i++) done[i] = 0;
+    if (report_pid >= 0) {
+        report_stacks_of(report_pid);
+        if (proc64_slot_of(report_pid) >= 0) done[proc64_slot_of(report_pid)] = 1;
+    }
+    for (int t = 0; t < SCHED64_MAX_TASKS; t++) {
+        uint64_t key = sched64_blocked_on(t);
+        int pid = sched64_blocked_pid(t), slot;
+        if (!key || key >= 0x1000000000000000ULL) continue;
+        slot = proc64_slot_of(pid);
+        if (slot < 0 || done[slot]) continue;
+        done[slot] = 1;
+        report_stacks_of(pid);
     }
 }
 
@@ -2157,6 +2182,8 @@ static uint64_t do_execve(const char* path, const char* const* argv,
      * line, which for a Wine process names the Windows program and, for
      * Chromium, the --type= of the child. Paired with the [exit] line
      * below, it says which child of a program went away, and how. */
+    mods_forget(proc64_current_pid());
+
     if (leader_pid >= 0) {
         int total = 0;
         serial64_puts("NOVARIS64: [exec] pid ");
