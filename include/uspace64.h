@@ -57,6 +57,7 @@ uint32_t uspace64_resv_peak(void);
  * in either ring, and from anything in the kernel about to touch user
  * memory it has checked page by page. */
 int      uspace64_fault(uint64_t va, int write);
+int      uspace64_back_in(int pid, uint64_t va, int write);
 uint64_t uspace64_lazy_faults(void);
 
 /* Maps frames belonging to somebody else - a file's - into this

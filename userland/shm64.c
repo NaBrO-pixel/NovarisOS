@@ -30,6 +30,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/uio.h>
+#include <sys/syscall.h>
 
 #define NAME "/tmp/shm64-file"
 #define SPAN 4096
@@ -165,6 +167,106 @@ int main(void)
 
     /* The name never came back. */
     ok("the name is still gone", stat(NAME, &st) == -1);
+
+    /* --- process_vm_readv and process_vm_writev --------------------- *
+     *
+     * One process reading and writing another's memory, which is how
+     * the wineserver does ReadProcessMemory and WriteProcessMemory. The
+     * child's buffer is shared copy-on-write with the parent's after the
+     * fork, so a write into it must land in the child alone; and a page
+     * the child mapped and never touched must read as zeros and take a
+     * write, which on a kernel that backs memory on first touch means
+     * backing it in the child from outside. */
+    {
+        static char buf[8192];
+        int go[2], back[2];
+        pid_t kid;
+        char *fresh, *ro;
+        char got[16];
+        struct iovec l, r;
+        ssize_t n;
+        int status;
+
+        strcpy(buf, "parent's");
+        ok("pipes for the remote-memory test", pipe(go) == 0 && pipe(back) == 0);
+        fresh = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        ro = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        kid = fork();
+        if (kid == 0) {
+            char c;
+            strcpy(buf, "child's!");
+            if (write(back[1], "r", 1) != 1) _exit(10);
+            if (read(go[0], &c, 1) != 1) _exit(11);
+            /* What the parent wrote, here and only here. */
+            if (strcmp(buf, "written!") != 0) _exit(1);
+            if (strcmp(fresh, "into new") != 0) _exit(2);
+            _exit(0);
+        }
+        {
+            char c;
+            ok("the child is ready", read(back[0], &c, 1) == 1);
+        }
+
+        l.iov_base = got; l.iov_len = 9;
+        r.iov_base = buf; r.iov_len = 9;
+        n = process_vm_readv(kid, &l, 1, &r, 1, 0);
+        ok("process_vm_readv reads the child's memory", n == 9);
+        ok("and gets the child's bytes, not the parent's",
+           strcmp(got, "child's!") == 0);
+
+        l.iov_base = "written!"; l.iov_len = 9;
+        n = process_vm_writev(kid, &l, 1, &r, 1, 0);
+        ok("process_vm_writev writes into it", n == 9);
+        ok("and the parent's own copy is untouched",
+           strcmp(buf, "parent's") == 0);
+
+        memset(got, 'x', sizeof(got));
+        l.iov_base = got; l.iov_len = 8;
+        r.iov_base = fresh; r.iov_len = 8;
+        n = process_vm_readv(kid, &l, 1, &r, 1, 0);
+        ok("a page the child never touched reads", n == 8);
+        ok("as zeros", got[0] == 0 && got[7] == 0);
+        l.iov_base = "into new"; l.iov_len = 9;
+        r.iov_base = fresh; r.iov_len = 9;
+        ok("and takes a write", process_vm_writev(kid, &l, 1, &r, 1, 0) == 9);
+
+        l.iov_base = "nope"; l.iov_len = 4;
+        r.iov_base = ro; r.iov_len = 4;
+        errno = 0;
+        n = process_vm_writev(kid, &l, 1, &r, 1, 0);
+        ok("a read-only page in the child is not written",
+           n == -1 && errno == EFAULT);
+
+        ok("the child sees what was written, and only that",
+           write(go[1], "g", 1) == 1 &&
+           waitpid(kid, &status, 0) == kid &&
+           WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+        errno = 0;
+        l.iov_base = got; l.iov_len = 1;
+        r.iov_base = buf; r.iov_len = 1;
+        n = process_vm_readv(kid, &l, 1, &r, 1, 0);
+        ok("and once it is gone, ESRCH", n == -1 && errno == ESRCH);
+        munmap(fresh, 4096);
+        munmap(ro, 4096);
+    }
+
+    /* --- fsync ------------------------------------------------------ *
+     *
+     * SQLite calls it at every commit and treats a failure as an I/O
+     * error, so a kernel without it has no working database. */
+    {
+        int fd = open("/tmp/shm64-sync", O_CREAT | O_RDWR | O_TRUNC, 0644);
+        ok("a file to sync", fd >= 0 && write(fd, "x", 1) == 1);
+        ok("fsync succeeds", fsync(fd) == 0);
+        ok("and fdatasync", fdatasync(fd) == 0);
+        close(fd);
+        errno = 0;
+        ok("on a closed descriptor it is EBADF",
+           fsync(fd) == -1 && errno == EBADF);
+        unlink("/tmp/shm64-sync");
+    }
 
     printf("shm64: %d failures\n", failures);
     return failures ? 1 : 119;

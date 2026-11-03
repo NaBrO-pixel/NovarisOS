@@ -274,6 +274,35 @@ static int resv_add(proc64_t* p, uint64_t start, uint64_t end,
     return 1;
 }
 
+/* The same first touch, made on behalf of another process: the
+ * wineserver writing into a Windows process, or reading from one, with
+ * process_vm_writev. The page is backed in that process's space, which
+ * need not be the loaded one. Returns 1 if it backed it. */
+int uspace64_back_in(int pid, uint64_t va, int write) {
+    proc64_t* p = proc64_get(pid);
+    uint32_t i;
+    uint64_t flags, frame;
+
+    if (!p || va >= USPACE64_LIMIT) return 0;
+    va &= ~(PAGE64_SIZE - 1);
+    i = resv_first_after(p, va);
+    if (i >= p->nresv || p->resv[i].start > va) return 0;
+    flags = p->resv[i].flags;
+    if (!flags) return 0;
+    if (write && !(flags & PAGE64_WRITE)) return 0;
+    if (vmspace64_user_frame(&p->space, va, 0)) return 0;   /* already there */
+    frame = pmm64_alloc_high();
+    if (!frame) return 0;
+    kmemset(phys64_to_virt(frame), 0, PAGE64_SIZE);
+    if (!vmspace64_install(&p->space, va, frame, flags)) {
+        pmm64_free_frame(frame);
+        return 0;
+    }
+    pages_allocated++;
+    lazy_faults++;
+    return 1;
+}
+
 /* A page fault on a page that is not there. If it lies in anonymous
  * memory this process holds and the access is one that memory allows,
  * this is the first touch: the page gets a frame of its own now and the

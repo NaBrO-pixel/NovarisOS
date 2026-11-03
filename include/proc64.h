@@ -46,9 +46,11 @@
 
 /* Ranges per process. A first wineboot's busiest process holds a few
  * dozen reservations; once anonymous memory is backed on demand too,
- * every mapping that does not merge with a neighbour is one more. 1024
- * is 24KB a slot. */
-#define PROC64_RESV_MAX 1024
+ * every mapping that does not merge with a neighbour is one more - 625
+ * in a first wineboot, and a headless Chromium filled 1024 and spilled
+ * 8.4 million reservation pages onto the zero page, 64MB of page tables.
+ * 4096 is 96KB a slot, 12MB across the table. */
+#define PROC64_RESV_MAX 4096
 
 /* 32 was the number a program that opens a few files needs, and the
  * wineserver is not that program. It holds a descriptor per client

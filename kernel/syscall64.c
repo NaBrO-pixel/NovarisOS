@@ -4215,6 +4215,112 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         return r;
     }
 
+    /* fsync(fd) and fdatasync(fd): the file is in memory and stays
+     * there, so there is nothing to make durable and the answer is that
+     * it is done.
+     *
+     * They were -ENOSYS, and SQLite treats a failed sync as an I/O error:
+     * Chromium's profile databases - its login database, its UKM store -
+     * all failed to commit ("disk I/O error", "Unable to commit a
+     * transaction") in the guest and not on the host. */
+    case SYS64_FSYNC:
+    case SYS64_FDATASYNC:
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9; /* -EBADF */
+        return 0;
+
+    /* times(buf): CPU time used, in clock ticks of 100 a second, and the
+     * time since an arbitrary point as the result. This kernel does not
+     * account CPU time per process, so the four times are the elapsed
+     * time for the caller and zero for its children - an overstatement,
+     * where Linux would be exact, but monotonic, which is what callers
+     * measure intervals with. */
+    case SYS64_TIMES: {
+        uint64_t t = clock64_ticks() * 100 / CLOCK64_HZ;
+        if (a1) {
+            if (!user_range_ok(a1, 32)) return (uint64_t)-14;
+            ((uint64_t*)a1)[0] = t;     /* tms_utime  */
+            ((uint64_t*)a1)[1] = 0;     /* tms_stime  */
+            ((uint64_t*)a1)[2] = 0;     /* tms_cutime */
+            ((uint64_t*)a1)[3] = 0;     /* tms_cstime */
+        }
+        return t;
+    }
+
+    /* process_vm_readv(pid, local, liovcnt, remote, riovcnt, flags) and
+     * process_vm_writev: copy between this process's memory and
+     * another's, without either stopping.
+     *
+     * The wineserver's ReadProcessMemory and WriteProcessMemory are
+     * these. It tries them first and, on -ENOSYS, decides they will
+     * never work and falls back to ptrace - which this kernel does not
+     * have - so every cross-process read and write a Windows program
+     * asked for failed. Chromium makes them on its own children as it
+     * starts them.
+     *
+     * The other process's memory is reached through its page tables and
+     * the direct map, a page at a time, so it need not be loaded. A write
+     * breaks copy-on-write for that process as its own write would, and
+     * a page it has never touched is backed in it first; a page it may
+     * not write is not written, as on Linux. Copying stops at the first
+     * page that cannot be reached, and the count so far is the answer -
+     * -EFAULT only if that is nothing. */
+    case SYS64_PROCESS_VM_READV:
+    case SYS64_PROCESS_VM_WRITEV: {
+        struct iov64 { uint64_t base, len; };
+        const struct iov64* liov = (const void*)a2;
+        const struct iov64* riov = (const void*)args->a4;
+        uint64_t lcnt = a3, rcnt = args->a5, done = 0;
+        uint64_t li = 0, ri = 0, loff = 0, roff = 0;
+        int writing = nr == SYS64_PROCESS_VM_WRITEV;
+        int pid = (int)(int64_t)a1;
+        proc64_t* target;
+
+        if (args->a6) return (uint64_t)-22;                   /* -EINVAL */
+        if (lcnt > 1024 || rcnt > 1024) return (uint64_t)-22;
+        if ((lcnt && !user_range_ok(a2, lcnt * sizeof(*liov))) ||
+            (rcnt && !user_range_ok(args->a4, rcnt * sizeof(*riov))))
+            return (uint64_t)-14;
+        target = proc64_get(pid);
+        if (!target || !target->used || target->exited)
+            return (uint64_t)-3;                              /* -ESRCH */
+        for (uint64_t k = 0; k < lcnt; k++)
+            if (liov[k].len && !user_range_ok(liov[k].base, liov[k].len))
+                return (uint64_t)-14;
+
+        while (li < lcnt && ri < rcnt) {
+            uint64_t lleft = liov[li].len - loff;
+            uint64_t rleft = riov[ri].len - roff;
+            uint64_t rva, in_page, n, frame;
+            uint8_t* local;
+
+            if (!lleft) { li++; loff = 0; continue; }
+            if (!rleft) { ri++; roff = 0; continue; }
+
+            rva = riov[ri].base + roff;
+            in_page = PAGE64_SIZE - (rva & (PAGE64_SIZE - 1));
+            n = lleft < rleft ? lleft : rleft;
+            if (n > in_page) n = in_page;
+
+            frame = vmspace64_user_frame(&target->space, rva, writing);
+            if (!frame && uspace64_back_in(pid, rva, writing))
+                frame = vmspace64_user_frame(&target->space, rva, writing);
+            if (!frame) break;
+
+            local = (uint8_t*)(liov[li].base + loff);
+            if (writing)
+                kmemcpy((uint8_t*)phys64_to_virt(frame)
+                            + (rva & (PAGE64_SIZE - 1)), local, n);
+            else
+                kmemcpy(local, (const uint8_t*)phys64_to_virt(frame)
+                                   + (rva & (PAGE64_SIZE - 1)), n);
+            done += n;
+            loff += n;
+            roff += n;
+        }
+        if (!done && li < lcnt && ri < rcnt) return (uint64_t)-14;
+        return done;
+    }
+
     /* signalfd(fd, mask, size) and signalfd4(fd, mask, size, flags): a
      * descriptor that reads signals. -1 makes a new one; an existing
      * signalfd has its mask replaced; anything else is -EINVAL. The mask

@@ -247,6 +247,11 @@ typedef struct {
 #define SYS64_RT_SIGRETURN    15
 #define SYS64_RT_SIGPENDING   127
 #define SYS64_RT_SIGTIMEDWAIT 128
+#define SYS64_FSYNC           74
+#define SYS64_FDATASYNC       75
+#define SYS64_TIMES           100
+#define SYS64_PROCESS_VM_READV  310
+#define SYS64_PROCESS_VM_WRITEV 311
 #define SYS64_RT_SIGSUSPEND   130
 #define SYS64_PSELECT6        270
 #define SYS64_SIGNALFD        282

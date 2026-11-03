@@ -479,29 +479,30 @@ int vmspace64_set_writable(uint64_t va, int writable) {
     return 1;
 }
 
-/* Stores a 32-bit value at `va` in a space that need not be the loaded
- * one - fork's CLONE_CHILD_SETTID, which writes the child's tid into the
- * child's copy of the parent's memory before the child has ever run.
+/* The frame behind `va` in a space that need not be the loaded one,
+ * ready for the kernel to read or - with `write` - to write through the
+ * direct map. Returns 0 for a page that is not there, not user memory,
+ * or (for a write) not writable.
  *
- * That copy is shared copy-on-write, so the page is almost certainly the
- * parent's too. A write here has to do what the child's own first write
- * would: take a frame of its own if anyone else still owns this one, or
- * simply keep it if nobody does. A page that was never writable is
- * refused, as is one that is not there. Returns 1 if it stored. */
-int vmspace64_write_u32(vmspace64_t* vs, uint64_t va, uint32_t value) {
+ * A write to a page shared copy-on-write does what the space's own first
+ * write would: takes a frame of its own if anyone else still owns this
+ * one, or simply keeps it if nobody does. That is what lets fork write
+ * the child's tid into the child's copy of the parent's memory, and the
+ * wineserver write into a Windows process with WriteProcessMemory. */
+uint64_t vmspace64_user_frame(vmspace64_t* vs, uint64_t va, int write) {
     uint64_t* pte;
     uint64_t e, frame, flags;
 
-    if (!vs || !vs->pml4_phys || (va & 3)) return 0;
+    if (!vs || !vs->pml4_phys) return 0;
     if (va >= 0x0000800000000000ULL) return 0;          /* not user */
     pte = pte_for(vs->pml4_phys, va & ~(PAGE64_SIZE - 1), 0);
     if (!pte) return 0;
     e = *pte;
     if (!(e & PAGE64_PRESENT) || !(e & PAGE64_USER)) return 0;
-
     frame = e & ADDR_MASK;
-    if (frame == uspace64_zero_frame()) return 0;       /* a reservation */
+    if (!write) return frame;
 
+    if (frame == uspace64_zero_frame()) return 0;       /* a reservation */
     if (e & PAGE64_COW) {
         if (!(e & PAGE64_COW_RW)) return 0;             /* never writable */
         flags = ((e & ~ADDR_MASK) & ~(PAGE64_COW | PAGE64_COW_RW))
@@ -515,14 +516,32 @@ int vmspace64_write_u32(vmspace64_t* vs, uint64_t va, uint32_t value) {
             frame = fresh;
         }
         *pte = frame | flags;
+        if ((read_cr3() & ADDR_MASK) == vs->pml4_phys)
+            __asm__ __volatile__("invlpg (%0)" :: "r"(va) : "memory");
     } else if (!(e & PAGE64_WRITE)) {
         return 0;
     }
+    return frame;
+}
 
-    /* The space may be the loaded one; then its old translation goes. */
-    if ((read_cr3() & ADDR_MASK) == vs->pml4_phys)
-        __asm__ __volatile__("invlpg (%0)" :: "r"(va) : "memory");
+/* Puts `frame` at `va` in a space that need not be the loaded one, where
+ * nothing is mapped now - backing another process's demand-paged memory.
+ * Returns 1 if it did. */
+int vmspace64_install(vmspace64_t* vs, uint64_t va, uint64_t frame,
+                      uint64_t flags) {
+    uint64_t* pte;
+    if (!vs || !vs->pml4_phys || va >= 0x0000800000000000ULL) return 0;
+    pte = pte_for(vs->pml4_phys, va & ~(PAGE64_SIZE - 1), 1);
+    if (!pte || (*pte & PAGE64_PRESENT)) return 0;
+    *pte = (frame & ADDR_MASK) | flags | PAGE64_PRESENT;
+    return 1;
+}
 
+int vmspace64_write_u32(vmspace64_t* vs, uint64_t va, uint32_t value) {
+    uint64_t frame;
+    if (va & 3) return 0;
+    frame = vmspace64_user_frame(vs, va, 1);
+    if (!frame) return 0;
     *(volatile uint32_t*)((uint8_t*)phys64_to_virt(frame)
                           + (va & (PAGE64_SIZE - 1))) = value;
     return 1;
