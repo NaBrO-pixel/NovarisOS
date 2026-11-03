@@ -28,6 +28,10 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <net/if.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #define SOCKNAME "/tmp/sock64-test"
 
@@ -233,6 +237,38 @@ int main(void)
     close(srv);
     unlink(SOCKNAME);
     ok("and the name goes away with it", stat(SOCKNAME, &st) == -1);
+
+    /* --- the interface list ------------------------------------------ *
+     *
+     * if_nameindex() and getifaddrs() ask a NETLINK_ROUTE socket, and
+     * glibc has no other way. With no such socket if_nameindex() was
+     * NULL, Wine's nsiproxy dereferenced it while holding a lock, and
+     * every GetAdaptersAddresses after that - a headless Chromium's
+     * among them - waited forever. The loopback is the one interface
+     * every Linux machine has, so it is what these look for. */
+    {
+        struct if_nameindex *ni = if_nameindex(), *e;
+        struct ifaddrs *ifa = NULL, *a;
+        int lo = 0, lo4 = 0;
+
+        ok("if_nameindex answers", ni != NULL);
+        for (e = ni; e && e->if_index; e++)
+            if (!strcmp(e->if_name, "lo")) lo = (int)e->if_index;
+        ok("and lists lo", lo > 0);
+        if (ni) if_freenameindex(ni);
+
+        ok("getifaddrs answers", getifaddrs(&ifa) == 0);
+        for (a = ifa; a; a = a->ifa_next) {
+            if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET) continue;
+            if (strcmp(a->ifa_name, "lo")) continue;
+            if (((struct sockaddr_in *)a->ifa_addr)->sin_addr.s_addr ==
+                htonl(INADDR_LOOPBACK) && (a->ifa_flags & IFF_LOOPBACK) &&
+                (a->ifa_flags & IFF_UP))
+                lo4 = 1;
+        }
+        ok("with lo up at 127.0.0.1", lo4);
+        if (ifa) freeifaddrs(ifa);
+    }
 
     printf("sock64: %d failures\n", failures);
     return failures ? 1 : 109;

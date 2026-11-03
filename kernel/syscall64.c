@@ -744,6 +744,152 @@ static int64_t do_pipe_read(const syscall64_args_t* args, uint64_t nr,
     return 0;
 }
 
+/* --- AF_NETLINK, NETLINK_ROUTE ------------------------------------ *
+ *
+ * How a Linux program learns what network interfaces exist. glibc's
+ * if_nameindex() and getifaddrs() have no other way to ask: they open a
+ * route socket, send an RTM_GETLINK or RTM_GETADDR dump request, and
+ * read the answer back until NLMSG_DONE.
+ *
+ * Without it if_nameindex() returns NULL, and Wine's nsiproxy does not
+ * check - Linux never fails here - so winedevice.exe took a null
+ * dereference in update_if_table while holding if_list_lock. Every
+ * later GetAdaptersAddresses in every process then slept on that lock
+ * forever, and a headless Chromium with them: three of its threads were
+ * in that call when the run ended, and the browser's main thread was
+ * waiting behind them on a Mojo channel.
+ *
+ * This machine's only interface is the loopback, so that is the answer:
+ * lo, index 1, 127.0.0.1/8. The answer is the same every time, so the
+ * descriptor keeps only the request it is answering - its type and
+ * sequence number, in `pos` - and the reply is built when it is read.
+ * Nothing is shared, so fork and dup need nothing. A socket bound to
+ * multicast groups, which is how nsiproxy waits for address changes, is
+ * never told of one: this machine's addresses do not change. */
+#define AF_NETLINK_     16
+#define NLM_F_MULTI_    2
+#define NLMSG_DONE_     3
+#define RTM_NEWLINK_    16
+#define RTM_GETLINK_    18
+#define RTM_NEWADDR_    20
+#define RTM_GETADDR_    22
+#define NL_PENDING      (1ULL << 63)
+#define NETLINK_WAIT_KEY 0x4000000000000000ULL
+
+typedef struct { uint32_t len; uint16_t type, flags; uint32_t seq, pid; } nlhdr64_t;
+
+static uint32_t nl_attr(uint8_t* out, uint32_t at, uint16_t type,
+                        const void* data, uint16_t n) {
+    uint16_t len = (uint16_t)(4 + n);
+    *(uint16_t*)(out + at)     = len;
+    *(uint16_t*)(out + at + 2) = type;
+    kmemcpy(out + at + 4, data, n);
+    for (uint32_t i = len; i < ((len + 3u) & ~3u); i++) out[at + i] = 0;
+    return at + ((len + 3u) & ~3u);
+}
+
+/* The reply to one dump request, into `out`. Returns its length. */
+static uint32_t nl_reply(uint16_t type, uint32_t seq, uint32_t pid,
+                         uint8_t* out) {
+    uint32_t at = 0;
+    nlhdr64_t* h;
+
+    if (type == RTM_GETLINK_) {
+        static const uint8_t zero6[6] = { 0 };
+        uint32_t mtu = 65536;
+        h = (nlhdr64_t*)out;
+        at = sizeof(*h);
+        /* ifinfomsg: family, pad, type ARPHRD_LOOPBACK, index, flags
+         * IFF_UP|IFF_LOOPBACK|IFF_RUNNING|IFF_LOWER_UP, change. */
+        out[at] = 0; out[at + 1] = 0;
+        *(uint16_t*)(out + at + 2) = 772;
+        *(int32_t*)(out + at + 4)  = 1;
+        *(uint32_t*)(out + at + 8) = 0x1u | 0x8u | 0x40u | 0x10000u;
+        *(uint32_t*)(out + at + 12) = 0;
+        at += 16;
+        at = nl_attr(out, at, 3, "lo", 3);          /* IFLA_IFNAME   */
+        at = nl_attr(out, at, 1, zero6, 6);         /* IFLA_ADDRESS  */
+        at = nl_attr(out, at, 2, zero6, 6);         /* IFLA_BROADCAST*/
+        at = nl_attr(out, at, 4, &mtu, 4);          /* IFLA_MTU      */
+        h->len = at; h->type = RTM_NEWLINK_; h->flags = NLM_F_MULTI_;
+        h->seq = seq; h->pid = pid;
+    } else if (type == RTM_GETADDR_) {
+        static const uint8_t lo4[4] = { 127, 0, 0, 1 };
+        h = (nlhdr64_t*)out;
+        at = sizeof(*h);
+        /* ifaddrmsg: AF_INET, /8, IFA_F_PERMANENT, RT_SCOPE_HOST, lo. */
+        out[at] = 2; out[at + 1] = 8; out[at + 2] = 0x80; out[at + 3] = 254;
+        *(uint32_t*)(out + at + 4) = 1;
+        at += 8;
+        at = nl_attr(out, at, 1, lo4, 4);           /* IFA_ADDRESS */
+        at = nl_attr(out, at, 2, lo4, 4);           /* IFA_LOCAL   */
+        at = nl_attr(out, at, 3, "lo", 3);          /* IFA_LABEL   */
+        h->len = at; h->type = RTM_NEWADDR_; h->flags = NLM_F_MULTI_;
+        h->seq = seq; h->pid = pid;
+    }
+    /* Every dump ends the same way, including one for a table this
+     * machine has nothing in. */
+    h = (nlhdr64_t*)(out + at);
+    h->len = sizeof(*h) + 4; h->type = NLMSG_DONE_; h->flags = NLM_F_MULTI_;
+    h->seq = seq; h->pid = pid;
+    *(int32_t*)(out + at + sizeof(*h)) = 0;
+    return at + sizeof(*h) + 4;
+}
+
+static int64_t nl_send(int fd, const void* buf, uint64_t n) {
+    const nlhdr64_t* h = (const nlhdr64_t*)buf;
+    if (n < sizeof(*h) || !user_range_ok((uint64_t)buf, sizeof(*h)))
+        return -22;                                    /* -EINVAL */
+    fds[fd].pos = NL_PENDING | ((uint64_t)h->seq << 16) | h->type;
+    return (int64_t)n;
+}
+
+/* Reads the pending reply, or waits for one that is never coming - which
+ * is what a socket listening for address changes is for. `name` is a
+ * sockaddr_nl to fill in: the reply is from the kernel, port 0, and
+ * glibc discards anything that is not. */
+static int64_t nl_recv(const syscall64_args_t* args, uint64_t nr, int fd,
+                       void* buf, uint64_t n, uint64_t flags,
+                       void* name, uint32_t* namelen, uint32_t* msgflags) {
+    static uint8_t reply[512];
+    registers64_t self, next;
+    vmspace64_t next_space;
+    uint64_t next_fs, p = fds[fd].pos;
+    uint32_t len;
+
+    if (!(p & NL_PENDING)) {
+        if (fds[fd].nonblock || (flags & 0x40)) return -11;   /* -EAGAIN */
+        if (signal_interrupts_wait()) return -4;               /* -EINTR  */
+        frame_from_args(args, nr, &self);
+        self.rip = args->ret_rip - 2;
+        if (!sched64_block_current(&self, NETLINK_WAIT_KEY, nr,
+                                   &next, &next_space, &next_fs))
+            return -11;
+        vmspace64_switch(&next_space);
+        write_msr(0xC0000100u, next_fs);
+        sched64_resume(&next);                         /* never returns */
+    }
+
+    len = nl_reply((uint16_t)(p & 0xFFFF), (uint32_t)(p >> 16),
+                   (uint32_t)proc64_current_pid(), reply);
+    if (n > len) n = len;
+    if (!user_range_ok((uint64_t)buf, n)) return -14;  /* -EFAULT */
+    kmemcpy(buf, reply, n);
+    if (!(flags & 0x2)) fds[fd].pos = 0;               /* not MSG_PEEK */
+    if (name && namelen && *namelen >= 12 && user_range_ok((uint64_t)name, 12)) {
+        uint8_t* a = (uint8_t*)name;
+        for (int i = 0; i < 12; i++) a[i] = 0;
+        *(uint16_t*)a = AF_NETLINK_;
+        *namelen = 12;
+    } else if (namelen) {
+        *namelen = 0;
+    }
+    if (msgflags) *msgflags = n < len ? 0x20 : 0;      /* MSG_TRUNC */
+    /* MSG_TRUNC asks for the real length back, which is how a caller
+     * sizes its buffer for a second try. */
+    return (flags & 0x20) ? (int64_t)len : (int64_t)n;
+}
+
 /* Writing to one descriptor, whatever it turns out to be.
  *
  * Factored out because write and writev must not be able to disagree.
@@ -765,6 +911,7 @@ static int64_t fd_write_bytes(uint64_t fd, const char* buf, uint64_t n) {
         if (fd_is_stream((int)fd)) return do_pipe_write((int)fd, buf, n);
         if (fds[fd].kind == FD64_SOCKET) return -107;  /* -ENOTCONN */
         if (fds[fd].kind == FD64_SIGNALFD) return -22; /* -EINVAL, as Linux */
+        if (fds[fd].kind == FD64_NETLINK) return nl_send((int)fd, buf, n);
         /* /dev/null takes everything and keeps none of it; the console
          * is the serial port, which is where this kernel's idea of
          * stdout has always gone. */
@@ -835,6 +982,8 @@ static int64_t fd_read_bytes(const syscall64_args_t* args, uint64_t nr,
     if (fds[fd].kind == FD64_SOCKET) return -107;      /* -ENOTCONN */
     if (fds[fd].kind == FD64_SIGNALFD)
         return signalfd_read(args, nr, (int)fd, buf, n);
+    if (fds[fd].kind == FD64_NETLINK)
+        return nl_recv(args, nr, (int)fd, buf, n, 0, 0, 0, 0);
 
     dev = ramfs64_device(fds[fd].node);
     if (dev == RAMFS64_DEV_NULL) return 0;             /* end of file */
@@ -2333,6 +2482,11 @@ static uint64_t do_poll(const syscall64_args_t* args, uint64_t nr,
             /* Readable while a signal it reports is pending for the
              * poller; never writable. */
             if (signal64_pending_in_set(fds[fd].sigmask)) got |= POLL64_IN;
+        } else if (fds[fd].kind == FD64_NETLINK) {
+            /* Readable while a reply is waiting; a request can always
+             * be sent. */
+            if (fds[fd].pos & NL_PENDING) got |= POLL64_IN;
+            got |= POLL64_OUT;
         } else if (fds[fd].kind == FD64_SOCKET && fds[fd].sock >= 0 &&
             sock64_state(fds[fd].sock) == SOCK64_LISTENING) {
             /* A listening socket is readable when somebody is
@@ -3652,6 +3806,25 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
     case SYS64_SOCKET: {
         int s, fd;
 
+        if (a1 == AF_NETLINK_) {
+            /* SOCK_RAW or SOCK_DGRAM, which Linux treats alike here;
+             * only the route family. */
+            if ((a2 & 0xFF) != 3 && (a2 & 0xFF) != 2) return (uint64_t)-94;
+            if (a3 != 0) return (uint64_t)-93;         /* -EPROTONOSUPPORT */
+            fd = fd_alloc(3);
+            if (fd < 0) return (uint64_t)-24;
+            fds[fd].kind     = FD64_NETLINK;
+            fds[fd].node     = -1;
+            fds[fd].pos      = 0;
+            fds[fd].rx       = -1;
+            fds[fd].tx       = -1;
+            fds[fd].sock     = -1;
+            fds[fd].sigmask  = 0;
+            fds[fd].nonblock = (a2 & O_NONBLOCK) != 0;
+            fds[fd].cloexec  = (a2 & O_CLOEXEC) != 0;
+            fds[fd].used     = 1;
+            return (uint64_t)fd;
+        }
         if (a1 != AF_UNIX_) return (uint64_t)-97;      /* -EAFNOSUPPORT */
         if ((int)(a2 & 0xFF) != SOCK_STREAM_) return (uint64_t)-94;
 
@@ -3677,6 +3850,13 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         int node;
 
         if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind == FD64_NETLINK) {
+            /* The groups are remembered and nothing is ever sent to
+             * them; the port is always the process's own pid. */
+            if (!addr || a3 < 12 || !user_range_ok(a2, 12)) return (uint64_t)-22;
+            fds[a1].sigmask = *(const uint32_t*)((const uint8_t*)a2 + 8);
+            return 0;
+        }
         if (fds[a1].kind != FD64_SOCKET || fds[a1].sock < 0)
             return (uint64_t)-88;                      /* -ENOTSOCK */
         if (!addr || addr->sun_family != AF_UNIX_) return (uint64_t)-22;
@@ -3816,11 +3996,41 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
      * reason it can be written at all is that a descriptor here is a
      * small record - a kind, a node or a pair of pipes - rather than a
      * pointer into the owner. */
+    /* sendto(fd, buf, len, flags, addr, addrlen) and recvfrom: only a
+     * route socket answers them. A connected stream socket would take
+     * them too on Linux, but nothing here has asked. */
+    case SYS64_SENDTO:
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind != FD64_NETLINK) return (uint64_t)-38;
+        return (uint64_t)nl_send((int)a1, (const void*)a2, a3);
+
+    case SYS64_RECVFROM: {
+        uint32_t nlen = 0;
+        int64_t r;
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind != FD64_NETLINK) return (uint64_t)-38;
+        if (args->a6) {
+            if (!user_range_ok(args->a6, 4)) return (uint64_t)-14;
+            nlen = *(uint32_t*)args->a6;
+        }
+        r = nl_recv(args, nr, (int)a1, (void*)a2, a3, args->a4,
+                    (void*)args->a5, args->a6 ? &nlen : 0, 0);
+        if (r >= 0 && args->a6) *(uint32_t*)args->a6 = nlen;
+        return (uint64_t)r;
+    }
+
     case SYS64_SENDMSG: {
         const msghdr64_t* msg = (const msghdr64_t*)a2;
         fdpass64_t carried[8];
         int ncarried = 0;
         int64_t total = 0;
+
+        if (a1 < FD_MAX && fds[a1].used && fds[a1].kind == FD64_NETLINK) {
+            if (!msg || !user_range_ok(a2, sizeof(*msg)) || !msg->msg_iovlen)
+                return (uint64_t)-22;
+            return (uint64_t)nl_send((int)a1, msg->msg_iov[0].iov_base,
+                                     msg->msg_iov[0].iov_len);
+        }
 
         /* Said out loud while tracing, because "bad file descriptor" is
          * the same answer to four different questions and the useful
@@ -3959,6 +4169,22 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         fdpass64_t got[8];
         int ngot, installed = 0;
         int64_t total = 0;
+
+        if (a1 < FD_MAX && fds[a1].used && fds[a1].kind == FD64_NETLINK) {
+            uint32_t nlen, mflags = 0;
+            int64_t r;
+            if (!msg || !user_range_ok(a2, sizeof(*msg)) || !msg->msg_iovlen)
+                return (uint64_t)-22;
+            nlen = msg->msg_name ? msg->msg_namelen : 0;
+            r = nl_recv(args, nr, (int)a1, msg->msg_iov[0].iov_base,
+                        msg->msg_iov[0].iov_len, a3, msg->msg_name, &nlen,
+                        &mflags);
+            if (r < 0) return (uint64_t)r;
+            msg->msg_namelen    = nlen;
+            msg->msg_flags      = mflags;
+            msg->msg_controllen = 0;
+            return (uint64_t)r;
+        }
 
         if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
         if (!fd_is_stream(a1)) return (uint64_t)-88;
@@ -4116,6 +4342,17 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
     case SYS64_GETSOCKNAME: {
         sockaddr_un64_t* addr = (sockaddr_un64_t*)a2;
         if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind == FD64_NETLINK) {
+            uint8_t* nl = (uint8_t*)a2;
+            if (!a2 || !a3 || !user_range_ok(a2, 12) || !user_range_ok(a3, 4))
+                return (uint64_t)-14;
+            for (int i = 0; i < 12; i++) nl[i] = 0;
+            *(uint16_t*)nl = AF_NETLINK_;
+            *(uint32_t*)(nl + 4) = (uint32_t)proc64_current_pid();
+            *(uint32_t*)(nl + 8) = (uint32_t)fds[a1].sigmask;
+            *(uint32_t*)a3 = 12;
+            return 0;
+        }
         if (fds[a1].kind != FD64_SOCKET) return (uint64_t)-88;
         if (!addr) return (uint64_t)-14;
         addr->sun_family = AF_UNIX_;
