@@ -383,8 +383,29 @@ static void page_fault_handler(registers64_t* r) {
      * and for either ring - a syscall writing into a buffer the program
      * never touched is the same first touch. Bit 1 is "it was a write". */
     if (!(r->err_code & 0x1) &&
-        uspace64_fault(pf_cr2, (r->err_code & 0x2) != 0))
+        uspace64_fault(pf_cr2, (r->err_code & 0x2) != 0)) {
+        /* One in 20,000, with who and where: what is touching memory
+         * says where a program's memory goes. */
+        if (uspace64_lazy_faults() % 20000 == 0) {
+            proc64_t* me = proc64_current();
+            serial64_puts("NOVARIS64: [touch] #");
+            serial64_putdec(uspace64_lazy_faults());
+            serial64_puts(" pid ");
+            serial64_putdec((uint64_t)proc64_current_pid());
+            serial64_puts(" ");
+            serial64_puts(me ? me->comm : "?");
+            serial64_puts(" va=");
+            serial64_puthex(pf_cr2);
+            serial64_puts(" rip=");
+            serial64_puthex(r->rip);
+            serial64_puts((r->cs & 3) ? " user" : " kernel");
+            serial64_puts((r->err_code & 0x2) ? " write" : " read");
+            serial64_puts(" free=");
+            serial64_putdec(pmm64_free_frames());
+            serial64_putc('\n');
+        }
         return;
+    }
 
     /* A write to a page fork shared (Milestone 69). First, and before
      * the diagnostic and the signal both: this is not an error, it is
