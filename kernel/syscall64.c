@@ -677,15 +677,85 @@ static int64_t do_pipe_write(int fd, const void* buf, uint64_t n) {
     if (fds[fd].tx < 0) return -9;                     /* -EBADF: read end */
     w = pipe64_write(fds[fd].tx, buf, n);
 
-    /* -EAGAIN here means the ring is full. A blocking write should park
-     * until a reader drains it; this reports it instead, which is
-     * honest and is enough for what runs today - Wine's requests are far
-     * smaller than 64KB, so a full pipe means the peer has stopped
-     * reading rather than that the writer is ahead. Written down rather
-     * than hidden: a blocking write that returns EAGAIN is a divergence
-     * from Linux, and the differential does not assert it. */
+    /* -EAGAIN here means the ring is full; stream_write below is what
+     * waits for room. */
     if (w > 0) sched64_wake(PIPE64_WAIT_KEY(fds[fd].tx), SCHED64_MAX_TASKS);
     return w;
+}
+
+/* write(2) and writev(2) on a pipe or a connected socket, all of it.
+ *
+ * A blocking write to a pipe on Linux does not return until every byte
+ * has gone, sleeping while the pipe is full. This one returned -EAGAIN
+ * instead, on the reasoning - written down here at the time - that
+ * Wine's requests are far smaller than the 64KB a pipe holds. They are
+ * not always: a driver completing an IRP sends the IRP's output back to
+ * the wineserver in the request, and Wine sends every request with one
+ * writev and treats anything short of all of it as fatal. winedevice.exe
+ * answered a headless Chromium's adapter query with more than 64KB,
+ * got 0x10000 and then -EAGAIN, printed "wine client error: write:
+ * Resource temporarily unavailable" and lost its dispatch thread with
+ * the browser's IRP in hand. Three browser threads waited for that
+ * answer for the rest of the run, and the page never printed.
+ *
+ * A blocked syscall here is restarted from the top when it wakes, so
+ * the bytes already written are kept per thread, against the exact call
+ * they belong to, and the restart skips them. A signal ends the wait as
+ * on Linux: what has gone is the answer, or -EINTR if nothing has. */
+static struct { int active; uint64_t nr, fd, buf, len, done; }
+    wprog[SCHED64_MAX_TASKS];
+
+static int64_t stream_write(const syscall64_args_t* args, uint64_t nr,
+                            int fd, const iovec64_t* iov, uint64_t cnt) {
+    registers64_t self, next;
+    vmspace64_t next_space;
+    uint64_t next_fs, done = 0, skip;
+    int t = sched64_current();
+
+    if (t >= 0 && t < SCHED64_MAX_TASKS && wprog[t].active &&
+        wprog[t].nr == nr && wprog[t].fd == (uint64_t)fd &&
+        wprog[t].buf == args->a2 && wprog[t].len == args->a3)
+        done = wprog[t].done;
+    if (t >= 0 && t < SCHED64_MAX_TASKS) wprog[t].active = 0;
+
+    skip = done;
+    for (uint64_t i = 0; i < cnt; i++) {
+        const char* p = (const char*)iov[i].iov_base;
+        uint64_t left = iov[i].iov_len;
+        if (skip >= left) { skip -= left; continue; }
+        p += skip; left -= skip; skip = 0;
+        while (left) {
+            int64_t w = do_pipe_write(fd, p, left);
+            if (w == -11) goto full;
+            if (w < 0) return done ? (int64_t)done : w;
+            done += (uint64_t)w; p += w; left -= (uint64_t)w;
+        }
+    }
+    return (int64_t)done;
+
+full:
+    if (fds[fd].nonblock) return done ? (int64_t)done : -11;
+    if (signal_interrupts_wait()) return done ? (int64_t)done : -4;
+    if (t < 0 || t >= SCHED64_MAX_TASKS) return done ? (int64_t)done : -11;
+    wprog[t].active = 1;
+    wprog[t].nr     = nr;
+    wprog[t].fd     = (uint64_t)fd;
+    wprog[t].buf    = args->a2;
+    wprog[t].len    = args->a3;
+    wprog[t].done   = done;
+
+    frame_from_args(args, nr, &self);
+    self.rip = args->ret_rip - 2;
+    if (!sched64_block_current(&self, PIPE64_WAIT_KEY(fds[fd].tx), nr,
+                               &next, &next_space, &next_fs)) {
+        /* Nothing else can run, so nothing will ever drain this. */
+        wprog[t].active = 0;
+        return done ? (int64_t)done : -11;
+    }
+    vmspace64_switch(&next_space);
+    write_msr(0xC0000100u, next_fs);
+    sched64_resume(&next);                             /* never returns */
+    return 0;
 }
 
 /* read(2) on a pipe, including the part that waits.
@@ -716,6 +786,9 @@ static int64_t do_pipe_read(const syscall64_args_t* args, uint64_t nr,
     if (fds[fd].rx < 0) return -9;                     /* -EBADF: write end */
 
     r = pipe64_read(fds[fd].rx, buf, n);
+    /* Room has been made, so a writer parked on a full pipe can go on.
+     * Same key as the readers': a spurious wake costs one re-check. */
+    if (r > 0) sched64_wake(PIPE64_WAIT_KEY(fds[fd].rx), SCHED64_MAX_TASKS);
     if (r != -11) return r;                            /* data, or EOF */
     if (fds[fd].nonblock) return -11;                  /* -EAGAIN */
 
@@ -2561,6 +2634,10 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
 
     switch (nr) {
     case SYS64_WRITE:
+        if (a1 < FD_MAX && fds[a1].used && fd_is_stream((int)a1)) {
+            iovec64_t one = { (void*)a2, a3 };
+            return (uint64_t)stream_write(args, nr, (int)a1, &one, 1);
+        }
         return (uint64_t)fd_write_bytes(a1, (const char*)a2, a3);
 
     /* writev(fd, iov, iovcnt).
@@ -2581,6 +2658,8 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         int64_t total = 0;
 
         if (!iov && a3) return (uint64_t)-14;          /* -EFAULT */
+        if (a1 < FD_MAX && fds[a1].used && fd_is_stream((int)a1))
+            return (uint64_t)stream_write(args, nr, (int)a1, iov, a3);
         for (uint64_t i = 0; i < a3; i++) {
             int64_t w;
             if (!iov[i].iov_len) continue;

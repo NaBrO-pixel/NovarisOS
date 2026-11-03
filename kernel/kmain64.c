@@ -3865,8 +3865,9 @@ void kernel_main(uint32_t magic, void* mbi) {
         serial64_puts(" pipes, ");
         serial64_putdec(syscall64_socketpairs() - pairs_before);
         serial64_puts(" socketpairs\n");
-        check("three pipes and one socketpair were made",
-              syscall64_pipes() - pipes_before == 3 &&
+        /* Four: the fourth carries the write larger than a pipe holds. */
+        check("four pipes and one socketpair were made",
+              syscall64_pipes() - pipes_before == 4 &&
               syscall64_socketpairs() - pairs_before == 1);
 
         /* And every one of them was given back. This is the leak the

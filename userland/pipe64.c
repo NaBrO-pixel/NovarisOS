@@ -23,6 +23,8 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <sys/uio.h>
+#include <stdlib.h>
 
 static int failures;
 
@@ -192,6 +194,42 @@ int main(void)
 
         waitpid(kid, &status, 0);
         ok("the child exited 11", WIFEXITED(status) && WEXITSTATUS(status) == 11);
+    }
+
+    /* --- a write larger than the pipe ---------------------------------- *
+     *
+     * A blocking write to a pipe returns only when every byte has gone,
+     * sleeping while the pipe is full. This kernel used to return what
+     * fitted and then -EAGAIN, and Wine sends each request to the
+     * wineserver with one writev that must go whole: winedevice.exe lost
+     * a thread answering an adapter query with more than 64KB. */
+    {
+        enum { BIG = 200000, V = 70000 };
+        static unsigned char out[BIG], back[BIG + V];
+        int p[2], status = 0, good = 1;
+        long got = 0, n;
+        pid_t kid;
+
+        for (int i = 0; i < BIG; i++) out[i] = (unsigned char)(i * 7 + 3);
+        ok("a pipe for the big write", pipe(p) == 0);
+        kid = fork();
+        if (kid == 0) {
+            struct iovec v[3] = { { out, 30000 }, { out + 30000, 30000 },
+                                  { out + 60000, V - 60000 } };
+            close(p[0]);
+            if (write(p[1], out, BIG) != BIG) _exit(1);
+            if (writev(p[1], v, 3) != V) _exit(2);
+            _exit(0);
+        }
+        close(p[1]);
+        while ((n = read(p[0], back + got, sizeof(back) - got)) > 0) got += n;
+        close(p[0]);
+        for (long i = 0; i < BIG && good; i++) good = back[i] == out[i];
+        for (long i = 0; i < V && good; i++) good = back[BIG + i] == out[i];
+        ok("a 200000-byte write and a 70000-byte writev go whole",
+           waitpid(kid, &status, 0) == kid && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0);
+        ok("and every byte arrives, in order", got == BIG + V && good);
     }
 
     printf("pipe64: %d failures\n", failures);
