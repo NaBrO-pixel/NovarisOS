@@ -4222,6 +4222,17 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         return r;
     }
 
+    /* madvise(addr, len, advice). DONTNEED (4) and FREE (8) give the
+     * anonymous pages in the range back; every other piece of advice is
+     * about how memory will be used, which this kernel does not act on,
+     * and is accepted. It was -ENOSYS, which glibc and Chromium treat as
+     * "could not discard" - Chromium's browser asked for it every few
+     * seconds of a headless run. */
+    case SYS64_MADVISE:
+        if (a1 & (PAGE64_SIZE - 1)) return (uint64_t)-22;   /* -EINVAL */
+        if (a3 == 4 || a3 == 8) uspace64_discard(a1, a2);
+        return 0;
+
     /* getcpu(cpu, node, cache): one CPU and one node, both 0. Chromium
      * asks it in a loop, from its thread pool, to spread work across
      * processors; -ENOSYS is not an answer it expects. */

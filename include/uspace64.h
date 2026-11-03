@@ -81,6 +81,10 @@ uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                        uint64_t flags);
 uint64_t uspace64_munmap(uint64_t addr, uint64_t length);
 
+/* madvise(MADV_DONTNEED/MADV_FREE): give back the anonymous pages in the
+ * range; they read as zeros when next touched. */
+void     uspace64_discard(uint64_t addr, uint64_t length);
+
 /* Narrows an existing mapping's permissions. Used by the file-mapping
  * path: the kernel has to write the file's bytes in, so the pages are
  * mapped writable and then closed down if the caller asked for

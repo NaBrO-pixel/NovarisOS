@@ -717,6 +717,34 @@ void uspace64_protect(uint64_t addr, uint64_t length, uint64_t prot) {
     }
 }
 
+/* madvise(MADV_DONTNEED or MADV_FREE) on anonymous memory: the pages
+ * there are given back, and the range reads as zeros when next touched,
+ * which is what both mean to a caller that does not race its own
+ * accesses. Only pages inside ranges this process holds as anonymous
+ * memory are dropped: a page of a file mapping has no first touch to
+ * come back through, and dropping one would turn the next access into a
+ * fault. Chromium discards memory this way as it runs. */
+void uspace64_discard(uint64_t addr, uint64_t length) {
+    proc64_t* p = cur();
+    uint64_t start = addr & ~(PAGE64_SIZE - 1);
+    uint64_t end = start + ((length + PAGE64_SIZE - 1) & ~(PAGE64_SIZE - 1));
+    uint64_t va = start;
+
+    if (!p) return;
+    while ((va = vmspace64_next_mapped(va, end)) < end) {
+        uint32_t i = resv_first_after(p, va);
+        if (i < p->nresv && p->resv[i].start <= va && p->resv[i].flags) {
+            uint64_t frame;
+            if (paging64_translate(va, &frame) == PAGING64_OK) {
+                frame &= ~(PAGE64_SIZE - 1);
+                paging64_unmap(va);
+                if (frame != zero_frame) pmm64_free_frame(frame);
+            }
+        }
+        va += PAGE64_SIZE;
+    }
+}
+
 uint64_t uspace64_munmap(uint64_t addr, uint64_t length) {
     uint64_t start = addr & ~(PAGE64_SIZE - 1);
     uint64_t end;
@@ -735,7 +763,7 @@ uint64_t uspace64_build_stack(vmspace64_t* space, uint64_t stack_top,
                               uint64_t interp_base,
                               const char* const* envp) {
     uint64_t saved_cr3, p, random_va, rsp;
-    uint64_t argv_va[8], env_va[16];
+    uint64_t argv_va[16], env_va[16];
     uint64_t* v;
     uint64_t n;
     int nenv = 0, nargv = 0;

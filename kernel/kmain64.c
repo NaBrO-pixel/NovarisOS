@@ -640,9 +640,9 @@ static void run_wine_program(const void* image, uint64_t len,
     const uint64_t STACK_PAGES = 128;
     const uint64_t EXE_BIAS    = 0x0000555555554000ULL;
     const uint64_t INTERP_BASE = 0x00007FFFF7000000ULL;
-    /* uspace64_build_stack copies eight argv entries; two are wine and
-     * the program, so six are left for the program's own arguments. */
-    const char* argv[9];
+    /* uspace64_build_stack copies sixteen argv entries; two are wine and
+     * the program, so fourteen are left for the program's own. */
+    const char* argv[17];
     int nargs = 0;
     elf64_info_t exe, interp;
     uint64_t rsp = 0, i;
@@ -651,7 +651,7 @@ static void run_wine_program(const void* image, uint64_t len,
 
     argv[0] = "/usr/bin/wine";
     argv[1] = program;
-    while (args && args[nargs] && nargs < 6) {
+    while (args && args[nargs] && nargs < 14) {
         argv[2 + nargs] = args[nargs];
         nargs++;
     }
@@ -5002,8 +5002,18 @@ void kernel_main(uint32_t magic, void* mbi) {
 #define CHROME64_URL "data:text/html,<p>novaris</p>"
 #endif
 static const char* const chrome_args[] = {
-    "--headless", "--no-sandbox", "--disable-gpu", "--dump-dom",
-    CHROME64_URL, 0
+    "--headless", "--no-sandbox", "--disable-gpu",
+    /* And as few processes as Chromium will run in: the GPU and network
+     * services in the browser process, and no crash reporter. Every
+     * Chromium process holds its own copy of chrome.dll's code - Wine
+     * cannot mmap a PE whose sections are 0x200-aligned in the file, so
+     * it reads them, here exactly as on Linux - and that is ~320MB a
+     * process. All three flags were checked on the Linux host to change
+     * nothing about the page printed. --single-process is not one of
+     * them: Chromium itself fails a CHECK with it. */
+    "--in-process-gpu", "--enable-features=NetworkServiceInProcess2",
+    "--disable-breakpad",
+    "--dump-dom", CHROME64_URL, 0
 };
 
     /* --- and then Windows programs, in the prefix just built --- *
