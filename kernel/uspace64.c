@@ -355,6 +355,51 @@ static int range_free(uint64_t start, uint64_t end) {
     return vmspace64_next_mapped(start, end) == end;
 }
 
+/* Where a mapping the caller did not place goes: the first range at or
+ * after the bump pointer with nothing in it - no reservation and no
+ * page.
+ *
+ * The bump pointer used to be the answer by itself, and it is not one.
+ * Wine places most of what it maps with MAP_FIXED, at addresses it
+ * picks, and a bump pointer that knows nothing of them walks straight
+ * into one. Then the new mapping lands on top of live memory - map_anon
+ * zeroes what it finds there - and Wine, having been told the range was
+ * free, records a second view over it. A headless Chromium's renderers
+ * died of exactly that: "create_view: Assertion `view->protect &
+ * VPROT_SYSTEM' failed". Linux never hands out an occupied range for a
+ * mapping it places itself. Returns 0 when nothing fits. */
+static uint64_t find_free(uint64_t length) {
+    proc64_t* p = cur();
+    uint64_t s = p->mmap_next;
+
+    for (;;) {
+        uint64_t e, m;
+        uint32_t i;
+
+        if (!fits_in_user_half(s, length)) return 0;
+        e = s + length;
+        i = resv_first_after(p, s);
+        if (i < p->nresv && p->resv[i].start < e) {
+            s = (p->resv[i].end + PAGE64_SIZE - 1) & ~(PAGE64_SIZE - 1);
+            continue;
+        }
+        m = vmspace64_next_mapped(s, e);
+        if (m < e) {
+            /* Past the whole run of mapped pages, not one page at a time. */
+            s = m + PAGE64_SIZE;
+            while (fits_in_user_half(s, PAGE64_SIZE) &&
+                   vmspace64_next_mapped(s, s + PAGE64_SIZE) == s)
+                s += PAGE64_SIZE;
+            continue;
+        }
+        return s;
+    }
+}
+
+static void bump_past(uint64_t end) {
+    if (end > cur()->mmap_next) cur()->mmap_next = end;
+}
+
 /* Maps [start, end) as anonymous zeroed user memory. Returns 0 on
  * failure, having mapped whatever it managed - the callers below undo
  * their own partial work by simply not advancing their pointer. */
@@ -472,11 +517,11 @@ uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
          * else comes out of the bump region. The whole range has to be
          * free, not just its first page - a hint that fits everywhere
          * except its last page is not a hint that fits. */
-        start = addr ? (addr & ~(PAGE64_SIZE - 1)) : cur()->mmap_next;
-        if (addr && !(fits_in_user_half(start, length) &&
-                      range_free(start, start + length)))
-            start = cur()->mmap_next;
-        if (!fits_in_user_half(start, length)) return (uint64_t)-12;
+        start = addr & ~(PAGE64_SIZE - 1);
+        if (!addr || !(fits_in_user_half(start, length) &&
+                       range_free(start, start + length)))
+            start = find_free(length);
+        if (!start) return (uint64_t)-12;              /* -ENOMEM */
         end = start + length;
     }
 
@@ -499,7 +544,7 @@ uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 
     /* A fixed mapping does not move the bump pointer: it was placed by
      * the caller, in a range the caller is keeping track of. */
-    if (!(flags & MAP_FIXED) && start == cur()->mmap_next) cur()->mmap_next = end;
+    if (!(flags & (MAP_FIXED | MAP_FIXED_NOREPLACE))) bump_past(end);
     return start;
 }
 
@@ -539,7 +584,8 @@ static uint64_t map_frames(uint64_t addr, int fixed,
      * every Windows program - and a mapping that succeeded somewhere
      * else would be worse than one that failed: the call reports an
      * address nobody is going to look at. */
-    start = fixed ? (addr & ~(PAGE64_SIZE - 1)) : cur()->mmap_next;
+    start = fixed ? (addr & ~(PAGE64_SIZE - 1)) : find_free(n * PAGE64_SIZE);
+    if (!fixed && !start) return (uint64_t)-12;
     if (!fits_in_user_half(start, n * PAGE64_SIZE)) return (uint64_t)-12;
 
     /* Whatever was there is replaced. It usually is something: Wine
@@ -607,7 +653,7 @@ static uint64_t map_frames(uint64_t addr, int fixed,
         pmm64_ref_frame(frames[i]);
     }
 
-    if (!fixed) cur()->mmap_next = start + n * PAGE64_SIZE;
+    if (!fixed) bump_past(start + n * PAGE64_SIZE);
     return start;
 }
 
@@ -645,7 +691,8 @@ uint64_t uspace64_map_phys(uint64_t length, uint64_t phys, uint64_t prot) {
     length = (length + PAGE64_SIZE - 1) & ~(PAGE64_SIZE - 1);
     if (phys & (PAGE64_SIZE - 1)) return (uint64_t)-22;
 
-    start = cur()->mmap_next;
+    start = find_free(length);
+    if (!start) return (uint64_t)-12;
 
     pflags = PAGE64_PRESENT | PAGE64_USER | PAGE64_PCD | PAGE64_PWT;
     if (prot & 0x2) pflags |= PAGE64_WRITE;           /* PROT_WRITE */
@@ -660,7 +707,7 @@ uint64_t uspace64_map_phys(uint64_t length, uint64_t phys, uint64_t prot) {
         }
     }
 
-    cur()->mmap_next = start + length;
+    bump_past(start + length);
     return start;
 }
 

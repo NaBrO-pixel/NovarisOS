@@ -238,6 +238,38 @@ int main(void)
     ok("after munmap the whole range is free again", got == area);
     munmap(area, SPAN);
 
+    /* --- a mapping the kernel places never lands on one already there -- *
+     *
+     * Wine places most of its mappings with MAP_FIXED, and the kernel
+     * used to place the rest from a bump pointer that knew nothing of
+     * them - so an ordinary mmap could come back on top of live memory,
+     * zero it, and leave Wine with two views of one range. */
+    {
+        char *one = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        char *mark = MAP_FAILED, *big = MAP_FAILED;
+        int clear = 1;
+
+        if (one != MAP_FAILED)
+            mark = mmap(one + 16 * 4096, 4096, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        ok("a page placed by hand just past an ordinary one",
+           one != MAP_FAILED && mark == one + 16 * 4096);
+        if (mark != MAP_FAILED) {
+            strcpy(mark, "still here");
+            big = mmap(NULL, 64 * 4096, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (big != MAP_FAILED)
+                clear = mark + 4096 <= big || mark >= big + 64 * 4096;
+            ok("an mmap the kernel places goes around it",
+               big != MAP_FAILED && clear);
+            ok("and what was there is untouched", !strcmp(mark, "still here"));
+        }
+        if (big != MAP_FAILED) munmap(big, 64 * 4096);
+        if (mark != MAP_FAILED) munmap(mark, 4096);
+        if (one != MAP_FAILED) munmap(one, 4096);
+    }
+
     printf("vmem64: %d failures\n", failures);
     return failures ? 1 : 101;
 }
