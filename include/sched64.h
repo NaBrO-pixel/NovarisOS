@@ -97,6 +97,8 @@ void sched64_dump_blocked(void);
  * which process it belongs to. For a caller that can interpret the wait
  * keys - syscall64.c owns PIPE64_WAIT_KEY and the rest. */
 uint64_t sched64_blocked_on(int i);
+int      sched64_task_peek(int i, int* pid, uint64_t* wait, uint64_t* gs,
+                          uint64_t* rsp, vmspace64_t* space);
 int      sched64_blocked_pid(int i);
 
 int  sched64_pid_tasks(int pid);

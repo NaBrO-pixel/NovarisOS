@@ -1633,6 +1633,137 @@ uint64_t syscall64_dispatch(syscall64_args_t* args) {
     return r;
 }
 
+/* Where the leader's modules are, for reading its stacks at the deadline.
+ *
+ * A return address is a number until it is known what was mapped
+ * there. The leader's file mappings at offset 0 give every ELF and PE
+ * module's base, and a page-aligned pread from offset 0 gives the ones
+ * Wine reads rather than maps - chrome.dll among them, whose sections
+ * the kernel cannot map. A later entry over the same address wins. */
+#define MODS_MAX 512
+static struct { uint64_t va, size; char path[80]; } mods[MODS_MAX];
+static int nmods;
+
+static void note_module(const syscall64_args_t* a, uint64_t r) {
+    int node;
+    uint64_t va;
+
+    if (leader_pid < 0 || proc64_current_pid() != leader_pid) return;
+    if ((int64_t)r < 0 && (int64_t)r > -4096) return;
+    if (a->nr == SYS64_MMAP && !(a->a4 & MAP_ANONYMOUS) && a->a6 == 0) {
+        int64_t fd = (int64_t)a->a5;
+        if (fd < 3 || fd >= FD_MAX || !fds[fd].used ||
+            fds[fd].kind != FD64_FILE) return;
+        node = fds[fd].node;
+        va = r;
+    } else if (a->nr == SYS64_PREAD64 && a->a4 == 0 && r >= 64 &&
+               !(a->a2 & (PAGE64_SIZE - 1))) {
+        if (a->a1 < 3 || a->a1 >= FD_MAX || !fds[a->a1].used) return;
+        node = fds[a->a1].node;
+        va = a->a2;
+    } else {
+        return;
+    }
+    if (nmods >= MODS_MAX) return;
+    mods[nmods].va   = va;
+    mods[nmods].size = ramfs64_size(node);
+    if (ramfs64_path(node, mods[nmods].path, sizeof(mods[nmods].path)) < 0)
+        mods[nmods].path[0] = 0;
+    nmods++;
+}
+
+static int module_of(uint64_t v) {
+    for (int i = nmods - 1; i >= 0; i--)
+        if (v >= mods[i].va && v < mods[i].va + mods[i].size) return i;
+    return -1;
+}
+
+static int peek_u64(vmspace64_t* vs, uint64_t va, uint64_t* out) {
+    uint64_t f;
+    if (va & 7) return 0;
+    f = vmspace64_user_frame(vs, va, 0);
+    if (!f) return 0;
+    *out = *(const uint64_t*)((const uint8_t*)phys64_to_virt(f) +
+                             (va & (PAGE64_SIZE - 1)));
+    return 1;
+}
+
+static void put_code(uint64_t v) {
+    int m = module_of(v);
+    serial64_puthex(v);
+    if (m >= 0) {
+        serial64_puts(" m");
+        serial64_putdec((uint64_t)m);
+        serial64_puts("+");
+        serial64_puthex(v - mods[m].va);
+    }
+}
+
+/* Every thread of the leader, with its Wine syscall frame - the
+ * Windows-side return address and stack of the call it is in - and the
+ * return addresses into known modules found above that stack pointer.
+ * Then the modules, so the numbers can be read. */
+void syscall64_report_leader_stacks(void) {
+    static uint8_t used_mod[MODS_MAX];
+
+    if (leader_pid < 0) return;
+    for (int i = 0; i < MODS_MAX; i++) used_mod[i] = 0;
+    for (int t = 0; t < SCHED64_MAX_TASKS; t++) {
+        int pid, hits = 0;
+        uint64_t wait, gs, rsp, fp = 0, rip = 0, ursp = 0, id = 0;
+        vmspace64_t vs;
+
+        if (!sched64_task_peek(t, &pid, &wait, &gs, &rsp, &vs)) continue;
+        if (pid != leader_pid) continue;
+        serial64_puts("NOVARIS64: [stack] slot ");
+        serial64_putdec((uint64_t)t);
+        serial64_puts(" on ");
+        serial64_puthex(wait);
+        serial64_puts(" teb ");
+        serial64_puthex(gs);
+        if (gs && peek_u64(&vs, gs + 0x378, &fp) && fp &&
+            peek_u64(&vs, fp + 0x70, &rip) && peek_u64(&vs, fp + 0x88, &ursp)) {
+            peek_u64(&vs, fp + 0xb0, &id);
+            serial64_puts(" syscall ");
+            serial64_puthex(id & 0xffffffffu);
+            serial64_puts(" from ");
+            put_code(rip);
+            if (module_of(rip) >= 0) used_mod[module_of(rip)] = 1;
+        }
+        serial64_putc('\n');
+        /* The Windows stack above the call, then the Unix one. */
+        for (int pass = 0; pass < 2; pass++) {
+            uint64_t base = pass ? rsp : ursp;
+            hits = 0;
+            if (!base) continue;
+            for (uint64_t a = base & ~7ULL; a < (base & ~7ULL) + 0x4000 && hits < 24;
+                 a += 8) {
+                uint64_t v;
+                int m;
+                if (!peek_u64(&vs, a, &v)) break;
+                m = module_of(v);
+                if (m < 0) continue;
+                used_mod[m] = 1;
+                serial64_puts(pass ? "NOVARIS64: [stack]   u " :
+                                     "NOVARIS64: [stack]   w ");
+                put_code(v);
+                serial64_putc('\n');
+                hits++;
+            }
+        }
+    }
+    for (int i = 0; i < nmods; i++) {
+        if (!used_mod[i]) continue;
+        serial64_puts("NOVARIS64: [stack] m");
+        serial64_putdec((uint64_t)i);
+        serial64_putc(' ');
+        serial64_puthex(mods[i].va);
+        serial64_putc(' ');
+        serial64_puts(mods[i].path);
+        serial64_putc('\n');
+    }
+}
+
 static uint64_t syscall64_dispatch_inner(syscall64_args_t* args) {
     uint64_t r;
 
@@ -1646,7 +1777,11 @@ static uint64_t syscall64_dispatch_inner(syscall64_args_t* args) {
         enter_user_mode64_abort();                     /* never returns */
     }
 
-    if (!trace) return dispatch(args);
+    if (!trace) {
+        r = dispatch(args);
+        note_module(args, r);
+        return r;
+    }
 
     /* A call that is being restarted is not a new call, and printing it
      * again says nothing that the first line did not. It matters here

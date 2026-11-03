@@ -215,6 +215,20 @@ void sched64_dump_blocked(void) {
     serial64_puts(" runnable\n");
 }
 
+/* Enough of a task to read its stacks from outside: its process, what
+ * it waits on, its GS base - a Wine thread's TEB - its ring-3 stack
+ * pointer and its address space. 0 if the slot is empty. */
+int sched64_task_peek(int i, int* pid, uint64_t* wait, uint64_t* gs,
+                      uint64_t* rsp, vmspace64_t* space) {
+    if (i < 0 || i >= SCHED64_MAX_TASKS || !tasks[i].used) return 0;
+    *pid   = tasks[i].pid;
+    *wait  = tasks[i].blocked ? tasks[i].wait_addr : 0;
+    *gs    = tasks[i].gs_base;
+    *rsp   = tasks[i].regs.rsp;
+    *space = tasks[i].space;
+    return 1;
+}
+
 /* What slot `i` is blocked on, or 0 if it is not blocked. Lets a layer
  * that knows what the wait keys mean - syscall64.c owns PIPE64_WAIT_KEY
  * - say something useful about them. */
