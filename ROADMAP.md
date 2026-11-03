@@ -10433,6 +10433,110 @@ guessed - the syscalls it asks this kernel for and does not get:
 and Chromium is a process tree.
 
 
+## Milestone 93 - headless Chromium prints the page
+
+`chrome.exe --headless --dump-dom "data:text/html,<p>novaris</p>"`
+prints `<html><head></head><body><p>novaris</p></body></html>` and
+exits 0, under Wine 11 on this kernel - the same bytes the Linux host
+prints from the same Chromium (r1698704, 156.0.8062.0). About 210
+seconds of guest time from exec to exit under TCG, against 22 on the
+host.
+
+Every stop on the way was a kernel bug, found by reading what the
+stopped run said about itself rather than by guessing, and fixed in the
+kernel rather than worked around in Wine or Chromium. In the order the
+runs hit them:
+
+- **Children gave up after 15 seconds.** A Chromium child exits 0 if the
+  browser has not finished the Mojo handshake by then, and under
+  emulation it had not. `--ipc-connection-timeout=600`, Chromium's own
+  switch, checked on the host to reach every child and change nothing.
+  Not a kernel bug - and not the fix either: the children then waited
+  the full 600 seconds, because of the rest of this list.
+- **Futex wakes crossed processes.** A private `FUTEX_WAKE` matched
+  waiters by address in every process; Wine puts ntdll at one address
+  everywhere, so a wake could be spent on another process's thread.
+  Private wakes now match only the waker's process.
+- **A futex sleeper woken by a signal returned to ring 3 without taking
+  it** - the futex wait resumes past its syscall, so nothing delivered
+  the signal. It is pointed back at the syscall now, whose re-run
+  returns EINTR and delivers on the way out. (Found by `shm64`'s new
+  check, not by Chromium.)
+- **No `NETLINK_ROUTE` socket.** glibc's `if_nameindex()` returned NULL,
+  and Wine's nsiproxy dereferences it without checking - in
+  winedevice.exe, holding `if_list_lock`. Every later
+  `GetAdaptersAddresses` in every process slept on that lock forever.
+  Found by teaching the deadline report to print each stuck thread's
+  Wine syscall frame and the return addresses above it, and symbolising
+  them against Chromium's published PDB: the browser's main thread was
+  in `Channel::WriteNextIpczMessage` waiting on a lock, three network
+  threads were in `GetAdaptersAddresses`, and winedevice had taken a
+  SIGSEGV at `nsiproxy.so+0x87d3`, `update_if_table`. The socket answers
+  `RTM_GETLINK` and `RTM_GETADDR` dumps with the loopback.
+- **A blocking pipe write over 64KB returned short.** A driver's IRP
+  output goes back to the wineserver inside one `writev`, and Wine treats
+  a short request write as fatal; winedevice lost its dispatch thread
+  with the browser's IRP in hand ("wine client error: write: Resource
+  temporarily unavailable"). Found with `TRACE64_COMM`, which traces one
+  process by name during a measured run. Blocking writes now sleep while
+  the pipe is full and finish.
+- **`MAP_SHARED` refused an offset**, so Wine fell back to reading a
+  section view into private memory - a snapshot that never saw the other
+  side's writes - and Chromium's children rejected their IPC as
+  `VALIDATION_ERROR_ILLEGAL_MEMORY_RANGE`. The test for it found that
+  fork also made shared pages copy-on-write; they carry `PAGE64_SHARED`
+  now and stay shared.
+- **Signal frames carried no x87/SSE state**, so a handler's use of xmm
+  or MXCSR leaked into the code it interrupted, and Wine found `fpregs`
+  NULL. The FXSAVE image is in the frame now and `rt_sigreturn`
+  restores it.
+- **6G was not enough.** Each renderer peaks at 740-790MB on the host
+  under the same Wine (its own copy of chrome.dll's code, and the
+  page-protection table of a 1.5TB reservation); the page's renderer was
+  the one that ran out. `QEMU_RAM` defaults to 12G when `CHROMIUM64_DIR`
+  is set.
+- **`mmap` handed out ranges Wine had already mapped.** A mapping the
+  kernel placed itself came from a bump pointer that knew nothing of
+  Wine's `MAP_FIXED` mappings, landed on live memory and zeroed it, and
+  Wine recorded two views of one range: renderers died on
+  `create_view: Assertion 'view->protect & VPROT_SYSTEM' failed`.
+  Placement now skips anything reserved or mapped.
+
+Each fix has a check that runs on the Linux host and in the guest:
+`shm64` (private futexes, a shared view at an offset, a child's write
+through an inherited shared mapping), `sock64` (`if_nameindex`,
+`getifaddrs`), `pipe64` (a 200000-byte `write` and a 70000-byte
+`writev`), `kill64` (xmm6 and MXCSR survive a handler) and `vmem64` (a
+placed mapping goes around one placed by hand).
+
+To reproduce, with Chromium unpacked beside the tree:
+
+```bash
+make -f Makefile.amd64 WINE64_INSTALL=1 \
+    CHROMIUM64_DIR=/path/to/chrome-win \
+    CHROMIUM64_FILES="chrome.exe chrome_elf.dll chrome.dll \
+      156.0.8062.0.manifest icudtl.dat v8_context_snapshot.bin \
+      resources.pak chrome_100_percent.pak chrome_200_percent.pak \
+      locales/en-US.pak" iso
+qemu-system-x86_64 -cdrom novaris64.iso -m 12G -display none \
+    -serial file:chrome.log -no-reboot
+```
+
+and look for `chrome = exit= 0 (0 = headless Chromium printed the page)`.
+
+**Still open from this round:**
+
+- The browser still rejects a few messages from its toolbar renderers
+  (`Message 2 rejected by interface blink.mojom.FrameWidgetHost` /
+  `blink.mojom.Widget`) and restarts them; the page's renderer is not
+  affected and the page prints. Something in the renderer-to-browser
+  direction is still arriving wrong.
+- A process killed by a fatal signal is not always noticed by the
+  wineserver: when the page's renderer ran out of memory in 6G, the
+  browser waited for it to the end of the run.
+- Running out of physical memory resets the machine instead of killing
+  a process (run 25b, and probably the unexplained reset in run 7).
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
@@ -10521,7 +10625,9 @@ list, and it is shorter than the one above but not smaller:
    things* needs, and that number is not yet measured.
 
 Then, and only then, Chrome's own requirements: a GPU it has a flag to
-do without, and a sandbox it has a flag to do without.
+do without, and a sandbox it has a flag to do without. **Since Milestone
+93 a headless Chromium renders a page and prints its DOM**, with both
+flags, in a 12G guest.
 
 The honest distance: the Windows-side loader work (52, 53, 54) was real
 and necessary, but the bulk has been Linux-side throughout, and it is
