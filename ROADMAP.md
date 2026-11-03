@@ -10833,7 +10833,8 @@ much each would widen what runs:
    checked against the Linux host first - `userland/kill64.c` carries
    the expectations, 162 of them, and runs unchanged on both. The
    second run of both suites, a day later on a restarted host, gave the
-   same answers to the line: nothing in them is timing luck.
+   same verdicts and counts (only the timings moved), so none of it is
+   timing luck.
 
    The project is licensed under the PolyForm Noncommercial License
    1.0.0 since `c0f26a6` - see `License.md` at the top of the tree.
