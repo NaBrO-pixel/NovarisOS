@@ -602,14 +602,18 @@ static void run_wine_program(const void* image, uint64_t len,
                              const void* ld_image, uint64_t ld_len,
                              const char* const* env, vmspace64_t* kspace,
                              const char* label, const char* success,
-                             const char* program, uint64_t budget,
+                             const char* program,
+                             const char* const* args, uint64_t budget,
                              int trace)
 {
     const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
     const uint64_t STACK_PAGES = 128;
     const uint64_t EXE_BIAS    = 0x0000555555554000ULL;
     const uint64_t INTERP_BASE = 0x00007FFFF7000000ULL;
-    const char* argv[3];
+    /* uspace64_build_stack copies eight argv entries; two are wine and
+     * the program, so six are left for the program's own arguments. */
+    const char* argv[9];
+    int nargs = 0;
     elf64_info_t exe, interp;
     uint64_t rsp = 0, i;
     int rc, stack_ok = 1, pid, slot;
@@ -617,7 +621,11 @@ static void run_wine_program(const void* image, uint64_t len,
 
     argv[0] = "/usr/bin/wine";
     argv[1] = program;
-    argv[2] = 0;
+    while (args && args[nargs] && nargs < 6) {
+        argv[2 + nargs] = args[nargs];
+        nargs++;
+    }
+    argv[2 + nargs] = 0;
 
     serial64_puts("NOVARIS64: --- ");
     serial64_puts(label);
@@ -4951,6 +4959,23 @@ void kernel_main(uint32_t magic, void* mbi) {
 #define CHROME64_BUDGET_SECS 300u
 #endif
 
+/* What chrome.exe is asked to do: render one page headless and print its
+ * DOM to stdout, which here is COM1. A finished run's transcript then
+ * contains the page - "<p>novaris</p>" inside <body> - and that, not the
+ * exit code alone, is what says Chromium worked.
+ *
+ * --no-sandbox because Chromium's sandbox is a Windows security feature
+ * Wine does not provide; --disable-gpu because there is no GPU. Run on
+ * the Linux host under the same Wine, with its null display driver, this
+ * exact command prints the page and exits 0 in 22 seconds. */
+#ifndef CHROME64_URL
+#define CHROME64_URL "data:text/html,<p>novaris</p>"
+#endif
+static const char* const chrome_args[] = {
+    "--headless", "--no-sandbox", "--disable-gpu", "--dump-dom",
+    CHROME64_URL, 0
+};
+
     /* --- and then Windows programs, in the prefix just built --- *
              *
              * Both run in the prefix wineboot has just built, in the
@@ -4961,7 +4986,7 @@ void kernel_main(uint32_t magic, void* mbi) {
             run_wine_program(image, len, ld_image, ld_len, boot_env, &kspace,
                              "winegui", "a window was created and drawn",
                              "/usr/bin/x86_64-windows/winegui64.exe",
-                             60u * CLOCK64_HZ, 1);
+                             0, 60u * CLOCK64_HZ, 1);
 
             /* Before chrome, the questions chrome_elf asks. Cheap, and
              * it means a failing chrome run is read against measured
@@ -4970,7 +4995,7 @@ void kernel_main(uint32_t magic, void* mbi) {
             run_wine_program(image, len, ld_image, ld_len, boot_env, &kspace,
                              "chromeprobe", "every question answered",
                              "/usr/bin/x86_64-windows/chromeprobe64.exe",
-                             240u * CLOCK64_HZ, 1);
+                             0, 240u * CLOCK64_HZ, 1);
 
             /* And then the one this tree is aimed at.
              *
@@ -4985,8 +5010,8 @@ void kernel_main(uint32_t magic, void* mbi) {
              * because chrome.exe is only the launcher: chrome_elf loads
              * chrome.dll, and chrome.dll is 332MB. */
             run_wine_program(image, len, ld_image, ld_len, boot_env, &kspace,
-                             "chrome", "chrome.exe ran",
-                             "/opt/chromium/chrome.exe",
+                             "chrome", "headless Chromium printed the page",
+                             "/opt/chromium/chrome.exe", chrome_args,
                              CHROME64_BUDGET_SECS * CLOCK64_HZ, 0);
         }
     }

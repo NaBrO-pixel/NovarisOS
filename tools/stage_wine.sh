@@ -1,5 +1,5 @@
 #!/bin/bash
-# stage_wine.sh <wine-build-tree> <destination>
+# stage_wine.sh <wine-build-tree> <destination> [<extra-module-list>...]
 #
 # Lays a Wine installation out the way Wine expects to find one, so that
 # the loader can locate its own libraries from /proc/self/exe rather
@@ -28,6 +28,10 @@ set -u
 TREE="${1:-}"
 DEST="${2:-}"
 LIST="$(dirname "$0")/wine_prefix_modules.txt"
+# Further lists, in the same format, staged on top - a program that
+# needs more than a prefix does (tools/wine_chromium_modules.txt).
+shift 2 2>/dev/null
+EXTRA_LISTS="$*"
 
 if [ -z "$TREE" ] || [ -z "$DEST" ]; then
     echo "usage: stage_wine.sh <wine-build-tree> <destination>" >&2
@@ -377,7 +381,7 @@ while IFS= read -r name; do
     else
         missing="$missing $name"
     fi
-done < "$LIST"
+done < <(cat "$LIST" $EXTRA_LISTS)
 
 # The kernel drivers, which are PE modules like the rest and are not on
 # the list because the list was written from what a prefix run opened

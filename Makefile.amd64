@@ -600,6 +600,14 @@ CHROMIUM64_DIR ?=
 # "Bad EXE format" that replaced it (Milestone 91). chrome.exe now
 # reaches chrome.dll, maps it and parses it as a PE.
 CHROMIUM64_FILES ?= chrome.exe chrome_elf.dll
+# What a headless run opens, measured with strace on the Linux host
+# against the same Wine: the launcher, chrome.dll, the version manifest,
+# ICU, the V8 snapshot and four .pak files - 358MB. Everything else in
+# the 808MB build is opened at most once and optional. Use it as
+#   CHROMIUM64_FILES="$(CHROMIUM64_HEADLESS)"
+CHROMIUM64_HEADLESS = chrome.exe chrome_elf.dll chrome.dll \
+    156.0.8062.0.manifest icudtl.dat v8_context_snapshot.bin resources.pak \
+    chrome_100_percent.pak chrome_200_percent.pak locales/en-US.pak
 # `../wine` is here because a Wine configured in its own source tree puts
 # the loader in exactly the same places as an out-of-tree build does, and
 # looking only for the out-of-tree name fails silently: the recipe below
@@ -640,7 +648,7 @@ $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
            $(BUILD_DIR)/forkchild64.elf userland/mkinitrd.py \
            $(BUILD_DIR)/winegui64.exe $(BUILD_DIR)/chromeprobe64.exe \
            tools/stage_wine.sh tools/wine_prefix_modules.txt \
-           $(INITRD_CONFIG)
+           tools/wine_chromium_modules.txt $(INITRD_CONFIG)
 	rm -rf $(INITRD_STAGE)
 	mkdir -p $(INITRD_STAGE)
 	cp $(BUILD_DIR)/dlllib64.dll $(INITRD_STAGE)/dlllib64.dll
@@ -701,9 +709,13 @@ $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
 	@# Off unless asked for: it is 64MB of initrd and every ordinary
 	@# test run would pay for it. Turn it on with
 	@#     make -f Makefile.amd64 WINE64_INSTALL=1 test-wine-prefix
+	@# With Chromium staged, the Wine modules it loads beyond a prefix's
+	@# go in too - tools/wine_chromium_modules.txt, measured on the host.
 	@if [ -n "$(WINE64_INSTALL)" ] && [ -x "$(WINE64_LOADER)" ]; then \
 	    bash tools/stage_wine.sh "$(dir $(WINE64_LOADER)).." \
-	        $(INITRD_STAGE) || exit 1; \
+	        $(INITRD_STAGE) \
+	        $(if $(CHROMIUM64_DIR),tools/wine_chromium_modules.txt) \
+	        || exit 1; \
 	 fi
 	@# Beside the rest of the PE modules, which is where Wine looks for
 	@# a builtin - so it is found by name without a path.
