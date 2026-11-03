@@ -5013,6 +5013,14 @@ static const char* const chrome_args[] = {
      * them: Chromium itself fails a CHECK with it. */
     "--in-process-gpu", "--enable-features=NetworkServiceInProcess2",
     "--disable-breakpad",
+    /* A child process gives the browser 15 seconds to finish the mojo
+     * handshake and then exits with status 0 - "Terminating current
+     * process after 15 seconds with no connection". Under emulation the
+     * browser is not done with its own startup by then: the storage
+     * service and every renderer quit cleanly and the browser waited on
+     * them forever. The switch is Chromium's own and is passed on to the
+     * children it starts. */
+    "--ipc-connection-timeout=600",
 #ifdef CHROME64_VERBOSE
     /* Chromium's own account of itself, children included: 616 lines
      * for a whole successful run on the Linux host, so the serial port
