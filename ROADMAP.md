@@ -10821,7 +10821,7 @@ much each would widen what runs:
 
    Nothing is left on the 64-bit open list from this round.
 
-   **Where it stands, verified at `674c22a`:**
+   **Where it stands, verified at `674c22a` and again at `5feb148`:**
    `make -f Makefile.amd64 WINE64_INSTALL=1 test` is 26/26 PASS; the
    bring-up's own checks are 855 `ok` and no `FAIL`, with wineboot,
    winegui and chromeprobe exiting 0 and 0 SIGSEGVs between them; and
@@ -10831,7 +10831,12 @@ much each would widen what runs:
    `test-desktop`, `test-wine-gui`, `test-desktop-gui`,
    `test-wine-prefix`) in about an hour. Every new syscall above was
    checked against the Linux host first - `userland/kill64.c` carries
-   the expectations, 162 of them, and runs unchanged on both.
+   the expectations, 162 of them, and runs unchanged on both. The
+   second run of both suites, a day later on a restarted host, gave the
+   same answers to the line: nothing in them is timing luck.
+
+   The project is licensed under the PolyForm Noncommercial License
+   1.0.0 since `c0f26a6` - see `License.md` at the top of the tree.
 
    Two habits that paid for themselves here, worth keeping. A new test
    is booted once against a kernel with the fix taken out, to see it
