@@ -10509,6 +10509,10 @@ through an inherited shared mapping), `sock64` (`if_nameindex`,
 `writev`), `kill64` (xmm6 and MXCSR survive a handler) and `vmem64` (a
 placed mapping goes around one placed by hand).
 
+With all of it in, `make -f Makefile.amd64 WINE64_INSTALL=1 test` is
+still 26/26 PASS (verified at `51e42ed`), with winegui and chromeprobe
+exiting 0.
+
 To reproduce, with Chromium unpacked beside the tree:
 
 ```bash
