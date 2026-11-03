@@ -989,6 +989,9 @@ static uint64_t sendmsgs, recvmsgs, fds_passed, renames, shared_maps;
 /* The process a layer started, as opposed to anything it spawned. See
  * syscall64_set_leader. */
 static int leader_pid = -1;
+/* The last leader, which the deadline report still needs after the
+ * layer has disarmed leader_pid. */
+static int report_pid = -1;
 
 /* A wall-clock bound on a run, in timer ticks, or 0. See
  * syscall64_set_run_ticks. */
@@ -1333,6 +1336,7 @@ void syscall64_set_trace(int on) { trace = on; }
  * shell does. -1 restores the old behaviour. */
 void syscall64_set_leader(int pid) {
     leader_pid = pid;
+    if (pid >= 0) report_pid = pid;
     /* Only *arming* clears the verdict, for exactly the reason spelled
      * out under set_run_ticks below - and this is the same bug, which
      * was fixed there and left here.
@@ -1648,7 +1652,10 @@ static void note_module(const syscall64_args_t* a, uint64_t r) {
     int node;
     uint64_t va;
 
+    static int mods_for = -1;
+
     if (leader_pid < 0 || proc64_current_pid() != leader_pid) return;
+    if (mods_for != leader_pid) { nmods = 0; mods_for = leader_pid; }
     if ((int64_t)r < 0 && (int64_t)r > -4096) return;
     if (a->nr == SYS64_MMAP && !(a->a4 & MAP_ANONYMOUS) && a->a6 == 0) {
         int64_t fd = (int64_t)a->a5;
@@ -1706,7 +1713,7 @@ static void put_code(uint64_t v) {
 void syscall64_report_leader_stacks(void) {
     static uint8_t used_mod[MODS_MAX];
 
-    if (leader_pid < 0) return;
+    if (report_pid < 0) return;
     for (int i = 0; i < MODS_MAX; i++) used_mod[i] = 0;
     for (int t = 0; t < SCHED64_MAX_TASKS; t++) {
         int pid, hits = 0;
@@ -1714,7 +1721,7 @@ void syscall64_report_leader_stacks(void) {
         vmspace64_t vs;
 
         if (!sched64_task_peek(t, &pid, &wait, &gs, &rsp, &vs)) continue;
-        if (pid != leader_pid) continue;
+        if (pid != report_pid) continue;
         serial64_puts("NOVARIS64: [stack] slot ");
         serial64_putdec((uint64_t)t);
         serial64_puts(" on ");
