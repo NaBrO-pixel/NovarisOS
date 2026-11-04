@@ -10528,13 +10528,33 @@ qemu-system-x86_64 -cdrom novaris64.iso -m 12G -display none \
 
 and look for `chrome = exit= 0 (0 = headless Chromium printed the page)`.
 
+**The rejected Mojo messages, since fixed.** With the page printing, the
+browser still rejected a few messages from its toolbar renderers
+(`Message 2 rejected by interface blink.mojom.FrameWidgetHost` and
+`blink.mojom.Widget` - `SetHasTouchEventConsumers`, and the reply to
+`UpdateScreenRects`) and closed the omnibox popup with reason `kCrash`.
+Nothing was arriving wrong: every rejection came straight after a toolbar
+renderer exited with status 1, `RESULT_CODE_KILLED`, and the rejected
+messages were ones it still had in flight. The browser was killing them,
+for two reasons:
+
+- **It thought it had no memory.** Wine learns free memory on Linux only
+  from `/proc/meminfo` and reports none available without it - of a
+  total it does get, from `sysinfo` - so Chromium saw 12G installed and
+  0 bytes free and discarded pages every five seconds (`Discarding
+  multiple pages`, 21 a run). The kernel writes `/proc/meminfo` fresh on
+  every open now; `vmem64` checks it, and `chromeprobe` prints
+  `GlobalMemoryStatusEx` in every boot. After it, `Memory.PressureLevel2`
+  is 0 in all 262 samples.
+- **The hang monitor**, which kills a renderer that has not acked an
+  update in 30 seconds. Under TCG the omnibox popup's renderer can take
+  longer than that to start - one lived 32 seconds and made 40,391
+  syscalls, so it was busy, not stuck. `--disable-hang-monitor`,
+  Chromium's own switch, checked on the host to change nothing. Run 31:
+  no rejected messages, no `kCrash`, no renderer killed, page printed.
+
 **Still open from this round:**
 
-- The browser still rejects a few messages from its toolbar renderers
-  (`Message 2 rejected by interface blink.mojom.FrameWidgetHost` /
-  `blink.mojom.Widget`) and restarts them; the page's renderer is not
-  affected and the page prints. Something in the renderer-to-browser
-  direction is still arriving wrong.
 - A process killed by a fatal signal is not always noticed by the
   wineserver: when the page's renderer ran out of memory in 6G, the
   browser waited for it to the end of the run.
