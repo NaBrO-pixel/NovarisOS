@@ -270,6 +270,28 @@ int main(void)
         if (one != MAP_FAILED) munmap(one, 4096);
     }
 
+    /* --- /proc/meminfo ------------------------------------------------- *
+     *
+     * Wine's only source for free memory on Linux. Without it Wine
+     * reports none available, and a headless Chromium believed it was
+     * under critical memory pressure and killed its own renderers. */
+    {
+        FILE *f = fopen("/proc/meminfo", "r");
+        unsigned long long total = 0, freek = 0, avail = 0, v;
+        char line[128];
+
+        ok("/proc/meminfo opens", f != NULL);
+        while (f && fgets(line, sizeof(line), f)) {
+            if (sscanf(line, "MemTotal: %llu kB", &v) == 1) total = v;
+            else if (sscanf(line, "MemFree: %llu kB", &v) == 1) freek = v;
+            else if (sscanf(line, "MemAvailable: %llu kB", &v) == 1) avail = v;
+        }
+        if (f) fclose(f);
+        ok("and says how much memory there is", total > 0);
+        ok("and how much of it is free", freek > 0 && freek <= total);
+        ok("and available", avail > 0 && avail <= total);
+    }
+
     printf("vmem64: %d failures\n", failures);
     return failures ? 1 : 101;
 }

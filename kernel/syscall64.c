@@ -1074,7 +1074,61 @@ static int64_t fd_read_bytes(const syscall64_args_t* args, uint64_t nr,
     return r;
 }
 
+/* /proc/meminfo, written fresh every time it is opened.
+ *
+ * Wine has no other way to learn how much memory is free on Linux: its
+ * NtQuerySystemInformation reads MemFree, MemAvailable, Buffers and
+ * Cached out of this file and nothing else, and without it reports zero
+ * bytes available - of a total it does get, from sysinfo. A headless
+ * Chromium asked GlobalMemoryStatusEx, was told it had 12GB and none of
+ * it free, decided it was under critical memory pressure, and discarded
+ * pages every five seconds: it killed its own toolbar renderers
+ * (RESULT_CODE_KILLED, exit 1), rejected the messages they still had in
+ * flight ("Message 2 rejected by interface blink.mojom.FrameWidgetHost")
+ * and reported the omnibox popup as crashed.
+ *
+ * The fields are Linux's, in kB. Free memory is what the frame
+ * allocator has; this kernel keeps no page cache and no swap, so
+ * MemAvailable is the same number and the rest are zero. */
+static char* put_kb_line(char* o, const char* name, uint64_t kb) {
+    char digits[24];
+    int n = 0;
+    while (*name) *o++ = *name++;
+    do { digits[n++] = (char)('0' + kb % 10); kb /= 10; } while (kb);
+    for (int pad = 15 - n; pad > 0; pad--) *o++ = ' ';
+    while (n) *o++ = digits[--n];
+    *o++ = ' '; *o++ = 'k'; *o++ = 'B'; *o++ = '\n';
+    return o;
+}
+
+static void refresh_meminfo(void) {
+    static char text[512];
+    uint64_t total = pmm64_total_frames() * (PAGE64_SIZE / 1024);
+    uint64_t freek = pmm64_free_frames() * (PAGE64_SIZE / 1024);
+    char* o = text;
+    int node;
+
+    o = put_kb_line(o, "MemTotal:", total);
+    o = put_kb_line(o, "MemFree:", freek);
+    o = put_kb_line(o, "MemAvailable:", freek);
+    o = put_kb_line(o, "Buffers:", 0);
+    o = put_kb_line(o, "Cached:", 0);
+    o = put_kb_line(o, "SwapTotal:", 0);
+    o = put_kb_line(o, "SwapFree:", 0);
+
+    node = ramfs64_lookup("/proc/meminfo");
+    if (node < 0) {
+        ramfs64_mkdirp("/proc");
+        node = ramfs64_create("/proc/meminfo", 0);
+        if (node < 0) return;
+        ramfs64_set_mode(node, 0444);
+    }
+    ramfs64_truncate(node);
+    ramfs64_write(node, 0, text, (uint64_t)(o - text));
+}
+
 static uint64_t do_open(const char* path, uint64_t flags, uint32_t mode) {
+    if (kstrcmp(path, "/proc/meminfo") == 0) refresh_meminfo();
     int node = ramfs64_lookup(path);
     int fd;
 
