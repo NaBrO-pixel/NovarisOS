@@ -5025,6 +5025,18 @@ static const char* const chrome_args[] = {
      * them forever. The switch is Chromium's own and is passed on to the
      * children it starts. */
     "--ipc-connection-timeout=600",
+    /* The same lesson for the hang monitor, which kills a renderer that
+     * has not answered an input or visual-properties update in thirty
+     * seconds. Under TCG a renderer for the toolbar's omnibox popup can
+     * take longer than that just to start - one lived 32 seconds and
+     * made 40,391 syscalls before the browser killed it, so it was busy,
+     * not stuck. The browser counted it (Renderer.Unresponsive,
+     * BrowserRenderProcessHost.ChildKills), rejected the messages it
+     * still had in flight - "Message 2 rejected by interface
+     * blink.mojom.Widget", UpdateScreenRects' reply - and closed the
+     * popup with reason kCrash, three times a run. Chromium's own switch,
+     * checked on the Linux host to change nothing about the page. */
+    "--disable-hang-monitor",
 #ifdef CHROME64_VERBOSE
     /* Chromium's own account of itself, children included: 616 lines
      * for a whole successful run on the Linux host, so the serial port

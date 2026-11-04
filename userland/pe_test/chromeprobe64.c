@@ -228,6 +228,30 @@ int main( void )
     }
     fflush( stdout );
 
+    /* --- memory, as Chromium's pressure monitor reads it ------------- *
+     *
+     * Chromium decides whether the machine is short of memory from
+     * GlobalMemoryStatusEx, and under "critical" it discards hidden pages
+     * on its own - a toolbar's renderer, which it then reports as
+     * crashed. Wine answers from /proc/meminfo, so this is where a
+     * kernel's figures become Chromium's. */
+    {
+        MEMORYSTATUSEX ms;
+        ms.dwLength = sizeof(ms);
+        if (GlobalMemoryStatusEx( &ms ))
+        {
+            printf( "     memory load %lu%%, phys %lluMB of %lluMB free, "
+                    "pagefile %lluMB of %lluMB free, virtual %lluGB free\n",
+                    ms.dwMemoryLoad, ms.ullAvailPhys >> 20, ms.ullTotalPhys >> 20,
+                    ms.ullAvailPageFile >> 20, ms.ullTotalPageFile >> 20,
+                    ms.ullAvailVirtual >> 30 );
+            printf( "%s  GlobalMemoryStatusEx says some memory is free\n",
+                    ms.ullAvailPhys && ms.ullAvailPhys <= ms.ullTotalPhys ? "ok " : "bad" );
+        }
+        else printf( "bad  GlobalMemoryStatusEx failed, %lu\n", GetLastError() );
+        fflush( stdout );
+    }
+
     say( "chromeprobe64: survived" );
     return 0;
 }
