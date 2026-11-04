@@ -5031,6 +5031,9 @@ static const char* const chrome_args[] = {
      * can carry it, and it can be read against that run line by line. */
     "--enable-logging=stderr", "--v=1",
 #endif
+#ifdef CHROME64_VMODULE
+    "--vmodule=" CHROME64_VMODULE,
+#endif
     "--dump-dom", CHROME64_URL, 0
 };
 
