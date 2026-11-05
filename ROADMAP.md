@@ -10553,13 +10553,28 @@ for two reasons:
   Chromium's own switch, checked on the host to change nothing. Run 31:
   no rejected messages, no `kCrash`, no renderer killed, page printed.
 
-**Still open from this round:**
+**Still open from this round:** nothing. The two items that were:
 
-- A process killed by a fatal signal is not always noticed by the
-  wineserver: when the page's renderer ran out of memory in 6G, the
-  browser waited for it to the end of the run.
-- Running out of physical memory resets the machine instead of killing
-  a process (run 25b, and probably the unexplained reset in run 7).
+- **"A process killed by a fatal signal is not noticed."** It is: a death
+  by signal does what `exit_group` does - every file closed, the exit
+  recorded, a waiting parent woken - and `kill64` now checks it from
+  outside (a multi-threaded child killed with SIGKILL is end of file on
+  its pipe and its socket, and SIGKILL to `wait`). What looked like the
+  wineserver missing a death was Chromium's own behaviour: on the Linux
+  host, `kill -9` of the page's renderer leaves headless Chromium waiting
+  to its timeout too. Checking found `recv`/`send` refused on stream
+  sockets; they are `read`/`write` with flags now.
+- **"Running out of memory resets the machine."** It did not, in either
+  run blamed. Run 25b had 130,413 frames free and no `[oom]` line when it
+  stopped - two 6G guests on a 15G host, and the host ended that QEMU -
+  and run 25a's real exhaustion killed the renderer and carried on. But
+  the way it killed was wrong: no frame for a page a process was
+  entitled to was reported as a SIGSEGV, which Wine's handler retries and
+  which ends a bring-up layer outright. It is SIGKILL now, as from
+  Linux's OOM killer, in either ring, with an 8MB reserve kept for the
+  kernel's own page tables and heap during the teardown. `vmem64` fills a
+  2G guest and checks the filler dies of SIGKILL and its memory comes
+  back.
 
 ## Where chrome.exe actually is from here
 
