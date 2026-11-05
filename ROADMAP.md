@@ -10553,6 +10553,15 @@ for two reasons:
   Chromium's own switch, checked on the host to change nothing. Run 31:
   no rejected messages, no `kCrash`, no renderer killed, page printed.
 
+**And it got four times faster.** `pmm64_free_frames` counted the
+whole frame bitmap - 400KB in a 12G machine - every time anything asked,
+and once the OOM reserve asked on every page a process touched, a run
+took over an hour. The allocator keeps the count as frames change hands
+now (a bring-up check compares it with a scan). With that, the whole 12G
+boot - prefix, wineboot, winegui, chromeprobe and Chromium printing the
+page - takes 414 seconds where it took about 25 minutes, and
+`make -f Makefile.amd64 WINE64_INSTALL=1 test` is 26/26 in 223 seconds.
+
 **Still open from this round:** nothing. The two items that were:
 
 - **"A process killed by a fatal signal is not noticed."** It is: a death
