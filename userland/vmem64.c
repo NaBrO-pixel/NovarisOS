@@ -334,9 +334,11 @@ int main(void)
                 ok("and its memory comes back for the next one", good);
                 if (q != MAP_FAILED) munmap(q, span);
             }
-        } else {
-            printf("skip a process that fills memory (MemTotal %llu kB)\n", total);
         }
+        /* Skipped silently otherwise: the suite runs this same binary on
+         * the build host and requires every line the host prints to
+         * appear in the guest's transcript too, and a host line carrying
+         * the host's memory size never would. */
     }
 
     printf("vmem64: %d failures\n", failures);
