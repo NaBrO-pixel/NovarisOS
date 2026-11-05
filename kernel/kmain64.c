@@ -969,6 +969,10 @@ void kernel_main(uint32_t magic, void* mbi) {
         check("a second frame was allocated", f2 != 0);
         check("the two are different frames", f1 != f2);
         check("frames are page aligned", (f1 % PMM64_FRAME_SIZE) == 0);
+    /* The free count is kept as frames change hands rather than counted;
+     * it has to be the number the bitmap itself gives. */
+    check("the running free count is the bitmap's",
+          pmm64_free_frames() == pmm64_free_frames_scanned());
         /* The first megabyte and the kernel's own image are the two things
          * that must never be handed out; a bug in the reserve pass shows
          * up here rather than as corruption three milestones later. */

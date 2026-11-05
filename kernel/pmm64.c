@@ -72,11 +72,22 @@ static uint64_t alloc_hint;              /* where the last upward scan left off 
 static uint64_t high_hint;               /* and the downward one */
 static int      ready;
 
+/* How many of the frame_count frames are marked used, kept as the bits
+ * change rather than counted when asked. Counting meant reading the
+ * whole bitmap - 400KB in a 12G machine - and the out-of-memory reserve
+ * asks on every page a process touches: a headless Chromium run went
+ * from 25 minutes to over an hour on that alone. */
+static uint64_t used_count;
+
 static inline void bitmap_set(uint64_t bit) {
-    bitmap[bit >> 3] |= (uint8_t)(1u << (bit & 7));
+    uint8_t m = (uint8_t)(1u << (bit & 7));
+    if (!(bitmap[bit >> 3] & m) && bit < frame_count) used_count++;
+    bitmap[bit >> 3] |= m;
 }
 static inline void bitmap_clear(uint64_t bit) {
-    bitmap[bit >> 3] &= (uint8_t)~(1u << (bit & 7));
+    uint8_t m = (uint8_t)(1u << (bit & 7));
+    if ((bitmap[bit >> 3] & m) && bit < frame_count) used_count--;
+    bitmap[bit >> 3] &= (uint8_t)~m;
 }
 static inline int bitmap_test(uint64_t bit) {
     return bitmap[bit >> 3] & (uint8_t)(1u << (bit & 7));
@@ -218,6 +229,7 @@ void pmm64_init(const multiboot_info_t* mbi,
      * The reverse - assume free, mark the exceptions - hands out MMIO and
      * firmware whenever the map has a hole nobody described. */
     for (uint64_t i = 0; i < bitmap_size_bytes; i++) bitmap[i] = 0xFF;
+    used_count = frame_count;
     for_each_available(mbi, free_region);
 
     /* The first megabyte is never ours: real-mode IVT, BDA, VGA, and the
@@ -400,6 +412,13 @@ uint64_t pmm64_total_frames(void) { return ready ? frame_count : 0; }
  * 12% of the whole boot. A used byte - the common case at the bottom of
  * memory - costs one test, and the rest a table lookup. */
 uint64_t pmm64_free_frames(void) {
+    if (!ready) return 0;
+    return frame_count - used_count;
+}
+
+/* The same number counted from the bitmap itself, which is what the
+ * running count above has to agree with - the bring-up checks it. */
+uint64_t pmm64_free_frames_scanned(void) {
     static const uint8_t used_bits[16] = {
         0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4
     };

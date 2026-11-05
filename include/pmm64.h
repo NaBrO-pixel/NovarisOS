@@ -50,6 +50,7 @@ void     pmm64_reserve_region(uint64_t start_addr, uint64_t end_addr);
 
 uint64_t pmm64_total_frames(void);
 uint64_t pmm64_free_frames(void);
+uint64_t pmm64_free_frames_scanned(void);
 uint64_t pmm64_used_frames(void);
 uint64_t pmm64_double_frees(void);
 
