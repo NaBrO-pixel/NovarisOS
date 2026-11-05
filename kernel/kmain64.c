@@ -373,6 +373,8 @@ void kmain64_fault_stats(uint64_t* faults, uint64_t* cow, uint64_t* segv) {
 }
 
 static void page_fault_handler(registers64_t* r) {
+    /* Only this fault's own refusal may count as running out. */
+    (void)pmm64_take_user_oom();
     pf_hits++;
     pf_cr2 = read_cr2();
     pf_err = r->err_code;
@@ -426,6 +428,16 @@ static void page_fault_handler(registers64_t* r) {
         cow_breaks++;
         return;
     }
+
+    /* Either of those failing for want of a frame is not a fault in the
+     * program, and neither ring gets a SIGSEGV for it: the process is
+     * out of memory and ends the way Linux ends it, with SIGKILL. A
+     * kernel-mode access to a user page lands here too - a syscall
+     * writing into a buffer never touched - and is the same process's
+     * problem, not the kernel's. */
+    if (pmm64_take_user_oom() && pf_cr2 < 0x0000800000000000ULL &&
+        proc64_current_pid() >= 0)
+        syscall64_oom_kill(pf_cr2);
 
     /* A ring-3 fault with a handler installed is the program's business,
      * not a kernel failure - it is how Wine turns a bad access into a

@@ -34,6 +34,8 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
+#include <stdlib.h>
 
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
@@ -290,6 +292,51 @@ int main(void)
         ok("and says how much memory there is", total > 0);
         ok("and how much of it is free", freek > 0 && freek <= total);
         ok("and available", avail > 0 && avail <= total);
+    }
+
+    /* --- running out of memory ------------------------------------------ *
+     *
+     * A process that touches more memory than the machine has is killed
+     * with SIGKILL, as Linux's OOM killer would, and the machine and
+     * everybody else carry on with the memory it held. This kernel used
+     * to call it a SIGSEGV - which Wine's handler retries, and which ends
+     * the run in a layer with no handler at all. Only where the machine
+     * is small enough to fill in a reasonable time. */
+    {
+        FILE *f = fopen("/proc/meminfo", "r");
+        unsigned long long total = 0, v;
+        char line[128];
+        while (f && fgets(line, sizeof(line), f))
+            if (sscanf(line, "MemTotal: %llu kB", &v) == 1) total = v;
+        if (f) fclose(f);
+
+        if (total && total <= 4ULL * 1024 * 1024) {
+            int status = 0;
+            pid_t kid = fork();
+            if (kid == 0) {
+                size_t span = 64ULL << 30;
+                volatile char *p = mmap(NULL, span, PROT_READ | PROT_WRITE,
+                                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                                        -1, 0);
+                if (p == MAP_FAILED) _exit(2);
+                for (size_t o = 0; o < span; o += 4096) p[o] = 1;
+                _exit(3);              /* touched 64GB: not this machine */
+            }
+            ok("a process that fills memory is killed with SIGKILL",
+               waitpid(kid, &status, 0) == kid && WIFSIGNALED(status) &&
+               WTERMSIG(status) == SIGKILL);
+            {
+                size_t span = 64 << 20;
+                char *q = mmap(NULL, span, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                int good = q != MAP_FAILED;
+                for (size_t o = 0; good && o < span; o += 4096) q[o] = 7;
+                ok("and its memory comes back for the next one", good);
+                if (q != MAP_FAILED) munmap(q, span);
+            }
+        } else {
+            printf("skip a process that fills memory (MemTotal %llu kB)\n", total);
+        }
     }
 
     printf("vmem64: %d failures\n", failures);

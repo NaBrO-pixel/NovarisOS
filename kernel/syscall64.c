@@ -1736,6 +1736,7 @@ static void leader_leaves_scheduler(void) {
 }
 
 static void die_by_signal(int sig);
+static uint64_t oom_kills;
 static void reclaim_report(const char* why, uint64_t before);
 
 /* Takes whatever the calling thread has pending and does not block, and
@@ -1848,6 +1849,43 @@ int syscall64_fault_kill(int sig, uint64_t rip, uint64_t addr) {
     enter_user_mode64_abort();                         /* never returns */
     return 1;
 }
+
+/* The out-of-memory kill.
+ *
+ * A page a process may have - in a range it reserved, touched for the
+ * first time, or a copy-on-write copy - and no frame to put behind it.
+ * That used to be reported as a SIGSEGV, which is the wrong signal for
+ * it: Wine installs a SIGSEGV handler, and a handler that returns retries
+ * the same access into the same empty allocator; and in a bring-up layer
+ * an unhandled fault ends the whole run, not the one process. Linux's
+ * answer is SIGKILL, which nothing catches, from its OOM killer.
+ *
+ * This kills the process that asked rather than the largest one, which
+ * is simpler than Linux and enough for the property that matters: the
+ * machine survives, the process's memory comes back, and whoever is
+ * waiting for it is told it died. The allocator refuses user frames
+ * while a reserve is left (PMM64_USER_RESERVE), so the kernel still has
+ * memory for the page tables and heap this teardown needs. */
+void syscall64_oom_kill(uint64_t addr) {
+    proc64_t* me = proc64_current();
+
+    serial64_puts("NOVARIS64: [oom-kill] pid ");
+    serial64_putdec((uint64_t)proc64_current_pid());
+    serial64_puts(" ");
+    serial64_puts(me ? me->comm : "?");
+    serial64_puts(" at ");
+    serial64_puthex(addr);
+    serial64_puts(", free=");
+    serial64_putdec(pmm64_free_frames());
+    serial64_puts("/");
+    serial64_putdec(pmm64_total_frames());
+    serial64_putc('\n');
+    oom_kills++;
+    die_by_signal(SIG64_KILLSIG);
+    enter_user_mode64_abort();                         /* never returns */
+}
+
+uint64_t syscall64_oom_kills(void) { return oom_kills; }
 
 uint64_t syscall64_dispatch(syscall64_args_t* args) {
     uint64_t r;
@@ -2260,9 +2298,15 @@ static int user_range_ok(uint64_t addr, uint64_t len) {
     if (addr + len < addr) return 0;                   /* wrapped */
     /* A page not there yet may be anonymous memory never touched: back
      * it now, so the caller can use the range as it stands. */
+    (void)pmm64_take_user_oom();
     for (p = addr & ~0xFFFULL; p < addr + len; p += 0x1000)
-        if (paging64_translate(p, &phys) != 0 && !uspace64_fault(p, 0))
+        if (paging64_translate(p, &phys) != 0 && !uspace64_fault(p, 0)) {
+            /* Not a bad pointer: no memory to put behind a good one.
+             * Linux's answer is the OOM killer, not an EFAULT the
+             * caller would retry. */
+            if (pmm64_take_user_oom()) syscall64_oom_kill(addr);
             return 0;
+        }
     return 1;
 }
 
@@ -4156,14 +4200,40 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
      * them too on Linux, but nothing here has asked. */
     case SYS64_SENDTO:
         if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
-        if (fds[a1].kind != FD64_NETLINK) return (uint64_t)-38;
-        return (uint64_t)nl_send((int)a1, (const void*)a2, a3);
+        if (fds[a1].kind == FD64_NETLINK)
+            return (uint64_t)nl_send((int)a1, (const void*)a2, a3);
+        /* A connected stream socket ignores the address, and send(2) is
+         * sendto with none: both are write(2) with flags. */
+        if (fd_is_stream((int)a1)) {
+            iovec64_t one = { (void*)a2, a3 };
+            if (args->a4 & 0x40) {                     /* MSG_DONTWAIT */
+                int64_t w = do_pipe_write((int)a1, (const void*)a2, a3);
+                return (uint64_t)w;
+            }
+            return (uint64_t)stream_write(args, nr, (int)a1, &one, 1);
+        }
+        return (uint64_t)-88;                          /* -ENOTSOCK */
 
     case SYS64_RECVFROM: {
         uint32_t nlen = 0;
         int64_t r;
         if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
-        if (fds[a1].kind != FD64_NETLINK) return (uint64_t)-38;
+        /* recv(2) is recvfrom with no address, and on a connected stream
+         * socket it is read(2) with flags - end of file included, which
+         * is how a peer learns the other end died. */
+        if (fds[a1].kind != FD64_NETLINK) {
+            int64_t rr;
+            if (!fd_is_stream((int)a1)) return (uint64_t)-88; /* -ENOTSOCK */
+            if (args->a4 & 0x40) {                     /* MSG_DONTWAIT */
+                if (fds[a1].rx < 0) return (uint64_t)-9;
+                rr = pipe64_read(fds[a1].rx, (void*)a2, a3);
+                if (rr > 0) sched64_wake(PIPE64_WAIT_KEY(fds[a1].rx),
+                                         SCHED64_MAX_TASKS);
+                return (uint64_t)rr;
+            }
+            if (args->a6 && user_range_ok(args->a6, 4)) *(uint32_t*)args->a6 = 0;
+            return (uint64_t)do_pipe_read(args, nr, (int)a1, (void*)a2, a3);
+        }
         if (args->a6) {
             if (!user_range_ok(args->a6, 4)) return (uint64_t)-14;
             nlen = *(uint32_t*)args->a6;

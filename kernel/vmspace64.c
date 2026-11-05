@@ -515,7 +515,7 @@ uint64_t vmspace64_user_frame(vmspace64_t* vs, uint64_t va, int write) {
         flags = ((e & ~ADDR_MASK) & ~(PAGE64_COW | PAGE64_COW_RW))
               | PAGE64_WRITE;
         if (pmm64_frame_owners(frame) > 1) {
-            uint64_t fresh = pmm64_alloc_high();
+            uint64_t fresh = pmm64_alloc_user();
             if (!fresh) return 0;
             kmemcpy(phys64_to_virt(fresh),
                     (const void*)phys64_to_virt(frame), PAGE64_SIZE);
@@ -571,7 +571,7 @@ int vmspace64_break_cow(uint64_t va) {
     flags = ((e & ~ADDR_MASK) & ~(PAGE64_COW | PAGE64_COW_RW)) | PAGE64_WRITE;
 
     if (pmm64_frame_owners(frame) > 1) {
-        uint64_t fresh = pmm64_alloc_high();
+        uint64_t fresh = pmm64_alloc_user();
         if (!fresh) return 0;
 
         kmemcpy(phys64_to_virt(fresh),

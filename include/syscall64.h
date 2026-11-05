@@ -485,4 +485,9 @@ int  syscall64_leader_exited(void);
  * Returns 0 when that does not apply, and the caller ends the run. */
 int syscall64_fault_kill(int sig, uint64_t rip, uint64_t addr);
 
+/* Ends the current process with SIGKILL because there was no memory to
+ * back a page it was entitled to - see syscall64.c. Does not return. */
+void syscall64_oom_kill(uint64_t addr);
+uint64_t syscall64_oom_kills(void);
+
 #endif

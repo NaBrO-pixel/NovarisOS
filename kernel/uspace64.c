@@ -194,7 +194,7 @@ uint64_t uspace64_lazy_faults(void) { return lazy_faults; }
 /* One fresh zeroed page at `va`, mapped with `flags`. 0 if memory ran
  * out, which is said once per page, with the numbers. */
 static int back_page(uint64_t va, uint64_t flags) {
-    uint64_t frame = pmm64_alloc_high();
+    uint64_t frame = pmm64_alloc_user();
     if (!frame) {
         serial64_puts("NOVARIS64: [oom] backing ");
         serial64_puthex(va);

@@ -283,6 +283,22 @@ uint64_t pmm64_alloc_frame(void) {
  * more than a single test that reaches high memory on purpose: the claim
  * "where a frame lives no longer matters" is only believable if the
  * ordinary path is the one exercising it. */
+static int user_oom;
+
+uint64_t pmm64_alloc_user(void) {
+    uint64_t f;
+    if (pmm64_free_frames() < PMM64_USER_RESERVE) { user_oom = 1; return 0; }
+    f = pmm64_alloc_high();
+    if (!f) user_oom = 1;
+    return f;
+}
+
+int pmm64_take_user_oom(void) {
+    int was = user_oom;
+    user_oom = 0;
+    return was;
+}
+
 uint64_t pmm64_alloc_high(void) {
     if (!ready) return 0;
     if (high_hint > frame_count) high_hint = frame_count;

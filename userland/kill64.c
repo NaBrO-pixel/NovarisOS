@@ -29,6 +29,7 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <poll.h>
 #include <sys/select.h>
@@ -226,6 +227,14 @@ static void fp_wrecker(int sig, siginfo_t *si, void *uc)
     fp_seen_fpregs = ((ucontext_t *)uc)->uc_mcontext.fpregs != NULL;
     __asm__ __volatile__("pcmpeqd %%xmm6, %%xmm6\n\tldmxcsr %0"
                          :: "m"(round_up) : "xmm6");
+}
+
+/* A second thread that just waits, so the child dies multi-threaded. */
+static void *sleeper(void *arg)
+{
+    (void)arg;
+    for (;;) pause();
+    return NULL;
 }
 
 int main(void)
@@ -1279,6 +1288,42 @@ int main(void)
         ok("and xmm6 is the interrupted code's again after it",
            back[0] == pattern[0] && back[1] == pattern[1]);
         ok("and so is MXCSR", mx_after == mx_before);
+    }
+
+    /* --- a death by signal is an ending, seen from outside --------------- *
+     *
+     * What a peer learns when a multi-threaded process is killed: end of
+     * file on the pipes and sockets it held, and a wait(2) that says
+     * SIGKILL. That is all the wineserver has to go on when a client
+     * dies, so it is what this checks - a process killed by a signal has
+     * to look exactly like one that exited. */
+    {
+        int pp[2], sp[2], status = 0;
+        char c;
+        pid_t kid;
+
+        ok("a pipe and a socketpair for the child",
+           pipe(pp) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
+        kid = fork();
+        if (kid == 0) {
+            pthread_t t;
+            close(pp[0]);
+            close(sp[0]);
+            pthread_create(&t, NULL, sleeper, NULL);
+            if (write(pp[1], "r", 1) != 1) _exit(4);
+            for (;;) pause();
+        }
+        close(pp[1]);
+        close(sp[1]);
+        ok("the child is up", read(pp[0], &c, 1) == 1);
+        kill(kid, SIGKILL);
+        ok("its death is end of file on the pipe", read(pp[0], &c, 1) == 0);
+        ok("and on the socket", recv(sp[0], &c, 1, 0) == 0);
+        ok("and wait says SIGKILL",
+           waitpid(kid, &status, 0) == kid && WIFSIGNALED(status) &&
+           WTERMSIG(status) == SIGKILL);
+        close(pp[0]);
+        close(sp[0]);
     }
 
     printf("kill64: %d failures\n", failures);
