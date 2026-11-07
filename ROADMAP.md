@@ -10585,6 +10585,39 @@ page - takes 414 seconds where it took about 25 minutes, and
   2G guest and checks the filler dies of SIGKILL and its memory comes
   back.
 
+## libNovaC - NovarisOS's own C library
+
+`userland/libnovac` is a freestanding C11 library for static x86-64
+NovarisOS programs: its own `_start`, stdio, allocator, strings, time,
+files, processes and now signals and exec, over the Linux syscall ABI the
+kernel implements and nothing else. It arrived as libNovaC 0.1
+(`f1ed518`, unchanged) and was brought up to date as 0.2:
+
+- `<signal.h>` - `signal`, `sigaction` with `SA_SIGINFO`, `raise`,
+  `kill`, `sigprocmask` and the set operations, with an `rt_sigreturn`
+  trampoline so a handler that returns resumes its caller.
+- `abort()` raises `SIGABRT`, so a parent sees a death by signal; 0.1
+  exited with status 134.
+- `execve`, `execv`, `execvp` (with a `PATH` search), and `setenv` and
+  `unsetenv`.
+- More errno values, `PATH_MAX`, a README.
+
+It is built by `Makefile.amd64` (its syscall numbers are checked against
+`include/syscall64.h` first), its target test runs as the "libNovaC"
+bring-up layer, and `make test` runs the same binary on the host and
+requires the guest to print every line the host does. The test execs
+`novac_child`, a second libNovaC program staged at `/tmp/novac_child`.
+
+Running it inside NovarisOS for the first time found four places the
+kernel differed from Linux, fixed in the kernel: `mkdir` on an existing
+path succeeded (it is `EEXIST` now, and `ENOENT`/`ENOTDIR` for a bad
+parent); `open` ignored `O_DIRECTORY` and `O_EXCL`; and a signal sent
+with `kill` or `tgkill` reached its handler with `siginfo` saying
+`SEGV_MAPERR` and no sender, where it now carries `SI_USER` or
+`SI_TKILL` and `si_pid`.
+
+`make -f Makefile.amd64 WINE64_INSTALL=1 test` is 27/27 with it in.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
