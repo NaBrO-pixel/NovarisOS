@@ -919,3 +919,62 @@ int inet64_proc_dev(char* out) {
     }
     return (int)(o - out);
 }
+
+/* Every socket at the deadline: what state the socket layer thinks it
+ * is in, what TCP thinks, and how much is waiting in its pipes. A page
+ * load that never finishes is either a connection that never completed
+ * or one whose news never reached the process polling it, and this says
+ * which. */
+void inet64_report(void) {
+    static const char* const names[] = { "free", "new", "listen", "connecting",
+                                         "connected", "done" };
+    int n = 0;
+    for (int i = 0; i < INET64_MAX; i++) {
+        isock_t* k = &socks[i];
+        if (k->state == S_FREE) continue;
+        n++;
+        serial64_puts("NOVARIS64: [inet] sock ");
+        serial64_putdec((uint64_t)i);
+        serial64_puts(k->type == INET64_DGRAM ? " udp " : " tcp ");
+        serial64_puts(names[k->state]);
+        serial64_puts(" refs ");
+        serial64_putdec((uint64_t)k->refs);
+        serial64_puts(" lport ");
+        serial64_putdec(k->lport);
+        serial64_puts(" peer ");
+        say_ip(k->rip);
+        serial64_putc(':');
+        serial64_putdec(k->rport);
+        if (k->tcp >= 0) {
+            serial64_puts(" tcpstate ");
+            serial64_putdec((uint64_t)tcp_state(k->tcp));
+            serial64_puts(" idle ");
+            serial64_putdec((uint64_t)tcp_tx_idle(k->tcp));
+            serial64_puts(" recvq ");
+            serial64_putdec(tcp_recv_ready(k->tcp));
+        }
+        if (k->rx >= 0) {
+            serial64_puts(" rx ");
+            serial64_putdec(pipe64_available(k->rx));
+            serial64_puts("/r");
+            serial64_putdec((uint64_t)pipe64_readers(k->rx));
+            serial64_puts(" tx ");
+            serial64_putdec(pipe64_available(k->tx));
+            serial64_puts("/w");
+            serial64_putdec((uint64_t)pipe64_writers(k->tx));
+        }
+        if (k->err) { serial64_puts(" err "); serial64_putdec((uint64_t)k->err); }
+        serial64_putc('\n');
+    }
+    serial64_puts("NOVARIS64: [inet] ");
+    serial64_putdec((uint64_t)n);
+    serial64_puts(" sockets; frames in ");
+    serial64_putdec(net_stats()->rx_frames);
+    serial64_puts(" out ");
+    serial64_putdec(net_stats()->tx_frames);
+    serial64_puts(", tcp retransmits ");
+    serial64_putdec(tcp_retransmits());
+    serial64_puts(", arp entries ");
+    serial64_putdec(net_arp_entries());
+    serial64_putc('\n');
+}

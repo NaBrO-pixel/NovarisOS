@@ -784,6 +784,7 @@ static void run_wine_program(const void* image, uint64_t len,
         syscall64_report_leader_stacks();
         syscall64_report_pipe_waits();
         syscall64_report_unread_pipes();
+        inet64_report();
     }
 
     serial64_puts("NOVARIS64: --- end of ");
