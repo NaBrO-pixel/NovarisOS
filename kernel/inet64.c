@@ -75,6 +75,37 @@ static uint16_t next_ephemeral = 32768;
 static uint64_t last_arp_refresh;
 static uint64_t events;
 
+#ifndef UDP_PORTS
+#define UDP_PORTS 8                 /* net.c's default, if not overridden */
+#endif
+
+/* A table that fills is said once, with how many of each kind are open,
+ * because what the program sees - ENFILE, ENOBUFS - surfaces far away:
+ * Wine could not map ENFILE and Chromium reported a page that failed to
+ * load with error 10014. */
+static void full_once(const char* what, int size) {
+    static int said;
+    int by_state[6] = { 0 };
+    if (said) return;
+    said = 1;
+    for (int i = 0; i < INET64_MAX; i++) by_state[socks[i].state]++;
+    serial64_puts("NOVARIS64: [inet] all ");
+    serial64_putdec((uint64_t)size);
+    serial64_puts(" ");
+    serial64_puts(what);
+    serial64_puts(" in use - sockets new ");
+    serial64_putdec((uint64_t)by_state[S_NEW]);
+    serial64_puts(" listening ");
+    serial64_putdec((uint64_t)by_state[S_LISTEN]);
+    serial64_puts(" connecting ");
+    serial64_putdec((uint64_t)by_state[S_CONNECTING]);
+    serial64_puts(" connected ");
+    serial64_putdec((uint64_t)by_state[S_CONNECTED]);
+    serial64_puts(" done ");
+    serial64_putdec((uint64_t)by_state[S_DONE]);
+    serial64_puts("\n");
+}
+
 static void wake_all(void) {
     events++;
     sched64_wake(INET64_WAIT_KEY, SCHED64_MAX_TASKS);
@@ -431,6 +462,7 @@ int inet64_socket(int type) {
         k->rx = k->tx = -1;
         return i;
     }
+    full_once("sockets", INET64_MAX);
     return -23;                                        /* -ENFILE */
 }
 
@@ -489,7 +521,10 @@ static uint16_t ephemeral(int type) {
 static int udp_attach(isock_t* k) {
     if (k->udp_bound) return 0;
     if (!k->lport) k->lport = ephemeral(INET64_DGRAM);
-    if (!k->lport || !net_udp_bind(k->lport)) return -105;   /* -ENOBUFS */
+    if (!k->lport || !net_udp_bind(k->lport)) {
+        full_once("UDP ports", UDP_PORTS);
+        return -105;                                   /* -ENOBUFS */
+    }
     k->udp_bound = 1;
     return 0;
 }
@@ -603,7 +638,10 @@ int inet64_connect(int s, uint32_t ip, uint16_t port) {
 
     h = tcp_connect(ip, port);
     if (h == -1) return -101;
-    if (h < 0) return -105;                            /* table full */
+    if (h < 0) {                                       /* table full */
+        full_once("TCP connections", TCP_MAX_CONNECTIONS);
+        return -105;
+    }
     k->tcp = h;
     k->rip = ip;
     k->rport = port;

@@ -50,9 +50,12 @@ CFLAGS = -std=gnu99 -ffreestanding -fno-builtin -fno-stack-protector \
 
 # The network stack's tables (kernel/net.c, tcp.c), which are sized for
 # the 32-bit kernel's one shell command at a time. A browser opens more
-# than four connections.
-NET64_SIZES = -DTCP_MAX_CONNECTIONS=48 -DTCP_RECV_BUFFER=16384 \
-              -DTCP_MAX_LISTEN=16 -DUDP_PORTS=32 -DUDP_QUEUE=16
+# than four connections - and 48 connections and 32 UDP ports were not
+# enough either: Chromium's DNS lookups and update checks, with the
+# wineserver holding a copy of every socket, filled a 64-socket table,
+# and the page it was asked to load failed with ENFILE.
+NET64_SIZES = -DTCP_MAX_CONNECTIONS=128 -DTCP_RECV_BUFFER=16384 \
+              -DTCP_MAX_LISTEN=32 -DUDP_PORTS=128 -DUDP_QUEUE=8
 
 # Anything extra a one-off run wants to define, without editing source.
 # Used for the chrome.exe budget, which `make test` cannot afford to

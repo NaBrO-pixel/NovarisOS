@@ -17,7 +17,7 @@
  * Everything here runs with interrupts off: from a system call, or from
  * the timer interrupt through inet64_timer(). */
 
-#define INET64_MAX 64
+#define INET64_MAX 512
 
 /* What a blocked accept, connect or UDP receive waits on. Every event
  * the pump sees wakes it, and the waiters look again. */
