@@ -10712,6 +10712,61 @@ no FAIL, the two new ones included. With Chromium staged, headless
 Chromium still prints the page (exit 0) with eth0 up. The 32-bit
 `test-inet` and `test-listen` pass on the shared protocol code.
 
+## Milestone 96 - headless Chromium loads a page over TCP
+
+Pointed at `http://10.0.2.2:18780/page.html`, a page
+`tools/net64_helper.py` serves from the build machine, headless Chromium
+fetches it over the RTL8139 and prints its DOM, including the paragraph
+the page's script adds (`script ran: 42`). Then it exits 0. The host
+logs `GET /page.html HTTP/1.1` 200 and the favicon request after it.
+The whole boot takes 253 seconds with `make chrome-net`.
+
+Five things stood in the way, each found from what the previous run
+showed:
+
+1. **Wine saw no network adapters.** Its `nsiproxy` asks a UDP socket
+   `SIOCGIFHWADDR`/`SIOCGIFFLAGS`/`SIOCGIFMTU` about each interface and
+   reads `/proc/net/route`; none of it existed, so `GetAdaptersAddresses`
+   failed with 50 throughout. Those ioctls (and the rest of the
+   `SIOCGIF*` family) and `/proc/net/route`/`dev` exist now.
+2. **The socket table filled.** 64 sockets was not enough for
+   Chromium's DNS lookups and update checks, with the wineserver holding
+   a copy of each. Wine could not map `ENFILE`, and the load failed as
+   `ERR_FAILED`. The table now holds 512 sockets, with 128 TCP
+   connections and 128 UDP ports, and a table that fills is reported
+   once.
+3. **A non-blocking connect returned 0.** QEMU's network can finish the
+   handshake inside `connect()`. Linux returns `EINPROGRESS` for a
+   non-blocking TCP connect regardless; Wine's server takes 0 as
+   "connected" and posts no `FD_CONNECT`, so Chromium hit `NOTREACHED`
+   in `tcp_socket_win.cc`.
+4. **Passed descriptors arrived blocking.** On Linux `O_NONBLOCK`
+   belongs to the open file and travels with `SCM_RIGHTS`. The
+   wineserver creates sockets non-blocking and hands them to the
+   client; here they arrived blocking, so Chromium's peek at the quiet
+   connection parked its network thread forever and the request was
+   never written.
+5. **`MSG_PEEK` consumed.** On a stream it read the byte instead of
+   leaving it, and `recvmsg` ignored both `MSG_PEEK` and `MSG_DONTWAIT`.
+
+A try took 20-25 minutes until `make chrome-net` (see the Makefile):
+
+- The initrd configuration was being rewritten by every make, so any
+  stray compile re-staged the 500MB initrd. It is written only when the
+  goal builds the image now.
+- `NOVARIS64_FAST` skips the unrelated test layers.
+- `CHROME64_STALL_SECS` ends a run whose outbound connection has carried
+  nothing for that long, and logs every call on such a socket. Set
+  `CHROME_NET_STALL=0` once the page loads, because Chromium keeps a
+  spare connection idle.
+
+Kernel objects also depend on a stamp of their compile flags now, so a
+`CFLAGS_EXTRA` change rebuilds them.
+
+`make -f Makefile.amd64 WINE64_INSTALL=1 test` still prints 30 PASS and
+no FAIL. The page load is an experiment (`make chrome-net`), not part of
+`make test`.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
