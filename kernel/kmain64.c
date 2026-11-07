@@ -5228,7 +5228,11 @@ fast_wine:
  * the Linux host under the same Wine, with its null display driver, this
  * exact command prints the page and exits 0 in 22 seconds. */
 #ifndef CHROME64_URL
-#define CHROME64_URL "data:text/html,<p>novaris</p>"
+/* A page tools/net64_helper.py serves on the build machine, by name and
+ * over TLS (Milestone 97): DNS through QEMU's forwarder, TCP through the
+ * RTL8139, a TLS handshake inside Chromium, and a script that has to run
+ * for the page to come out right. make test supplies the network. */
+#define CHROME64_URL "https://novaris.test:18783/page.html"
 #endif
 static const char* const chrome_args[] = {
     "--headless", "--no-sandbox", "--disable-gpu",
@@ -5262,6 +5266,9 @@ static const char* const chrome_args[] = {
      * popup with reason kCrash, three times a run. Chromium's own switch,
      * checked on the Linux host to change nothing about the page. */
     "--disable-hang-monitor",
+    /* The helper's certificate is self-signed for novaris.test: a page
+     * load that has to succeed cannot also be a lesson in trust. */
+    "--ignore-certificate-errors",
 #ifdef CHROME64_VERBOSE
     /* Chromium's own account of itself, children included: 616 lines
      * for a whole successful run on the Linux host, so the serial port

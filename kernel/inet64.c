@@ -190,6 +190,7 @@ int inet64_init(void) {
 int inet64_card_up(void) { return card && net_config()->configured; }
 uint32_t inet64_ip(void) { return card ? net_config()->ip : 0; }
 uint32_t inet64_netmask(void) { return card ? net_config()->netmask : 0; }
+uint32_t inet64_dns(void) { return card ? net_config()->dns : 0; }
 const uint8_t* inet64_mac(void) { return card ? netdev_get()->mac : 0; }
 
 /* --- the pump ----------------------------------------------------------- */
@@ -320,16 +321,25 @@ static int pump_one(isock_t* k) {
     /* The process's bytes into TCP, one segment at a time - tcp.c keeps
      * one in flight - and the FIN once there are no more. */
     if (k->tx_open && (st == TCP_ESTABLISHED || st == TCP_CLOSE_WAIT)) {
-        while (pipe64_available(k->tx) > 0 && tcp_tx_idle(h)) {
-            int64_t n = pipe64_read(k->tx, buf, sizeof(buf));
+        /* As much as TCP's send ring has room for: tcp.c sends what the
+         * peer's window allows and keeps the rest until it does. */
+        for (int round = 0; round < 16 && pipe64_available(k->tx) > 0; round++) {
+            uint32_t space = tcp_send_space(h);
+            int64_t n;
+            int took;
+            if (!space) break;
+            n = pipe64_read(k->tx, buf, space < sizeof(buf) ? space : sizeof(buf));
             if (n <= 0) break;
-            tcp_send(h, buf, (uint32_t)n);
+            took = tcp_send(h, buf, (uint32_t)n);
+            if (took < (int)n) {
+                /* Cannot happen - it was asked for no more than the room
+                 * it had - but losing bytes silently is the one thing a
+                 * stream must not do, so say so. */
+                serial64_puts("NOVARIS64: [inet] tcp_send took less than its space\n");
+            }
             k->bytes_out += (uint64_t)n;
             sched64_wake(PIPE64_WAIT_KEY_(k->tx), SCHED64_MAX_TASKS);
             moved = 1;
-            /* Let the segment go out and the stack answer before the
-             * next one is asked for. */
-            break;
         }
         if (!k->fin_sent && pipe64_available(k->tx) == 0 && tcp_tx_idle(h) &&
             (k->shut_wr || k->refs == 0) &&

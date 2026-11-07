@@ -10767,6 +10767,45 @@ Kernel objects also depend on a stamp of their compile flags now, so a
 no FAIL. The page load is an experiment (`make chrome-net`), not part of
 `make test`.
 
+## Milestone 97 - DNS, HTTPS, a sliding window, and the page load in make test
+
+- **Names resolve in the guest.** `nsswitch.conf` says `hosts: files
+  dns`, and `/etc/resolv.conf` names the server DHCP gave, which is
+  QEMU's forwarder at 10.0.2.3. To test that path for real, make test
+  runs QEMU through `tools/qemu_net64.sh`, which gives QEMU a private
+  `/etc/resolv.conf` naming 127.0.0.1. There `tools/net64_helper.py
+  --dns53` answers: `.test` names are 10.0.2.2, `example.com` is
+  192.0.2.1, and anything else is NXDOMAIN. The guest is configured as
+  in any run, and the build machine's own resolver is left alone.
+  `userland/inet64.c` resolves `novaris.test` with `getaddrinfo`,
+  fetches through it, and checks that an unknown name fails.
+- **HTTPS.** The helper serves TLS on 18783 with a self-signed
+  certificate for `novaris.test`. Headless Chromium's page is now
+  `https://novaris.test:18783/page.html`, loaded with
+  `--ignore-certificate-errors`. That one URL exercises DNS, TCP, TLS
+  inside Chromium, and a script that has to run.
+- **The page load is in make test.** With Chromium staged, the printed
+  DOM must contain `script ran: 42`, and the helper must have logged the
+  lookup of `novaris.test` and the HTTPS request.
+- **TCP sends a window, not a segment.** Each connection has a 16KB send
+  ring (`TCP_SEND_BUFFER`). Sending follows the peer's advertised
+  window, which was never read before. Timeouts go back to the oldest
+  unacknowledged byte, a shut window is probed, and a FIN queues behind
+  unsent data. For 192KB over the loopback with
+  `-DNET_LOOPBACK_DELAY_TICKS=2` (20ms each way), the time went from
+  5438ms to 559ms. QEMU's network has almost no round trip, so 2MB down
+  (~45ms) and up (~125ms) stay as they were. The 32-bit kernel's
+  `test-inet`, `test-listen` and `test-winsock` pass on the shared code.
+
+`make -f Makefile.amd64 WINE64_INSTALL=1 test` with Chromium staged
+prints 32 PASS lines and no FAIL.
+
+Still not done: IPv6; the receive side keeps only in-order data (no
+reassembly queue), so on a lossy link a gap costs a retransmission
+timeout; no congestion control beyond the peer's window; and real
+internet names and sites were never tried, because this build machine
+has no outside network.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the

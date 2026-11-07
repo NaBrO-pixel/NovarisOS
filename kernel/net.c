@@ -265,8 +265,17 @@ static int next_hop_mac(uint32_t dest_ip, uint8_t mac_out[ETH_ALEN]) {
 #define LOOPBACK_QUEUE 32
 #endif
 
+/* A delay on the loopback, for measuring: -DNET_LOOPBACK_DELAY_TICKS=2
+ * holds every packet 20ms, so a TCP conversation with itself has a round
+ * trip like a real network's - which is where a stop-and-wait sender and
+ * a windowed one differ. 0, the default, delivers on the next poll. */
+#ifndef NET_LOOPBACK_DELAY_TICKS
+#define NET_LOOPBACK_DELAY_TICKS 0
+#endif
+
 typedef struct {
     uint32_t len;
+    uint32_t stamp;
     uint8_t  data[ETH_MTU];
 } loop_packet_t;
 
@@ -293,6 +302,10 @@ static void loopback_drain(void) {
     while (n--) {
         static uint8_t copy[ETH_MTU];
         loop_packet_t* p = &loop_q[loop_tail];
+#if NET_LOOPBACK_DELAY_TICKS
+        if (pit_get_ticks() - p->stamp < NET_LOOPBACK_DELAY_TICKS)
+            break;                              /* not due yet, nor anything after */
+#endif
         uint32_t len = p->len;
         kmemcpy(copy, p->data, len);
         loop_tail = (loop_tail + 1) % LOOPBACK_QUEUE;
@@ -330,6 +343,7 @@ int net_send_ip(uint32_t dest_ip, uint8_t protocol,
         uint32_t next = (loop_head + 1) % LOOPBACK_QUEUE;
         if (next == loop_tail) return -1;      /* full: dropped, like a wire */
         loop_q[loop_head].len = (uint32_t)sizeof(ip_header_t) + len;
+        loop_q[loop_head].stamp = pit_get_ticks();
         kmemcpy(loop_q[loop_head].data, packet, loop_q[loop_head].len);
         loop_head = next;
         loop_packets++;

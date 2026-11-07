@@ -878,15 +878,19 @@ TEST_TIMEOUT ?= 900
 NET64_HTTP = 18780
 NET64_DNS  = 18781
 NET64_FWD  = 18782
+NET64_HTTPS = 18783
 NET64_QEMU = -netdev user,id=n0,hostfwd=tcp:127.0.0.1:$(NET64_FWD)-:8080 \
              -device rtl8139,netdev=n0
 
 test: iso
-	@rm -f $(BUILD_DIR)/serial.log $(BUILD_DIR)/net64.status
-	@python3 tools/net64_helper.py --http $(NET64_HTTP) --dns $(NET64_DNS) \
+	@rm -f $(BUILD_DIR)/serial.log $(BUILD_DIR)/net64.status $(BUILD_DIR)/net64.http.log
+	@echo "nameserver 127.0.0.1" > $(BUILD_DIR)/resolv.net64
+	@python3 tools/net64_helper.py --http $(NET64_HTTP) --https $(NET64_HTTPS) \
+	    --dns $(NET64_DNS) --dns53 \
 	    --connect $(NET64_FWD) --status $(BUILD_DIR)/net64.status \
 	    --log $(BUILD_DIR)/net64.http.log & \
 	  hpid=$$!; \
+	  tools/qemu_net64.sh $(BUILD_DIR)/resolv.net64 \
 	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -display none \
 	    $(NET64_QEMU) \
 	    -serial file:$(BUILD_DIR)/serial.log -no-reboot >/dev/null 2>&1 & \
@@ -1286,6 +1290,24 @@ test: iso
 	@grep -q connected $(BUILD_DIR)/net64.status 2>/dev/null \
 	    || (echo "FAIL: the host could not connect to a socket in the guest"; exit 1)
 	@echo "PASS: TCP and UDP through an RTL8139 to this machine, both directions"
+	@grep -q dns53 $(BUILD_DIR)/net64.status 2>/dev/null \
+	    || (echo "FAIL: the helper could not answer DNS on port 53 (not root?)"; exit 1)
+	@grep -q "\[ok\] to 10.0.2.2 (guest only)" $(BUILD_DIR)/serial.log \
+	    && grep -q "\[ok\] and the file fetched by name (guest only)" $(BUILD_DIR)/serial.log \
+	    || (echo "FAIL: getaddrinfo in the guest did not resolve novaris.test"; exit 1)
+	@echo "PASS: a name resolves in the guest through DHCP's DNS server"
+	@grep -a "2MB in" $(BUILD_DIR)/serial.log | head -1
+	@# Headless Chromium, when it is staged: the page is fetched by name
+	@# over HTTPS, and its script's paragraph is in the DOM it prints.
+	@if grep -q "NOVARIS64: --- chrome ---" $(BUILD_DIR)/serial.log; then \
+	    grep -q '<p id="js">script ran: 42</p>' $(BUILD_DIR)/serial.log \
+	        || { echo "FAIL: Chromium did not print the page it was sent"; exit 1; }; \
+	    grep -q 'https .*"GET /page.html' $(BUILD_DIR)/net64.http.log \
+	        || { echo "FAIL: Chromium never asked for the page over HTTPS"; exit 1; }; \
+	    grep -q "dns novaris.test type 1" $(BUILD_DIR)/net64.http.log \
+	        || { echo "FAIL: Chromium never looked novaris.test up"; exit 1; }; \
+	    echo "PASS: headless Chromium loads https://novaris.test/page.html and runs its script"; \
+	fi
 
 # One headless Chromium page load over the network, as fast as this
 # machine can do it: the kernel built with NOVARIS64_FAST (the test
@@ -1298,7 +1320,7 @@ test: iso
 # Chromium printed of the page, and the socket report. Needs
 # CHROMIUM64_DIR and CHROMIUM64_FILES as for a Chromium `make test`.
 # Not a test: nothing here is asserted.
-CHROME_NET_URL    ?= http://10.0.2.2:$(NET64_HTTP)/page.html
+CHROME_NET_URL    ?= https://novaris.test:$(NET64_HTTPS)/page.html
 CHROME_NET_BUDGET ?= 300
 CHROME_NET_STALL  ?= 30
 CHROME_NET_FLAGS   = -DNOVARIS64_FAST -DCHROME64_VERBOSE \
@@ -1312,10 +1334,13 @@ chrome-net:
 	@$(MAKE) -f Makefile.amd64 WINE64_INSTALL=1 \
 	    CFLAGS_EXTRA='$(CHROME_NET_FLAGS) $(CFLAGS_EXTRA)' iso
 	@rm -f $(BUILD_DIR)/serial.log $(BUILD_DIR)/net64.status $(BUILD_DIR)/net64.http.log
-	@python3 tools/net64_helper.py --http $(NET64_HTTP) --dns $(NET64_DNS) \
+	@echo "nameserver 127.0.0.1" > $(BUILD_DIR)/resolv.net64
+	@python3 tools/net64_helper.py --http $(NET64_HTTP) --https $(NET64_HTTPS) \
+	    --dns $(NET64_DNS) --dns53 \
 	    --connect $(NET64_FWD) --status $(BUILD_DIR)/net64.status \
 	    --log $(BUILD_DIR)/net64.http.log & \
 	  hpid=$$!; \
+	  tools/qemu_net64.sh $(BUILD_DIR)/resolv.net64 \
 	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -display none \
 	    $(NET64_QEMU) \
 	    -serial file:$(BUILD_DIR)/serial.log -no-reboot >/dev/null 2>&1 & \

@@ -34,6 +34,9 @@
 #ifndef TCP_MAX_CONNECTIONS
 #define TCP_MAX_CONNECTIONS 4
 #endif
+#ifndef TCP_SEND_BUFFER
+#define TCP_SEND_BUFFER     16384
+#endif
 #ifndef TCP_RECV_BUFFER
 #define TCP_RECV_BUFFER     65536
 #endif
@@ -120,6 +123,12 @@ void tcp_tick(void);
 /* Nothing in flight: the next tcp_send will be taken, and a FIN sent now
  * will not overwrite a data segment still waiting to be acknowledged. */
 int tcp_tx_idle(int handle);
+
+/* How much tcp_send would take now: the send ring's free space, or 0
+ * when the connection cannot take data (not established, closing, or a
+ * SYN or FIN still in flight). tcp_send takes what fits and returns how
+ * much that was. */
+uint32_t tcp_send_space(int handle);
 
 /* Wires tcp_input into kernel/net.c. Called once by net_init(). */
 void tcp_init(void);
