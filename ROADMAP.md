@@ -9965,6 +9965,626 @@ they described, and execve abandoning the space it replaced - worth
 118MB a run, which is not the 1.7GB that 390 live processes cost.
 
 
+## Milestone 85 - wineboot exits 0
+
+    NOVARIS64: wineboot exit= 0, enosys 78, last 62, nodes 751
+    NOVARIS64: prefix  = 7/7 present, 751 nodes, run ended on its own
+
+Reproduced on consecutive runs, with no GPF, no out-of-memory, and no
+table reaching its ceiling. "Run ended on its own" is the part that took
+the longest to earn: every run before this one was stopped by the
+watchdog and reported a failure that had not happened.
+
+**It was never deadlocked.** wineboot ran to completion and exited 0 at
+87% of its budget, and the remaining 13% was the run waiting to find
+out. The wineserver's own request log said so plainly once it was turned
+on - `terminate_process(handle=0000, exit_code=0) = 0 { self=1 }` - and
+services.exe, the thing that was supposed to be stuck, ended with
+SetEvent on the started event and a wait on exit_event, which is what a
+service control manager does when it is *up*.
+
+**The bug was FD_CLOEXEC.** Every path in this kernel that opens a
+descriptor records it - open(2), fcntl, dup3, even one arriving over
+SCM_RIGHTS with MSG_CMSG_CLOEXEC - and no path ever acted on it. execve
+handed on the whole table. Wine marks its wineserver socket
+close-on-exec precisely so that a process's death becomes visible: the
+server notices a client is gone by seeing end of file on that socket,
+and end of file needs the last writer to let go. Measured at wineboot's
+exit, its sockets still had six writers - the services.exe, explorer and
+rundll32 it had exec'd, each holding a copy it should never have been
+given.
+
+Two more fell out of getting that far. glibc's abort() is
+tgkill(getpid(), gettid(), SIGABRT), and with no tgkill it took its
+fallback path into an instruction the CPU refuses - so a missing syscall
+arrived two steps later as a general protection fault that *halted the
+machine* with thirty processes still alive. tgkill and tkill now deliver
+to the calling thread, and a protection fault or invalid opcode from
+ring 3 ends the process the way an uncaught page fault already did
+rather than stopping the kernel.
+
+**What the graph looked like before it was read properly.** 32 live
+tasks, 31 blocked, 1 runnable - which reads as a deadlock and was not
+one. PlugPlay had reported started and was waiting for control messages;
+winedevice was waiting for device requests; an RPC listener was waiting
+for a connection. Those are the correct resting states of a system that
+has finished booting, and from outside they are indistinguishable from
+being stuck. What separated them was reading what each wait was *for*.
+
+**Three things this milestone reported and had to correct.** The run
+budget is 300 seconds (`syscall64_set_run_ticks`), not the fifteen
+minutes described elsewhere here, so every "did not finish in fifteen
+minutes" was five; raising it to 1800 changed nothing, which is what
+proved the symptom was not a shortage of time. The 84% of syscalls spent
+in a retry loop was a staging gap - ten .winmd files, 110KB - rather
+than anything in the kernel. And the first thread read as wineboot's
+belonged to an earlier bring-up layer, which nearly produced a confident
+wrong answer about the leader exiting immediately.
+
+The prefix is 751 nodes against the host's 829. What is missing is
+listed in the errors that remain: `nodrv_CreateWindow`, `start_rpcss`,
+and four setupapi copy failures.
+
+
+## Milestone 86 - the clock said 1970, so every wait was already over
+
+`err:winediag:nodrv_CreateWindow`, twelve of them across six processes,
+turned out to be a clock bug. Measured: 12 -> 0.
+
+**The chain, read backwards from the error.** `load_display_driver()`
+read `GraphicsDriver` out of the null GUID key - twenty opens of
+`{00000000-...}` - while the real key,
+`{e580df57-...}\0000\GraphicsDriver`, had held `winenovaris` all
+along. It read the wrong key because
+`NtUserGetProp(hwnd, "__wine_display_device_guid")` found nothing: seven
+`get_window_property` calls for that name and zero `set_window_property`
+anywhere in the run, with no GUID-shaped `add_atom` either. The property
+is set by `desktop_window_proc` on `WM_NCCREATE`, so the desktop window
+had never been through explorer's window procedure. The server had made
+it instead: `get_desktop_window(force=1)` creates a bare top window, and
+explorer's own desktop-class `create_window(parent=0)` then came back
+`parent=00010020` - a child of the server's, not the desktop.
+
+That race is supposed to be lost by the server. `get_desktop_window()`
+starts explorer and calls `NtUserWaitForInputIdle(process, 10000)`
+before it falls back to forcing. The wait returned at once:
+
+    002c: select( timeout=19db1dedc81c890 ) = TIMEOUT
+
+which decodes to 1970-01-01 00:00:12.185, while the server's own clock
+said 2026-09-12. `wait_message()` sends the server an **absolute**
+deadline - `NtQuerySystemTime()` plus the timeout - so a client clock
+stuck in 1970 makes every timed wait in Wine arrive already expired.
+
+**The bug was one constant.** `NtQuerySystemTime` asks `clock_getres`
+whether `CLOCK_REALTIME_COARSE` resolves to a millisecond or better and,
+if it does, uses that clock for every date it reports thereafter. Ours
+does. But this kernel's list of ids meaning "a date" read 0 and 8. 8 is
+`CLOCK_REALTIME_ALARM`; `CLOCK_REALTIME_COARSE` is **5**, and 5 fell
+through to the uptime counter. Measured over one run: 82,572
+`clock_gettime` calls, 81,698 of them id 7 and **874 of them id 5** -
+and all nineteen `clock_getres` calls were about id 5 and nothing else.
+
+This was never only a display bug. It zeroed every timeout in Wine; the
+twelve errors were the visible corner.
+
+**Two more of the same shape, found by looking rather than by failing.**
+`clock_nanosleep` never read its flags, so `TIMER_ABSTIME` was a
+relative sleep - "wake at 09:15" became "sleep for 09:15 from now",
+which on `CLOCK_REALTIME` is fifty-six years. Nothing in the prefix
+calls it: zero calls in a full run. And `clock_getres` never read its
+id at all, answering for clocks this kernel does not have, which tells a
+caller a clock is present when it is not. The three syscalls now share
+one `clock64_kind()` table, because having the list in one of them and
+not the others is exactly how the first bug survived.
+
+**What the differential corrected.** `userland/clock64.c` runs on both
+machines, and the host rejected two assumptions this kernel had been
+built on: Linux leaves `nanosleep`'s remainder **untouched** when the
+sleep runs to completion - it only fills it in after a signal - and it
+**ignores** flag bits it does not know rather than refusing them. Both
+were written the other way round first and changed to match what was
+measured.
+
+**And a harness that had stopped reporting.** The suite had been saying
+"the kernel did not reach the end of kernel_main" on every commit,
+whatever the commit did. Three places stopped the machine on a fixed
+clock chosen when bring-up was a second of assertions - `timeout 30`
+around qemu, 90 seconds in `fbtest.py`, 60 in `inputtest.py` - and
+bring-up now ends by running wineboot to completion. All three cut the
+run off before the last line, so the gate every other assertion sits
+behind could never hold, and the twenty-one differentials behind it had
+not run for as long as the Wine layer has been finishing. They wait for
+the marker now, with the timeout as a cap on a hang rather than as an
+estimate of the duration. 22 checks, 0 failures.
+
+
+## Milestone 89 - a Windows program draws a window
+
+    ok   the window class registered
+    ok   a window exists
+    ok   it was shown
+    ok   it has a device context
+    metrics: caption=19 xframe=4 yframe=4 border=1
+    popup  rect  = (10,10)-(210,160)  [asked 10,10 200x150]
+    desktop rect = (0,0)-(1024,768), visible=1
+    ok   its client area is 392x273
+    ok   the message loop ran (1 message, 1 paint)
+    ok   it was destroyed
+    NOVARIS64: winegui = exit= 0
+
+`userland/pe_test/winegui64.c` registers a class, creates an overlapped
+window, shows it, takes a device context, pumps its queue and is
+painted, under Wine, on this kernel. That is the sequence every program
+with a user interface begins with, and the one chrome.exe would begin
+with.
+
+**Two things were wrong and neither was what the previous session said.**
+
+The first was a path. Handed the bare name `winegui64.exe`, Wine found
+no such program - `usr/bin/x86_64-windows` is where it looks for a
+*builtin module*, not for an application - and fell through to
+ShellExecuteEx, which reported `0x6d` about a document association. The
+diagnosis written at the time was a session being torn down under the
+second process, and it was wrong: the process gets pid 46 with no
+collision, nine processes are live including the wineserver at pid 3,
+and it makes 10,407 syscalls whose last pairs are working
+`write(5)`/`read(6)` on the server pipes. Nothing was torn down. An
+absolute unix path resolves through Z: and it runs.
+
+The second was a font, four layers from where it showed. `SM_CYCAPTION`
+measured **6750319**, so a 400x300 window came back
+`(100,100)-(6750524,6750427)` with a client area zero pixels tall -
+while a `WS_POPUP` window, which has no caption, was exactly the size it
+asked for, and the desktop was exactly the screen. One number out of
+four. The caption height comes from the caption font and there was no
+font: **win32u dlopens libfreetype rather than linking it**, so it
+appears in no NEEDED anywhere and the objdump-based dependency check in
+`stage_wine.sh` could not have found it. That is the Milestone 81 libm
+bug one level further out - libm was missing and *named*; this was
+missing and named nowhere.
+
+**Staging FreeType alone made it much worse**, which is worth writing
+down because it is the sort of half-fix that looks like progress:
+
+| staged | segfaults | wineboot |
+|---|---|---|
+| nothing | 12 | exits 0 |
+| FreeType | 865 | never finishes |
+| FreeType + 13 fonts | 865 | never finishes |
+| FreeType + fontconfig + expat + fonts | 13 | exits 0 |
+
+793 of those crashes were one null dereference at offset 0xc, in a
+process that also searched four directories for `libfontconfig.so.1`
+and found none. FreeType with nothing to answer its queries is not an
+improvement on no FreeType.
+
+**So the list is derived rather than written.** Wine's own `config.h`
+names every library it dlopens - three `SONAME_*` entries, two of them
+present on this host - and `stage_wine.sh` now reads that, resolves each
+against `ldconfig`, closes the set under `ldd` and stages what it finds
+under the sonames the loader will ask for. A tree configured with more
+optional libraries stages them without the script being edited; one
+configured with fewer does not carry libraries nothing will open. The
+thirteen faces Wine ships go beside the NLS tables, in both places, for
+the same reason they do.
+
+The prefix is 792 nodes against the host's 829, up from 751.
+
+**And the screendump moved.** `fbtest.py` compares sixteen pixels
+against the picture layers 6c and 21 drew, and it waited for the end of
+the run to look. The end of the run is now on the far side of a Wine
+desktop with a real window painted on it, and a white client area landed
+on the red block. The window is entitled to be there, so the screendump
+is taken at a new `---- display settled ----` marker instead - after
+everything that draws has drawn, before the Wine layer starts. fbtest
+boots its own qemu and stops it there, so it also stops paying for a
+prefix it never looks at.
+
+22 checks, 0 failures.
+
+
+## Milestone 90 - chrome.exe runs, and stops at one instruction
+
+    NOVARIS64: --- chrome ---
+    err:module:loader_init "chrome_elf.dll" failed to initialize, aborting
+    err:module:loader_init Initializing dlls for
+        L"Z:\opt\chromium\chrome.exe" failed, status 80000003
+    NOVARIS64: chrome = exit= 2147483651
+
+The real binary. The proxy denies dl.google.com but allows
+commondatastorage.googleapis.com, so the official Chromium Win_x64
+snapshot (r1698704, 156.0.8062.0) downloads: 356MB zipped, 808MB
+unpacked, chrome.exe 3MB and chrome.dll 332MB.
+
+**The number this file has called unmeasured since Milestone 45.** The
+other 509 Wine DLLs were "what running things needs, and that number is
+not yet measured". For chrome.exe it is now measured, and it is small:
+
+| binary | DLLs | imported functions | no Wine export |
+|---|---|---|---|
+| `chrome.exe` | 15 | 368 | 7 |
+| `chrome_elf.dll` | 8 | 229 | **0** |
+
+Five of the seven are chrome_elf's own exports, which Chromium ships
+beside the launcher. The real gap is two functions - `AddConditionalAce`
+and `DeriveAppContainerSidFromAppContainerName` - and both are
+delay-loaded, so neither costs anything unless called. That is nothing
+like the 1316 functions chrome.dll imports, because **chrome.exe is only
+the launcher**: it is 4.6MB with chrome_elf, and everything else it
+needs was already staged except winhttp.dll.
+
+**What works.** chrome.exe is found, mapped at its own image base
+(0x140000000), and executes. chrome_elf.dll is found beside it, loaded,
+and its DllMain runs. Then it stops.
+
+**Where it stops, exactly.** 0x80000003 is STATUS_BREAKPOINT - an
+`int3`, which in Chromium means a CHECK called IMMEDIATE_CRASH.
+chrome_elf ships no symbols, so `userland/pe_test/chromeprobe64.c` asks
+the machine what chrome_elf asks and installs a vectored handler that
+turns the exception into an address:
+
+    RtlGetVersion = 10.0 build 19045   <- what Chromium reads
+    GetVersionEx  = 6.2 build 9200
+    GetFileVersionInfoSize(chrome.exe) = 2420
+    chrome.exe file version = 156.0.8062.0
+    LoadLibraryEx(AS_DATAFILE) = ok
+    BREAKPOINT at Z:\opt\chromium\chrome_elf.dll + 0xbe678
+
+and at +0xbe678:
+
+    mov  r8d, [rsi+0x128]
+    mov  rdx, [rsi+0x120]
+    mov  ecx, [rsi+0x8]
+    call QWORD PTR [rip+0x9e7c8]   ; a global function pointer, returns bool
+    test al, al
+    jne  <carry on>
+    ...
+    cmp  DWORD PTR [rsi+0x8], 3
+    je   <int3; ud2>
+    add  rsi, 0x12c                ; stride an array of 300-byte structs
+
+**Five things it is not**, each ruled out by measurement rather than by
+argument:
+
+- *The OS version.* `GetVersionEx` says 6.2, which looks damning and is
+  not: Windows lies to programs with no compatibility manifest and Wine
+  copies it. Chromium calls `RtlGetVersion` for exactly that reason and
+  gets 10.0.19045.
+- *The version resource.* Read perfectly, 2420 bytes, 156.0.8062.0.
+- *An incomplete install.* The whole 358MB runtime set - chrome.dll, the
+  .pak files, icudtl.dat, the v8 snapshot, en-US - was staged and the
+  breakpoint did not move. chrome.dll is never opened at all.
+- *Process mitigation policies.* Wine's `SetProcessMitigationPolicy` is
+  a stub returning TRUE and prints a FIXME; no such FIXME appears, so
+  chrome_elf never calls it.
+- *Channel detection.* `DetermineChannel` returns immediately when
+  `USE_GOOGLE_UPDATE_INTEGRATION` is off, which it is for Chromium.
+
+DllMain, fetched from the Chromium mirror, makes two calls before
+anything is wrapped in `__try`:
+
+    install_static::InitializeProductDetailsForPrimaryModule();
+    install_static::InitializeProcessType();
+
+so the check is in one of those two. Everything after them is inside
+`__try/__except`, and cannot be what aborts the loader. The remaining
+work is matching r1698704's sources rather than `main`, which is where
+the next session starts.
+
+Staged behind `CHROMIUM64_DIR`, minimal by default: 4.6MB is what
+reproduces this, and the full 358MB set makes a 483MB initrd that
+`make test`'s 2G would not boot. The one-off winegui64 block is now
+`run_wine_program()`, called three times.
+
+22 checks, 0 failures.
+
+
+## Milestone 91 - a file too big to store, reported as a file of zero bytes
+
+    NOVARIS64: --- chrome ---
+    [0916/...:ERROR:main_dll_loader_win.cc(240)] Failed to load Chrome DLL
+        from Z:\opt\chromium\chrome.dll: Bad EXE format (0xC1)
+
+chrome.dll is 332,455,424 bytes and perfectly well formed. The
+wineserver's own trace says what really happened: it opened the file,
+`fstat`'d it, `dup`'d, `fstat`'d again, closed - and never once
+`pread`. Wine's `server/mapping.c` begins `get_image_params` with
+
+    if (!file_size) return STATUS_INVALID_FILE_FOR_SECTION;
+    size = pread( unix_fd, &mz, sizeof(mz), 0 );
+
+so the missing `pread` is proof rather than inference: the size we
+reported was **zero**. "Bad EXE format" was four layers downstream of a
+filesystem that had quietly stored nothing.
+
+Three defects, each of which hid the next.
+
+**`ramfs64_write` could not store it.** `ensure_capacity` doubles a
+`kmalloc64` until the file fits, and the entire kernel heap is
+`KHEAP64_MAX_SIZE` - 256MB. A 332MB file was never going to fit, at any
+amount of doubling; this was a ceiling, not fragmentation. Files above
+`RAMFS64_CONTIGUOUS_MAX` now live in frames: page-granular, from the
+physical allocator, needing no contiguity. The threshold sits above
+everything that has to stay contiguous, because only `execve` reads a
+file straight out of the heap - through `ramfs64_data` - and the largest
+thing this system execve's is the wineserver at 4.7MB.
+
+**The seeding loop threw the error away.** `ramfs64_seed_from_initrd`
+ignored `ramfs64_write`'s return value, so a file too big to store was
+created, left empty, and reported to every reader as a zero-length file
+that was definitely there. That is the whole reason this cost a
+milestone: not that the write failed, but that nothing anywhere said so.
+The failures are counted now and the boot path asserts the count is zero.
+
+**`ramfs64_init` leaked every frame.** It freed `->data` and never gave
+the frames back to the PMM - survivable while frames arrived only
+through `mmap`, and not for a moment longer than that. Every bring-up
+layer re-seeds the initrd, so each one leaked the frames of every large
+file it had loaded. Fixing the first two exposed this on the very next
+run, exactly as it should have:
+
+    NOVARIS64: free    = 0 frames after
+    NOVARIS64: FAIL  every file in the image was stored
+
+A check written for one bug finding a different one is the test earning
+its keep. Frames before wineboot: **0 -> 252,900**.
+
+And one cliff this change created rather than found: `make_framed`
+reallocated and recopied the whole frame array on every write, so
+appending to a framed file cost O(n) a write and O(n^2) overall - which
+is the exact shape of the wineserver saving the registry a page at a
+time. It grows the array geometrically now, tracked by `fcap`.
+
+The new checks write a file larger than any single heap block in chunks
+that straddle the threshold, so what is tested is both the large case
+and the migration from heap block to frames, then read it back at the
+far end - where a file that only pretended to be written has nothing:
+
+    ok    a file larger than one heap block can be created
+    ok    and every write of it was accepted
+    ok    and it is as long as what was written
+    ok    and its last page reads back what was put there
+    ok    and a framed file offers no contiguous pointer
+    ok    every file in the image was stored
+
+`bcryptprimitives.dll` is on the staged module list too - Milestone 90
+ended by finding `[FATAL:rand_util_win.cc(33)] Check failed: hmod.`,
+which is `LoadLibraryW(L"bcryptprimitives.dll")` and a CHECK on the
+result.
+
+**The lesson this tree keeps paying for**: a failure that is not
+reported is not a failure that did not happen. `ramfs64_write` returned
+`-ENOMEM` correctly every single time. One caller dropped it on the
+floor, and the cost was a wrong answer about a different program four
+layers away.
+
+
+## Milestone 92 - chrome.dll loads
+
+    ok   chrome.dll LOADED at 00006fffea9d0000
+    NOVARIS64: chromeprobe = exit= 0 (0 = every question answered)
+
+All 332,455,424 bytes of it, mapped under Wine on this kernel, every
+import resolved. Milestone 45 measured that DLL as importing 1316
+functions across 67 DLLs and called the number unreachable. It is
+reached.
+
+Two things stood between Milestone 91 and this line.
+
+**DirectWrite.** With chrome.dll finally stored whole, the loader
+stopped saying "Bad EXE format" and started saying "Module not found" -
+0xC1 to 0x7E, which is the difference between "this is not a PE" and
+"this is a PE and something it needs is absent". Measured rather than
+guessed: of chrome.dll's 66 imported DLLs, 35 were unstaged, but only
+two of those were *ordinary* imports, and an ordinary import is the
+only kind that can stop a load. One was chrome_elf.dll, already sitting
+beside chrome.dll. The other was `DWrite.dll`, in the Wine tree,
+never staged, imported for exactly one function. The other 33 are
+delay-loaded - free unless called - or api-ms-win-* API sets that Wine
+answers internally and has no file for. The 24 delay-loaded ones the
+tree can supply went in anyway, since finding out one at a time that
+another is missing is how the last three milestones went; closing that
+under PE imports pulled in wined3d, opengl32, bluetoothapis and
+netutils, for 128 modules.
+
+**And asking the right program.** The first run after staging DWrite
+looked like this:
+
+    NOVARIS64: chrome = did not exit, run timed out
+    chrome.dll mentions in the log: 0
+
+No loader error - because chrome.exe spent its entire 300-second budget
+inside Chromium's startup and never reached
+`main_dll_loader_win.cc` at all. The run before it, which did reach the
+load, reported the error in under two seconds. So "no error" and
+"loaded" produce identical logs, and only one of them was true.
+
+That is the same shape as the bug in Milestone 91, one level up: a
+thing that did not happen, indistinguishable from a thing that
+succeeded. The fix was to stop inferring. chromeprobe64 already loads
+chrome_elf.dll and prints GetLastError; it loads chrome.dll now too,
+with LOAD_WITH_ALTERED_SEARCH_PATH so the search for its imports starts
+in chrome.dll's own directory where chrome_elf lives. One call,
+answered in the chromeprobe layer, instead of requiring all of
+Chromium's startup to survive first.
+
+For the record the DirectWrite change did move chrome.exe: that run
+reached seven Wine calls the previous one never did, among them
+NtSetInformationThread, RtlSetHeapInformation, GetUserObjectSecurity
+and EtwRegisterTraceGuidsW. Further was just not far enough to prove
+anything.
+
+**What chrome.exe still needs**, measured from its own run rather than
+guessed - the syscalls it asks this kernel for and does not get:
+
+| nr | name | seen |
+|---|---|---|
+| 334 | `rseq` | 5 |
+| 323 | `membarrier` | 4 |
+| 157 | `prctl` | 3 |
+| 62 | `kill` | 2 |
+| 435 | `clone3` | 1 |
+| 100 | `times` | 1 |
+
+`kill` is the interesting one and is not a small job: `tkill` and
+`tgkill` exist but both begin `if (tid != proc64_current_pid()) return
+-ESRCH`, so this kernel has no cross-process signal delivery at all -
+and Chromium is a process tree.
+
+
+## Milestone 93 - headless Chromium prints the page
+
+`chrome.exe --headless --dump-dom "data:text/html,<p>novaris</p>"`
+prints `<html><head></head><body><p>novaris</p></body></html>` and
+exits 0, under Wine 11 on this kernel - the same bytes the Linux host
+prints from the same Chromium (r1698704, 156.0.8062.0). About 210
+seconds of guest time from exec to exit under TCG, against 22 on the
+host.
+
+Every stop on the way was a kernel bug, found by reading what the
+stopped run said about itself rather than by guessing, and fixed in the
+kernel rather than worked around in Wine or Chromium. In the order the
+runs hit them:
+
+- **Children gave up after 15 seconds.** A Chromium child exits 0 if the
+  browser has not finished the Mojo handshake by then, and under
+  emulation it had not. `--ipc-connection-timeout=600`, Chromium's own
+  switch, checked on the host to reach every child and change nothing.
+  Not a kernel bug - and not the fix either: the children then waited
+  the full 600 seconds, because of the rest of this list.
+- **Futex wakes crossed processes.** A private `FUTEX_WAKE` matched
+  waiters by address in every process; Wine puts ntdll at one address
+  everywhere, so a wake could be spent on another process's thread.
+  Private wakes now match only the waker's process.
+- **A futex sleeper woken by a signal returned to ring 3 without taking
+  it** - the futex wait resumes past its syscall, so nothing delivered
+  the signal. It is pointed back at the syscall now, whose re-run
+  returns EINTR and delivers on the way out. (Found by `shm64`'s new
+  check, not by Chromium.)
+- **No `NETLINK_ROUTE` socket.** glibc's `if_nameindex()` returned NULL,
+  and Wine's nsiproxy dereferences it without checking - in
+  winedevice.exe, holding `if_list_lock`. Every later
+  `GetAdaptersAddresses` in every process slept on that lock forever.
+  Found by teaching the deadline report to print each stuck thread's
+  Wine syscall frame and the return addresses above it, and symbolising
+  them against Chromium's published PDB: the browser's main thread was
+  in `Channel::WriteNextIpczMessage` waiting on a lock, three network
+  threads were in `GetAdaptersAddresses`, and winedevice had taken a
+  SIGSEGV at `nsiproxy.so+0x87d3`, `update_if_table`. The socket answers
+  `RTM_GETLINK` and `RTM_GETADDR` dumps with the loopback.
+- **A blocking pipe write over 64KB returned short.** A driver's IRP
+  output goes back to the wineserver inside one `writev`, and Wine treats
+  a short request write as fatal; winedevice lost its dispatch thread
+  with the browser's IRP in hand ("wine client error: write: Resource
+  temporarily unavailable"). Found with `TRACE64_COMM`, which traces one
+  process by name during a measured run. Blocking writes now sleep while
+  the pipe is full and finish.
+- **`MAP_SHARED` refused an offset**, so Wine fell back to reading a
+  section view into private memory - a snapshot that never saw the other
+  side's writes - and Chromium's children rejected their IPC as
+  `VALIDATION_ERROR_ILLEGAL_MEMORY_RANGE`. The test for it found that
+  fork also made shared pages copy-on-write; they carry `PAGE64_SHARED`
+  now and stay shared.
+- **Signal frames carried no x87/SSE state**, so a handler's use of xmm
+  or MXCSR leaked into the code it interrupted, and Wine found `fpregs`
+  NULL. The FXSAVE image is in the frame now and `rt_sigreturn`
+  restores it.
+- **6G was not enough.** Each renderer peaks at 740-790MB on the host
+  under the same Wine (its own copy of chrome.dll's code, and the
+  page-protection table of a 1.5TB reservation); the page's renderer was
+  the one that ran out. `QEMU_RAM` defaults to 12G when `CHROMIUM64_DIR`
+  is set.
+- **`mmap` handed out ranges Wine had already mapped.** A mapping the
+  kernel placed itself came from a bump pointer that knew nothing of
+  Wine's `MAP_FIXED` mappings, landed on live memory and zeroed it, and
+  Wine recorded two views of one range: renderers died on
+  `create_view: Assertion 'view->protect & VPROT_SYSTEM' failed`.
+  Placement now skips anything reserved or mapped.
+
+Each fix has a check that runs on the Linux host and in the guest:
+`shm64` (private futexes, a shared view at an offset, a child's write
+through an inherited shared mapping), `sock64` (`if_nameindex`,
+`getifaddrs`), `pipe64` (a 200000-byte `write` and a 70000-byte
+`writev`), `kill64` (xmm6 and MXCSR survive a handler) and `vmem64` (a
+placed mapping goes around one placed by hand).
+
+With all of it in, `make -f Makefile.amd64 WINE64_INSTALL=1 test` is
+still 26/26 PASS (verified at `f7f0eb0`), with winegui and chromeprobe
+exiting 0.
+
+To reproduce, with Chromium unpacked beside the tree:
+
+```bash
+make -f Makefile.amd64 WINE64_INSTALL=1 \
+    CHROMIUM64_DIR=/path/to/chrome-win \
+    CHROMIUM64_FILES="chrome.exe chrome_elf.dll chrome.dll \
+      156.0.8062.0.manifest icudtl.dat v8_context_snapshot.bin \
+      resources.pak chrome_100_percent.pak chrome_200_percent.pak \
+      locales/en-US.pak" iso
+qemu-system-x86_64 -cdrom novaris64.iso -m 12G -display none \
+    -serial file:chrome.log -no-reboot
+```
+
+and look for `chrome = exit= 0 (0 = headless Chromium printed the page)`.
+
+**The rejected Mojo messages, since fixed.** With the page printing, the
+browser still rejected a few messages from its toolbar renderers
+(`Message 2 rejected by interface blink.mojom.FrameWidgetHost` and
+`blink.mojom.Widget` - `SetHasTouchEventConsumers`, and the reply to
+`UpdateScreenRects`) and closed the omnibox popup with reason `kCrash`.
+Nothing was arriving wrong: every rejection came straight after a toolbar
+renderer exited with status 1, `RESULT_CODE_KILLED`, and the rejected
+messages were ones it still had in flight. The browser was killing them,
+for two reasons:
+
+- **It thought it had no memory.** Wine learns free memory on Linux only
+  from `/proc/meminfo` and reports none available without it - of a
+  total it does get, from `sysinfo` - so Chromium saw 12G installed and
+  0 bytes free and discarded pages every five seconds (`Discarding
+  multiple pages`, 21 a run). The kernel writes `/proc/meminfo` fresh on
+  every open now; `vmem64` checks it, and `chromeprobe` prints
+  `GlobalMemoryStatusEx` in every boot. After it, `Memory.PressureLevel2`
+  is 0 in all 262 samples.
+- **The hang monitor**, which kills a renderer that has not acked an
+  update in 30 seconds. Under TCG the omnibox popup's renderer can take
+  longer than that to start - one lived 32 seconds and made 40,391
+  syscalls, so it was busy, not stuck. `--disable-hang-monitor`,
+  Chromium's own switch, checked on the host to change nothing. Run 31:
+  no rejected messages, no `kCrash`, no renderer killed, page printed.
+
+**And it got four times faster.** `pmm64_free_frames` counted the
+whole frame bitmap - 400KB in a 12G machine - every time anything asked,
+and once the OOM reserve asked on every page a process touched, a run
+took over an hour. The allocator keeps the count as frames change hands
+now (a bring-up check compares it with a scan). With that, the whole 12G
+boot - prefix, wineboot, winegui, chromeprobe and Chromium printing the
+page - takes 414 seconds where it took about 25 minutes, and
+`make -f Makefile.amd64 WINE64_INSTALL=1 test` is 26/26 in 223 seconds.
+
+**Still open from this round:** nothing. The two items that were:
+
+- **"A process killed by a fatal signal is not noticed."** It is: a death
+  by signal does what `exit_group` does - every file closed, the exit
+  recorded, a waiting parent woken - and `kill64` now checks it from
+  outside (a multi-threaded child killed with SIGKILL is end of file on
+  its pipe and its socket, and SIGKILL to `wait`). What looked like the
+  wineserver missing a death was Chromium's own behaviour: on the Linux
+  host, `kill -9` of the page's renderer leaves headless Chromium waiting
+  to its timeout too. Checking found `recv`/`send` refused on stream
+  sockets; they are `read`/`write` with flags now.
+- **"Running out of memory resets the machine."** It did not, in either
+  run blamed. Run 25b had 130,413 frames free and no `[oom]` line when it
+  stopped - two 6G guests on a 15G host, and the host ended that QEMU -
+  and run 25a's real exhaustion killed the renderer and carried on. But
+  the way it killed was wrong: no frame for a page a process was
+  entitled to was reported as a SIGSEGV, which Wine's handler retries and
+  which ends a bring-up layer outright. It is SIGKILL now, as from
+  Linux's OOM killer, in either ring, with an 8MB reserve kept for the
+  kernel's own page tables and heap during the teardown. `vmem64` fills a
+  2G guest and checks the filler dies of SIGKILL and its memory comes
+  back.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
@@ -10053,7 +10673,9 @@ list, and it is shorter than the one above but not smaller:
    things* needs, and that number is not yet measured.
 
 Then, and only then, Chrome's own requirements: a GPU it has a flag to
-do without, and a sandbox it has a flag to do without.
+do without, and a sandbox it has a flag to do without. **Since Milestone
+93 a headless Chromium renders a page and prints its DOM**, with both
+flags, in a 12G guest.
 
 The honest distance: the Windows-side loader work (52, 53, 54) was real
 and necessary, but the bulk has been Linux-side throughout, and it is
@@ -10150,6 +10772,235 @@ much each would widen what runs:
    cd ../NovarisOS && make WINE_BUILD=../wine
    make test-wine test-wine-threads test-wine-gui
    ```
+
+   The 64-bit kernel, which is where the Wine work is now, wants an
+   x86_64 Wine instead, configured in its own source tree beside this
+   one (`../wine` is one of the places `Makefile.amd64` looks):
+
+   ```bash
+   apt-get install autoconf libfreetype-dev libfontconfig-dev
+   git clone --depth 1 -b stable https://github.com/wine-mirror/wine
+   cd wine && ./configure --enable-archs=x86_64 --disable-tests \
+       --without-x --with-freetype --without-vulkan --without-opengl \
+       && make -j4
+   cd ../NovarisOS && sh tools/build_wine_driver.sh ../wine
+   make -f Makefile.amd64 WINE64_INSTALL=1 test
+   ```
+
+   That boots the ISO with Wine in it and runs `wine --version`,
+   wineboot (a 7/7 prefix, exit 0), `winegui64.exe` and
+   `chromeprobe64.exe` before `bring-up complete`; verified against
+   wine-11.0 at 26 PASS, 0 FAIL. Switching `WINE64_INSTALL` on or off
+   rebuilds the initrd by itself - `build64/initrd64.config` records
+   what it was built with.
+
+   The 32-bit desktop ISO was verified against wine-11.0 the same day:
+   `test`, `test-qemu`, `test-wm`, `test-wine`, `test-wine-threads`,
+   `test-wine-gui`, `test-desktop`, `test-desktop-gui`,
+   `test-wine-prefix` and `test-winsock` all pass. Two things it took,
+   both now in the tools: `install_wine.sh` stages what win32u dlopens
+   from Wine's `config.h` (fontconfig with FreeType, not FreeType
+   alone), and `build_wine_driver.sh` raises win32u's ten-second wait
+   for explorer to two minutes, which an emulated machine needs. For
+   the 32-bit tree, `apt-get install libfreetype-dev:i386
+   libfontconfig-dev:i386` before configuring. `WINE_BUILD` is
+   remembered in `build/wine.config`, so `make WINE_BUILD=../wine32`
+   once and then the bare `make test-wine...` targets.
+
+   **A first boot that finishes, on the 32-bit side.** Until then the
+   32-bit image staged too few modules for Wine's services - no
+   `rpcss.exe`, no `atl100.dll`, no `svchost`/`plugplay`/`winedevice` or
+   kernel drivers - so every first boot sat out Wine's five-minute
+   timeout with RpcSs unavailable. `install_wine.sh` now stages the
+   64-bit side's measured list as well, and staging it exposed four
+   kernel bugs, each of which ended in every task parked and the CPU
+   idle: `exit_group` ended only the calling thread; the task table was
+   32 append-only slots against the 82 tasks a prefix creates;
+   descriptors 0-2 were never closed whatever they held; and a failed
+   fork or an unreceived `SCM_RIGHTS` message leaked references. Plus
+   two staging ones: the winmd files (rundll32 looped looking for them)
+   and `appwiz.cpl`, whose Wine Mono dialog waits for a click. All of
+   it was found with F12, which now dumps every task and socket to
+   COM1, and with the staged image run in a chroot on the host, which
+   tells a missing file from a kernel bug in seconds.
+
+   The whole 32-bit suite passes, `test-posix` and `test-wine-persist`
+   included, and the 64-bit boot is 26/26. One `start_rpcss` line on a
+   first boot is stock Wine's own ordering and is gone on the second.
+
+   **And then a first boot in fifty seconds.** A fresh `wine
+   hellowin.exe` ran 335s after the command, behind Wine's five-minute
+   boot timeout; it now runs 50s after it, with wineboot finished and no
+   timeout (`make test-wine`: 366s to 82s, boot included). Two causes,
+   both measured with Shift+F12, which prints a timer-sampled profile
+   and TSC cycles per syscall:
+
+   - **The wineserver missed most of its clients.** A task parked by
+     `poll` registered at most twelve wake addresses; the server polls
+     186 descriptors, so a client whose request pipe was not among the
+     twelve waited for the server's next timed re-test, and spun in
+     `read` meanwhile - 71 million retried reads in one boot.
+     `PROC_WAIT_MAX` is 256.
+   - **Frame allocation scanned from frame 0 every time**, 18% of all
+     CPU. It keeps a hint now; and `kmemcpy` and fork's page copy move
+     words, not bytes.
+
+   Finishing the boot reached three things a timed-out boot never did:
+   `link` (fontconfig's cache lock - EPERM, as on FAT), `fadvise64_64`,
+   and a 256-entry socket table that ran out of pipes (1024 now).
+
+   The 64-bit kernel parks `poll` on a shared key any wake releases, so
+   it does not have the first bug. Why its wineboot was slow anyway was
+   measured later - see "The 64-bit wineboot, measured" below.
+
+   **The 32-bit fork is copy-on-write now**, as the 64-bit side's has
+   been since Milestone 69: frames are reference-counted in the PMM, a
+   fork shares every private page read-only, and the first write breaks
+   it. It needed CR0.WP set - with it clear, ring 0 ignores read-only
+   pages, so every kernel write into user memory after a fork (getcwd,
+   stat, poll's revents, a signal frame) would have gone into both
+   processes; `fork_test.c` section 8 fails on a kernel without it.
+   Through a first wineboot fork shared 209,377 pages where it used to
+   copy 210,913 (824MB), and copied 244 when somebody wrote. Wall clock
+   did not move (46s either way) - the exec after each fork threw the
+   copies away - but forking a large process no longer needs the memory
+   to duplicate it.
+
+   **The 64-bit wineboot, measured.** Each layer's report now says where
+   the time went: `[cycles]` (TSC cycles in syscalls, costliest numbers
+   first), `[maps]` (mmap and munmap split by kind, per page), `[faults]`
+   (page faults, copy-on-write breaks, SIGSEGVs, and every syscall made
+   5,000 times or more) and `[segv]` (the commonest faulting rip/page,
+   with each process's first faults logged in full - name, registers and
+   the top of the stack). In order of what they found:
+
+   - **The syscall trace was the largest cost.** With it on, wineboot
+     ran out its 300s budget unfinished and bring-up took 503s against
+     189s. `WINE64_TRACE` now defaults to 0; `-DWINE64_TRACE=1` turns it
+     back on.
+   - **fstatfs recounted free memory a bit at a time** (9.6M cycles a
+     call, 12% of wineboot); a byte at a time now. **kmemset zeroed a
+     byte at a time** - every fresh page Wine maps, 350K cycles each and
+     a quarter of wineboot; `rep stos` now, shared with the 32-bit side.
+   - **PROT_NONE reservations are regions, not page-table entries.**
+     Wine reserves about 43GB - 11.2 million PTEs on the zero page and
+     88MB of page tables. Each process keeps a sorted list of up to 512
+     ranges; mprotect commits from it, munmap and MAP_FIXED carve it,
+     fork copies it. A reserved page now faults, as PROT_NONE should.
+   - **clone ignored its tid words.** No `CLONE_PARENT_SETTID`, so
+     glibc's `pd->tid` stayed 0 and every `pthread_join` returned at
+     once; Wine then freed exited threads' stacks under them, and each
+     such thread faulted forever inside its own SIGSEGV handler - 5.8
+     million SIGSEGVs, most of the time spent outside syscalls. The tid
+     words, `CLONE_CHILD_CLEARTID` with a futex wake at thread exit, and
+     the `FUTEX_WAIT_BITSET` that a real join then needs are all in.
+     Wineboot went from 307G to 189G cycles on the same host.
+
+   Bring-up went from 503s, through 189s and 130s, to 108s on the same
+   host; a later, faster host runs it in 54-90s.
+
+   **Signals, done properly on the 64-bit side.** Per-thread signal
+   masks (`rt_sigprocmask`, `rt_sigpending`, `sa_mask`, `SA_NODEFER`,
+   `SA_RESETHAND`, the mask restored by `rt_sigreturn`), `rt_sigsuspend`
+   and `ppoll` with Linux's saved-mask rule, and a fault the thread is
+   blocking kills the process rather than looping. An uncaught fault in
+   a run with several processes now ends that process, not the run, and
+   a death by signal ends every thread of it and frees its space.
+
+   **Two crashes that were the kernel's.** winedevice.exe died in every
+   first wineboot, somewhere different each time: the alternate signal
+   stack was per process, Wine registers one per thread, and two
+   threads' signal frames were written over each other (rip
+   `0x001b000000000023` is cs and ss out of a sigcontext). It is per
+   thread now. And a SIGSEGV at the start of every chromeprobe layer was
+   winegui64.exe's main thread, resumed from a stale frame after it had
+   exited: a run's leader ended the layer without leaving the
+   scheduler. Wineboot, winegui and chromeprobe now run with 0 SIGSEGVs.
+
+   **Memory is given back between layers.** A Wine layer's leader frees
+   its space and slot when its layer ends (9,259, 8,412 and 4,712
+   frames), and every bring-up layer starts by sweeping the spaces no
+   task stands in and the exited processes nobody can reap - about 73MB
+   more free by the time the prefix starts. vmspace64 tracks which
+   spaces are live and refuses to destroy one twice, because exec and
+   exit destroy through copies of a descriptor the layer still holds.
+
+   `test-inet` no longer needs the internet: it used to ask QEMU's
+   10.0.2.3, which relays to the build machine's resolver and failed
+   wherever that cannot reach out - a sandbox behind an HTTP proxy, for
+   one - and now asks a responder `tools/qemu_test.py --dns` runs on the
+   build machine (every name is 192.0.2.1).
+
+   A forked child is told its own tid too: fork honours
+   `CLONE_CHILD_SETTID` (written through the child's page tables,
+   breaking copy-on-write for it), `CLONE_PARENT_SETTID` and
+   `CLONE_CHILD_CLEARTID`. Before, the child's `pd->tid` was its
+   parent's - invisible to `raise()`, which asks `gettid`, but not to
+   anything that records an owner, such as a robust mutex.
+
+   `ppoll` writes the time left back into its timeout, as Linux does,
+   whether it returns ready, timed out (zero) or interrupted - only
+   visible through the raw syscall, since glibc's `ppoll()` copies the
+   timeout to a local first.
+
+   `rt_sigtimedwait` takes a signal as a return value instead of through
+   a handler - glibc's `sigwait`, `sigwaitinfo` and `sigtimedwait`: a
+   pending one in the set at once, blocked or not; otherwise it parks
+   until one arrives, a signal outside the set ends it with EINTR, and a
+   timeout ends it with EAGAIN. The siginfo carries SI_TKILL or SI_USER
+   and the sender's pid, which the pending sets now record.
+
+   `pselect6` is in, which on x86-64 is `select()` too - glibc's
+   select calls it. The three fd sets become one list for `do_poll`, so
+   readiness and parking are poll's; the sets are rewritten only when
+   the call really returns, a closed descriptor is EBADF, end of file is
+   readable, and the mask and the time left work as `ppoll`'s.
+   exceptfds always comes back empty: nothing here has out-of-band data.
+
+   And `signalfd`/`signalfd4`: a descriptor kind of its own whose reads
+   take the reader's pending signals in its mask, 128-byte records as
+   many as fit, and which poll and select see as readable while one is
+   pending. Blocking or not, mask replaceable in place, and inherited
+   across fork reading the child's own signals - Linux's rules.
+
+   Futex bitsets are honoured: each waiter records its mask, and a
+   `FUTEX_WAKE_BITSET` releases only waiters whose masks share a bit
+   with it (a zero mask is EINVAL). Getting there fixed a missed wake: a
+   timed `FUTEX_WAIT` parked on the shared poll key and re-checked its
+   word on every wake anywhere, so a `FUTEX_WAKE` that left the word
+   unchanged was lost and the waiter slept out its timeout. Timed waits
+   now sleep on the word with a deadline, and the scheduler keeps what
+   an expired deadline returns (`ETIMEDOUT`) apart from what a wake
+   returns (0).
+
+   Nothing is left on the 64-bit open list from this round.
+
+   **Where it stands, verified at `785cb43` and again at `74b013e`:**
+   `make -f Makefile.amd64 WINE64_INSTALL=1 test` is 26/26 PASS; the
+   bring-up's own checks are 855 `ok` and no `FAIL`, with wineboot,
+   winegui and chromeprobe exiting 0 and 0 SIGSEGVs between them; and
+   all fifteen 32-bit targets pass (`test`, `test-posix`, `test-wm`,
+   `test-qemu`, `test-wine`, `test-wine-threads`, `test-inet`,
+   `test-listen`, `test-winsock`, `test-qemu-disk`, `test-wine-persist`,
+   `test-desktop`, `test-wine-gui`, `test-desktop-gui`,
+   `test-wine-prefix`) in about an hour. Every new syscall above was
+   checked against the Linux host first - `userland/kill64.c` carries
+   the expectations, 162 of them, and runs unchanged on both. The
+   second run of both suites, a day later on a restarted host, gave the
+   same verdicts and counts (only the timings moved), so none of it is
+   timing luck.
+
+   The project is licensed under the PolyForm Noncommercial License
+   1.0.0 since `ac3be5b` - see `License.md` at the top of the tree.
+
+   Two habits that paid for themselves here, worth keeping. A new test
+   is booted once against a kernel with the fix taken out, to see it
+   fail: the first version of the forked-child tid test passed either
+   way, because glibc's `raise()` asks `gettid` rather than reading
+   `pd->tid`. And a regression that only shows as wall clock is compared
+   against the previous commit booted the same way on the same host -
+   the reservation change looked like a slowdown until the old kernel,
+   booted after a host restart, turned out to be just as slow.
 
    `--with-freetype` is not optional if you want windows: without a font
    engine Wine's caption metrics are uninitialised stack, and the window

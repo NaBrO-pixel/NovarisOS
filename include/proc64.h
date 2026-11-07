@@ -44,6 +44,15 @@
  * to start explorer.exe. */
 #define PROC64_MAX     128
 
+
+/* Ranges per process. A first wineboot's busiest process holds a few
+ * dozen reservations; once anonymous memory is backed on demand too,
+ * every mapping that does not merge with a neighbour is one more - 625
+ * in a first wineboot, and a headless Chromium filled 1024 and spilled
+ * 8.4 million reservation pages onto the zero page, 64MB of page tables.
+ * 4096 is 96KB a slot, 12MB across the table. */
+#define PROC64_RESV_MAX 4096
+
 /* 32 was the number a program that opens a few files needs, and the
  * wineserver is not that program. It holds a descriptor per client
  * thread - the socket, the reply pipe and the wait pipe, three each -
@@ -81,7 +90,13 @@
  * Which makes this arithmetic rather than a guess. PROC64_MAX is 128, so
  * a wineserver serving all of them holds 256 descriptors for connections
  * alone, before the hundred-odd files it has open at once. 512. */
-#define PROC64_FD_MAX  512
+/* And then a headless Chromium, which ran the wineserver out of 512:
+ * 182 files and 328 pipes, because the server also holds a descriptor
+ * for every file it opens on a process's behalf, and a pipe pair for
+ * every thread of every client - and Chromium is many processes with
+ * many threads. NtCreateFile said "Too many open files" and Chromium's
+ * network service could not open its cache. 2048 is 115KB a slot. */
+#define PROC64_FD_MAX  2048
 
 /* 128 was under the 170 characters a real prefix's deepest path needs -
  * measured, see ramfs64.h. */
@@ -92,9 +107,16 @@
 #define FD64_FILE   0
 #define FD64_PIPE   1
 #define FD64_SOCKET 2
+#define FD64_SIGNALFD 3   /* signalfd(2): reads the reader's own signals */
+#define FD64_NETLINK  4   /* AF_NETLINK, NETLINK_ROUTE: the interface list */
 
 typedef struct {
-    int      kind;      /* FD64_FILE or FD64_PIPE */
+    int      kind;      /* FD64_FILE, FD64_PIPE, FD64_SOCKET, FD64_SIGNALFD */
+
+    /* FD64_SIGNALFD: the signals it reports, as a user sigset_t word.
+     * Its node, rx, tx and sock are all -1, so every reference count the
+     * other kinds keep passes over it. */
+    uint64_t sigmask;
     int      node;      /* FD64_FILE: the ramfs node */
     uint64_t pos;
 
@@ -129,6 +151,16 @@ typedef struct {
     int         exited;
     int         exit_status;
 
+    /* The signal that ended it, or 0 if it ended by exiting.
+     *
+     * Kept apart from exit_status because wait(2) does not encode them
+     * the same way, and a parent tells them apart with WIFSIGNALED. A
+     * process killed by SIGTERM used to be recorded as having exited
+     * with status 128+SIGTERM - which is what a shell *prints*, not what
+     * the kernel reports - so every parent in this system saw a clean
+     * exit where Linux would have shown a death. */
+    int         term_sig;
+
     /* The pid of a parent suspended in vfork waiting for this process,
      * or 0. glibc's posix_spawn is clone(CLONE_VM|CLONE_VFORK) and Wine
      * reaches the wineserver through it, so "the parent does not run
@@ -144,8 +176,31 @@ typedef struct {
      * gives the child its own copy of both. */
     uint64_t    brk_base, brk_current, mmap_next;
 
+    /* The anonymous memory this process holds that has no pages behind
+     * it yet, as sorted, non-overlapping [start, end) ranges - see
+     * uspace64.c. `flags` is what a page is mapped with when it is first
+     * touched; 0 is a PROT_NONE reservation, which nothing may touch.
+     * A range that does not fit here falls back to being backed at once
+     * (a reservation: the shared zero page), so running out is slower
+     * rather than wrong. */
+    uint32_t    nresv;
+    struct { uint64_t start, end, flags; } resv[PROC64_RESV_MAX];
+
     proc64_fd_t fds[PROC64_FD_MAX];
     char        exe_path[PROC64_PATH_MAX];
+
+    /* prctl(PR_SET_NAME)'s answer, and execve's. Sixteen bytes because
+     * that is Linux's TASK_COMM_LEN and the limit is visible: a longer
+     * name is truncated to fifteen characters and a NUL, not refused,
+     * so a caller that sets one and reads it back gets a shorter string
+     * and no error. Measured on the host rather than assumed.
+     *
+     * Per process, where Linux keeps it per thread. Threads here share
+     * a process slot, so two threads of one process cannot have
+     * different names - right for every single-threaded case and wrong
+     * in the same direction as sigaltstack above, and said rather than
+     * left to be found. */
+    char        comm[16];
 
     /* The working directory, as text rather than as a node index.
      *
@@ -158,20 +213,6 @@ typedef struct {
      * Always absolute, always without a trailing slash except for the
      * root itself. fork inherits it and execve keeps it. */
     char        cwd[PROC64_PATH_MAX];
-
-    /* The alternate signal stack, per process because that is what it
-     * is. A global one was written first and was wrong the moment more
-     * than one process registered one: this prefix run has wineboot,
-     * services.exe and rundll32 all calling sigaltstack, and services
-     * alone registers three - one per thread. Delivering process A's
-     * signal on process B's alternate stack is a write to an address
-     * that is not mapped in A.
-     *
-     * Per thread is what Linux actually does and what Wine assumes; per
-     * process is what this kernel can express today, and it is right for
-     * every single-threaded case and wrong in the same direction as
-     * before for the rest. Said plainly rather than left to be found. */
-    uint64_t    sas_sp, sas_size;
 } proc64_t;
 
 void      proc64_init(void);
@@ -186,6 +227,7 @@ int       proc64_fork_from(int pid);
 
 proc64_t* proc64_get(int pid);
 proc64_t* proc64_current(void);
+int       proc64_release_orphans(void);
 void      proc64_set_current(int pid);
 int       proc64_current_pid(void);
 
@@ -200,11 +242,36 @@ int       proc64_current_slot(void);
 void      proc64_exit(int pid, int status);
 
 /* The first exited child of `parent`, or -1. Reaps it. */
+/* Reap an exited child. `want` is a particular child's pid, or -1 for
+ * whichever of them has exited.
+ *
+ * The pid mattered and was being thrown away: wait4 passed its caller's
+ * first argument nowhere, so waitpid(child_a, ...) would happily reap
+ * child_b and report child_b's pid - and a parent polling for one
+ * specific child would consume, and lose, the status of another. */
+int       proc64_reap_child_pid(int parent, int want, int* status);
+
+/* The same, for whichever child has exited. */
 int       proc64_reap_child(int parent, int* status);
+
+/* Mark a process as ended by a signal rather than by exiting. Sets the
+ * same exited/exit_status a normal exit would, so nothing that only
+ * looks at those changes behaviour. */
+void      proc64_exit_signalled(int pid, int sig);
+
+/* The signal that ended the last process reaped, or 0. Read straight
+ * after proc64_reap_child, which is the only caller that needs it. */
+int       proc64_reaped_signal(void);
 
 /* Does this process have any children at all, exited or not? wait4 has
  * to tell "nothing to reap yet" from "there was never anything". */
 int       proc64_has_children(int pid);
+
+/* Whether this parent has a child matching `want` (-1 for any), exited
+ * or not. wait(2) returns -ECHILD on the strength of this and not on
+ * whether one has exited: a parent whose child simply has not finished
+ * yet must wait, not be told it has no children. */
+int       proc64_has_child(int pid, int want);
 
 /* The address a parent blocks on while waiting. Not a real address -
  * user pointers stop well below this - so it cannot collide with a

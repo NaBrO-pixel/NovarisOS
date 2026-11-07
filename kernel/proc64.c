@@ -117,7 +117,13 @@ int proc64_fork_from(int pid) {
     child->brk_base    = parent->brk_base;
     child->brk_current = parent->brk_current;
     child->mmap_next   = parent->mmap_next;
+    child->nresv       = parent->nresv;
+    for (uint32_t r = 0; r < parent->nresv; r++)
+        child->resv[r] = parent->resv[r];
     kstrlcpy(child->exe_path, parent->exe_path, PROC64_PATH_MAX);
+    /* The name comes across too: Linux's child keeps the name its
+     * parent had until something execs. Measured. */
+    kstrlcpy(child->comm, parent->comm, sizeof(child->comm));
     kstrlcpy(child->cwd, parent->cwd, PROC64_PATH_MAX);
     child->parent = parent->pid;
 
@@ -135,21 +141,79 @@ void proc64_exit(int pid, int status) {
      * system that has ever had fork. */
 }
 
-int proc64_reap_child(int parent, int* status) {
+/* The signal that ended the process most recently reaped, so that
+ * wait4 can encode a death the way Linux does without every caller of
+ * proc64_reap_child growing another out-parameter. */
+static int reaped_signal;
+
+int proc64_reaped_signal(void) { return reaped_signal; }
+
+void proc64_exit_signalled(int pid, int sig) {
+    proc64_t* p = slot_for(pid);
+    if (!p) return;
+    p->term_sig = sig;
+    proc64_exit(pid, 128 + sig);
+}
+
+int proc64_reap_child_pid(int parent, int want, int* status) {
     for (int i = 0; i < PROC64_MAX; i++) {
         if (!procs[i].used || !procs[i].exited) continue;
         if (procs[i].parent != parent) continue;
+        if (want > 0 && procs[i].pid != want) continue;
         if (status) *status = procs[i].exit_status;
+        reaped_signal = procs[i].term_sig;
         procs[i].used = 0;
         return procs[i].pid;
     }
+    reaped_signal = 0;
     return -1;
 }
 
-int proc64_has_children(int pid) {
-    for (int i = 0; i < PROC64_MAX; i++)
-        if (procs[i].used && procs[i].parent == pid) return 1;
+/* Releases every exited process nobody is left to reap: one whose
+ * parent is 0 - a bring-up layer's own program - or whose parent's slot
+ * is gone. Repeats until nothing changes, because releasing a parent
+ * orphans its exited children. Returns how many slots it freed.
+ *
+ * Their address spaces are not this file's business; by the time a
+ * process is exited, the kernel has destroyed its space or will sweep
+ * it. */
+int proc64_release_orphans(void) {
+    int n = 0, changed = 1;
+    while (changed) {
+        changed = 0;
+        for (int i = 0; i < PROC64_MAX; i++) {
+            proc64_t* par;
+            if (!procs[i].used || !procs[i].exited) continue;
+            /* Never the current process, exited or not: the early
+             * bring-up layers run one program after another as the same
+             * process, and each one's exit marks it exited while the next
+             * layer goes on using its descriptors. */
+            if (procs[i].pid == current_pid) continue;
+            par = procs[i].parent ? slot_for(procs[i].parent) : 0;
+            if (par) continue;
+            procs[i].used = 0;
+            n++;
+            changed = 1;
+        }
+    }
+    return n;
+}
+
+int proc64_reap_child(int parent, int* status) {
+    return proc64_reap_child_pid(parent, -1, status);
+}
+
+int proc64_has_child(int pid, int want) {
+    for (int i = 0; i < PROC64_MAX; i++) {
+        if (!procs[i].used || procs[i].parent != pid) continue;
+        if (want > 0 && procs[i].pid != want) continue;
+        return 1;
+    }
     return 0;
+}
+
+int proc64_has_children(int pid) {
+    return proc64_has_child(pid, -1);
 }
 
 uint64_t proc64_count(void) {

@@ -1,0 +1,30 @@
+# The Wine modules a headless Chromium loads that creating a prefix does
+# not - staged, on top of wine_prefix_modules.txt, when Chromium is
+# (CHROMIUM64_DIR).
+#
+# Measured, not guessed: Chromium r1698704 run on the Linux host under
+# the same Wine build with WINEDEBUG=+loaddll,
+#
+#   chrome.exe --headless --no-sandbox --disable-gpu \
+#       --dump-dom "data:text/html,<p>novaris</p>"
+#
+# loads 95 modules; these are the ones not already staged, less
+# Chromium's own files and the kernel drivers stage_wine.sh copies
+# anyway. tools/close_wine_modules.py, seeded with them, adds nothing:
+# everything they import is already on the prefix list.
+actxprxy.dll
+cryptowinrt.dll
+directmanipulation.dll
+hnetcfg.dll
+kerberos.dll
+msctf.dll
+msv1_0.dll
+netprofm.dll
+powrprof.dll
+wbemprox.dll
+windows.media.dll
+windows.security.credentials.ui.userconsentverifier.dll
+windows.ui.dll
+wlanapi.dll
+wpc.dll
+winemenubuilder.exe

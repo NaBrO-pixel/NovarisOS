@@ -1,5 +1,5 @@
 #!/bin/bash
-# stage_wine.sh <wine-build-tree> <destination>
+# stage_wine.sh <wine-build-tree> <destination> [<extra-module-list>...]
 #
 # Lays a Wine installation out the way Wine expects to find one, so that
 # the loader can locate its own libraries from /proc/self/exe rather
@@ -28,6 +28,10 @@ set -u
 TREE="${1:-}"
 DEST="${2:-}"
 LIST="$(dirname "$0")/wine_prefix_modules.txt"
+# Further lists, in the same format, staged on top - a program that
+# needs more than a prefix does (tools/wine_chromium_modules.txt).
+shift 2 2>/dev/null
+EXTRA_LISTS="$*"
 
 if [ -z "$TREE" ] || [ -z "$DEST" ]; then
     echo "usage: stage_wine.sh <wine-build-tree> <destination>" >&2
@@ -266,6 +270,106 @@ else
     echo "stage_wine: no nls directory at $TREE/nls" >&2
 fi
 
+# The fonts. In both places, for the same reason as the NLS tables.
+#
+# Wine ships thirteen TrueType faces of its own and looks for them in
+# %WINDIR%/fonts and in datadir/fonts. Without them there is no font on
+# the machine at all, and Milestone 88 found what that costs: every
+# system metric derived from the caption font is read out of memory
+# nothing wrote. SM_CYCAPTION measured 6750319, so a 400x300 window came
+# back with a client area zero pixels tall, while a WS_POPUP window -
+# which has no caption - was exactly the size it asked for.
+#
+# Staging libfreetype without these is worse than staging neither.
+# FreeType then loads, finds nothing to load *with*, and the font code
+# goes on into paths that assume at least one face exists: 576 segfaults
+# in one run, against a dozen with no FreeType at all, and wineboot
+# never finished. The library and the faces are one change.
+# --- the libraries Wine dlopens ----------------------------------------
+#
+# Not the ones it links. Those are in NEEDED and the objdump above finds
+# them; these are opened by name at first use and appear in no ELF header
+# anywhere:
+#
+#     #define SONAME_LIBFREETYPE   "libfreetype.so.6"
+#     #define SONAME_LIBFONTCONFIG "libfontconfig.so.1"
+#
+# That is the Milestone 81 libm bug one level further out - libm was
+# missing and *named* in NEEDED, these are missing and named nowhere -
+# and what it costs is not a missing font. Wine says "cannot find the
+# FreeType font library" once, carries on, and every system metric
+# derived from the caption font is then read out of memory nothing
+# wrote: Milestone 88 measured SM_CYCAPTION as 6750319, so a 400x300
+# window came back with a client area zero pixels tall while a WS_POPUP
+# window, which has no caption, was exactly the size it asked for.
+#
+# The seed list is Wine's own config.h rather than anything written
+# here, so a tree configured with more optional libraries stages them
+# without this script being edited, and one configured with fewer does
+# not carry libraries nothing will open. Closed under ldd, because a
+# dlopen that fails on a dependency is the same silence as one that
+# fails on the library itself.
+CFG="$TREE/include/config.h"
+if [ -f "$CFG" ]; then
+    mkdir -p "$DEST/lib/x86_64-linux-gnu" || exit 1
+    seeds=$(sed -n 's/^#define SONAME_[A-Z0-9_]*  *"\(.*\)"/\1/p' "$CFG")
+    staged=0 skipped=""
+    for so in $seeds; do
+        path=$(ldconfig -p 2>/dev/null | awk -v s="$so" '$1==s {print $NF; exit}')
+        if [ -z "$path" ] || [ ! -f "$path" ]; then
+            skipped="$skipped $so"
+            continue
+        fi
+        # The library and everything it needs, each under the soname the
+        # loader will ask for rather than the versioned file name.
+        for pair in "$so|$path" $(ldd "$path" 2>/dev/null |
+                        sed -n 's/^[[:space:]]*\([^ ]*\) => \([^ ]*\).*/\1|\2/p'); do
+            name=${pair%%|*}
+            file=${pair#*|}
+            case "$name" in
+                # Already staged by the Makefile, which pins the exact
+                # build it also gives ld.so.
+                libc.so.6|libm.so.6|libgcc_s.so.1|ld-linux*) continue ;;
+            esac
+            [ -f "$file" ] || continue
+            cp "$file" "$DEST/lib/x86_64-linux-gnu/$name" 2>/dev/null &&
+                staged=$((staged+1))
+        done
+    done
+    echo "stage_wine: $staged dlopen libraries and dependencies"
+    [ -n "$skipped" ] && echo "stage_wine: not on this host:$skipped"
+else
+    echo "stage_wine: no config.h at $CFG, no dlopen libraries staged" >&2
+fi
+
+# Wine's own thirteen TrueType faces, in both places for the same reason
+# as the NLS tables. FreeType with nothing to load is not an improvement
+# on no FreeType.
+if ls "$TREE"/fonts/*.ttf >/dev/null 2>&1; then
+    for d in "$DEST/usr/share/wine/fonts" "$DEST/share/wine/fonts"; do
+        mkdir -p "$d" || exit 1
+        cp "$TREE"/fonts/*.ttf "$d/" 2>/dev/null
+    done
+    echo "stage_wine: $(ls "$DEST/usr/share/wine/fonts" | wc -l) fonts, in both places"
+else
+    echo "stage_wine: no fonts at $TREE/fonts" >&2
+fi
+
+# And fontconfig's configuration, naming those faces. Without one,
+# fontconfig prints "Cannot load default config file" once per process
+# that loads win32u, into the serial log the run is judged by - the same
+# reason tools/install_wine.sh stages it for the 32-bit side.
+mkdir -p "$DEST/etc/fonts"
+cat > "$DEST/etc/fonts/fonts.conf" <<'FONTSCONF'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <dir>/usr/share/wine/fonts</dir>
+  <cachedir>/tmp/fontconfig</cachedir>
+</fontconfig>
+FONTSCONF
+echo "stage_wine: /etc/fonts/fonts.conf"
+
 # The PE halves, from the measured list.
 found_pe=0
 missing=""
@@ -277,7 +381,7 @@ while IFS= read -r name; do
     else
         missing="$missing $name"
     fi
-done < "$LIST"
+done < <(cat "$LIST" $EXTRA_LISTS)
 
 # The kernel drivers, which are PE modules like the rest and are not on
 # the list because the list was written from what a prefix run opened

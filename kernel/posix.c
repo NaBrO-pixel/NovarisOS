@@ -99,7 +99,9 @@ void posix_request_block_multi(const uint32_t* addrs, int n, uint32_t deadline,
                                registers_t* regs) {
     if (n > PROC_WAIT_MAX) n = PROC_WAIT_MAX;
     if (n < 0) n = 0;
-    for (int i = 0; i < n; i++) block_addrs[i] = addrs[i];
+    if (addrs != block_addrs) {
+        for (int i = 0; i < n; i++) block_addrs[i] = addrs[i];
+    }
     block_count = n;
     block_deadline = deadline;
     posix_request_retry();
@@ -155,6 +157,49 @@ int posix_fd_import(uint32_t token) {
     p->fds[fd] = *src;
     src->kind = FD_FREE;
     return fd;
+}
+
+/* A descriptor that was sent and will never be received - its socket is
+ * being freed with the message still in it - released the way close()
+ * would release it.
+ *
+ * Without this the in-flight entry, and the reference it holds, lasted
+ * for ever. That leaks a slot of a 32-entry table, which is bad, and it
+ * keeps the passed object open, which is worse: a pipe or socket end
+ * nobody can ever close again is one whose peer never sees end of
+ * stream. Wine is where that bit. A client that exits with the server's
+ * last descriptor still queued to it - the server answering a request
+ * the client no longer waits for - left the objects in that message
+ * alive, and the wineserver, which learns of a client's death from the
+ * hang-up on its descriptors, never learnt of this one. So the process
+ * handle never became signalled, and wineboot, waiting on it, waited
+ * with every other task in the machine: a first boot that went silent
+ * after the last terminate_process and stayed that way. */
+/* How many queued, not-yet-received descriptors name `sock` - for the F12
+ * dump, so a socket that no process holds can be told apart from one
+ * that is kept alive by a message nobody will read. */
+int posix_in_flight_refs(struct socket* sock) {
+    int n = 0;
+    for (int i = 0; i < MAX_IN_FLIGHT; i++) {
+        if (in_flight[i].kind == FD_SOCKET && in_flight[i].sock == sock) n++;
+    }
+    return n;
+}
+
+int posix_in_flight_used(void) {
+    int n = 0;
+    for (int i = 0; i < MAX_IN_FLIGHT; i++) if (in_flight[i].kind != FD_FREE) n++;
+    return n;
+}
+
+void posix_fd_discard(uint32_t token) {
+    if (!token || token > MAX_IN_FLIGHT) return;
+    fd_entry_t* e = &in_flight[token - 1];
+    if (e->kind == FD_SOCKET) socket_close(e->sock);
+    if (e->kind == FD_FILE) vfs_node_unref(e->node);
+    e->kind = FD_FREE;
+    e->node = 0;
+    e->sock = 0;
 }
 
 /* --- files kept alive by a mapping (Milestone 30) ------------------------
@@ -308,8 +353,9 @@ static void process_teardown(int status) {
 
     /* Every descriptor this process still holds. A socket's peer has to
      * find out, or a reader on the far side waits for a writer that has
-     * gone - which is precisely how a pipe reports end of file. */
-    for (int i = 3; i < MAX_FDS; i++) {
+     * gone - which is precisely how a pipe reports end of file. From 0,
+     * not 3: a standard stream can be a pipe - see sys_close(). */
+    for (int i = 0; i < MAX_FDS; i++) {
         if (p->fds[i].kind == FD_SOCKET) socket_close(p->fds[i].sock);
         if (p->fds[i].kind == FD_FILE) vfs_node_unref(p->fds[i].node);
         p->fds[i].kind = FD_FREE;
@@ -352,7 +398,7 @@ void posix_exit_process_group(int wstatus) {
     /* Force the teardown even though siblings exist: they are about to
      * stop too. */
     posix_proc_t* p = posix_current();
-    for (int i = 3; i < MAX_FDS; i++) {
+    for (int i = 0; i < MAX_FDS; i++) {
         if (p->fds[i].kind == FD_SOCKET) socket_close(p->fds[i].sock);
         if (p->fds[i].kind == FD_FILE) vfs_node_unref(p->fds[i].node);
         p->fds[i].kind = FD_FREE;
@@ -423,7 +469,7 @@ uint32_t posix_unimplemented_count(void) {
 static int map_range(uint32_t base, uint32_t bytes, uint32_t flags) {
     for (uint32_t va = base; va < base + bytes; va += PAGE_SIZE) {
         uint32_t pte = paging_get_entry(va);
-        if ((pte & PAGE_PRESENT) && !(pte & PAGE_SHARED)) {
+        if ((pte & PAGE_PRESENT) && !(pte & PAGE_SHARED) && !(pte & PAGE_COW)) {
             /* Already mapped - which is the normal case for MAP_FIXED, and
              * exactly what a dynamic linker does: reserve the whole span
              * of a library with one PROT_NONE anonymous mapping, then map
@@ -446,8 +492,16 @@ static int map_range(uint32_t base, uint32_t bytes, uint32_t flags) {
          * tail over the end of it with MAP_FIXED|MAP_ANONYMOUS. Nothing
          * noticed while a private file mapping was a private copy;
          * Milestone 34 made those frames the file's, which is what turned
-         * this from a leak of somebody else's page into corruption of it. */
-        if (pte & PAGE_PRESENT) paging_unmap_page(va);
+         * this from a leak of somebody else's page into corruption of it.
+         *
+         * And a page a fork shares (PAGE_COW without PAGE_SHARED) for the
+         * same reason: its frame is the other process's too. This
+         * process's reference to it is released - pmm_free_frame() frees
+         * it only if nobody else holds it - and the page starts again. */
+        if (pte & PAGE_PRESENT) {
+            paging_unmap_page(va);
+            if (!(pte & PAGE_SHARED)) pmm_free_frame(pte & ~0xFFFu);
+        }
         uint32_t phys = pmm_alloc_frame();
         if (!phys) return 0;
         paging_map_page(va, phys, flags);
@@ -587,7 +641,9 @@ static int map_file_range(uint32_t base, uint32_t bytes, vfs_node_t* node,
      * handled below. */
     uint32_t need = off + bytes;
     if (need > node->length) need = node->length;
-    if (!vfs_make_mappable(node, need)) return 0;
+    /* A shared mapping is the only kind through which a file is grown
+     * while mapped, so it is the only kind given room to grow. */
+    if (!vfs_make_mappable(node, need, !cow)) return 0;
 
     for (uint32_t p = 0; p < bytes; p += PAGE_SIZE) {
         /* MAP_FIXED over something this process already had: that frame
@@ -1101,7 +1157,18 @@ static int32_t sys_open(const char* path, int flags, uint32_t mode) {
 static int32_t sys_close(int fd) {
     fd_entry_t* e = fd_get(fd);
     if (!e) return -EBADF;
-    if (fd < 3) return 0; /* closing a standard stream is a no-op here */
+    /* Closing the console is a no-op here - there is one console and
+     * every process shares it. That used to be "closing descriptors 0, 1
+     * and 2 is a no-op", whatever they held, and they do not always hold
+     * the console: a process given standard handles dup2s pipes and
+     * sockets onto them, which is how Wine starts every child with its
+     * handles. A pipe there was never closed - not by close(), and not by
+     * the dup2 that "closed" it before overwriting the entry, so its
+     * reference was simply lost. Its peer then never saw end of stream,
+     * and the peer was the wineserver, which learns of a client's death
+     * from exactly that: the process handle was never signalled, and a
+     * first wineboot waited on it with every other task in the machine. */
+    if (e->kind == FD_CONSOLE) return 0;
     if (e->kind == FD_SOCKET) socket_close(e->sock);
     if (e->kind == FD_FILE) vfs_node_unref(e->node);
     e->kind = FD_FREE;
@@ -1583,6 +1650,37 @@ static int32_t sys_unlink(const char* path, int want_dir) {
     return r;
 }
 
+/* link(2), answered the way Linux answers it on a filesystem that cannot
+ * give one file two names - FAT, for one - and for the same reason: a
+ * ramfs node *is* its directory entry, name, parent and all, so a second
+ * name would be a second node with its own bytes, and that is a copy, not
+ * a link. EPERM is the documented answer for exactly this, after the
+ * checks every caller is entitled to (the source exists, the target does
+ * not).
+ *
+ * It was ENOSYS, and printed as an unimplemented syscall on every call.
+ * fontconfig takes the lock on its cache by creating a file and link()ing
+ * it to a .LCK name, and falls back to a lock directory on EPERM - not on
+ * ENOSYS - so every Wine process that loaded win32u logged two of them,
+ * and test-wine, which rejects that line, failed on its first faster
+ * boot. Wine's own CreateHardLink reaches here too, and gets an honest
+ * "access denied". */
+static int32_t sys_link(const char* oldpath, const char* newpath) {
+    if (!oldpath || !newpath) return -EFAULT;
+    char joined[PATH_JOIN_MAX];
+    const char* p = abs_into(oldpath, joined, sizeof(joined));
+    const char* leaf = 0;
+    vfs_node_t* dir = vfs_resolve_parent(p, &leaf);
+    vfs_node_t* src = dir ? vfs_finddir(dir, leaf) : 0;
+    if (!src) return -ENOENT;
+    if (src->flags & VFS_DIRECTORY) return -EPERM;
+    p = abs_into(newpath, joined, sizeof(joined));
+    dir = vfs_resolve_parent(p, &leaf);
+    if (!dir) return -ENOENT;
+    if (vfs_finddir(dir, leaf)) return -EEXIST;
+    return -EPERM;
+}
+
 static int32_t sys_mkdir(const char* path, uint32_t mode) {
     if (!path) return -EFAULT;
     char joined[PATH_JOIN_MAX];
@@ -1748,6 +1846,16 @@ static int32_t fork_common(registers_t* regs, uint32_t child_stack, int vfork) {
 
     int tid = scheduler_fork_current(regs, child_pd, vfork ? "vfork" : "fork");
     if (tid < 0) {
+        /* posix_proc_clone() took a reference on every descriptor and
+         * mapping the child inherited; a child that never runs has to give
+         * them back, or each failed fork pins every pipe the parent had
+         * open - and a pipe pinned is one whose reader never sees EOF. */
+        for (int f = 0; f < MAX_FDS; f++) {
+            if (child->fds[f].kind == FD_SOCKET) socket_close(child->fds[f].sock);
+            if (child->fds[f].kind == FD_FILE) vfs_node_unref(child->fds[f].node);
+            child->fds[f].kind = FD_FREE;
+        }
+        posix_unpin_proc(child);
         posix_proc_reap(child);
         paging_destroy_address_space(child_pd);
         return -EAGAIN;
@@ -2077,7 +2185,10 @@ static int32_t sys_poll(k_pollfd_t* fds_u, uint32_t nfds, int timeout_ms,
     if (nfds > MAX_FDS * 2) return -EINVAL;
 
     int ready = 0;
-    uint32_t socks[PROC_WAIT_MAX];
+    /* The set is built straight into block_addrs rather than a local
+     * array: PROC_WAIT_MAX entries is a kilobyte, and this runs on an 8KB
+     * kernel stack. posix_request_block_multi() then has nothing to copy. */
+    uint32_t* socks = block_addrs;
     int nsocks = 0;
     int all_registered = 1;    /* every descriptor in the set is a socket
                                 * this task is now parked on */
@@ -2142,7 +2253,10 @@ static int32_t sys_select(int nfds, uint32_t* rd, uint32_t* wr, uint32_t* ex,
 
     uint32_t rout = 0, wout = 0, eout = 0;
     int ready = 0;
-    uint32_t socks[PROC_WAIT_MAX];
+    /* The set is built straight into block_addrs rather than a local
+     * array: PROC_WAIT_MAX entries is a kilobyte, and this runs on an 8KB
+     * kernel stack. posix_request_block_multi() then has nothing to copy. */
+    uint32_t* socks = block_addrs;
     int nsocks = 0;
     int all_registered = 1;
 
@@ -2399,6 +2513,9 @@ static const char* syscall_name(uint32_t n) {
         case SYS_faccessat2: return "faccessat2";
         case SYS_readlinkat: return "readlinkat";
         case SYS_symlink: return "symlink";
+        case SYS_link: return "link";
+        case SYS_fadvise64_64: return "fadvise64_64";
+        case SYS_linkat: return "linkat";
         case SYS_symlinkat: return "symlinkat";
         case SYS_getxattr: return "getxattr";
         case SYS_lgetxattr: return "lgetxattr";
@@ -3092,6 +3209,33 @@ void posix_syscall(registers_t* regs) {
             break;
         }
 
+        case SYS_link:
+            r = sys_link((const char*)a, (const char*)b);
+            break;
+
+        case SYS_fadvise64_64: {
+            /* Advice, and there is nothing here to advise: no page cache,
+             * no readahead. Linux's checks and then success - which is
+             * what Linux itself returns for advice it ignores. fontconfig
+             * calls this on every cache file it opens, so every Wine
+             * process logged it as unimplemented. On i386 the 64-bit
+             * offset and length take two registers each, so the advice is
+             * the sixth argument. */
+            fd_entry_t* fe = fd_get((int)a);
+            int advice = (int)f;
+            if (!fe) r = -EBADF;
+            else if (fe->kind == FD_SOCKET) r = -ESPIPE;
+            else if (advice < 0 || advice > 5) r = -EINVAL;
+            else r = 0;
+            break;
+        }
+        case SYS_linkat:
+            /* (olddirfd, oldpath, newdirfd, newpath, flags): the dirfds
+             * are ignored as every other *at variant here ignores them -
+             * see SYS_symlinkat below. */
+            r = sys_link((const char*)b, (const char*)d);
+            break;
+
         case SYS_symlink:
             /* On since Milestone 32. Milestone 31 built symlinks and then
              * held them back, because switching them on gives Wine its
@@ -3334,13 +3478,31 @@ void posix_syscall(registers_t* regs) {
              * for, or a joiner waits for ever. exit_group takes the whole
              * program with it, so it does not. */
             posix_thread_exiting();
-            /* fall through */
-        case SYS_exit_group:
             /* The status is real since Milestone 29, and in Linux's
              * encoding rather than raw: a normal exit is the low byte of
              * the code shifted up eight, which is what WIFEXITED and
-             * WEXITSTATUS read. A parent in wait4 is woken by this. */
+             * WEXITSTATUS read. A parent in wait4 is woken by this. Ends
+             * the process only if this was its last thread. */
             posix_exit_status((int)((a & 0xFFu) << 8));
+            return; /* eax is not written: this task is finished */
+
+        case SYS_exit_group:
+            /* Every thread, not just this one. exit_group used to fall
+             * through to exit, which ended the calling thread and left the
+             * rest of the process running - and since process_teardown()
+             * only runs for a process's last thread, its descriptors were
+             * never closed either. Every Wine process has several threads
+             * and leaves through exit_group, so every one of them
+             * survived its own exit with its pipes and sockets open, and
+             * the wineserver, which learns of a death from the hang-up on
+             * those, never learnt of any. The process handle was never
+             * signalled, and on a first boot wineboot waited on one of
+             * those handles with every other task in the machine.
+             *
+             * A forked child, vfork included, has an address space of its
+             * own (fork_common copies it), so "every task in this address
+             * space" is exactly this process. */
+            posix_exit_process_group((int)((a & 0xFFu) << 8));
             return; /* eax is not written: this task is finished */
 
         default:
@@ -3365,7 +3527,12 @@ void posix_syscall(registers_t* regs) {
          * the retry loop finally using it. Waking must not overwrite eax,
          * which now holds the syscall number - see PROC_BLOCKED's
          * wait_retry in the scheduler. */
-        uint32_t waiting_on[PROC_WAIT_MAX];
+        /* Static rather than on the stack, for the same reason as
+         * sys_poll()'s set: PROC_WAIT_MAX entries is a kilobyte. One
+         * syscall is in this path at a time - nothing re-enters it from
+         * an interrupt - and the scheduler copies the set into the task
+         * before it switches away. */
+        static uint32_t waiting_on[PROC_WAIT_MAX];
         int waiting_n = block_count;
         for (int i = 0; i < waiting_n; i++) waiting_on[i] = block_addrs[i];
         uint32_t until = block_deadline;

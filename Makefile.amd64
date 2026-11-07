@@ -46,7 +46,14 @@ ISO       = novaris64.iso
 CFLAGS = -std=gnu99 -ffreestanding -fno-builtin -fno-stack-protector \
          -fno-pic -fno-pie -m64 -mcmodel=kernel -mno-red-zone \
          -mno-sse -mno-mmx \
-         -Wall -Wextra -O2 -Iinclude -MMD -MP
+         -Wall -Wextra -O2 -Iinclude -MMD -MP $(CFLAGS_EXTRA)
+
+# Anything extra a one-off run wants to define, without editing source.
+# Used for the chrome.exe budget, which `make test` cannot afford to
+# raise but an investigation needs to:
+#
+#   make -f Makefile.amd64 CFLAGS_EXTRA=-DCHROME64_BUDGET_SECS=1800u ...
+CFLAGS_EXTRA ?=
 
 # -w+error=label-orphan turns "label alone on a line" into an error. NASM
 # accepts an unrecognised mnemonic as a label definition, so a 64-bit
@@ -96,6 +103,11 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/cwd64_blob.o \
        $(BUILD_DIR)/cowfork64_blob.o \
        $(BUILD_DIR)/vmem64_blob.o \
+       $(BUILD_DIR)/clock64_blob.o \
+       $(BUILD_DIR)/kill64_blob.o \
+       $(BUILD_DIR)/wait64_blob.o \
+       $(BUILD_DIR)/prctl64_blob.o \
+       $(BUILD_DIR)/tgkill64_blob.o \
        $(BUILD_DIR)/spawn64_blob.o \
        $(BUILD_DIR)/pipetest64_blob.o \
        $(BUILD_DIR)/socktest64_blob.o \
@@ -254,6 +266,72 @@ $(BUILD_DIR)/vmem64_blob.c: $(BUILD_DIR)/vmem64.elf userland/embed64.py
 $(BUILD_DIR)/vmem64_blob.o: $(BUILD_DIR)/vmem64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# The clocks: which id means a date, and what TIMER_ABSTIME means
+# (Milestone 86). Static, like every other differential here.
+$(BUILD_DIR)/clock64.elf: userland/clock64.c | $(BUILD_DIR)
+	gcc -static -O2 -o $@ $<
+	@file $@ | grep -q "statically linked" \
+	    || (echo "ERROR: $@ is not static"; false)
+
+$(BUILD_DIR)/clock64_blob.c: $(BUILD_DIR)/clock64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ clock64_elf
+
+$(BUILD_DIR)/clock64_blob.o: $(BUILD_DIR)/clock64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# kill(2): one process signalling another (Milestone 93). Static, like
+# every other differential here.
+$(BUILD_DIR)/kill64.elf: userland/kill64.c | $(BUILD_DIR)
+	gcc -static -O2 -o $@ $<
+	@file $@ | grep -q "statically linked" \
+	    || (echo "ERROR: $@ is not static"; false)
+
+$(BUILD_DIR)/kill64_blob.c: $(BUILD_DIR)/kill64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ kill64_elf
+
+$(BUILD_DIR)/kill64_blob.o: $(BUILD_DIR)/kill64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# wait4's pid and options, both of which used to be read and discarded
+# (Milestone 94). Static, like every other differential here.
+$(BUILD_DIR)/wait64.elf: userland/wait64.c | $(BUILD_DIR)
+	gcc -static -O2 -o $@ $<
+	@file $@ | grep -q "statically linked" \
+	    || (echo "ERROR: $@ is not static"; false)
+
+$(BUILD_DIR)/wait64_blob.c: $(BUILD_DIR)/wait64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ wait64_elf
+
+$(BUILD_DIR)/wait64_blob.o: $(BUILD_DIR)/wait64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# prctl's PR_SET_NAME/PR_GET_NAME, which Wine's preloader checks the
+# result of (Milestone 95). Static, like every other differential here.
+$(BUILD_DIR)/prctl64.elf: userland/prctl64.c | $(BUILD_DIR)
+	gcc -static -O2 -o $@ $<
+	@file $@ | grep -q "statically linked" \
+	    || (echo "ERROR: $@ is not static"; false)
+
+$(BUILD_DIR)/prctl64_blob.c: $(BUILD_DIR)/prctl64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ prctl64_elf
+
+$(BUILD_DIR)/prctl64_blob.o: $(BUILD_DIR)/prctl64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# tgkill's thread target (Milestone 96), which the wineserver uses to
+# stop a thread. Threaded, so -pthread; static, like every other
+# differential here.
+$(BUILD_DIR)/tgkill64.elf: userland/tgkill64.c | $(BUILD_DIR)
+	gcc -static -O2 -pthread -o $@ $<
+	@file $@ | grep -q "statically linked" \
+	    || (echo "ERROR: $@ is not static"; false)
+
+$(BUILD_DIR)/tgkill64_blob.c: $(BUILD_DIR)/tgkill64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ tgkill64_elf
+
+$(BUILD_DIR)/tgkill64_blob.o: $(BUILD_DIR)/tgkill64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 # posix_spawn, which is clone(CLONE_VM|CLONE_VFORK) and is how Wine
 # starts the wineserver (Milestone 73). It execs forkchild64, which the
 # initrd already stages at /tmp/forkchild64 for the fork/exec test.
@@ -370,6 +448,37 @@ $(BUILD_DIR)/fbdraw64_blob.c: $(BUILD_DIR)/fbdraw64.elf userland/embed64.py
 $(BUILD_DIR)/fbdraw64_blob.o: $(BUILD_DIR)/fbdraw64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# A Windows program that really does make a window (Milestone 87).
+#
+# pe_test/gui_app.c is the opposite test - it runs on this kernel's own
+# PE loader and expects CreateWindowEx to fail. This one runs under
+# Wine, on a kernel that has a display driver now, and expects it to
+# work. Full CRT and real imports from user32 and gdi32, because the
+# question is whether Wine's USER and GDI work here and not whether a
+# hand-written PE loads.
+#
+# Console subsystem deliberately: a GUI-subsystem binary has nowhere to
+# write, and every other layer in this tree reports by writing to the
+# serial port.
+$(BUILD_DIR)/winegui64.exe: userland/pe_test/winegui64.c | $(BUILD_DIR)
+	@if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then \
+	    x86_64-w64-mingw32-gcc -O2 -o $@ $< -lgdi32 -luser32 \
+	        && echo "  built $@"; \
+	 else \
+	    echo "  no mingw, skipping $@"; \
+	 fi
+
+# The probe that asks chrome_elf's own questions (Milestone 90). It is a
+# console program like the rest, and it links version.dll because
+# reading chrome.exe's VS_VERSION_INFO is one of the things it checks.
+$(BUILD_DIR)/chromeprobe64.exe: userland/pe_test/chromeprobe64.c | $(BUILD_DIR)
+	@if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then \
+	    x86_64-w64-mingw32-gcc -O2 -o $@ $< -lversion -ladvapi32 \
+	        && echo "  built $@"; \
+	 else \
+	    echo "  no mingw, skipping $@"; \
+	 fi
+
 # A real 64-bit Windows executable - the format chrome.exe is in. Built
 # by mingw, importing from kernel32, linked at a Windows image base, and
 # with no idea Novaris exists.
@@ -458,11 +567,47 @@ LIBC   := $(shell readlink -f /lib/x86_64-linux-gnu/libc.so.6)
 LIBGCC := $(shell readlink -f /lib/x86_64-linux-gnu/libgcc_s.so.1 2>/dev/null)
 LIBM   := $(shell readlink -f /lib/x86_64-linux-gnu/libm.so.6 2>/dev/null)
 
+
 # An x86-64 Wine built out-of-tree beside the repository, if there is
 # one. Two candidates because a git worktree sits four levels below the
 # checkout it belongs to, and the build has to work from either.
 # Override with `make -f Makefile.amd64 WINE64_LOADER=/path/to/wine`.
 WINE64_INSTALL ?=
+
+# An unpacked Chromium chrome-win directory, if there is one, and which
+# of its files to carry. Milestone 90 measured chrome.exe as needing
+# fifteen DLLs and 368 functions with Wine covering all but two, so the
+# launcher and the DLL it imports are 4.6MB and go in; chrome.dll is
+# 332MB and is opt-in, through CHROMIUM64_FILES below.
+CHROMIUM64_DIR ?=
+# The launcher and the DLL it imports, and no more by default: 4.6MB
+# against an initrd that is 107MB with Wine in it, and `make test` boots
+# with QEMU_RAM=2G. The whole runtime set is 358MB and makes a 483MB
+# initrd, which needs more memory than the test target gives it, so it
+# is opt-in - and leaving either variable off is quiet rather than
+# fatal, because a plain `make iso` rebuilds a 7.5MB initrd with no
+# Wine and no Chromium in it:
+#
+#   make -f Makefile.amd64 WINE64_INSTALL=1 CHROMIUM64_DIR=... \
+#        CHROMIUM64_FILES="chrome.exe chrome_elf.dll chrome.dll \
+#            resources.pak chrome_100_percent.pak chrome_200_percent.pak \
+#            icudtl.dat v8_context_snapshot.bin locales/en-US.pak" iso
+#
+# That was once measured as changing nothing, because chrome_elf
+# breakpointed before anything reached the rest of the install. Both
+# halves of that have since moved: bcryptprimitives.dll fixed the
+# breakpoint (Milestone 90), and storing a 332MB file at all fixed the
+# "Bad EXE format" that replaced it (Milestone 91). chrome.exe now
+# reaches chrome.dll, maps it and parses it as a PE.
+CHROMIUM64_FILES ?= chrome.exe chrome_elf.dll
+# What a headless run opens, measured with strace on the Linux host
+# against the same Wine: the launcher, chrome.dll, the version manifest,
+# ICU, the V8 snapshot and four .pak files - 358MB. Everything else in
+# the 808MB build is opened at most once and optional. Use it as
+#   CHROMIUM64_FILES="$(CHROMIUM64_HEADLESS)"
+CHROMIUM64_HEADLESS = chrome.exe chrome_elf.dll chrome.dll \
+    156.0.8062.0.manifest icudtl.dat v8_context_snapshot.bin resources.pak \
+    chrome_100_percent.pak chrome_200_percent.pak locales/en-US.pak
 # `../wine` is here because a Wine configured in its own source tree puts
 # the loader in exactly the same places as an out-of-tree build does, and
 # looking only for the out-of-tree name fails silently: the recipe below
@@ -478,8 +623,32 @@ WINE64_NTDLL  ?= $(firstword $(wildcard \
     ../wine/dlls/ntdll/ntdll.so \
     ../../../../wine/dlls/ntdll/ntdll.so))
 
+# What the variables above asked for, as a file whose contents change
+# when they do. Without it `make WINE64_INSTALL=1 iso` after a plain
+# `make iso` finds an initrd newer than every prerequisite and keeps it -
+# so the ISO boots with no Wine in it, and the run says "no Wine
+# installation in the initrd" ten minutes later. The file is rewritten
+# only when its contents differ, so an unchanged configuration is still
+# an up-to-date initrd.
+INITRD_CONFIG = $(BUILD_DIR)/initrd64.config
+INITRD_CONFIG_TEXT = WINE64_INSTALL=$(WINE64_INSTALL) \
+    WINE64_LOADER=$(abspath $(WINE64_LOADER)) \
+    WINE64_NTDLL=$(abspath $(WINE64_NTDLL)) \
+    CHROMIUM64_DIR=$(CHROMIUM64_DIR) CHROMIUM64_FILES=$(CHROMIUM64_FILES)
+$(shell mkdir -p $(BUILD_DIR); \
+    [ "`cat $(INITRD_CONFIG) 2>/dev/null`" = "$(INITRD_CONFIG_TEXT)" ] \
+    || echo "$(INITRD_CONFIG_TEXT)" > $(INITRD_CONFIG))
+
+# tools/stage_wine.sh and its module list are prerequisites because they
+# decide what goes *into* the image. Without them here, editing the list
+# of staged modules leaves the initrd untouched and the next run tests
+# the previous list - which costs a build and a boot to notice, and
+# looks exactly like the fix not working.
 $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
-           $(BUILD_DIR)/forkchild64.elf userland/mkinitrd.py
+           $(BUILD_DIR)/forkchild64.elf userland/mkinitrd.py \
+           $(BUILD_DIR)/winegui64.exe $(BUILD_DIR)/chromeprobe64.exe \
+           tools/stage_wine.sh tools/wine_prefix_modules.txt \
+           tools/wine_chromium_modules.txt $(INITRD_CONFIG)
 	rm -rf $(INITRD_STAGE)
 	mkdir -p $(INITRD_STAGE)
 	cp $(BUILD_DIR)/dlllib64.dll $(INITRD_STAGE)/dlllib64.dll
@@ -540,9 +709,45 @@ $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
 	@# Off unless asked for: it is 64MB of initrd and every ordinary
 	@# test run would pay for it. Turn it on with
 	@#     make -f Makefile.amd64 WINE64_INSTALL=1 test-wine-prefix
+	@# With Chromium staged, the Wine modules it loads beyond a prefix's
+	@# go in too - tools/wine_chromium_modules.txt, measured on the host.
 	@if [ -n "$(WINE64_INSTALL)" ] && [ -x "$(WINE64_LOADER)" ]; then \
 	    bash tools/stage_wine.sh "$(dir $(WINE64_LOADER)).." \
-	        $(INITRD_STAGE) || exit 1; \
+	        $(INITRD_STAGE) \
+	        $(if $(CHROMIUM64_DIR),tools/wine_chromium_modules.txt) \
+	        || exit 1; \
+	 fi
+	@# Beside the rest of the PE modules, which is where Wine looks for
+	@# a builtin - so it is found by name without a path.
+	@if [ -n "$(WINE64_INSTALL)" ] && [ -f "$(BUILD_DIR)/winegui64.exe" ]; then \
+	    mkdir -p $(INITRD_STAGE)/usr/bin/x86_64-windows; \
+	    cp $(BUILD_DIR)/winegui64.exe \
+	       $(INITRD_STAGE)/usr/bin/x86_64-windows/winegui64.exe; \
+	    echo "  initrd: winegui64.exe staged"; \
+	 fi
+	@if [ -n "$(WINE64_INSTALL)" ] && [ -f "$(BUILD_DIR)/chromeprobe64.exe" ]; then \
+	    cp $(BUILD_DIR)/chromeprobe64.exe \
+	       $(INITRD_STAGE)/usr/bin/x86_64-windows/chromeprobe64.exe; \
+	    echo "  initrd: chromeprobe64.exe staged"; \
+	 fi
+	@# Chromium, if a build has been unpacked beside the tree.
+	@#
+	@# In its own directory rather than among the PE modules: chrome.exe
+	@# imports chrome_elf.dll, and Windows looks in the application's own
+	@# directory first, which is also how a real Chromium install is laid
+	@# out. usr/bin/x86_64-windows is for builtins.
+	@#
+	@# What goes in is chosen by CHROMIUM64_FILES rather than by copying
+	@# the directory: the whole build is 808MB against an initrd that is
+	@# 107MB with Wine already in it.
+	@if [ -n "$(CHROMIUM64_DIR)" ] && [ -d "$(CHROMIUM64_DIR)" ]; then \
+	    mkdir -p $(INITRD_STAGE)/opt/chromium; \
+	    for f in $(CHROMIUM64_FILES); do \
+	        [ -f "$(CHROMIUM64_DIR)/$$f" ] || continue; \
+	        mkdir -p "$(INITRD_STAGE)/opt/chromium/$$(dirname $$f)"; \
+	        cp "$(CHROMIUM64_DIR)/$$f" $(INITRD_STAGE)/opt/chromium/$$f; \
+	    done; \
+	    echo "  initrd: chromium, $$(du -sh $(INITRD_STAGE)/opt/chromium | cut -f1)"; \
 	 fi
 	python3 userland/mkinitrd.py $(INITRD_STAGE) $@
 
@@ -564,19 +769,47 @@ iso: $(KERNEL) $(INITRD)
 # preference: Milestone 66's whole claim is that a frame above the 1GB
 # boot window is usable, and with 128MB there is no such frame - the test
 # would report SKIP and prove nothing.
-QEMU_RAM ?= 2G
+# A headless Chromium is the one thing here that needs more. Measured on
+# the Linux host under the same Wine, each renderer peaks at 740-790MB
+# resident - its own copy of chrome.dll's 320MB of code, which Wine cannot
+# map, and the page tables of a 1.5TB address-space reservation - and a
+# run has four or five of them beside a 450MB browser. In 6G the page's
+# renderer was the one that ran out; 12G finishes with 6.7GB free.
+QEMU_RAM ?= $(if $(CHROMIUM64_DIR),12G,2G)
 
 run: iso
 	qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -serial stdio
 
-# The bring-up test. kernel_main halts rather than exiting, so the run is
-# bounded by `timeout` and judged by what reached the serial port.
+# The bring-up test. kernel_main halts rather than exiting, so the run has
+# to be stopped from outside and judged by what reached the serial port.
+#
+# It used to be stopped by `timeout 30`, which was true when bring-up was
+# a second of kernel assertions. It is not true now: the Wine layer runs
+# wineboot to completion, which takes minutes, so a thirty-second cap cut
+# every run off long before the last line and the suite reported that the
+# kernel never reached the end of kernel_main - on every commit, whatever
+# the commit did. A test that cannot pass is not reporting on the code.
+#
+# So wait for the marker instead of for the clock. TEST_TIMEOUT is the cap
+# for a run that never gets there, which is a real failure - it is not the
+# expected duration, and the run stops as soon as bring-up says it is done.
+TEST_TIMEOUT ?= 900
 test: iso
 	@rm -f $(BUILD_DIR)/serial.log
-	@timeout 30 qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -display none \
-	    -serial file:$(BUILD_DIR)/serial.log -no-reboot >/dev/null 2>&1 || true
-	@echo "--- serial ---"
-	@cat $(BUILD_DIR)/serial.log 2>/dev/null || true
+	@qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -display none \
+	    -serial file:$(BUILD_DIR)/serial.log -no-reboot >/dev/null 2>&1 & \
+	  qpid=$$!; waited=0; \
+	  while [ $$waited -lt $(TEST_TIMEOUT) ]; do \
+	      grep -q "bring-up complete" $(BUILD_DIR)/serial.log 2>/dev/null && break; \
+	      kill -0 $$qpid 2>/dev/null || break; \
+	      sleep 1; waited=$$((waited+1)); \
+	  done; \
+	  kill $$qpid 2>/dev/null; wait $$qpid 2>/dev/null || true
+	@# The log is hundreds of megabytes with the syscall trace on, so show
+	@# the end of it rather than all of it. The assertions below read the
+	@# file, not this excerpt.
+	@echo "--- serial (last 40 lines of `wc -c < $(BUILD_DIR)/serial.log` bytes) ---"
+	@tail -n 40 $(BUILD_DIR)/serial.log 2>/dev/null || true
 	@echo "--------------"
 	@if ! grep -q "bring-up complete" $(BUILD_DIR)/serial.log 2>/dev/null; then \
 	    echo "FAIL: the kernel did not reach the end of kernel_main"; exit 1; fi
@@ -774,6 +1007,78 @@ test: iso
 	    || (echo "FAIL: the host run of the vmem binary did not exit 101"; \
 	        exit 1)
 	@echo "PASS: the address space behaves the same, and exits 101, on both"
+	@# The clocks. Line by line, because the interesting assertions are
+	@# the ones about which clock id means a date and what an absolute
+	@# deadline is - and both of those were wrong in ways that still
+	@# produced a plausible-looking time.
+	@timeout 60 ./$(BUILD_DIR)/clock64.elf > $(BUILD_DIR)/clock64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/clock64.host.status
+	@while read -r line; do \
+	    grep -qF "$$line" $(BUILD_DIR)/serial.log \
+	        || (echo "FAIL: the guest never printed: $$line"; exit 1) \
+	        || exit 1; \
+	done < $(BUILD_DIR)/clock64.host.txt
+	@[ "`cat $(BUILD_DIR)/clock64.host.status`" = "127" ] \
+	    || (echo "FAIL: the host run of the clock binary did not exit 127"; \
+	        exit 1)
+	@echo "PASS: the clocks behave the same, and exit 127, on both"
+	@# kill(2). The assertions that matter are the ones a boolean
+	@# cannot express: that SIG_IGN is not the same as no handler, that
+	@# an uncaught SIGCHLD is ignored rather than fatal, and that a
+	@# killed child is reported as killed rather than as having exited.
+	@timeout 120 ./$(BUILD_DIR)/kill64.elf > $(BUILD_DIR)/kill64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/kill64.host.status
+	@while read -r line; do \
+	    grep -qF "$$line" $(BUILD_DIR)/serial.log \
+	        || (echo "FAIL: the guest never printed: $$line"; exit 1) \
+	        || exit 1; \
+	done < $(BUILD_DIR)/kill64.host.txt
+	@[ "`cat $(BUILD_DIR)/kill64.host.status`" = "127" ] \
+	    || (echo "FAIL: the host run of the kill binary did not exit 127"; \
+	        exit 1)
+	@echo "PASS: kill(2) behaves the same, and exits 127, on both"
+	@# wait4. The assertion that costs the most to get wrong is the
+	@# quietest: waiting for one child by pid must not reap another and
+	@# report its status, which only two children can show.
+	@timeout 120 ./$(BUILD_DIR)/wait64.elf > $(BUILD_DIR)/wait64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/wait64.host.status
+	@while read -r line; do \
+	    grep -qF "$$line" $(BUILD_DIR)/serial.log \
+	        || (echo "FAIL: the guest never printed: $$line"; exit 1) \
+	        || exit 1; \
+	done < $(BUILD_DIR)/wait64.host.txt
+	@[ "`cat $(BUILD_DIR)/wait64.host.status`" = "127" ] \
+	    || (echo "FAIL: the host run of the wait binary did not exit 127"; \
+	        exit 1)
+	@echo "PASS: wait4 behaves the same, and exits 127, on both"
+	@# prctl. The assertion worth having is the truncation one: a name
+	@# too long is cut rather than refused, and the call still says 0,
+	@# so a caller checking only the return value cannot tell.
+	@timeout 120 ./$(BUILD_DIR)/prctl64.elf > $(BUILD_DIR)/prctl64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/prctl64.host.status
+	@while read -r line; do \
+	    grep -qF "$$line" $(BUILD_DIR)/serial.log \
+	        || (echo "FAIL: the guest never printed: $$line"; exit 1) \
+	        || exit 1; \
+	done < $(BUILD_DIR)/prctl64.host.txt
+	@[ "`cat $(BUILD_DIR)/prctl64.host.status`" = "127" ] \
+	    || (echo "FAIL: the host run of the prctl binary did not exit 127"; \
+	        exit 1)
+	@echo "PASS: prctl behaves the same, and exits 127, on both"
+	@# tgkill. The two assertions that matter are the two that were
+	@# broken: the signal reaches the thread that was named and no
+	@# other, and it reaches it while it sleeps in read(2).
+	@timeout 120 ./$(BUILD_DIR)/tgkill64.elf > $(BUILD_DIR)/tgkill64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/tgkill64.host.status
+	@while read -r line; do \
+	    grep -qF "$$line" $(BUILD_DIR)/serial.log \
+	        || (echo "FAIL: the guest never printed: $$line"; exit 1) \
+	        || exit 1; \
+	done < $(BUILD_DIR)/tgkill64.host.txt
+	@[ "`cat $(BUILD_DIR)/tgkill64.host.status`" = "127" ] \
+	    || (echo "FAIL: the host run of the tgkill binary did not exit 127"; \
+	        exit 1)
+	@echo "PASS: tgkill behaves the same, and exits 127, on both"
 	@# posix_spawn. Needs the child staged where both sides look for it,
 	@# the same way the fork/exec differential does.
 	@cp $(BUILD_DIR)/forkchild64.elf /tmp/forkchild64

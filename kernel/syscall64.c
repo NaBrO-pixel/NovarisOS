@@ -41,6 +41,18 @@
 extern void syscall64_entry(void);
 
 static uint64_t call_count;
+
+/* Where the time goes, by process and by syscall number.
+ *
+ * chrome.exe spends a 300-second budget inside Chromium's startup and
+ * times out before it reaches the DLL load, and "it is slow" is not a
+ * diagnosis - it does not say whether chrome is doing a great deal of
+ * work or being starved by something else that is. A global call count
+ * cannot tell those apart; a per-process one can, and a histogram of
+ * syscall numbers shows a spin for what it is. */
+static uint64_t calls_by_slot[PROC64_MAX];
+static uint64_t calls_by_nr[512];
+static int      pid_of_slot[PROC64_MAX];
 static uint64_t last_arg;
 static uint64_t exit_code;
 
@@ -378,6 +390,51 @@ static void fd_release(int fd) {
     fds[fd].tx   = -1;
 }
 
+/* --- which clock is which ------------------------------------------ *
+ *
+ * One table, because clock_gettime, clock_getres and clock_nanosleep all
+ * take a clock id and all have to agree about it. They did not: the id
+ * list lived spelled out in clock_gettime, clock_getres ignored the
+ * argument entirely and answered for anything, and clock_nanosleep never
+ * looked at it. Milestone 86 cost a run to 5 being in one of those
+ * places and not the others, so there is now one place.
+ *
+ * CLOCK_REALTIME and friends are a date - boot_epoch plus uptime. The
+ * monotonic family measures from an unspecified point, and boot is one.
+ * The two CPU-time clocks are answered from the monotonic counter rather
+ * than from per-task accounting, which overstates them for a task that
+ * has been descheduled; they are here so the id is recognised, not
+ * because this kernel measures CPU time. */
+#define CLOCK64_KIND_NONE 0                /* not a clock this kernel has */
+#define CLOCK64_KIND_REAL 1                /* a date                      */
+#define CLOCK64_KIND_MONO 2                /* an interval                 */
+
+static int clock64_kind(uint64_t id) {
+    switch (id) {
+    case 0:                                /* CLOCK_REALTIME           */
+    case 5:                                /* CLOCK_REALTIME_COARSE    */
+    case 8:                                /* CLOCK_REALTIME_ALARM     */
+        return CLOCK64_KIND_REAL;
+    case 1:                                /* CLOCK_MONOTONIC          */
+    case 2:                                /* CLOCK_PROCESS_CPUTIME_ID */
+    case 3:                                /* CLOCK_THREAD_CPUTIME_ID  */
+    case 4:                                /* CLOCK_MONOTONIC_RAW      */
+    case 6:                                /* CLOCK_MONOTONIC_COARSE   */
+    case 7:                                /* CLOCK_BOOTTIME           */
+    case 9:                                /* CLOCK_BOOTTIME_ALARM     */
+        return CLOCK64_KIND_MONO;
+    default:
+        return CLOCK64_KIND_NONE;
+    }
+}
+
+/* Reads whichever clock the id names, so a caller comparing against an
+ * absolute deadline compares against the clock it asked for. */
+static void clock64_read(uint64_t id, uint64_t* sec, uint64_t* nsec) {
+    if (clock64_kind(id) == CLOCK64_KIND_REAL) clock64_realtime(sec, nsec);
+    else                                       clock64_now(sec, nsec);
+}
+
 /* Leave, and come back to the same call.
  *
  * Used by the two syscalls that have to wait for time rather than for an
@@ -418,7 +475,80 @@ static int wait_expired(void) {
 }
 
 static int wait_started(void) { return wait_pending[wait_slot()]; }
+
+/* Forget whatever the previous occupant of this task slot was waiting
+ * for.
+ *
+ * The bookkeeping above is indexed by task slot, and slots are
+ * recycled. While a waiting thread always came back to ring 3 - which
+ * is what yielding around a loop meant - it always cleared its own
+ * entry on the way out. A thread that sleeps does not: it can block,
+ * be woken, and exit without ever passing through wait_done, leaving
+ * wait_pending set for whoever gets the slot next. That thread's first
+ * timed wait then finds a deadline already in the past and returns at
+ * once.
+ *
+ * Measured, not imagined: the wait4 differential's child was told to
+ * sleep 400ms and exited immediately, and the kill differential's
+ * child ran through five hundred sleeps without pausing long enough
+ * for a signal to reach it. */
+/* Each thread's clear_child_tid: the word the kernel zeroes and
+ * futex-wakes when the thread is gone, set by clone(CLONE_CHILD_CLEARTID)
+ * or set_tid_address. 0 for none.
+ *
+ * This is what pthread_join waits on - it sleeps until the thread's
+ * pd->tid reads 0 - and it must be the kernel that writes it, after the
+ * thread has left ring 3 for good, because the thread is still running
+ * on the stack the joiner is about to free. Wine frees each exited
+ * thread's stack and TEB as soon as pthread_join returns.
+ *
+ * Neither half existed. clone ignored CLONE_PARENT_SETTID too, so pd->tid
+ * was 0 from the start and every pthread_join returned at once: Wine
+ * freed a thread's stack while it was still unwinding in pthread_exit,
+ * the thread faulted on its own stack, and Wine's SIGSEGV handler -
+ * which reaches the TEB through that thread's now-missing thread block -
+ * faulted in turn, forever. Measured: 5.8 million SIGSEGVs in one
+ * process over one first wineboot, most of the time the run spent
+ * outside syscalls. */
+static uint64_t clear_child_tid[SCHED64_MAX_TASKS];
+
+static int user_range_ok(uint64_t addr, uint64_t len);
+
+static void wait_slot_reset(int t) {
+    if (t < 0 || t >= SCHED64_MAX_TASKS) return;
+    clear_child_tid[t] = 0;
+    wait_pending[t]  = 0;
+    wait_deadline[t] = 0;
+    wait_call[t]     = 0;
+    /* And anything tgkill(2) addressed to whoever held this slot
+     * before. A new thread inheriting a dead one's pending SIGUSR1
+     * would stop on a suspend nobody asked it for. Its signal mask is
+     * the creating thread's, which is what clone and fork give on
+     * Linux - the caller here is always that thread. */
+    signal64_task_start(t, sched64_current());
+}
 static void wait_done(void)   { wait_pending[wait_slot()] = 0; }
+
+/* Whether a signal is waiting that this thread would actually act on.
+ *
+ * A pending signal whose disposition is to ignore it is not one: it
+ * would be dropped at the delivery point and the caller would have
+ * returned -EINTR for nothing. */
+static int signal_interrupts_wait(void) {
+    int me = proc64_current_pid();
+    uint64_t set;
+
+    if (me < 0) return 0;
+    set = signal64_pending_set_task(sched64_current()) |
+          signal64_pending_set(me);
+    if (!set) return 0;
+
+    for (int sig = 1; sig < 64; sig++) {
+        if (!(set & (1ull << sig))) continue;
+        if (signal64_disposition(me, sig) != SIG64_DISP_IGNORE) return 1;
+    }
+    return 0;
+}
 
 static uint64_t wait_restart(const syscall64_args_t* args, uint64_t nr,
                              uint64_t deadline) {
@@ -427,12 +557,61 @@ static uint64_t wait_restart(const syscall64_args_t* args, uint64_t nr,
     uint64_t next_fs;
     int t = wait_slot();
 
+    /* A signal waiting for this thread ends the call here rather than
+     * parking, because parking is where it would be lost: a task that
+     * blocks leaves through the scheduler and never reaches the
+     * delivery point at the end of syscall64_dispatch, so the handler
+     * would not run until something else happened to wake it.
+     *
+     * Linux interrupts a blocking call for exactly this reason, and
+     * Wine depends on it. The wineserver stops a thread by sending it
+     * SIGUSR1 and the thread it stops is very often asleep in a read on
+     * its wait descriptor; without this, the signal sits pending and
+     * the thread sleeps through its own suspension.
+     *
+     * -EINTR is returned to the syscall's caller, and the signal is
+     * delivered on the way out with that in rax - which is what a
+     * handler installed without SA_RESTART sees on Linux. */
+    if (signal_interrupts_wait()) {
+        wait_pending[t] = 0;
+        return (uint64_t)-4;                               /* -EINTR */
+    }
+
     wait_deadline[t] = deadline;
     wait_call[t]     = nr;
     wait_pending[t]  = 1;
 
     frame_from_args(args, nr, &self);
     self.rip = args->ret_rip - 2;
+
+    /* Sleep rather than yield around a loop.
+     *
+     * This handed the CPU on and came straight back, because
+     * sched64_block_current had no deadline and a wait with a timeout
+     * has to reach ring 3 to notice its own. The scheduler takes a
+     * deadline now and halts when there is nothing to run, so the
+     * thread parks and the clock wakes it.
+     *
+     * What that cost: a chrome.exe run made 13,975,980 syscalls and
+     * 13,931,034 of them - 99% - were the wineserver re-running one
+     * poll that never had anything ready, while chrome's own processes
+     * got 0.3% of the machine and timed out. poll x13,870,656 here
+     * against poll x9,465 in the layer before is not a busier
+     * workload, it is a spin.
+     *
+     * The key is shared because a poll cannot name what it waits for,
+     * so any wake anywhere releases it and it looks again - which is
+     * what every caller of this does on re-entry regardless.
+     *
+     * Falling through to a yield keeps the old behaviour wherever
+     * sleeping is not safe: the scheduler refuses when the timer is
+     * masked or nothing is waiting on the clock. */
+    if (sched64_block_until(&self, SCHED64_COND_KEY, nr, deadline,
+                            &next, &next_space, &next_fs)) {
+        vmspace64_switch(&next_space);
+        write_msr(0xC0000100u, next_fs);
+        sched64_resume(&next);                         /* never returns */
+    }
 
     if (sched64_yield_current(&self, &next, &next_space, &next_fs)) {
         vmspace64_switch(&next_space);
@@ -498,15 +677,85 @@ static int64_t do_pipe_write(int fd, const void* buf, uint64_t n) {
     if (fds[fd].tx < 0) return -9;                     /* -EBADF: read end */
     w = pipe64_write(fds[fd].tx, buf, n);
 
-    /* -EAGAIN here means the ring is full. A blocking write should park
-     * until a reader drains it; this reports it instead, which is
-     * honest and is enough for what runs today - Wine's requests are far
-     * smaller than 64KB, so a full pipe means the peer has stopped
-     * reading rather than that the writer is ahead. Written down rather
-     * than hidden: a blocking write that returns EAGAIN is a divergence
-     * from Linux, and the differential does not assert it. */
+    /* -EAGAIN here means the ring is full; stream_write below is what
+     * waits for room. */
     if (w > 0) sched64_wake(PIPE64_WAIT_KEY(fds[fd].tx), SCHED64_MAX_TASKS);
     return w;
+}
+
+/* write(2) and writev(2) on a pipe or a connected socket, all of it.
+ *
+ * A blocking write to a pipe on Linux does not return until every byte
+ * has gone, sleeping while the pipe is full. This one returned -EAGAIN
+ * instead, on the reasoning - written down here at the time - that
+ * Wine's requests are far smaller than the 64KB a pipe holds. They are
+ * not always: a driver completing an IRP sends the IRP's output back to
+ * the wineserver in the request, and Wine sends every request with one
+ * writev and treats anything short of all of it as fatal. winedevice.exe
+ * answered a headless Chromium's adapter query with more than 64KB,
+ * got 0x10000 and then -EAGAIN, printed "wine client error: write:
+ * Resource temporarily unavailable" and lost its dispatch thread with
+ * the browser's IRP in hand. Three browser threads waited for that
+ * answer for the rest of the run, and the page never printed.
+ *
+ * A blocked syscall here is restarted from the top when it wakes, so
+ * the bytes already written are kept per thread, against the exact call
+ * they belong to, and the restart skips them. A signal ends the wait as
+ * on Linux: what has gone is the answer, or -EINTR if nothing has. */
+static struct { int active; uint64_t nr, fd, buf, len, done; }
+    wprog[SCHED64_MAX_TASKS];
+
+static int64_t stream_write(const syscall64_args_t* args, uint64_t nr,
+                            int fd, const iovec64_t* iov, uint64_t cnt) {
+    registers64_t self, next;
+    vmspace64_t next_space;
+    uint64_t next_fs, done = 0, skip;
+    int t = sched64_current();
+
+    if (t >= 0 && t < SCHED64_MAX_TASKS && wprog[t].active &&
+        wprog[t].nr == nr && wprog[t].fd == (uint64_t)fd &&
+        wprog[t].buf == args->a2 && wprog[t].len == args->a3)
+        done = wprog[t].done;
+    if (t >= 0 && t < SCHED64_MAX_TASKS) wprog[t].active = 0;
+
+    skip = done;
+    for (uint64_t i = 0; i < cnt; i++) {
+        const char* p = (const char*)iov[i].iov_base;
+        uint64_t left = iov[i].iov_len;
+        if (skip >= left) { skip -= left; continue; }
+        p += skip; left -= skip; skip = 0;
+        while (left) {
+            int64_t w = do_pipe_write(fd, p, left);
+            if (w == -11) goto full;
+            if (w < 0) return done ? (int64_t)done : w;
+            done += (uint64_t)w; p += w; left -= (uint64_t)w;
+        }
+    }
+    return (int64_t)done;
+
+full:
+    if (fds[fd].nonblock) return done ? (int64_t)done : -11;
+    if (signal_interrupts_wait()) return done ? (int64_t)done : -4;
+    if (t < 0 || t >= SCHED64_MAX_TASKS) return done ? (int64_t)done : -11;
+    wprog[t].active = 1;
+    wprog[t].nr     = nr;
+    wprog[t].fd     = (uint64_t)fd;
+    wprog[t].buf    = args->a2;
+    wprog[t].len    = args->a3;
+    wprog[t].done   = done;
+
+    frame_from_args(args, nr, &self);
+    self.rip = args->ret_rip - 2;
+    if (!sched64_block_current(&self, PIPE64_WAIT_KEY(fds[fd].tx), nr,
+                               &next, &next_space, &next_fs)) {
+        /* Nothing else can run, so nothing will ever drain this. */
+        wprog[t].active = 0;
+        return done ? (int64_t)done : -11;
+    }
+    vmspace64_switch(&next_space);
+    write_msr(0xC0000100u, next_fs);
+    sched64_resume(&next);                             /* never returns */
+    return 0;
 }
 
 /* read(2) on a pipe, including the part that waits.
@@ -537,8 +786,21 @@ static int64_t do_pipe_read(const syscall64_args_t* args, uint64_t nr,
     if (fds[fd].rx < 0) return -9;                     /* -EBADF: write end */
 
     r = pipe64_read(fds[fd].rx, buf, n);
+    /* Room has been made, so a writer parked on a full pipe can go on.
+     * Same key as the readers': a spurious wake costs one re-check. */
+    if (r > 0) sched64_wake(PIPE64_WAIT_KEY(fds[fd].rx), SCHED64_MAX_TASKS);
     if (r != -11) return r;                            /* data, or EOF */
     if (fds[fd].nonblock) return -11;                  /* -EAGAIN */
+
+    /* This is the read a Wine client sleeps in - the wineserver writes
+     * a thread's wakeup to it - so it is the one that has to end when
+     * the server signals that thread to stop. A signal that waits for
+     * the sleeper to wake up by itself never arrives.
+     *
+     * Checked after the pipe, not before: data already there is
+     * returned rather than discarded in favour of -EINTR, which is
+     * Linux's order too. */
+    if (signal_interrupts_wait()) return -4;           /* -EINTR */
 
     frame_from_args(args, nr, &self);
     self.rip = args->ret_rip - 2;
@@ -553,6 +815,152 @@ static int64_t do_pipe_read(const syscall64_args_t* args, uint64_t nr,
     write_msr(0xC0000100u, next_fs);
     sched64_resume(&next);                             /* never returns */
     return 0;
+}
+
+/* --- AF_NETLINK, NETLINK_ROUTE ------------------------------------ *
+ *
+ * How a Linux program learns what network interfaces exist. glibc's
+ * if_nameindex() and getifaddrs() have no other way to ask: they open a
+ * route socket, send an RTM_GETLINK or RTM_GETADDR dump request, and
+ * read the answer back until NLMSG_DONE.
+ *
+ * Without it if_nameindex() returns NULL, and Wine's nsiproxy does not
+ * check - Linux never fails here - so winedevice.exe took a null
+ * dereference in update_if_table while holding if_list_lock. Every
+ * later GetAdaptersAddresses in every process then slept on that lock
+ * forever, and a headless Chromium with them: three of its threads were
+ * in that call when the run ended, and the browser's main thread was
+ * waiting behind them on a Mojo channel.
+ *
+ * This machine's only interface is the loopback, so that is the answer:
+ * lo, index 1, 127.0.0.1/8. The answer is the same every time, so the
+ * descriptor keeps only the request it is answering - its type and
+ * sequence number, in `pos` - and the reply is built when it is read.
+ * Nothing is shared, so fork and dup need nothing. A socket bound to
+ * multicast groups, which is how nsiproxy waits for address changes, is
+ * never told of one: this machine's addresses do not change. */
+#define AF_NETLINK_     16
+#define NLM_F_MULTI_    2
+#define NLMSG_DONE_     3
+#define RTM_NEWLINK_    16
+#define RTM_GETLINK_    18
+#define RTM_NEWADDR_    20
+#define RTM_GETADDR_    22
+#define NL_PENDING      (1ULL << 63)
+#define NETLINK_WAIT_KEY 0x4000000000000000ULL
+
+typedef struct { uint32_t len; uint16_t type, flags; uint32_t seq, pid; } nlhdr64_t;
+
+static uint32_t nl_attr(uint8_t* out, uint32_t at, uint16_t type,
+                        const void* data, uint16_t n) {
+    uint16_t len = (uint16_t)(4 + n);
+    *(uint16_t*)(out + at)     = len;
+    *(uint16_t*)(out + at + 2) = type;
+    kmemcpy(out + at + 4, data, n);
+    for (uint32_t i = len; i < ((len + 3u) & ~3u); i++) out[at + i] = 0;
+    return at + ((len + 3u) & ~3u);
+}
+
+/* The reply to one dump request, into `out`. Returns its length. */
+static uint32_t nl_reply(uint16_t type, uint32_t seq, uint32_t pid,
+                         uint8_t* out) {
+    uint32_t at = 0;
+    nlhdr64_t* h;
+
+    if (type == RTM_GETLINK_) {
+        static const uint8_t zero6[6] = { 0 };
+        uint32_t mtu = 65536;
+        h = (nlhdr64_t*)out;
+        at = sizeof(*h);
+        /* ifinfomsg: family, pad, type ARPHRD_LOOPBACK, index, flags
+         * IFF_UP|IFF_LOOPBACK|IFF_RUNNING|IFF_LOWER_UP, change. */
+        out[at] = 0; out[at + 1] = 0;
+        *(uint16_t*)(out + at + 2) = 772;
+        *(int32_t*)(out + at + 4)  = 1;
+        *(uint32_t*)(out + at + 8) = 0x1u | 0x8u | 0x40u | 0x10000u;
+        *(uint32_t*)(out + at + 12) = 0;
+        at += 16;
+        at = nl_attr(out, at, 3, "lo", 3);          /* IFLA_IFNAME   */
+        at = nl_attr(out, at, 1, zero6, 6);         /* IFLA_ADDRESS  */
+        at = nl_attr(out, at, 2, zero6, 6);         /* IFLA_BROADCAST*/
+        at = nl_attr(out, at, 4, &mtu, 4);          /* IFLA_MTU      */
+        h->len = at; h->type = RTM_NEWLINK_; h->flags = NLM_F_MULTI_;
+        h->seq = seq; h->pid = pid;
+    } else if (type == RTM_GETADDR_) {
+        static const uint8_t lo4[4] = { 127, 0, 0, 1 };
+        h = (nlhdr64_t*)out;
+        at = sizeof(*h);
+        /* ifaddrmsg: AF_INET, /8, IFA_F_PERMANENT, RT_SCOPE_HOST, lo. */
+        out[at] = 2; out[at + 1] = 8; out[at + 2] = 0x80; out[at + 3] = 254;
+        *(uint32_t*)(out + at + 4) = 1;
+        at += 8;
+        at = nl_attr(out, at, 1, lo4, 4);           /* IFA_ADDRESS */
+        at = nl_attr(out, at, 2, lo4, 4);           /* IFA_LOCAL   */
+        at = nl_attr(out, at, 3, "lo", 3);          /* IFA_LABEL   */
+        h->len = at; h->type = RTM_NEWADDR_; h->flags = NLM_F_MULTI_;
+        h->seq = seq; h->pid = pid;
+    }
+    /* Every dump ends the same way, including one for a table this
+     * machine has nothing in. */
+    h = (nlhdr64_t*)(out + at);
+    h->len = sizeof(*h) + 4; h->type = NLMSG_DONE_; h->flags = NLM_F_MULTI_;
+    h->seq = seq; h->pid = pid;
+    *(int32_t*)(out + at + sizeof(*h)) = 0;
+    return at + sizeof(*h) + 4;
+}
+
+static int64_t nl_send(int fd, const void* buf, uint64_t n) {
+    const nlhdr64_t* h = (const nlhdr64_t*)buf;
+    if (n < sizeof(*h) || !user_range_ok((uint64_t)buf, sizeof(*h)))
+        return -22;                                    /* -EINVAL */
+    fds[fd].pos = NL_PENDING | ((uint64_t)h->seq << 16) | h->type;
+    return (int64_t)n;
+}
+
+/* Reads the pending reply, or waits for one that is never coming - which
+ * is what a socket listening for address changes is for. `name` is a
+ * sockaddr_nl to fill in: the reply is from the kernel, port 0, and
+ * glibc discards anything that is not. */
+static int64_t nl_recv(const syscall64_args_t* args, uint64_t nr, int fd,
+                       void* buf, uint64_t n, uint64_t flags,
+                       void* name, uint32_t* namelen, uint32_t* msgflags) {
+    static uint8_t reply[512];
+    registers64_t self, next;
+    vmspace64_t next_space;
+    uint64_t next_fs, p = fds[fd].pos;
+    uint32_t len;
+
+    if (!(p & NL_PENDING)) {
+        if (fds[fd].nonblock || (flags & 0x40)) return -11;   /* -EAGAIN */
+        if (signal_interrupts_wait()) return -4;               /* -EINTR  */
+        frame_from_args(args, nr, &self);
+        self.rip = args->ret_rip - 2;
+        if (!sched64_block_current(&self, NETLINK_WAIT_KEY, nr,
+                                   &next, &next_space, &next_fs))
+            return -11;
+        vmspace64_switch(&next_space);
+        write_msr(0xC0000100u, next_fs);
+        sched64_resume(&next);                         /* never returns */
+    }
+
+    len = nl_reply((uint16_t)(p & 0xFFFF), (uint32_t)(p >> 16),
+                   (uint32_t)proc64_current_pid(), reply);
+    if (n > len) n = len;
+    if (!user_range_ok((uint64_t)buf, n)) return -14;  /* -EFAULT */
+    kmemcpy(buf, reply, n);
+    if (!(flags & 0x2)) fds[fd].pos = 0;               /* not MSG_PEEK */
+    if (name && namelen && *namelen >= 12 && user_range_ok((uint64_t)name, 12)) {
+        uint8_t* a = (uint8_t*)name;
+        for (int i = 0; i < 12; i++) a[i] = 0;
+        *(uint16_t*)a = AF_NETLINK_;
+        *namelen = 12;
+    } else if (namelen) {
+        *namelen = 0;
+    }
+    if (msgflags) *msgflags = n < len ? 0x20 : 0;      /* MSG_TRUNC */
+    /* MSG_TRUNC asks for the real length back, which is how a caller
+     * sizes its buffer for a second try. */
+    return (flags & 0x20) ? (int64_t)len : (int64_t)n;
 }
 
 /* Writing to one descriptor, whatever it turns out to be.
@@ -575,6 +983,8 @@ static int64_t fd_write_bytes(uint64_t fd, const char* buf, uint64_t n) {
         if (fd >= FD_MAX || !fds[fd].used) return -9;  /* -EBADF */
         if (fd_is_stream((int)fd)) return do_pipe_write((int)fd, buf, n);
         if (fds[fd].kind == FD64_SOCKET) return -107;  /* -ENOTCONN */
+        if (fds[fd].kind == FD64_SIGNALFD) return -22; /* -EINVAL, as Linux */
+        if (fds[fd].kind == FD64_NETLINK) return nl_send((int)fd, buf, n);
         /* /dev/null takes everything and keeps none of it; the console
          * is the serial port, which is where this kernel's idea of
          * stdout has always gone. */
@@ -600,6 +1010,38 @@ static int64_t fd_write_bytes(uint64_t fd, const char* buf, uint64_t n) {
 
 /* And reading from one. `nr` is the call to restart as if this blocks -
  * see do_pipe_read. */
+/* read(2) on a signalfd: one struct signalfd_siginfo, 128 bytes, per
+ * signal in its mask that is pending for the reader - the thread's own
+ * first, then its process's - taken off the pending set, as many as fit.
+ * Nothing pending parks the reader until a kill or tgkill wakes it, or
+ * is -EAGAIN on a non-blocking descriptor. A buffer too small for one
+ * record is -EINVAL, as on Linux.
+ *
+ * The reader's signals, not the creator's: a signalfd inherited across
+ * fork reads the child's, which is Linux's rule too. */
+static int64_t signalfd_read(const syscall64_args_t* args, uint64_t nr,
+                             int fd, void* buf, uint64_t n) {
+    uint8_t* out = (uint8_t*)buf;
+    uint64_t done = 0;
+
+    if (n < 128) return -22;                           /* -EINVAL */
+    if (!user_range_ok((uint64_t)buf, n)) return -14;  /* -EFAULT */
+
+    while (done + 128 <= n) {
+        int to_thread = 0, sender = 0;
+        int sig = signal64_take_in_set(fds[fd].sigmask, &to_thread, &sender);
+        if (!sig) break;
+        for (int i = 0; i < 128; i++) out[done + i] = 0;
+        *(uint32_t*)(out + done + 0)  = (uint32_t)sig;          /* ssi_signo */
+        *(int32_t*)(out + done + 8)   = to_thread ? -6 : 0;     /* ssi_code  */
+        *(uint32_t*)(out + done + 12) = (uint32_t)sender;       /* ssi_pid   */
+        done += 128;
+    }
+    if (done) { wait_done(); return (int64_t)done; }
+    if (fds[fd].nonblock) return -11;                  /* -EAGAIN */
+    return (int64_t)wait_restart(args, nr, 0);
+}
+
 static int64_t fd_read_bytes(const syscall64_args_t* args, uint64_t nr,
                              uint64_t fd, void* buf, uint64_t n) {
     int64_t r;
@@ -611,6 +1053,10 @@ static int64_t fd_read_bytes(const syscall64_args_t* args, uint64_t nr,
     if (fd_is_stream((int)fd))
         return do_pipe_read(args, nr, (int)fd, buf, n);
     if (fds[fd].kind == FD64_SOCKET) return -107;      /* -ENOTCONN */
+    if (fds[fd].kind == FD64_SIGNALFD)
+        return signalfd_read(args, nr, (int)fd, buf, n);
+    if (fds[fd].kind == FD64_NETLINK)
+        return nl_recv(args, nr, (int)fd, buf, n, 0, 0, 0, 0);
 
     dev = ramfs64_device(fds[fd].node);
     if (dev == RAMFS64_DEV_NULL) return 0;             /* end of file */
@@ -628,7 +1074,61 @@ static int64_t fd_read_bytes(const syscall64_args_t* args, uint64_t nr,
     return r;
 }
 
+/* /proc/meminfo, written fresh every time it is opened.
+ *
+ * Wine has no other way to learn how much memory is free on Linux: its
+ * NtQuerySystemInformation reads MemFree, MemAvailable, Buffers and
+ * Cached out of this file and nothing else, and without it reports zero
+ * bytes available - of a total it does get, from sysinfo. A headless
+ * Chromium asked GlobalMemoryStatusEx, was told it had 12GB and none of
+ * it free, decided it was under critical memory pressure, and discarded
+ * pages every five seconds: it killed its own toolbar renderers
+ * (RESULT_CODE_KILLED, exit 1), rejected the messages they still had in
+ * flight ("Message 2 rejected by interface blink.mojom.FrameWidgetHost")
+ * and reported the omnibox popup as crashed.
+ *
+ * The fields are Linux's, in kB. Free memory is what the frame
+ * allocator has; this kernel keeps no page cache and no swap, so
+ * MemAvailable is the same number and the rest are zero. */
+static char* put_kb_line(char* o, const char* name, uint64_t kb) {
+    char digits[24];
+    int n = 0;
+    while (*name) *o++ = *name++;
+    do { digits[n++] = (char)('0' + kb % 10); kb /= 10; } while (kb);
+    for (int pad = 15 - n; pad > 0; pad--) *o++ = ' ';
+    while (n) *o++ = digits[--n];
+    *o++ = ' '; *o++ = 'k'; *o++ = 'B'; *o++ = '\n';
+    return o;
+}
+
+static void refresh_meminfo(void) {
+    static char text[512];
+    uint64_t total = pmm64_total_frames() * (PAGE64_SIZE / 1024);
+    uint64_t freek = pmm64_free_frames() * (PAGE64_SIZE / 1024);
+    char* o = text;
+    int node;
+
+    o = put_kb_line(o, "MemTotal:", total);
+    o = put_kb_line(o, "MemFree:", freek);
+    o = put_kb_line(o, "MemAvailable:", freek);
+    o = put_kb_line(o, "Buffers:", 0);
+    o = put_kb_line(o, "Cached:", 0);
+    o = put_kb_line(o, "SwapTotal:", 0);
+    o = put_kb_line(o, "SwapFree:", 0);
+
+    node = ramfs64_lookup("/proc/meminfo");
+    if (node < 0) {
+        ramfs64_mkdirp("/proc");
+        node = ramfs64_create("/proc/meminfo", 0);
+        if (node < 0) return;
+        ramfs64_set_mode(node, 0444);
+    }
+    ramfs64_truncate(node);
+    ramfs64_write(node, 0, text, (uint64_t)(o - text));
+}
+
 static uint64_t do_open(const char* path, uint64_t flags, uint32_t mode) {
+    if (kstrcmp(path, "/proc/meminfo") == 0) refresh_meminfo();
     int node = ramfs64_lookup(path);
     int fd;
 
@@ -765,6 +1265,10 @@ static uint64_t sendmsgs, recvmsgs, fds_passed, renames, shared_maps;
 /* The process a layer started, as opposed to anything it spawned. See
  * syscall64_set_leader. */
 static int leader_pid = -1;
+/* The last leader, which the deadline report still needs after the
+ * layer has disarmed leader_pid. */
+static int report_pid = -1;
+static void mods_forget(int pid);
 
 /* A wall-clock bound on a run, in timer ticks, or 0. See
  * syscall64_set_run_ticks. */
@@ -838,7 +1342,7 @@ static uint64_t do_fork_common(const syscall64_args_t* args,
 
     if (!vmspace64_create(&cp->space)) {
         proc64_exit(child_pid, 0);
-        proc64_reap_child(proc64_current_pid(), 0);
+        proc64_reap_child_pid(proc64_current_pid(), child_pid, 0);
         return (uint64_t)-12;                          /* -ENOMEM */
     }
     /* Shared, not copied (Milestone 69). The eager clone is still there
@@ -848,7 +1352,7 @@ static uint64_t do_fork_common(const syscall64_args_t* args,
     if (!vmspace64_clone_cow(vmspace64_current_phys(), &cp->space)) {
         vmspace64_destroy(&cp->space);
         proc64_exit(child_pid, 0);
-        proc64_reap_child(proc64_current_pid(), 0);
+        proc64_reap_child_pid(proc64_current_pid(), child_pid, 0);
         return (uint64_t)-12;
     }
 
@@ -874,10 +1378,39 @@ static uint64_t do_fork_common(const syscall64_args_t* args,
      * fs:0x10; with FS_BASE at 0 that is a read of linear address 0x10
      * and the child dies on a null dereference that has nothing
      * visibly to do with fork. */
-    if (sched64_add_frame_for(&child, &cp->space,
-                              read_msr(0xC0000100u), child_pid) < 0) {
-        vmspace64_destroy(&cp->space);
-        return (uint64_t)-11;
+    {
+        int slot = sched64_add_frame_for(&child, &cp->space,
+                                         read_msr(0xC0000100u), child_pid);
+        if (slot < 0) {
+            vmspace64_destroy(&cp->space);
+            return (uint64_t)-11;
+        }
+        wait_slot_reset(slot);
+        /* A fork's only thread is a copy of the calling one, alternate
+         * signal stack and all; a new thread's is not. */
+        signal64_task_inherit_altstack(slot, sched64_current());
+
+        /* The tid words, which glibc's fork asks for - it is
+         * clone(CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID|SIGCHLD) with
+         * &THREAD_SELF->tid - and which were ignored. The child then
+         * carried its parent's tid in pd->tid, so raise() in a forked
+         * child - tgkill(getpid(), pd->tid) - named a thread of another
+         * process and got -ESRCH. SYS_fork itself has no flags.
+         *
+         * The child's word is in the child's copy of the parent's
+         * memory, shared copy-on-write, so it is written through the
+         * child's page tables and breaks the share for the child. */
+        {
+            uint64_t cflags = args->nr == SYS64_CLONE ? args->a1 : 0;
+            uint32_t ctid = (uint32_t)(slot + 1);
+
+            if (cflags & CLONE_CHILD_SETTID)
+                vmspace64_write_u32(&cp->space, args->a4, ctid);
+            if ((cflags & CLONE_PARENT_SETTID) && user_range_ok(args->a3, 4))
+                *(volatile uint32_t*)args->a3 = ctid;
+            if (cflags & CLONE_CHILD_CLEARTID)
+                clear_child_tid[slot] = args->a4;
+        }
     }
     forks++;
     {
@@ -984,6 +1517,67 @@ void syscall64_set_exit_code(uint64_t code) { exit_code = code; }
 static uint64_t futex_timed, futex_shared;
 static uint64_t futex_waits, futex_wakes;
 
+/* The last futex calls, for the deadline report.
+ *
+ * A thread asleep in futex at the deadline says only that nobody woke
+ * it, and that has two very different explanations: a wake was issued
+ * and went somewhere else (the kernel's bug), or nobody ever issued one
+ * (the program's deadlock, or something upstream of it). This ring
+ * says which: for each such thread, the waits and wakes on its own
+ * word, by whom and with what result. */
+#define FTRACE_N 4096
+static struct {
+    uint64_t tick, addr;
+    uint32_t val;
+    int16_t  pid, slot;
+    char     op;          /* 'W' blocked, 'A' -EAGAIN, 'K' wake */
+    int16_t  n;
+} ftrace[FTRACE_N];
+static uint32_t ftrace_next;
+
+static void ftrace_note(char op, uint64_t addr, uint32_t val, int n) {
+    uint32_t i = ftrace_next++ % FTRACE_N;
+    ftrace[i].tick = clock64_ticks();
+    ftrace[i].addr = addr;
+    ftrace[i].val  = val;
+    ftrace[i].pid  = (int16_t)proc64_current_pid();
+    ftrace[i].slot = (int16_t)sched64_current();
+    ftrace[i].op   = op;
+    ftrace[i].n    = (int16_t)n;
+}
+
+void syscall64_report_futex_waits(void) {
+    for (int t = 0; t < SCHED64_MAX_TASKS; t++) {
+        uint64_t key = sched64_blocked_on(t);
+        int pid = sched64_blocked_pid(t), shown = 0;
+        if (!key || key >= 0x1000000000000000ULL) continue;
+        serial64_puts("NOVARIS64: [futex] slot ");
+        serial64_putdec((uint64_t)t);
+        serial64_puts(" pid ");
+        serial64_putdec((uint64_t)pid);
+        serial64_puts(" asleep on ");
+        serial64_puthex(key);
+        serial64_puts(", latest calls on that word:\n");
+        for (uint32_t k = 1; k <= FTRACE_N && k <= ftrace_next && shown < 8; k++) {
+            uint32_t i = (ftrace_next - k) % FTRACE_N;
+            if (ftrace[i].addr != key || ftrace[i].pid != pid) continue;
+            shown++;
+            serial64_puts("NOVARIS64: [futex]   tick ");
+            serial64_putdec(ftrace[i].tick);
+            serial64_puts(" slot ");
+            serial64_putdec((uint64_t)(int64_t)ftrace[i].slot);
+            serial64_putc(' ');
+            serial64_putc(ftrace[i].op);
+            serial64_puts(" val ");
+            serial64_putdec(ftrace[i].val);
+            serial64_puts(" n ");
+            serial64_putdec((uint64_t)(int64_t)ftrace[i].n);
+            serial64_putc('\n');
+        }
+        if (!shown) serial64_puts("NOVARIS64: [futex]   (none in the last 4096)\n");
+    }
+}
+
 /* File-backed mappings made. Counted for the same reason the futex
  * counters are: a program can be handed a correct-looking pointer by
  * the anonymous path and never notice the file was not involved. */
@@ -1019,6 +1613,7 @@ void syscall64_set_trace(int on) { trace = on; }
  * shell does. -1 restores the old behaviour. */
 void syscall64_set_leader(int pid) {
     leader_pid = pid;
+    if (pid >= 0) report_pid = pid;
     /* Only *arming* clears the verdict, for exactly the reason spelled
      * out under set_run_ticks below - and this is the same bug, which
      * was fixed there and left here.
@@ -1112,13 +1707,421 @@ static void usd_check(const char* when, syscall64_args_t* args) {
  * whichever call happens to run next. */
 static uint64_t syscall64_dispatch_inner(syscall64_args_t* args);
 
+/* End the calling process because a signal nothing caught says to.
+ *
+ * Returns only when there was no other thread to hand the CPU to, which
+ * the caller reports as an ordinary syscall return; every other path out
+ * of here resumes somebody else and never comes back. Shared by tgkill,
+ * which is a process asking for this about itself, and by kill(2)
+ * delivery, where another process asked for it. */
+/* The run's leader has ended, and the layer is about to end with it.
+ *
+ * Every other ending of a process takes its threads out of the scheduler
+ * on the way to resuming somebody else. The leader's ending did not: it
+ * went straight back to the layer, so its tasks - the very thread that
+ * called exit_group among them - stayed in the table, runnable, with the
+ * frame the last timer tick had saved for each. The next layer's
+ * scheduler then resumed them: a process with every descriptor already
+ * closed, picking up from somewhere before its own exit.
+ *
+ * That was the crash at the start of every chromeprobe run. winegui64.exe
+ * had exited, and its main thread came back in the next layer, wrote to
+ * a wineserver socket that close_all_files had closed ("wine client
+ * error: write: Bad file descriptor"), and died on the way out at rip 0.
+ *
+ * Taken out here, not resumed: the layer is ending and there is nothing
+ * to switch to. */
+static void leader_leaves_scheduler(void) {
+    sched64_remove_pid(proc64_current_pid());
+}
+
+static void die_by_signal(int sig);
+static uint64_t oom_kills;
+static void reclaim_report(const char* why, uint64_t before);
+
+/* Takes whatever the calling thread has pending and does not block, and
+ * acts on it with `self` as the interrupted frame: ignored ones are
+ * dropped, the first one with a handler is entered (and this does not
+ * return), and one whose default is to end the process ends it.
+ * Returns when nothing deliverable was left.
+ *
+ * Shared by the end of every syscall and by rt_sigreturn, which resumes
+ * directly rather than through the end of a syscall - and which is the
+ * moment a signal blocked for the handler's duration becomes
+ * deliverable again. */
+static void deliver_pending(registers64_t* self) {
+    int me = proc64_current_pid();
+    int sig;
+
+    if (me < 0) return;
+    while ((sig = signal64_take_pending_task(sched64_current())) > 0 ||
+           (sig = signal64_take_pending(me)) > 0) {
+        int disp = signal64_disposition(me, sig);
+
+        if (disp == SIG64_DISP_IGNORE) continue;
+
+        if (disp == SIG64_DISP_HANDLER) {
+            if (signal64_deliver(sig, self, 0))
+                sched64_resume(self);                  /* never returns */
+            /* Fell through: a handler is installed but no frame could
+             * be built for it. Treated as uncaught, which is what
+             * signal64_deliver returning 0 means. */
+        }
+
+        die_by_signal(sig);
+        return;
+    }
+}
+
+static void die_by_signal(int sig) {
+    exit_code = 128 + sig;
+    vfork_release(proc64_current());
+    close_all_files();
+    /* Recorded as a death rather than as an exit, so the parent's
+     * wait(2) can say WIFSIGNALED. 128+sig stays the exit_status for
+     * everything that only reads that. */
+    {
+        proc64_t* me = proc64_current();
+        int parent = me ? me->parent : 0;
+
+        proc64_exit_signalled(proc64_current_pid(), sig);
+        if (leader_pid >= 0 && proc64_current_pid() == leader_pid) {
+            leader_exited = 1;
+            leader_leaves_scheduler();
+            enter_user_mode64_abort();                 /* never returns */
+        }
+        /* The parent may be parked in wait4 for exactly this; exit_group
+         * wakes it and a death by signal is no less an ending. */
+        if (parent) sched64_wake(PROC64_WAIT_KEY(parent), SCHED64_MAX_TASKS);
+    }
+    /* Every thread of the process, not just this one: a signal's default
+     * action ends the process. Ending only the calling thread left its
+     * siblings running in a process already recorded as dead - and the
+     * address space with them, so it was never given back. */
+    {
+        registers64_t next; vmspace64_t ns; uint64_t nfs;
+        if (sched64_exit_process(proc64_current_pid(), &next, &ns, &nfs)) {
+            vmspace64_t dying = { vmspace64_current_phys() };
+            vmspace64_switch(&ns);
+            write_msr(0xC0000100u, nfs);
+            if (!sched64_space_in_use(dying.pml4_phys)) {
+                uint64_t before = pmm64_free_frames();
+                vmspace64_destroy(&dying);
+                reclaim_report("signal", before);
+            }
+            sched64_resume(&next);                     /* never returns */
+        }
+    }
+}
+
+/* A fault ring 3 did not handle, in a run of several processes.
+ *
+ * The fault handlers' answer to an uncaught fault is to end the run,
+ * which is right for the bring-up tests - one program, whose death is
+ * the result - and wrong for a Wine prefix, where it is one process of
+ * dozens and Linux would end that process and nothing else. So in a run
+ * with a leader, a process other than the leader dies of the signal the
+ * way kill(2)'s default action would end it, and the rest carry on.
+ *
+ * This became reachable rather than theoretical with signal masks: a
+ * fault inside a SIGSEGV handler now finds SIGSEGV blocked and is not
+ * delivered, where it used to be delivered again forever.
+ *
+ * Returns 0 when it does not apply - no leader, or the leader itself -
+ * and the caller ends the run as before. Otherwise does not return. */
+int syscall64_fault_kill(int sig, uint64_t rip, uint64_t addr) {
+    int me = proc64_current_pid();
+
+    if (leader_pid < 0 || me < 0 || me == leader_pid) return 0;
+
+    serial64_puts("NOVARIS64: [fatal signal ");
+    serial64_putdec((uint64_t)sig);
+    serial64_puts(" pid ");
+    serial64_putdec((uint64_t)me);
+    serial64_puts("] rip=");
+    serial64_puthex(rip);
+    serial64_puts(" addr=");
+    serial64_puthex(addr);
+    serial64_putc('\n');
+
+    die_by_signal(sig);
+    /* Nothing else to run. Ending the run is all that is left. */
+    enter_user_mode64_abort();                         /* never returns */
+    return 1;
+}
+
+/* The out-of-memory kill.
+ *
+ * A page a process may have - in a range it reserved, touched for the
+ * first time, or a copy-on-write copy - and no frame to put behind it.
+ * That used to be reported as a SIGSEGV, which is the wrong signal for
+ * it: Wine installs a SIGSEGV handler, and a handler that returns retries
+ * the same access into the same empty allocator; and in a bring-up layer
+ * an unhandled fault ends the whole run, not the one process. Linux's
+ * answer is SIGKILL, which nothing catches, from its OOM killer.
+ *
+ * This kills the process that asked rather than the largest one, which
+ * is simpler than Linux and enough for the property that matters: the
+ * machine survives, the process's memory comes back, and whoever is
+ * waiting for it is told it died. The allocator refuses user frames
+ * while a reserve is left (PMM64_USER_RESERVE), so the kernel still has
+ * memory for the page tables and heap this teardown needs. */
+void syscall64_oom_kill(uint64_t addr) {
+    proc64_t* me = proc64_current();
+
+    serial64_puts("NOVARIS64: [oom-kill] pid ");
+    serial64_putdec((uint64_t)proc64_current_pid());
+    serial64_puts(" ");
+    serial64_puts(me ? me->comm : "?");
+    serial64_puts(" at ");
+    serial64_puthex(addr);
+    serial64_puts(", free=");
+    serial64_putdec(pmm64_free_frames());
+    serial64_puts("/");
+    serial64_putdec(pmm64_total_frames());
+    serial64_putc('\n');
+    oom_kills++;
+    die_by_signal(SIG64_KILLSIG);
+    enter_user_mode64_abort();                         /* never returns */
+}
+
+uint64_t syscall64_oom_kills(void) { return oom_kills; }
+
 uint64_t syscall64_dispatch(syscall64_args_t* args) {
     uint64_t r;
 
     usd_check("before", args);
     r = syscall64_dispatch_inner(args);
     usd_check("after", args);
+
+    /* Anything kill(2) left for this process, taken on the way out.
+     *
+     * This is where Linux acts on an asynchronous signal too: not when
+     * it is sent, but when the target next crosses back into user mode.
+     * Here rather than in the timer interrupt because the default action
+     * has to be expressible - ending a process needs close_all_files, a
+     * vfork release and a successor to resume, none of which belong in
+     * an interrupt handler.
+     *
+     * What that costs: a process making no syscalls does not notice a
+     * signal until it makes one. A process spinning in user code is
+     * therefore unkillable here, where Linux would stop it at the next
+     * tick. Everything in this system is a Wine process making thousands
+     * of calls a second, so the gap is real and never reached - said
+     * plainly rather than left for somebody to discover.
+     *
+     * A process that has already exited is skipped: the dispatch it just
+     * came out of may have been its exit, and the frame below would be
+     * built from a thread that is gone. */
+    {
+        int me = proc64_current_pid();
+        proc64_t* p = proc64_current();
+
+        /* Two sets are drained here, the thread's before the process's.
+         * A signal sent with tgkill(2) names this thread and no other,
+         * so it is kept against the task slot; one sent with kill(2)
+         * belongs to the process and may be taken by whichever thread
+         * gets here first. Linux keeps them apart for the same reason
+         * and takes the thread's first. */
+        if (me >= 0 && p && !p->exited &&
+            (signal64_has_pending_task(sched64_current()) ||
+             signal64_has_pending(me))) {
+            registers64_t self;
+
+            /* rax = r, so a handler that returns lands after the
+             * syscall with the value the syscall produced. The signal
+             * interrupted the return, not the call. */
+            frame_from_args(args, r, &self);
+            deliver_pending(&self);
+        }
+
+        /* A call that replaced the mask and is ending with no handler to
+         * carry the old one in its frame gives it back here. Then
+         * anything the old mask allows and the temporary one did not -
+         * none, for every caller there is today, but cheap to be right
+         * about. */
+        if (me >= 0 && p && !p->exited && signal64_pop_mask() &&
+            (signal64_has_pending_task(sched64_current()) ||
+             signal64_has_pending(me))) {
+            registers64_t self;
+            frame_from_args(args, r, &self);
+            deliver_pending(&self);
+        }
+    }
+
     return r;
+}
+
+/* Where each process's modules are, for reading stacks at the deadline.
+ *
+ * A return address is a number until it is known what was mapped
+ * there. A process's file mappings at offset 0 give every ELF and PE
+ * module's base, and a page-aligned pread from offset 0 gives the ones
+ * Wine reads rather than maps - chrome.dll among them, whose sections
+ * the kernel cannot map. A later entry over the same address wins, and
+ * execve forgets a process's earlier ones. Kept for every process
+ * because the thread a stuck program waits on is often in another one:
+ * a browser asking winedevice.exe for the network adapters. */
+#define MODS_MAX 8192
+static struct { uint64_t va, size; int pid; char path[76]; } mods[MODS_MAX];
+static int nmods;
+
+static void mods_forget(int pid) {
+    for (int i = 0; i < nmods; i++) if (mods[i].pid == pid) mods[i].pid = -1;
+}
+
+static void note_module(const syscall64_args_t* a, uint64_t r) {
+    int node;
+    uint64_t va;
+
+    if ((int64_t)r < 0 && (int64_t)r > -4096) return;
+    if (a->nr == SYS64_MMAP && !(a->a4 & MAP_ANONYMOUS) && a->a6 == 0) {
+        int64_t fd = (int64_t)a->a5;
+        if (fd < 3 || fd >= FD_MAX || !fds[fd].used ||
+            fds[fd].kind != FD64_FILE) return;
+        node = fds[fd].node;
+        va = r;
+    } else if (a->nr == SYS64_PREAD64 && a->a4 == 0 && r >= 64 &&
+               !(a->a2 & (PAGE64_SIZE - 1))) {
+        if (a->a1 < 3 || a->a1 >= FD_MAX || !fds[a->a1].used) return;
+        node = fds[a->a1].node;
+        va = a->a2;
+    } else {
+        return;
+    }
+    if (nmods >= MODS_MAX) {
+        /* Full: squeeze out what execve and exit have orphaned. */
+        int j = 0;
+        for (int i = 0; i < nmods; i++)
+            if (mods[i].pid >= 0 && proc64_get(mods[i].pid)) mods[j++] = mods[i];
+        nmods = j;
+        if (nmods >= MODS_MAX) return;
+    }
+    mods[nmods].va   = va;
+    mods[nmods].size = ramfs64_size(node);
+    mods[nmods].pid  = proc64_current_pid();
+    if (ramfs64_path(node, mods[nmods].path, sizeof(mods[nmods].path)) < 0)
+        mods[nmods].path[0] = 0;
+    nmods++;
+}
+
+static int module_of(int pid, uint64_t v) {
+    for (int i = nmods - 1; i >= 0; i--)
+        if (mods[i].pid == pid && v >= mods[i].va && v < mods[i].va + mods[i].size)
+            return i;
+    return -1;
+}
+
+static int peek_u64(vmspace64_t* vs, uint64_t va, uint64_t* out) {
+    uint64_t f;
+    if (va & 7) return 0;
+    f = vmspace64_user_frame(vs, va, 0);
+    if (!f) return 0;
+    *out = *(const uint64_t*)((const uint8_t*)phys64_to_virt(f) +
+                             (va & (PAGE64_SIZE - 1)));
+    return 1;
+}
+
+/* Every thread of one process, with its Wine syscall frame - the
+ * Windows-side return address and stack of the call it is in - and the
+ * values above each stack pointer that land in one of its modules. Then
+ * the modules those were in, so the numbers can be read. */
+static void report_stacks_of(int which) {
+    static uint8_t used_mod[MODS_MAX];
+
+    for (int i = 0; i < nmods; i++) used_mod[i] = 0;
+    for (int t = 0; t < SCHED64_MAX_TASKS; t++) {
+        int pid, hits;
+        uint64_t wait, gs, rsp, fp = 0, rip = 0, ursp = 0, id = 0;
+        vmspace64_t vs;
+
+        if (!sched64_task_peek(t, &pid, &wait, &gs, &rsp, &vs)) continue;
+        if (pid != which) continue;
+        serial64_puts("NOVARIS64: [stack] slot ");
+        serial64_putdec((uint64_t)t);
+        serial64_puts(" pid ");
+        serial64_putdec((uint64_t)pid);
+        serial64_puts(" on ");
+        serial64_puthex(wait);
+        serial64_puts(" teb ");
+        serial64_puthex(gs);
+        if (gs && peek_u64(&vs, gs + 0x378, &fp) && fp &&
+            peek_u64(&vs, fp + 0x70, &rip) && peek_u64(&vs, fp + 0x88, &ursp)) {
+            int m = module_of(pid, rip);
+            peek_u64(&vs, fp + 0xb0, &id);
+            serial64_puts(" syscall ");
+            serial64_puthex(id & 0xffffffffu);
+            serial64_puts(" from ");
+            serial64_puthex(rip);
+            if (m >= 0) used_mod[m] = 1;
+        }
+        serial64_putc('\n');
+        /* The Windows stack above the call, then the Unix one. */
+        for (int pass = 0; pass < 2; pass++) {
+            uint64_t base = pass ? rsp : ursp;
+            hits = 0;
+            if (!base) continue;
+            for (uint64_t a = base & ~7ULL;
+                 a < (base & ~7ULL) + 0x4000 && hits < 32; a += 8) {
+                uint64_t v;
+                int m;
+                if (!peek_u64(&vs, a, &v)) break;
+                m = module_of(pid, v);
+                if (m < 0) continue;
+                used_mod[m] = 1;
+                serial64_puts(pass ? "NOVARIS64: [stack]   u " :
+                                     "NOVARIS64: [stack]   w ");
+                serial64_puthex(v);
+                serial64_putc('\n');
+                hits++;
+            }
+        }
+    }
+    for (int i = 0; i < nmods; i++) {
+        if (!used_mod[i]) continue;
+        serial64_puts("NOVARIS64: [stack] pid ");
+        serial64_putdec((uint64_t)which);
+        serial64_puts(" m ");
+        serial64_puthex(mods[i].va);
+        serial64_putc(' ');
+        serial64_puts(mods[i].path);
+        serial64_putc('\n');
+    }
+}
+
+/* The leader, and every other process with a thread asleep in futex -
+ * the waits a server round trip cannot explain. */
+void syscall64_report_leader_stacks(void) {
+    static uint8_t done[PROC64_MAX];
+
+    for (int i = 0; i < PROC64_MAX; i++) done[i] = 0;
+    if (report_pid >= 0) {
+        report_stacks_of(report_pid);
+        if (proc64_slot_of(report_pid) >= 0) done[proc64_slot_of(report_pid)] = 1;
+    }
+    for (int t = 0; t < SCHED64_MAX_TASKS; t++) {
+        uint64_t key = sched64_blocked_on(t);
+        int pid = sched64_blocked_pid(t), slot;
+        if (!key || key >= 0x1000000000000000ULL) continue;
+        slot = proc64_slot_of(pid);
+        if (slot < 0 || done[slot]) continue;
+        done[slot] = 1;
+        report_stacks_of(pid);
+    }
+}
+
+/* One process traced, by name, while a measured run is going: what
+ * winedevice.exe did with the requests a stuck program sent it is a few
+ * hundred calls, and the whole machine's trace buries them under the
+ * program's own hundreds of thousands. Build with
+ * -DTRACE64_COMM='"winedevice.exe"'. */
+static int trace_this_process(void) {
+#ifdef TRACE64_COMM
+    proc64_t* p = proc64_current();
+    return leader_pid >= 0 && p && kstrcmp(p->comm, TRACE64_COMM) == 0;
+#else
+    return 0;
+#endif
 }
 
 static uint64_t syscall64_dispatch_inner(syscall64_args_t* args) {
@@ -1134,7 +2137,11 @@ static uint64_t syscall64_dispatch_inner(syscall64_args_t* args) {
         enter_user_mode64_abort();                     /* never returns */
     }
 
-    if (!trace) return dispatch(args);
+    if (!trace && !trace_this_process()) {
+        r = dispatch(args);
+        note_module(args, r);
+        return r;
+    }
 
     /* A call that is being restarted is not a new call, and printing it
      * again says nothing that the first line did not. It matters here
@@ -1289,8 +2296,17 @@ static int user_range_ok(uint64_t addr, uint64_t len) {
      * like as a pointer - lands there. */
     if (addr >= 0x0000800000000000ULL) return 0;
     if (addr + len < addr) return 0;                   /* wrapped */
+    /* A page not there yet may be anonymous memory never touched: back
+     * it now, so the caller can use the range as it stands. */
+    (void)pmm64_take_user_oom();
     for (p = addr & ~0xFFFULL; p < addr + len; p += 0x1000)
-        if (paging64_translate(p, &phys) != 0) return 0;
+        if (paging64_translate(p, &phys) != 0 && !uspace64_fault(p, 0)) {
+            /* Not a bad pointer: no memory to put behind a good one.
+             * Linux's answer is the OOM killer, not an EFAULT the
+             * caller would retry. */
+            if (pmm64_take_user_oom()) syscall64_oom_kill(addr);
+            return 0;
+        }
     return 1;
 }
 
@@ -1489,7 +2505,42 @@ static uint64_t do_execve(const char* path, const char* const* argv,
     vfork_release(p);
     p->brk_base = p->brk_current = info.brk_start;
     p->mmap_next = USPACE64_MMAP_BASE;
+    p->nresv = 0;
+    {
+        int t = sched64_current();
+        if (t >= 0 && t < SCHED64_MAX_TASKS) clear_child_tid[t] = 0;
+    }
     kstrlcpy(p->exe_path, kpath, PROC64_PATH_MAX);
+
+    /* In a run of several processes, what each one became: its command
+     * line, which for a Wine process names the Windows program and, for
+     * Chromium, the --type= of the child. Paired with the [exit] line
+     * below, it says which child of a program went away, and how. */
+    mods_forget(proc64_current_pid());
+
+    if (leader_pid >= 0) {
+        int total = 0;
+        serial64_puts("NOVARIS64: [exec] pid ");
+        serial64_putdec((uint64_t)proc64_current_pid());
+        serial64_puts(":");
+        for (int i = 0; kargv[i] && total < 300; i++) {
+            serial64_putc(' ');
+            for (const char* c = kargv[i]; *c && total < 300; c++, total++)
+                serial64_putc(*c);
+        }
+        serial64_putc('\n');
+    }
+
+    /* And the name, which execve resets to the new program's basename.
+     * Measured on the host: a process that called PR_SET_NAME and then
+     * exec'd reads back the name of what it became, not what it chose.
+     * The old name belonged to the old image. */
+    {
+        const char* base = kpath;
+        for (const char* c = kpath; *c; c++)
+            if (*c == '/') base = c + 1;
+        kstrlcpy(p->comm, base, sizeof(p->comm));
+    }
 
     /* The exe's own info either way - AT_PHDR and friends describe the
      * program, not the interpreter - plus where ld.so was put, which is
@@ -1534,11 +2585,139 @@ static uint64_t do_execve(const char* path, const char* const* argv,
     return 0;
 }
 
+static uint64_t dispatch_body(syscall64_args_t* args);
+
+/* What each syscall number costs the kernel in TSC cycles, beside how
+ * often it is made - printed with the counts by syscall64_report_calls().
+ *
+ * Counted around the dispatch because nothing else can see it: syscall
+ * enters with interrupts masked, so a timer tick during kernel work is
+ * delivered on the way back to ring 3 and charged to the program. A call
+ * that parks its task switches away inside and does not come back
+ * through here; what it spent before parking goes uncounted, which is
+ * small, and the time it then waits is not the kernel's anyway. */
+static uint64_t cycles_by_nr[512];
+static uint64_t calls_reset_tsc;
+static uint64_t faults_at_reset[3];
+
+void kmain64_fault_stats(uint64_t* faults, uint64_t* cow, uint64_t* segv);
+void kmain64_segv_reset(void);
+void kmain64_segv_report(void);
+
+/* mmap is several different operations behind one number, and they do
+ * not cost the same: a PROT_NONE reservation maps the shared zero page,
+ * an anonymous mapping allocates and zeroes every page up front, and a
+ * private file mapping at an offset copies the file in. So its cycles
+ * are split by which of them a call was, along with how many pages it
+ * asked for - which is what each of them scales with. */
+enum { MAPK_RESERVE, MAPK_ANON, MAPK_DEVICE, MAPK_SHARED, MAPK_FILE_COW,
+       MAPK_FILE_COPY, MAPK_UNMAP, MAPK_N };
+static const char* const mapk_name[MAPK_N] = {
+    "reserve", "anon", "device", "shared", "file-cow", "file-copy", "munmap"
+};
+static int mmap_kind;
+static uint64_t mapk_cycles[MAPK_N], mapk_calls[MAPK_N], mapk_pages[MAPK_N];
+
+static inline uint64_t tsc64(void) {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
 static uint64_t dispatch(syscall64_args_t* args) {
+    uint64_t nr = args->nr;
+    uint64_t t0 = tsc64();
+    uint64_t r;
+    mmap_kind = -1;
+    r = dispatch_body(args);
+    if (nr < 512) cycles_by_nr[nr] += tsc64() - t0;
+    if ((nr == SYS64_MMAP || nr == SYS64_MUNMAP) && mmap_kind >= 0) {
+        int k = nr == SYS64_MUNMAP ? MAPK_UNMAP : mmap_kind;
+        mapk_cycles[k] += tsc64() - t0;
+        mapk_calls[k]++;
+        mapk_pages[k] += (args->a2 + PAGE64_SIZE - 1) / PAGE64_SIZE;
+    }
+    return r;
+}
+
+/* poll(2)'s body, shared with ppoll(2): checks the descriptors, and if
+ * none is ready parks the caller until something might have changed or
+ * `timeout` milliseconds have gone - negative for no limit, 0 for not at
+ * all. A parked call is re-issued from the start when it wakes, so this
+ * is re-entered with the same arguments and finds its deadline in the
+ * wait bookkeeping. */
+struct pollfd64 { int fd; short events; short revents; };
+
+static uint64_t do_poll(const syscall64_args_t* args, uint64_t nr,
+                        struct pollfd64* pfds, uint64_t n, int64_t timeout) {
+    uint64_t ready = 0;
+
+    if (n > FD_MAX * 2) return (uint64_t)-22;      /* -EINVAL */
+
+    for (uint64_t i = 0; i < n; i++) {
+        int fd = pfds[i].fd;
+        short want = pfds[i].events, got = 0;
+
+        pfds[i].revents = 0;
+        if (fd < 0) continue;
+        if (fd >= FD_MAX || !fds[fd].used) { pfds[i].revents = POLL64_NVAL;
+                                             ready++; continue; }
+
+        if (fds[fd].kind == FD64_SIGNALFD) {
+            /* Readable while a signal it reports is pending for the
+             * poller; never writable. */
+            if (signal64_pending_in_set(fds[fd].sigmask)) got |= POLL64_IN;
+        } else if (fds[fd].kind == FD64_NETLINK) {
+            /* Readable while a reply is waiting; a request can always
+             * be sent. */
+            if (fds[fd].pos & NL_PENDING) got |= POLL64_IN;
+            got |= POLL64_OUT;
+        } else if (fds[fd].kind == FD64_SOCKET && fds[fd].sock >= 0 &&
+            sock64_state(fds[fd].sock) == SOCK64_LISTENING) {
+            /* A listening socket is readable when somebody is
+             * waiting to be accepted. That is the event the whole
+             * server loop turns on. */
+            if (sock64_pending(fds[fd].sock)) got |= POLL64_IN;
+        } else if (fd_is_stream(fd)) {
+            int rx = fds[fd].rx, tx = fds[fd].tx;
+            if (rx >= 0 && (pipe64_available(rx) > 0 ||
+                            pipe64_writers(rx) == 0)) got |= POLL64_IN;
+            if (tx >= 0 && pipe64_space(tx) > 0)      got |= POLL64_OUT;
+            if (tx >= 0 && pipe64_readers(tx) == 0)   got |= POLL64_HUP;
+        } else {
+            /* A file is always ready, which is what Linux says too. */
+            got |= POLL64_IN | POLL64_OUT;
+        }
+
+        got &= (short)(want | POLL64_HUP | POLL64_NVAL);
+        if (got) { pfds[i].revents = got; ready++; }
+    }
+
+    if (ready) { wait_done(); return ready; }
+    if (timeout == 0) return 0;
+
+    if (wait_started()) {
+        if (wait_expired()) { wait_done(); return 0; }
+        return wait_restart(args, nr, wait_deadline[wait_slot()]);
+    }
+    return wait_restart(args, nr,
+                        timeout < 0 ? 0    /* forever */
+                                    : clock64_ticks() + (uint64_t)timeout);
+}
+
+static uint64_t dispatch_body(syscall64_args_t* args) {
     uint64_t nr = args->nr;
     uint64_t a1 = args->a1, a2 = args->a2, a3 = args->a3;
 
     call_count++;
+    {
+        int sl = proc64_current_slot();
+        if (sl >= 0 && sl < PROC64_MAX) {
+            calls_by_slot[sl]++;
+            pid_of_slot[sl] = proc64_current_pid();
+        }
+        if (nr < 512) calls_by_nr[nr]++;
+    }
 
     /* A Win32 import, arriving through one of pe64.c's thunks. Checked
      * before the switch because the range is contiguous and has nothing
@@ -1553,6 +2732,10 @@ static uint64_t dispatch(syscall64_args_t* args) {
 
     switch (nr) {
     case SYS64_WRITE:
+        if (a1 < FD_MAX && fds[a1].used && fd_is_stream((int)a1)) {
+            iovec64_t one = { (void*)a2, a3 };
+            return (uint64_t)stream_write(args, nr, (int)a1, &one, 1);
+        }
         return (uint64_t)fd_write_bytes(a1, (const char*)a2, a3);
 
     /* writev(fd, iov, iovcnt).
@@ -1573,6 +2756,8 @@ static uint64_t dispatch(syscall64_args_t* args) {
         int64_t total = 0;
 
         if (!iov && a3) return (uint64_t)-14;          /* -EFAULT */
+        if (a1 < FD_MAX && fds[a1].used && fd_is_stream((int)a1))
+            return (uint64_t)stream_write(args, nr, (int)a1, iov, a3);
         for (uint64_t i = 0; i < a3; i++) {
             int64_t w;
             if (!iov[i].iov_len) continue;
@@ -1617,12 +2802,15 @@ static uint64_t dispatch(syscall64_args_t* args) {
         uint64_t mapped;
         int node;
 
-        if (flags & MAP_ANONYMOUS)
+        if (flags & MAP_ANONYMOUS) {
+            mmap_kind = a3 == 0 ? MAPK_RESERVE : MAPK_ANON;
             return uspace64_mmap(a1, a2, a3, flags);
+        }
 
         if (fd < 3 || fd >= FD_MAX || !fds[fd].used) return (uint64_t)-9;
         if (off & (PAGE64_SIZE - 1)) return (uint64_t)-22;  /* -EINVAL */
         node = fds[fd].node;
+        mmap_kind = MAPK_DEVICE;
 
         /* /dev/fb0, decided before the rule below rather than after.
          *
@@ -1696,19 +2884,28 @@ static uint64_t dispatch(syscall64_args_t* args) {
          * refusing to produce again. */
         if (flags & MAP_SHARED) {
             const uint64_t* frames;
-            uint64_t nframes = 0, want;
+            uint64_t nframes = 0, want, skip = off / PAGE64_SIZE;
 
-            /* An offset would mean mapping from the middle of the frame
-             * list, which is a small change and has no caller: refused
-             * rather than half-answered. */
-            if (off) return (uint64_t)-22;             /* -EINVAL */
-
-            frames = ramfs64_frames(node, a2, &nframes);
+            /* From the middle of the file: the same frames, starting
+             * further in. Refused until a caller turned up, and the
+             * caller was the one that mattered - Wine maps a view of a
+             * section at an offset this way, and Chromium's IPC is built
+             * on views of shared sections. -EINVAL sent Wine to its
+             * fallback, which reads the bytes into private memory: a
+             * snapshot that never sees the other side's later writes.
+             * The renderers and the storage service rejected what came
+             * through as VALIDATION_ERROR_ILLEGAL_MEMORY_RANGE and quit,
+             * and a headless Chromium kept starting new ones. */
+            frames = ramfs64_frames(node, off + a2, &nframes);
             if (!frames) return (uint64_t)-12;         /* -ENOMEM */
+            if (nframes <= skip) return (uint64_t)-22; /* past the end */
+            frames  += skip;
+            nframes -= skip;
 
             want = (a2 + PAGE64_SIZE - 1) / PAGE64_SIZE;
             if (nframes > want) nframes = want;
             shared_maps++;
+            mmap_kind = MAPK_SHARED;
             /* The frame behind KUSER_SHARED_DATA, named by what actually
              * backs it rather than by a constant: which frame ramfs
              * hands out depends on everything allocated before it, so
@@ -1789,32 +2986,40 @@ static uint64_t dispatch(syscall64_args_t* args) {
          * be registered, no desktop window, and a mapping that reported
          * success throughout.
          *
-         * Only from the start of the file, because ramfs64_frames
-         * counts from there and an offset would mean mapping from the
-         * middle of the list. Every caller that needs this maps from
-         * zero; a PE section mapped at an offset still takes the copy
-         * below, which is wasteful and correct, because a module file
-         * does not change under its reader. */
+         * At any page-aligned offset, from that page of the file's
+         * frame list. It used to be from the start of the file only, and
+         * a PE section mapped at an offset took the copy below instead -
+         * "wasteful and correct", this comment said, because a module
+         * does not change under its reader. Wasteful turned out to be
+         * the whole machine: Wine maps every section of chrome.dll at
+         * its file offset, so each Chromium process copied ~330MB of
+         * code it would never write - 200,000 pages a process, measured
+         * by sampling first-touch faults, all of them kernel writes into
+         * the DLL's range - and five of them ran 3GB out of memory. Now
+         * the code is shared with the file and every other process that
+         * maps it, and only a page somebody writes is copied. */
         /* A writable private mapping belongs here too, and is in fact
          * the case that matters: Wine maps the session PROT_READ |
          * PROT_WRITE and then only reads it. Copy-on-write is exactly
          * that bargain - the permission is real, and the copy is taken
          * when it is used rather than before. PAGE64_COW_RW carries the
          * permission so break_cow can tell that write from a fault. */
-        if (off == 0) {
+        {
             uint64_t nframes = 0;
-            const uint64_t* frames = ramfs64_frames(node, a2, &nframes);
+            uint64_t first = off / PAGE64_SIZE;
+            const uint64_t* frames = ramfs64_frames(node, off + a2, &nframes);
             uint64_t want = (a2 + PAGE64_SIZE - 1) / PAGE64_SIZE;
 
             /* All of it, or none of it. A mapping that runs past the end
              * of the file needs zero pages for the tail, and mixing the
              * two here would leave a half-built mapping to unpick on
              * failure. */
-            if (frames && nframes >= want) {
+            if (frames && nframes >= first + want) {
                 uint64_t r = uspace64_map_frames_cow(a1,
                                  (flags & MAP_FIXED) != 0,
-                                 frames, want, a3);
+                                 frames + first, want, a3);
                 if ((int64_t)r > 0) {
+                    mmap_kind = MAPK_FILE_COW;
                     file_maps++;
                     return r;
                 }
@@ -1823,6 +3028,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
 
         /* Mapped writable whatever the caller asked for, because the
          * kernel is about to write the file's contents into it. */
+        mmap_kind = MAPK_FILE_COPY;
         mapped = uspace64_mmap(a1, a2, PROT_READ | PROT_WRITE,
                                flags | MAP_ANONYMOUS);
         if ((int64_t)mapped < 0) return mapped;
@@ -1877,6 +3083,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
     }
 
     case SYS64_MUNMAP:
+        mmap_kind = MAPK_UNMAP;
         return uspace64_munmap(a1, a2);
 
     case SYS64_MPROTECT:
@@ -1897,6 +3104,79 @@ static uint64_t dispatch(syscall64_args_t* args) {
     /* arch_prctl(ARCH_SET_FS, addr) is how a thread pointer is set on
      * x86-64, and glibc does it before it can touch a single piece of
      * thread-local storage - errno included. Nothing works before this. */
+    /* prctl(2), and only the two options anything here asks for.
+     *
+     * Wine calls it in three places and two of them are PR_SET_NAME:
+     * env.c when a process learns what it is called, and the preloader,
+     * which is the only one of the three that looks at the answer -
+     * `if (wld_prctl(15, name) == -1) return;`. chrome.exe's run asked
+     * for prctl three times and got -ENOSYS every time.
+     *
+     * The third is PR_SET_PTRACER, Wine's comment calling it a work
+     * around for "Ubuntu's ptrace breakage". That is a Yama option, and
+     * a kernel built without Yama answers EINVAL - measured on the host,
+     * which does exactly that - so falling through to the default below
+     * is not a gap, it is the same answer Linux gives.
+     *
+     * Everything else is EINVAL, which is what Linux says about an
+     * option it does not implement. Reported once per option, because
+     * EINVAL from a syscall that exists is much harder to notice than
+     * ENOSYS from one that does not, and the next program to want
+     * PR_SET_PDEATHSIG should not have to be guessed at. */
+    case SYS64_PRCTL: {
+        proc64_t* p = proc64_current();
+
+        switch ((int)a1) {
+        case PRCTL64_SET_NAME: {
+            char tmp[PRCTL64_COMM_LEN];
+
+            /* NULL is the EFAULT this can catch. A pointer that is not
+             * null but is not mapped either would fault in ring 0
+             * instead of returning EFAULT, because this kernel has no
+             * copy-from-user: every syscall here reads user memory
+             * directly. That is the tree's existing bargain, not
+             * something prctl introduces, and it is the same for wait4's
+             * status pointer two hundred lines up. Named so the next
+             * person does not have to discover it. */
+            if (!a2) return (uint64_t)-14;             /* -EFAULT */
+            if (!p)  return (uint64_t)-22;
+
+            /* Truncated, not refused: Linux copies at most fifteen
+             * characters and terminates, and returns 0 either way. */
+            kstrlcpy(tmp, (const char*)a2, PRCTL64_COMM_LEN);
+            kstrlcpy(p->comm, tmp, sizeof(p->comm));
+            return 0;
+        }
+
+        case PRCTL64_GET_NAME: {
+            if (!a2) return (uint64_t)-14;             /* -EFAULT */
+            if (!p)  return (uint64_t)-22;
+
+            /* Sixteen bytes, because that is what the caller is
+             * required to provide and what Linux writes. */
+            kmemset((void*)a2, 0, PRCTL64_COMM_LEN);
+            kstrlcpy((char*)a2, p->comm, PRCTL64_COMM_LEN);
+            return 0;
+        }
+
+        default: {
+            static int said[8];
+            static int nsaid;
+            int already = 0;
+
+            for (int i = 0; i < nsaid; i++)
+                if (said[i] == (int)a1) { already = 1; break; }
+            if (!already && nsaid < 8) {
+                said[nsaid++] = (int)a1;
+                serial64_puts("NOVARIS64: [prctl] option ");
+                serial64_putdec((uint64_t)(uint32_t)a1);
+                serial64_puts(" is not implemented - EINVAL\n");
+            }
+            return (uint64_t)-22;                      /* -EINVAL */
+        }
+        }
+    }
+
     case SYS64_ARCH_PRCTL:
         switch (a1) {
         case 0x1002:                                   /* ARCH_SET_FS */
@@ -2007,6 +3287,17 @@ static uint64_t dispatch(syscall64_args_t* args) {
         tid = sched64_add_frame(&child, space,
                                 (a1 & CLONE_SETTLS) ? args->a5 : 0);
         if (tid < 0) return (uint64_t)-11;              /* -EAGAIN */
+        wait_slot_reset(tid);
+
+        /* The three tid words. glibc passes &pd->tid as both pointers,
+         * and the first is how pthread_create learns the tid at all. A
+         * thread shares its parent's memory, so "in the child" and "in
+         * the parent" are the same store. */
+        if ((a1 & CLONE_PARENT_SETTID) && user_range_ok(a3, 4))
+            *(volatile uint32_t*)a3 = (uint32_t)(tid + 1);
+        if ((a1 & CLONE_CHILD_SETTID) && user_range_ok(args->a4, 4))
+            *(volatile uint32_t*)args->a4 = (uint32_t)(tid + 1);
+        if (a1 & CLONE_CHILD_CLEARTID) clear_child_tid[tid] = args->a4;
 
         /* The parent gets the child's tid; the child gets 0 above. */
         return (uint64_t)tid + 1;
@@ -2028,18 +3319,64 @@ static uint64_t dispatch(syscall64_args_t* args) {
         return do_execve((const char*)a1, (const char* const*)a2,
                          (const char* const*)a3, args);
 
+    /* wait4(pid, status, options, rusage).
+     *
+     * Both of the first and third arguments used to be read and thrown
+     * away, which made this "reap whichever child has exited, and block
+     * until one does" wearing the name of a call that means neither.
+     *
+     * WNOHANG is the one that gets noticed, because a poll loop written
+     * against it does not poll - it blocks on the first turn, and a
+     * supervisor that meant "has anything finished?" asks "wait until
+     * something does". Chromium's child management is exactly that loop.
+     *
+     * The pid is the quieter of the two and the worse: waitpid(child_a)
+     * would reap child_b, report child_b's pid, and destroy the status
+     * child_a's parent was waiting for.
+     */
     case SYS64_WAIT4: {
-        int status = 0;
-        int reaped = proc64_reap_child(proc64_current_pid(), &status);
+        int want    = (int)(int32_t)a1;
+        int options = (int)(int32_t)a3;
+        int status  = 0;
+        int reaped;
         registers64_t self, next;
         vmspace64_t next_space;
         uint64_t next_fs;
+
+        /* pid < -1 waits on a process group, and 0 on the caller's own.
+         * There are no process groups here and no way to invent one
+         * honestly, so: 0 is treated as "any child", which is what it
+         * means on a system where everything shares one group, and a
+         * named group is -ECHILD rather than a wrong answer. */
+        if (want < -1) return (uint64_t)-10;           /* -ECHILD */
+        if (want == 0) want = -1;
+
+        /* WUNTRACED and WCONTINUED ask to hear about children that
+         * stopped or continued. Nothing stops here - see the note on
+         * the stopping signals in signal64.c - so there is never such a
+         * child to report, and honouring the flags is the same as
+         * ignoring them. That is true today and would stop being true
+         * the moment job control arrived. */
+
+        reaped = proc64_reap_child_pid(proc64_current_pid(), want, &status);
 
         if (reaped >= 0) {
             /* wait4 reports a *wait status*, not an exit code: the low
              * byte says how it died and the next says with what. A
              * caller using WEXITSTATUS shifts it back down. */
-            if (a2) *(int*)a2 = (status & 0xFF) << 8;
+            /* A process killed by a signal is not a process that
+             * exited, and wait(2) encodes the two differently: the
+             * signal goes in the low seven bits, where WIFSIGNALED
+             * looks, and an exit code goes in the second byte, where
+             * WEXITSTATUS looks. Reporting a killed child as having
+             * exited with 128+sig is what a *shell* prints; a parent
+             * reading the raw status - which is what Chromium does to
+             * manage its children - would see a clean exit. */
+            {
+                int tsig = proc64_reaped_signal();
+                if (a2) *(int*)a2 = tsig ? (tsig & 0x7F)
+                                         : ((status & 0xFF) << 8);
+            }
             return (uint64_t)reaped;
         }
 
@@ -2048,8 +3385,20 @@ static uint64_t dispatch(syscall64_args_t* args) {
          * the entire point of the call, and returning -ECHILD to a
          * parent whose child simply has not been scheduled yet is the
          * difference between a working fork and a racing one. */
-        if (!proc64_has_children(proc64_current_pid()))
+        if (!proc64_has_child(proc64_current_pid(), want))
             return (uint64_t)-10;                      /* -ECHILD */
+
+        /* There is a child and it has not finished. WNOHANG says to
+         * report that and return rather than wait for it, and 0 is how
+         * wait4 says "nothing to report": not an error, not a pid. */
+        if (options & WAIT64_NOHANG) return 0;
+
+        /* A signal waiting for this thread ends the call rather than
+         * parking it, because parking is where it would be lost: a
+         * task that blocks leaves through the scheduler and never
+         * reaches the delivery point at the end of syscall64_dispatch.
+         * See the longer note in wait_restart. */
+        if (signal_interrupts_wait()) return (uint64_t)-4;  /* -EINTR */
 
         /* Blocked, and restarted rather than resumed: rewind rip by the
          * two bytes of the `syscall` instruction and put the number
@@ -2101,8 +3450,11 @@ static uint64_t dispatch(syscall64_args_t* args) {
     case SYS64_GETTID:
         return (uint64_t)sched64_current() + 1;
 
-    case SYS64_SET_TID_ADDRESS:
-        return (uint64_t)sched64_current() + 1;
+    case SYS64_SET_TID_ADDRESS: {
+        int t = sched64_current();
+        if (t >= 0 && t < SCHED64_MAX_TASKS) clear_child_tid[t] = a1;
+        return (uint64_t)t + 1;
+    }
 
     case SYS64_SET_ROBUST_LIST:
         return 0;
@@ -2266,7 +3618,33 @@ static uint64_t dispatch(syscall64_args_t* args) {
      * semantic. With one address space per process and no shared memory
      * here, private and shared behave identically. */
     case SYS64_FUTEX: {
-        uint32_t op = (uint32_t)a2 & ~(uint32_t)FUTEX_PRIVATE_FLAG;
+        uint32_t op = (uint32_t)a2 & ~(uint32_t)(FUTEX_PRIVATE_FLAG |
+                                                 FUTEX_CLOCK_REALTIME);
+        /* The bitset forms, which are what glibc's pthread_join and its
+         * clock-based waits use. With every bit set - the only mask
+         * anything here passes - a bitset wait is a plain wait whose
+         * deadline is absolute rather than relative, on CLOCK_MONOTONIC
+         * or, with FUTEX_CLOCK_REALTIME, CLOCK_REALTIME; and a bitset
+         * wake is a plain wake. A narrower mask is treated as all of
+         * them, which can only wake too much, never too little.
+         *
+         * Unreachable until clone set pd->tid: pthread_join had never
+         * had a non-zero tid to wait on. The first join that did got
+         * -ENOSYS and glibc aborted with "The futex facility returned an
+         * unexpected error code". */
+        int absolute = 0;
+        /* The bitset: val3 for the _BITSET forms, every bit for the
+         * plain ones. A wake releases a waiter only if their masks share
+         * a bit - which is what lets one futex word carry two kinds of
+         * waiter, readers and writers say, and wake only one kind. 0
+         * matches nothing and Linux refuses it. */
+        uint32_t bits = 0xFFFFFFFFu;
+        if (op == FUTEX_WAIT_BITSET || op == FUTEX_WAKE_BITSET) {
+            bits = (uint32_t)args->a6;
+            if (!bits) return (uint64_t)-22;           /* -EINVAL */
+        }
+        if (op == FUTEX_WAIT_BITSET) { op = FUTEX_WAIT; absolute = 1; }
+        if (op == FUTEX_WAKE_BITSET) op = FUTEX_WAKE;
 
         if (op == FUTEX_WAIT) {
             registers64_t self, next;
@@ -2330,8 +3708,11 @@ static uint64_t dispatch(syscall64_args_t* args) {
              * it is why futex has no race: between the caller deciding
              * to sleep and this check, the waker may already have run
              * and changed the value. If it has, do not sleep. */
-            if (*(volatile uint32_t*)a1 != (uint32_t)a3)
+            if (*(volatile uint32_t*)a1 != (uint32_t)a3) {
+                ftrace_note('A', a1, (uint32_t)a3, 0);
                 return (uint64_t)-11;              /* -EAGAIN */
+            }
+            ftrace_note('W', a1, (uint32_t)a3, args->a4 ? 1 : 0);
 
             if (args->a4) {
                 const struct { uint64_t sec, nsec; }* ts =
@@ -2340,20 +3721,61 @@ static uint64_t dispatch(syscall64_args_t* args) {
 
                 if (!user_range_ok(args->a4, sizeof(*ts)))
                     return (uint64_t)-14;          /* -EFAULT */
-                want = ts->sec * CLOCK64_HZ
-                     + ts->nsec / (1000000000ull / CLOCK64_HZ);
+                if (absolute) {
+                    /* Made relative against the clock it names; a
+                     * deadline already gone is a zero timeout. */
+                    uint64_t ns_s, ns_n, at, now;
+                    clock64_read(((uint32_t)a2 & FUTEX_CLOCK_REALTIME)
+                                     ? 0 : 1, &ns_s, &ns_n);
+                    at  = ts->sec * 1000000000ull + ts->nsec;
+                    now = ns_s * 1000000000ull + ns_n;
+                    want = at > now
+                         ? (at - now) / (1000000000ull / CLOCK64_HZ) : 0;
+                } else {
+                    want = ts->sec * CLOCK64_HZ
+                         + ts->nsec / (1000000000ull / CLOCK64_HZ);
+                }
                 /* A deadline already past still gets one turn, so that
                  * a zero timeout polls once rather than reporting a
                  * timeout for a word it never looked at. */
                 futex_waits++;
+
+                /* Asleep on the word itself, with the deadline - so a
+                 * wake releases exactly the waiters it names, and the
+                 * clock ending the wait reads as -ETIMEDOUT rather than
+                 * as a wake.
+                 *
+                 * It used to park on the shared poll key and re-check
+                 * the word on every wake anywhere. That cannot honour a
+                 * bitset, and it lost a FUTEX_WAKE that left the word
+                 * unchanged: the waiter re-checked, saw the same value,
+                 * and went back to sleep until its timeout. The old way
+                 * stays as the fallback for when sleeping is refused -
+                 * the timer masked, as in some bring-up layers. */
+                if (signal_interrupts_wait())
+                    return (uint64_t)-4;           /* -EINTR */
+                frame_from_args(args, 0, &self);
+                sched64_signal_restart(nr);
+                if (sched64_block_until_ex(&self, a1, 0, (uint64_t)-110,
+                                           clock64_ticks() + (want ? want : 1),
+                                           bits, &next, &next_space,
+                                           &next_fs)) {
+                    vmspace64_switch(&next_space);
+                    write_msr(0xC0000100u, next_fs);
+                    sched64_resume(&next);         /* never returns */
+                }
                 return wait_restart(args, nr,
                                     clock64_ticks() + (want ? want : 1));
             }
 
+            if (signal_interrupts_wait())
+                return (uint64_t)-4;               /* -EINTR */
+
             futex_waits++;
             frame_from_args(args, 0, &self);
-            if (!sched64_block_current(&self, a1, 0, &next, &next_space,
-                                       &next_fs))
+            sched64_signal_restart(nr);
+            if (!sched64_block_until_ex(&self, a1, 0, 0, 0, bits,
+                                        &next, &next_space, &next_fs))
                 return (uint64_t)-35;              /* -EDEADLK */
 
             vmspace64_switch(&next_space);
@@ -2362,8 +3784,12 @@ static uint64_t dispatch(syscall64_args_t* args) {
         }
 
         if (op == FUTEX_WAKE) {
-            int n = sched64_wake(a1, (int)(uint32_t)a3);
+            int n = sched64_wake_futex(a1, (int)(uint32_t)a3, bits,
+                        ((uint32_t)a2 & (uint32_t)FUTEX_PRIVATE_FLAG)
+                            ? proc64_current_pid() : -1);
             futex_wakes += (uint64_t)n;
+            ftrace_note('K', a1, user_range_ok(a1, 4)
+                                     ? *(volatile uint32_t*)a1 : 0, n);
             return (uint64_t)n;
         }
 
@@ -2398,16 +3824,37 @@ static uint64_t dispatch(syscall64_args_t* args) {
          * handler is returning from. Resuming it is the same trick as
          * futex: this syscall does not return, the thread does. */
         signal64_sigreturn(saved_user_rsp, &resumed);
+        /* The handler's mask is gone and the old one is back, so a
+         * signal that arrived while it ran - blocked then - is taken
+         * now, before the interrupted code runs another instruction. */
+        deliver_pending(&resumed);
         /* The scheduler's saved copy for this task is stale now, and
          * harmlessly so: the next timer tick overwrites it from the
          * live frame before anything switches away. */
         sched64_resume(&resumed);                 /* never returns */
     }
 
-    case SYS64_RT_SIGPROCMASK:
-        /* Still accepted and ignored. Masking matters for asynchronous
-         * signals; a fault is delivered to the thread that caused it
-         * whether or not it wanted to hear about it. */
+    /* rt_sigprocmask(how, set, oldset, sigsetsize). Real now - see the
+     * blocked sets in signal64.c. Unblocking something pending needs no
+     * more than returning: the end of this syscall delivers it. */
+    case SYS64_RT_SIGPROCMASK: {
+        uint64_t set, old;
+        int rc;
+
+        if (a2 && !user_range_ok(a2, 8)) return (uint64_t)-14;  /* -EFAULT */
+        if (a3 && !user_range_ok(a3, 8)) return (uint64_t)-14;
+        if (a2) set = *(const uint64_t*)a2;
+        rc = signal64_sigprocmask((int)a1, a2 ? &set : 0,
+                                  a3 ? &old : 0, args->a4);
+        if (rc) return (uint64_t)(int64_t)rc;
+        if (a3) *(uint64_t*)a3 = old;
+        return 0;
+    }
+
+    case SYS64_RT_SIGPENDING:
+        if (a2 != 8) return (uint64_t)-22;                       /* -EINVAL */
+        if (!user_range_ok(a1, 8)) return (uint64_t)-14;         /* -EFAULT */
+        *(uint64_t*)a1 = signal64_sigpending();
         return 0;
 
     /* --- files ---------------------------------------------------- */
@@ -2558,6 +4005,25 @@ static uint64_t dispatch(syscall64_args_t* args) {
     case SYS64_SOCKET: {
         int s, fd;
 
+        if (a1 == AF_NETLINK_) {
+            /* SOCK_RAW or SOCK_DGRAM, which Linux treats alike here;
+             * only the route family. */
+            if ((a2 & 0xFF) != 3 && (a2 & 0xFF) != 2) return (uint64_t)-94;
+            if (a3 != 0) return (uint64_t)-93;         /* -EPROTONOSUPPORT */
+            fd = fd_alloc(3);
+            if (fd < 0) return (uint64_t)-24;
+            fds[fd].kind     = FD64_NETLINK;
+            fds[fd].node     = -1;
+            fds[fd].pos      = 0;
+            fds[fd].rx       = -1;
+            fds[fd].tx       = -1;
+            fds[fd].sock     = -1;
+            fds[fd].sigmask  = 0;
+            fds[fd].nonblock = (a2 & O_NONBLOCK) != 0;
+            fds[fd].cloexec  = (a2 & O_CLOEXEC) != 0;
+            fds[fd].used     = 1;
+            return (uint64_t)fd;
+        }
         if (a1 != AF_UNIX_) return (uint64_t)-97;      /* -EAFNOSUPPORT */
         if ((int)(a2 & 0xFF) != SOCK_STREAM_) return (uint64_t)-94;
 
@@ -2583,6 +4049,13 @@ static uint64_t dispatch(syscall64_args_t* args) {
         int node;
 
         if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind == FD64_NETLINK) {
+            /* The groups are remembered and nothing is ever sent to
+             * them; the port is always the process's own pid. */
+            if (!addr || a3 < 12 || !user_range_ok(a2, 12)) return (uint64_t)-22;
+            fds[a1].sigmask = *(const uint32_t*)((const uint8_t*)a2 + 8);
+            return 0;
+        }
         if (fds[a1].kind != FD64_SOCKET || fds[a1].sock < 0)
             return (uint64_t)-88;                      /* -ENOTSOCK */
         if (!addr || addr->sun_family != AF_UNIX_) return (uint64_t)-22;
@@ -2673,6 +4146,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
 
         if (rc == -11) {                               /* -EAGAIN */
             if (fds[a1].nonblock) return (uint64_t)-11;
+            if (signal_interrupts_wait()) return (uint64_t)-4;  /* -EINTR */
 
             frame_from_args(args, nr, &self);
             self.rip = args->ret_rip - 2;
@@ -2721,11 +4195,67 @@ static uint64_t dispatch(syscall64_args_t* args) {
      * reason it can be written at all is that a descriptor here is a
      * small record - a kind, a node or a pair of pipes - rather than a
      * pointer into the owner. */
+    /* sendto(fd, buf, len, flags, addr, addrlen) and recvfrom: only a
+     * route socket answers them. A connected stream socket would take
+     * them too on Linux, but nothing here has asked. */
+    case SYS64_SENDTO:
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind == FD64_NETLINK)
+            return (uint64_t)nl_send((int)a1, (const void*)a2, a3);
+        /* A connected stream socket ignores the address, and send(2) is
+         * sendto with none: both are write(2) with flags. */
+        if (fd_is_stream((int)a1)) {
+            iovec64_t one = { (void*)a2, a3 };
+            if (args->a4 & 0x40) {                     /* MSG_DONTWAIT */
+                int64_t w = do_pipe_write((int)a1, (const void*)a2, a3);
+                return (uint64_t)w;
+            }
+            return (uint64_t)stream_write(args, nr, (int)a1, &one, 1);
+        }
+        return (uint64_t)-88;                          /* -ENOTSOCK */
+
+    case SYS64_RECVFROM: {
+        uint32_t nlen = 0;
+        int64_t r;
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        /* recv(2) is recvfrom with no address, and on a connected stream
+         * socket it is read(2) with flags - end of file included, which
+         * is how a peer learns the other end died. */
+        if (fds[a1].kind != FD64_NETLINK) {
+            int64_t rr;
+            if (!fd_is_stream((int)a1)) return (uint64_t)-88; /* -ENOTSOCK */
+            if (args->a4 & 0x40) {                     /* MSG_DONTWAIT */
+                if (fds[a1].rx < 0) return (uint64_t)-9;
+                rr = pipe64_read(fds[a1].rx, (void*)a2, a3);
+                if (rr > 0) sched64_wake(PIPE64_WAIT_KEY(fds[a1].rx),
+                                         SCHED64_MAX_TASKS);
+                return (uint64_t)rr;
+            }
+            if (args->a6 && user_range_ok(args->a6, 4)) *(uint32_t*)args->a6 = 0;
+            return (uint64_t)do_pipe_read(args, nr, (int)a1, (void*)a2, a3);
+        }
+        if (args->a6) {
+            if (!user_range_ok(args->a6, 4)) return (uint64_t)-14;
+            nlen = *(uint32_t*)args->a6;
+        }
+        r = nl_recv(args, nr, (int)a1, (void*)a2, a3, args->a4,
+                    (void*)args->a5, args->a6 ? &nlen : 0, 0);
+        if (r >= 0 && args->a6) *(uint32_t*)args->a6 = nlen;
+        return (uint64_t)r;
+    }
+
     case SYS64_SENDMSG: {
         const msghdr64_t* msg = (const msghdr64_t*)a2;
         fdpass64_t carried[8];
         int ncarried = 0;
         int64_t total = 0;
+
+        if (a1 < FD_MAX && fds[a1].used && fds[a1].kind == FD64_NETLINK) {
+            if (!msg || !user_range_ok(a2, sizeof(*msg)) || !msg->msg_iovlen)
+                return (uint64_t)-22;
+            return (uint64_t)nl_send((int)a1, msg->msg_iov[0].iov_base,
+                                     msg->msg_iov[0].iov_len);
+        }
 
         /* Said out loud while tracing, because "bad file descriptor" is
          * the same answer to four different questions and the useful
@@ -2864,6 +4394,22 @@ static uint64_t dispatch(syscall64_args_t* args) {
         fdpass64_t got[8];
         int ngot, installed = 0;
         int64_t total = 0;
+
+        if (a1 < FD_MAX && fds[a1].used && fds[a1].kind == FD64_NETLINK) {
+            uint32_t nlen, mflags = 0;
+            int64_t r;
+            if (!msg || !user_range_ok(a2, sizeof(*msg)) || !msg->msg_iovlen)
+                return (uint64_t)-22;
+            nlen = msg->msg_name ? msg->msg_namelen : 0;
+            r = nl_recv(args, nr, (int)a1, msg->msg_iov[0].iov_base,
+                        msg->msg_iov[0].iov_len, a3, msg->msg_name, &nlen,
+                        &mflags);
+            if (r < 0) return (uint64_t)r;
+            msg->msg_namelen    = nlen;
+            msg->msg_flags      = mflags;
+            msg->msg_controllen = 0;
+            return (uint64_t)r;
+        }
 
         if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
         if (!fd_is_stream(a1)) return (uint64_t)-88;
@@ -3021,6 +4567,17 @@ static uint64_t dispatch(syscall64_args_t* args) {
     case SYS64_GETSOCKNAME: {
         sockaddr_un64_t* addr = (sockaddr_un64_t*)a2;
         if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind == FD64_NETLINK) {
+            uint8_t* nl = (uint8_t*)a2;
+            if (!a2 || !a3 || !user_range_ok(a2, 12) || !user_range_ok(a3, 4))
+                return (uint64_t)-14;
+            for (int i = 0; i < 12; i++) nl[i] = 0;
+            *(uint16_t*)nl = AF_NETLINK_;
+            *(uint32_t*)(nl + 4) = (uint32_t)proc64_current_pid();
+            *(uint32_t*)(nl + 8) = (uint32_t)fds[a1].sigmask;
+            *(uint32_t*)a3 = 12;
+            return 0;
+        }
         if (fds[a1].kind != FD64_SOCKET) return (uint64_t)-88;
         if (!addr) return (uint64_t)-14;
         addr->sun_family = AF_UNIX_;
@@ -3116,17 +4673,30 @@ static uint64_t dispatch(syscall64_args_t* args) {
     /* clock_gettime(clkid, ts).
      *
      * The distinction is not decoration. CLOCK_REALTIME is a date and
-     * CLOCK_MONOTONIC is an interval, and answering both with "seconds
-     * since the timer started" makes the first of them 1970 - which
-     * Milestone 81 found Wine acting on. 0 is REALTIME and 8
-     * REALTIME_COARSE; 1 MONOTONIC, 4 MONOTONIC_RAW, 6 MONOTONIC_COARSE
-     * and 7 BOOTTIME all measure from an unspecified point, and boot is
-     * one. */
+     * CLOCK_MONOTONIC is an interval, and answering a date with "seconds
+     * since the timer started" puts it in 1970 - which Milestone 81
+     * found Wine acting on.
+     *
+     * The ids have to be right one at a time, because getting one of
+     * them wrong is indistinguishable from not having a wall clock at
+     * all. Milestone 86 had 8 written down as REALTIME_COARSE. 8 is
+     * REALTIME_ALARM; REALTIME_COARSE is 5, and 5 is the one that
+     * matters, because NtQuerySystemTime asks clock_getres whether
+     * REALTIME_COARSE resolves to a millisecond or better and uses it
+     * for every date it ever reports if it does. Ours does, so every
+     * date Wine read came off the uptime counter while the wineserver,
+     * which calls gettimeofday, read the RTC. The two then disagreed by
+     * fifty-six years, and MsgWaitForMultipleObjects - which sends the
+     * server an absolute deadline of "now plus the timeout" - handed it
+     * deadlines in 1970 and got WAIT_TIMEOUT back at once, every time.
+     *
+     * Which id is which now lives in clock64_kind, above, because
+     * clock_getres and clock_nanosleep have to answer for the same set. */
     case SYS64_CLOCK_GETTIME: {
         struct { uint64_t sec, nsec; }* ts = (void*)a2;
+        if (clock64_kind(a1) == CLOCK64_KIND_NONE) return (uint64_t)-22;
         if (!ts) return (uint64_t)-14;
-        if (a1 == 0 || a1 == 8) clock64_realtime(&ts->sec, &ts->nsec);
-        else                    clock64_now(&ts->sec, &ts->nsec);
+        clock64_read(a1, &ts->sec, &ts->nsec);
         return 0;
     }
 
@@ -3169,8 +4739,26 @@ static uint64_t dispatch(syscall64_args_t* args) {
         return sec;
     }
 
+    /* clock_getres(clkid, res).
+     *
+     * The tick is the answer, because the tick is what the clock is: a
+     * counter incremented CLOCK64_HZ times a second with nothing finer
+     * underneath it. That is worth stating plainly rather than rounding
+     * down to look good, because Wine acts on it - NtQuerySystemTime
+     * asks this about CLOCK_REALTIME_COARSE and, if the answer is a
+     * millisecond or better, uses that clock for every date it reports
+     * for the rest of the process's life. In this prefix it is the only
+     * question anything asks: nineteen calls, all of them about id 5.
+     *
+     * What it must not do is answer for a clock this kernel does not
+     * have. A resolution for every id, valid or not, is the same lie as
+     * a time for every id - it tells the caller the clock is there, and
+     * the caller believes it. res may be NULL: then the call is only
+     * asking whether the clock exists, and the id check is the whole
+     * answer. */
     case SYS64_CLOCK_GETRES: {
         struct { uint64_t sec, nsec; }* ts = (void*)a2;
+        if (clock64_kind(a1) == CLOCK64_KIND_NONE) return (uint64_t)-22;
         if (ts) { ts->sec = 0; ts->nsec = 1000000000ull / CLOCK64_HZ; }
         return 0;
     }
@@ -3193,30 +4781,85 @@ static uint64_t dispatch(syscall64_args_t* args) {
      * reached by going out and coming back. */
     case SYS64_NANOSLEEP:
     case SYS64_CLOCK_NANOSLEEP: {
+        /* The two calls differ in where their arguments sit and in one
+         * flag. nanosleep(req, rem) is always relative to now.
+         * clock_nanosleep(clkid, flags, req, rem) names a clock, and
+         * with TIMER_ABSTIME the request is not a length at all - it is
+         * a point on that clock.
+         *
+         * The flag used to be ignored, and ignoring it is not a small
+         * approximation. An absolute deadline read as a length turns
+         * "wake at 09:15" into "sleep until 09:15 from now", which on a
+         * REALTIME deadline is a sleep of fifty-six years. Nothing in
+         * this prefix calls either syscall today - the count is zero
+         * across a full run - so this is a trap set for the first caller
+         * that does, which is exactly the kind that gets blamed on
+         * something else. */
+        int      abstime = 0;
         const struct { uint64_t sec, nsec; }* req =
             (const void*)(nr == SYS64_NANOSLEEP ? a1 : args->a3);
         uint64_t want;
 
+        if (nr == SYS64_CLOCK_NANOSLEEP) {
+            if (clock64_kind(a1) == CLOCK64_KIND_NONE)
+                return (uint64_t)-22;                  /* -EINVAL */
+            /* The two CPU-time clocks are refused rather than answered.
+             * Linux refuses CLOCK_THREAD_CPUTIME_ID the same way, and
+             * sleeps on CLOCK_PROCESS_CPUTIME_ID until the process has
+             * burned the requested CPU - which, for a process that is
+             * asleep, is never. This kernel does not measure CPU time
+             * per task, so it has nothing to wait for and says so
+             * instead of sleeping forever. */
+            if (a1 == 2 || a1 == 3) return (uint64_t)-95;  /* -ENOTSUP */
+            /* Only TIMER_ABSTIME is read. Bits Linux does not know it
+             * ignores rather than rejects - measured, not assumed - so
+             * rejecting them here would be this kernel being stricter
+             * than the one it is copying. */
+            abstime = (a2 & 1) != 0;
+        }
+
         /* Checked, because this is the call that proved it was needed. */
         if (!user_range_ok((uint64_t)req, sizeof(*req)))
             return (uint64_t)-14;                      /* -EFAULT */
-        if (nr == SYS64_NANOSLEEP && a2 &&
-            !user_range_ok(a2, sizeof(*req)))
-            return (uint64_t)-14;
 
         if (wait_started()) {
             if (!wait_expired()) return wait_restart(args, nr,
                                                      wait_deadline[wait_slot()]);
             wait_done();
-            if (nr == SYS64_NANOSLEEP && a2) {
-                struct { uint64_t sec, nsec; }* rem = (void*)a2;
-                rem->sec = rem->nsec = 0;
-            }
+            /* rem is deliberately not written. Linux only fills it in
+             * when the sleep was cut short by a signal, and leaves
+             * whatever the caller had there alone when the sleep ran to
+             * completion - checked against the host, which leaves a
+             * remainder of -1.-1 exactly as it found it. Nothing here
+             * ends a sleep early, so there is never a remainder to
+             * report. */
             return 0;
         }
 
         if (!req) return (uint64_t)-14;
-        want = req->sec * CLOCK64_HZ + req->nsec / (1000000000ull / CLOCK64_HZ);
+        if (abstime) {
+            /* Subtract on the clock the caller named, then convert. A
+             * REALTIME deadline counts from boot_epoch and a MONOTONIC
+             * one does not, so comparing either against the other is
+             * wrong by the epoch - which is the whole of the bug this
+             * fixes. Taking the difference first also keeps the sleep
+             * the same length whichever clock was named. */
+            uint64_t ns = 0, ss = 0, dsec;
+            int64_t  dns;
+
+            clock64_read(a1, &ss, &ns);
+            if (req->sec < ss || (req->sec == ss && req->nsec <= ns))
+                return 0;                              /* already past */
+
+            dsec = req->sec - ss;
+            dns  = (int64_t)req->nsec - (int64_t)ns;
+            if (dns < 0) { dns += 1000000000; dsec--; }
+            want = dsec * CLOCK64_HZ
+                 + (uint64_t)dns / (1000000000ull / CLOCK64_HZ);
+        } else {
+            want = req->sec * CLOCK64_HZ
+                 + req->nsec / (1000000000ull / CLOCK64_HZ);
+        }
         if (want == 0) return 0;
         return wait_restart(args, nr, clock64_ticks() + want);
     }
@@ -3232,68 +4875,447 @@ static uint64_t dispatch(syscall64_args_t* args) {
      * and hung up. POLLIN on a stream is "there is a byte, or there will
      * never be one again" - end of file has to report readable, or a
      * server waiting on a client that has gone never notices. */
-    case SYS64_POLL: {
-        struct pollfd64 { int fd; short events; short revents; }* pfds =
-            (void*)a1;
-        uint64_t n = a2;
-        int64_t  timeout = (int64_t)(int32_t)a3;
-        uint64_t ready = 0;
+    case SYS64_POLL:
+        return do_poll(args, nr, (struct pollfd64*)a1, a2,
+                       (int64_t)(int32_t)a3);
 
-        if (n > FD_MAX * 2) return (uint64_t)-22;      /* -EINVAL */
+    /* ppoll(fds, nfds, timeout, sigmask, sigsetsize): poll with a
+     * timespec, and with the thread's signal mask replaced by `sigmask`
+     * for exactly the length of the wait.
+     *
+     * That second part is the reason it exists. A program that wants to
+     * sleep until a descriptor is ready *or* a signal arrives cannot do
+     * it with sigprocmask and poll: a signal landing between the unblock
+     * and the poll is handled before the poll starts, and the poll then
+     * sleeps through it. ppoll makes the swap and the sleep one step.
+     *
+     * Interrupted by a signal, it returns -EINTR and the handler runs
+     * under the temporary mask, with the old one saved in its frame.
+     * Any other return puts the old mask back first, as Linux does, so
+     * a signal the temporary mask let through but the real one blocks
+     * is not delivered on the way out.
+     *
+     * And it writes the time left back into *timeout, however it ends -
+     * ready, timed out (zero), or interrupted - which is what Linux does
+     * and what a caller that loops on EINTR uses to keep its total wait
+     * the same. glibc's own ppoll() hides it, copying the timeout to a
+     * local first; the raw syscall sees it.
+     *
+     * Only a call that actually waited has anything to subtract. One
+     * that returns on its first pass leaves *timeout as it was, which is
+     * Linux's answer to within the microseconds this clock cannot see. */
+    case SYS64_PPOLL: {
+        int64_t timeout = -1;
+        uint64_t r;
+        int waited = wait_started();
+        uint64_t deadline = waited ? wait_deadline[wait_slot()] : 0;
 
-        for (uint64_t i = 0; i < n; i++) {
-            int fd = pfds[i].fd;
-            short want = pfds[i].events, got = 0;
-
-            pfds[i].revents = 0;
-            if (fd < 0) continue;
-            if (fd >= FD_MAX || !fds[fd].used) { pfds[i].revents = POLL64_NVAL;
-                                                 ready++; continue; }
-
-            if (fds[fd].kind == FD64_SOCKET && fds[fd].sock >= 0 &&
-                sock64_state(fds[fd].sock) == SOCK64_LISTENING) {
-                /* A listening socket is readable when somebody is
-                 * waiting to be accepted. That is the event the whole
-                 * server loop turns on. */
-                if (sock64_pending(fds[fd].sock)) got |= POLL64_IN;
-            } else if (fd_is_stream(fd)) {
-                int rx = fds[fd].rx, tx = fds[fd].tx;
-                if (rx >= 0 && (pipe64_available(rx) > 0 ||
-                                pipe64_writers(rx) == 0)) got |= POLL64_IN;
-                if (tx >= 0 && pipe64_space(tx) > 0)      got |= POLL64_OUT;
-                if (tx >= 0 && pipe64_readers(tx) == 0)   got |= POLL64_HUP;
-            } else {
-                /* A file is always ready, which is what Linux says too. */
-                got |= POLL64_IN | POLL64_OUT;
-            }
-
-            got &= (short)(want | POLL64_HUP | POLL64_NVAL);
-            if (got) { pfds[i].revents = got; ready++; }
+        if (a3) {
+            const struct { int64_t sec, nsec; }* ts = (const void*)a3;
+            if (!user_range_ok(a3, sizeof(*ts))) return (uint64_t)-14;
+            if (ts->sec < 0 || ts->nsec < 0 || ts->nsec >= 1000000000)
+                return (uint64_t)-22;                  /* -EINVAL */
+            /* Rounded up, as Linux rounds: a timeout is a minimum. */
+            timeout = ts->sec * (int64_t)CLOCK64_HZ
+                    + (ts->nsec + (1000000000 / CLOCK64_HZ) - 1)
+                      / (1000000000 / CLOCK64_HZ);
+        }
+        if (args->a4) {
+            if (args->a5 != 8) return (uint64_t)-22;
+            if (!user_range_ok(args->a4, 8)) return (uint64_t)-14;
+            signal64_push_mask(*(const uint64_t*)args->a4);
         }
 
-        if (ready) { wait_done(); return ready; }
-        if (timeout == 0) return 0;
+        r = do_poll(args, nr, (struct pollfd64*)a1, a2, timeout);
+        if (r != (uint64_t)-4) signal64_pop_mask();     /* not -EINTR */
 
+        if (a3 && waited && deadline) {
+            struct { int64_t sec, nsec; }* ts = (void*)a3;
+            uint64_t now = clock64_ticks();
+            uint64_t left = deadline > now ? deadline - now : 0;
+            ts->sec  = (int64_t)(left / CLOCK64_HZ);
+            ts->nsec = (int64_t)(left % CLOCK64_HZ)
+                     * (1000000000 / CLOCK64_HZ);
+        }
+        return r;
+    }
+
+    /* msync(addr, len, flags): a shared mapping here is the file's own
+     * frames, so there is nothing between the mapping and the file to
+     * write back, and it is already done. Wine's NtFlushVirtualMemory -
+     * FlushViewOfFile - is this, and Chromium's browser asks for it. */
+    case SYS64_MSYNC:
+        if (a1 & (PAGE64_SIZE - 1)) return (uint64_t)-22;   /* -EINVAL */
+        return 0;
+
+    /* madvise(addr, len, advice). DONTNEED (4) and FREE (8) give the
+     * anonymous pages in the range back; every other piece of advice is
+     * about how memory will be used, which this kernel does not act on,
+     * and is accepted. It was -ENOSYS, which glibc and Chromium treat as
+     * "could not discard" - Chromium's browser asked for it every few
+     * seconds of a headless run. */
+    case SYS64_MADVISE:
+        if (a1 & (PAGE64_SIZE - 1)) return (uint64_t)-22;   /* -EINVAL */
+        if (a3 == 4 || a3 == 8) uspace64_discard(a1, a2);
+        return 0;
+
+    /* getcpu(cpu, node, cache): one CPU and one node, both 0. Chromium
+     * asks it in a loop, from its thread pool, to spread work across
+     * processors; -ENOSYS is not an answer it expects. */
+    case SYS64_GETCPU:
+        if (a1) { if (!user_range_ok(a1, 4)) return (uint64_t)-14;
+                  *(uint32_t*)a1 = 0; }
+        if (a2) { if (!user_range_ok(a2, 4)) return (uint64_t)-14;
+                  *(uint32_t*)a2 = 0; }
+        return 0;
+
+    /* fsync(fd) and fdatasync(fd): the file is in memory and stays
+     * there, so there is nothing to make durable and the answer is that
+     * it is done.
+     *
+     * They were -ENOSYS, and SQLite treats a failed sync as an I/O error:
+     * Chromium's profile databases - its login database, its UKM store -
+     * all failed to commit ("disk I/O error", "Unable to commit a
+     * transaction") in the guest and not on the host. */
+    case SYS64_FSYNC:
+    case SYS64_FDATASYNC:
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9; /* -EBADF */
+        return 0;
+
+    /* times(buf): CPU time used, in clock ticks of 100 a second, and the
+     * time since an arbitrary point as the result. This kernel does not
+     * account CPU time per process, so the four times are the elapsed
+     * time for the caller and zero for its children - an overstatement,
+     * where Linux would be exact, but monotonic, which is what callers
+     * measure intervals with. */
+    case SYS64_TIMES: {
+        uint64_t t = clock64_ticks() * 100 / CLOCK64_HZ;
+        if (a1) {
+            if (!user_range_ok(a1, 32)) return (uint64_t)-14;
+            ((uint64_t*)a1)[0] = t;     /* tms_utime  */
+            ((uint64_t*)a1)[1] = 0;     /* tms_stime  */
+            ((uint64_t*)a1)[2] = 0;     /* tms_cutime */
+            ((uint64_t*)a1)[3] = 0;     /* tms_cstime */
+        }
+        return t;
+    }
+
+    /* process_vm_readv(pid, local, liovcnt, remote, riovcnt, flags) and
+     * process_vm_writev: copy between this process's memory and
+     * another's, without either stopping.
+     *
+     * The wineserver's ReadProcessMemory and WriteProcessMemory are
+     * these. It tries them first and, on -ENOSYS, decides they will
+     * never work and falls back to ptrace - which this kernel does not
+     * have - so every cross-process read and write a Windows program
+     * asked for failed. Chromium makes them on its own children as it
+     * starts them.
+     *
+     * The other process's memory is reached through its page tables and
+     * the direct map, a page at a time, so it need not be loaded. A write
+     * breaks copy-on-write for that process as its own write would, and
+     * a page it has never touched is backed in it first; a page it may
+     * not write is not written, as on Linux. Copying stops at the first
+     * page that cannot be reached, and the count so far is the answer -
+     * -EFAULT only if that is nothing. */
+    case SYS64_PROCESS_VM_READV:
+    case SYS64_PROCESS_VM_WRITEV: {
+        struct iov64 { uint64_t base, len; };
+        const struct iov64* liov = (const void*)a2;
+        const struct iov64* riov = (const void*)args->a4;
+        uint64_t lcnt = a3, rcnt = args->a5, done = 0;
+        uint64_t li = 0, ri = 0, loff = 0, roff = 0;
+        int writing = nr == SYS64_PROCESS_VM_WRITEV;
+        int pid = (int)(int64_t)a1;
+        proc64_t* target;
+
+        if (args->a6) return (uint64_t)-22;                   /* -EINVAL */
+        if (lcnt > 1024 || rcnt > 1024) return (uint64_t)-22;
+        if ((lcnt && !user_range_ok(a2, lcnt * sizeof(*liov))) ||
+            (rcnt && !user_range_ok(args->a4, rcnt * sizeof(*riov))))
+            return (uint64_t)-14;
+        target = proc64_get(pid);
+        if (!target || !target->used || target->exited)
+            return (uint64_t)-3;                              /* -ESRCH */
+        for (uint64_t k = 0; k < lcnt; k++)
+            if (liov[k].len && !user_range_ok(liov[k].base, liov[k].len))
+                return (uint64_t)-14;
+
+        while (li < lcnt && ri < rcnt) {
+            uint64_t lleft = liov[li].len - loff;
+            uint64_t rleft = riov[ri].len - roff;
+            uint64_t rva, in_page, n, frame;
+            uint8_t* local;
+
+            if (!lleft) { li++; loff = 0; continue; }
+            if (!rleft) { ri++; roff = 0; continue; }
+
+            rva = riov[ri].base + roff;
+            in_page = PAGE64_SIZE - (rva & (PAGE64_SIZE - 1));
+            n = lleft < rleft ? lleft : rleft;
+            if (n > in_page) n = in_page;
+
+            frame = vmspace64_user_frame(&target->space, rva, writing);
+            if (!frame && uspace64_back_in(pid, rva, writing))
+                frame = vmspace64_user_frame(&target->space, rva, writing);
+            if (!frame) break;
+
+            local = (uint8_t*)(liov[li].base + loff);
+            if (writing)
+                kmemcpy((uint8_t*)phys64_to_virt(frame)
+                            + (rva & (PAGE64_SIZE - 1)), local, n);
+            else
+                kmemcpy(local, (const uint8_t*)phys64_to_virt(frame)
+                                   + (rva & (PAGE64_SIZE - 1)), n);
+            done += n;
+            loff += n;
+            roff += n;
+        }
+        if (!done && li < lcnt && ri < rcnt) return (uint64_t)-14;
+        return done;
+    }
+
+    /* signalfd(fd, mask, size) and signalfd4(fd, mask, size, flags): a
+     * descriptor that reads signals. -1 makes a new one; an existing
+     * signalfd has its mask replaced; anything else is -EINVAL. The mask
+     * does not block anything - the caller blocks the signals itself,
+     * or they are delivered as usual before a read can see them - and
+     * SIGKILL and SIGSTOP are dropped from it, as Linux drops them.
+     *
+     * A signalfd is how a program that waits on descriptors waits on
+     * signals in the same loop: systemd and every event library built
+     * on epoll or poll use it. */
+    case SYS64_SIGNALFD:
+    case SYS64_SIGNALFD4: {
+        int fd = (int)(int64_t)a1;
+        uint64_t flags = nr == SYS64_SIGNALFD4 ? args->a4 : 0;
+        uint64_t mask;
+
+        if (a3 != 8) return (uint64_t)-22;                     /* -EINVAL */
+        if (flags & ~(uint64_t)(O_NONBLOCK | O_CLOEXEC)) return (uint64_t)-22;
+        if (!user_range_ok(a2, 8)) return (uint64_t)-14;       /* -EFAULT */
+        mask = *(const uint64_t*)a2
+             & ~((1ull << (SIG64_KILLSIG - 1)) | (1ull << (SIG64_STOP - 1)));
+
+        if (fd != -1) {
+            if (fd < 0 || fd >= FD_MAX || !fds[fd].used) return (uint64_t)-9;
+            if (fds[fd].kind != FD64_SIGNALFD) return (uint64_t)-22;
+            fds[fd].sigmask = mask;
+            return (uint64_t)fd;
+        }
+
+        fd = fd_alloc(3);
+        if (fd < 0) return (uint64_t)-24;                      /* -EMFILE */
+        fds[fd].kind     = FD64_SIGNALFD;
+        fds[fd].node     = -1;
+        fds[fd].pos      = 0;
+        fds[fd].rx       = -1;
+        fds[fd].tx       = -1;
+        fds[fd].sock     = -1;
+        fds[fd].sigmask  = mask;
+        fds[fd].nonblock = (flags & O_NONBLOCK) != 0;
+        fds[fd].cloexec  = (flags & O_CLOEXEC) != 0;
+        fds[fd].used     = 1;
+        return (uint64_t)fd;
+    }
+
+    /* pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask):
+     * select(2) with a timespec and a temporary signal mask - and, on
+     * x86-64, select(2) itself, because that is what glibc's select()
+     * calls (measured with strace on the host).
+     *
+     * Built on poll rather than beside it. The three sets become one
+     * list for do_poll, so readiness and parking are poll's exactly; the
+     * user's sets are rewritten only when the call really returns,
+     * because a call that parks is re-issued with the same arguments and
+     * must find them as they were. The list is a static scratch array:
+     * a syscall runs to completion or parks with nothing left in it, and
+     * the re-issue builds it again.
+     *
+     * Readable is POLLIN or a hangup, which is what makes end of file
+     * readable; writable is POLLOUT, or a hangup on a descriptor asked
+     * about for writing, which is Linux's POLLERR on a pipe with no
+     * reader - select says yes so that the write fails at once. Nothing
+     * here has out-of-band data, so exceptfds always comes back empty.
+     *
+     * The sixth argument is not a sigset but a pointer to { sigset*,
+     * size }, and either half may be absent. The mask and the time left
+     * in *timeout are handled exactly as ppoll's. */
+    case SYS64_PSELECT6: {
+        static struct pollfd64 sel[FD_MAX];
+        int nfds = (int)(int64_t)a1;
+        uint64_t rd = a2, wr = a3, ex = args->a4, tsp = args->a5,
+                 smarg = args->a6;
+        uint64_t setbytes, count = 0, r, n = 0, deadline;
+        int64_t timeout = -1;
+        int waited = wait_started();
+
+        deadline = waited ? wait_deadline[wait_slot()] : 0;
+        if (nfds < 0 || nfds > 1024) return (uint64_t)-22;     /* -EINVAL */
+        setbytes = (uint64_t)((nfds + 63) / 64) * 8;
+        if ((rd && setbytes && !user_range_ok(rd, setbytes)) ||
+            (wr && setbytes && !user_range_ok(wr, setbytes)) ||
+            (ex && setbytes && !user_range_ok(ex, setbytes)))
+            return (uint64_t)-14;                              /* -EFAULT */
+
+        if (tsp) {
+            const struct { int64_t sec, nsec; }* ts = (const void*)tsp;
+            if (!user_range_ok(tsp, sizeof(*ts))) return (uint64_t)-14;
+            if (ts->sec < 0 || ts->nsec < 0 || ts->nsec >= 1000000000)
+                return (uint64_t)-22;
+            timeout = ts->sec * (int64_t)CLOCK64_HZ
+                    + (ts->nsec + (1000000000 / CLOCK64_HZ) - 1)
+                      / (1000000000 / CLOCK64_HZ);
+        }
+
+        /* The descriptors asked about, checked before anything waits:
+         * one that is not open is -EBADF, as on Linux. */
+        for (int fd = 0; fd < nfds; fd++) {
+            uint64_t bit = 1ull << (fd % 64), w = (uint64_t)(fd / 64) * 8;
+            short ev = 0;
+            if (rd && (*(const uint64_t*)(rd + w) & bit)) ev |= POLL64_IN;
+            if (wr && (*(const uint64_t*)(wr + w) & bit)) ev |= POLL64_OUT;
+            if (ex && (*(const uint64_t*)(ex + w) & bit)) ev |= 0x002;  /* POLLPRI */
+            if (!ev) continue;
+            if (fd >= FD_MAX || !fds[fd].used) return (uint64_t)-9; /* -EBADF */
+            sel[n].fd = fd;
+            sel[n].events = ev;
+            sel[n].revents = 0;
+            n++;
+        }
+
+        if (smarg) {
+            uint64_t ss, len;
+            if (!user_range_ok(smarg, 16)) return (uint64_t)-14;
+            ss  = *(const uint64_t*)smarg;
+            len = *(const uint64_t*)(smarg + 8);
+            if (ss) {
+                if (len != 8) return (uint64_t)-22;
+                if (!user_range_ok(ss, 8)) return (uint64_t)-14;
+                signal64_push_mask(*(const uint64_t*)ss);
+            }
+        }
+
+        r = do_poll(args, nr, sel, n, timeout);
+
+        if (tsp && waited && deadline) {
+            struct { int64_t sec, nsec; }* ts = (void*)tsp;
+            uint64_t now = clock64_ticks();
+            uint64_t left = deadline > now ? deadline - now : 0;
+            ts->sec  = (int64_t)(left / CLOCK64_HZ);
+            ts->nsec = (int64_t)(left % CLOCK64_HZ)
+                     * (1000000000 / CLOCK64_HZ);
+        }
+        if ((int64_t)r < 0) {
+            if (r != (uint64_t)-4) signal64_pop_mask();
+            return r;              /* -EINTR keeps the mask for delivery */
+        }
+        signal64_pop_mask();
+
+        /* The answer, written over the question. */
+        for (uint64_t w = 0; w < setbytes; w += 8) {
+            if (rd) *(uint64_t*)(rd + w) = 0;
+            if (wr) *(uint64_t*)(wr + w) = 0;
+            if (ex) *(uint64_t*)(ex + w) = 0;
+        }
+        for (uint64_t i = 0; i < n; i++) {
+            int fd = sel[i].fd;
+            uint64_t bit = 1ull << (fd % 64), w = (uint64_t)(fd / 64) * 8;
+            short got = sel[i].revents, want = sel[i].events;
+            if ((want & POLL64_IN) && (got & (POLL64_IN | POLL64_HUP))) {
+                *(uint64_t*)(rd + w) |= bit;
+                count++;
+            }
+            if ((want & POLL64_OUT) && (got & (POLL64_OUT | POLL64_HUP))) {
+                *(uint64_t*)(wr + w) |= bit;
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /* rt_sigtimedwait(set, info, timeout, sigsetsize): wait for one of
+     * the signals in `set` and take it, rather than have it delivered.
+     *
+     * This is the other way to receive a signal - synchronously, as a
+     * return value, with no handler - and the usual one for a thread
+     * that blocks a set of signals and then sits waiting for them:
+     * glibc's sigwait, sigwaitinfo and sigtimedwait are all this call.
+     *
+     * A signal in `set` that is already pending is taken at once,
+     * whether or not it is blocked. Otherwise the call parks; each wake
+     * re-issues it and looks again. Linux unblocks `set` for the length
+     * of the wait so its members can wake the thread; here every kill
+     * and tgkill wakes its target anyway, and the members are taken
+     * here before delivery could see them. A signal not in `set` that
+     * the thread does not block ends the wait with -EINTR and is
+     * delivered on the way out. A timeout of zero is a poll, and one
+     * that runs out is -EAGAIN.
+     *
+     * The siginfo says what this kernel knows: the signal, SI_TKILL or
+     * SI_USER for whether it was sent to the thread or the process, and
+     * the sender's pid. uid is 0, which is the only uid there is. */
+    case SYS64_RT_SIGTIMEDWAIT: {
+        uint64_t uset;
+        int64_t timeout = -1;
+        int sig, to_thread = 0, sender = 0;
+
+        if (args->a4 != 8) return (uint64_t)-22;               /* -EINVAL */
+        if (!user_range_ok(a1, 8)) return (uint64_t)-14;       /* -EFAULT */
+        if (a2 && !user_range_ok(a2, 128)) return (uint64_t)-14;
+        uset = *(const uint64_t*)a1;
+        if (a3) {
+            const struct { int64_t sec, nsec; }* ts = (const void*)a3;
+            if (!user_range_ok(a3, sizeof(*ts))) return (uint64_t)-14;
+            if (ts->sec < 0 || ts->nsec < 0 || ts->nsec >= 1000000000)
+                return (uint64_t)-22;
+            timeout = ts->sec * (int64_t)CLOCK64_HZ
+                    + (ts->nsec + (1000000000 / CLOCK64_HZ) - 1)
+                      / (1000000000 / CLOCK64_HZ);
+        }
+
+        sig = signal64_take_in_set(uset, &to_thread, &sender);
+        if (sig) {
+            wait_done();
+            if (a2) {
+                uint8_t* info = (uint8_t*)a2;
+                for (int i = 0; i < 128; i++) info[i] = 0;
+                *(int32_t*)(info + 0)  = sig;                  /* si_signo */
+                *(int32_t*)(info + 8)  = to_thread ? -6 : 0;   /* SI_TKILL / SI_USER */
+                *(int32_t*)(info + 16) = sender;               /* si_pid */
+                *(uint32_t*)(info + 20) = 0;                   /* si_uid */
+            }
+            return (uint64_t)sig;
+        }
+
+        if (timeout == 0) return (uint64_t)-11;                /* -EAGAIN */
         if (wait_started()) {
-            if (wait_expired()) { wait_done(); return 0; }
+            if (wait_expired()) { wait_done(); return (uint64_t)-11; }
             return wait_restart(args, nr, wait_deadline[wait_slot()]);
         }
         return wait_restart(args, nr,
-                            timeout < 0 ? 0    /* forever */
+                            timeout < 0 ? 0
                                         : clock64_ticks() + (uint64_t)timeout);
     }
 
-    /* socketpair(domain, type, protocol, int sv[2]).
+    /* rt_sigsuspend(mask, sigsetsize): replace the mask and sleep until
+     * a signal is taken. It only ever returns -EINTR, and only once a
+     * handler is about to run - an ignored signal does not end it, and
+     * one whose default is to end the process ends the process. The
+     * handler runs under `mask` and puts the old one back when it
+     * returns.
      *
-     * Two pipes, crossed. Only AF_UNIX/SOCK_STREAM is answered, because
-     * that is the only thing a socketpair can be that this kernel could
-     * honestly serve - there is no network stack behind it, and a
-     * SOCK_DGRAM that silently behaved like a stream would lose message
-     * boundaries a caller was relying on.
-     *
-     * This is how every Wine process talks to the wineserver. The type
-     * argument carries SOCK_CLOEXEC and SOCK_NONBLOCK in its high bits,
-     * which are the same values as O_CLOEXEC and O_NONBLOCK. */
+     * glibc's sigsuspend and sigwaitinfo-free waiting loops are built
+     * on this; so is the classic "block, check, sigsuspend" idiom,
+     * which is the only race-free way to wait for a signal at all. */
+    case SYS64_RT_SIGSUSPEND:
+        if (a2 != 8) return (uint64_t)-22;                     /* -EINVAL */
+        if (!user_range_ok(a1, 8)) return (uint64_t)-14;       /* -EFAULT */
+        signal64_push_mask(*(const uint64_t*)a1);
+        /* Parked until something wakes it, then re-issued; returns
+         * -EINTR as soon as a signal is deliverable under `mask`. */
+        return wait_restart(args, nr, 0);
+
     case SYS64_SOCKETPAIR: {
         int* sv = (int*)args->a4;
         int type = (int)(a2 & 0xFF);
@@ -3499,8 +5521,77 @@ static uint64_t dispatch(syscall64_args_t* args) {
     case SYS64_FREMOVEXATTR:
         return (uint64_t)-61;                      /* -ENODATA */
 
-    /* tkill(2) and tgkill(2), which is how a program raises a signal on
-     * itself.
+    /* kill(2).
+     *
+     * Chromium asks for this twice in a run and got -ENOSYS both times,
+     * which is what a process tree gets from a kernel whose only signal
+     * calls are tkill and tgkill - and both of those begin
+     * `if (tid != proc64_current_pid()) return -ESRCH`, so until now
+     * nothing here could signal anything but itself.
+     *
+     * To itself, the signal is delivered now, on this frame, exactly as
+     * tgkill does it: raise() and abort() expect the handler to have run
+     * by the time the call returns, not at some later syscall.
+     *
+     * To another process, there is no frame to rewrite - the target may
+     * be blocked, or on no CPU at all - so the signal is recorded and
+     * acted on where the target next returns from a syscall. See the
+     * delivery point in syscall64_dispatch.
+     */
+    case SYS64_KILL: {
+        int pid = (int)(int32_t)a1;
+        int sig = (int)(int32_t)a2;
+        proc64_t* target;
+        registers64_t self;
+
+        if (sig < 0 || sig >= 64) return (uint64_t)-22;    /* -EINVAL */
+
+        /* pid <= 0 selects a process group, every process the caller may
+         * signal, or the caller's own group. This kernel has no process
+         * groups and no credentials to decide "may" with, so there is no
+         * honest answer: refused rather than quietly signalling one
+         * process and reporting that a group was signalled. */
+        if (pid <= 0) return (uint64_t)-38;                /* -ENOSYS */
+
+        target = proc64_get(pid);
+        if (!target || !target->used || target->exited)
+            return (uint64_t)-3;                           /* -ESRCH  */
+
+        /* Signal 0 is the existence check and nothing else: the checks
+         * above are the whole of its work. */
+        if (sig == 0) return 0;
+
+        /* To itself and blocked: pending, like any other blocked
+         * signal, until the mask lets it through. */
+        if (pid == proc64_current_pid() &&
+            (signal64_blocked(sched64_current()) & (1ull << sig))) {
+            int rc = signal64_raise(pid, sig);
+            /* A sibling that does not block it may take it. */
+            if (rc == 0) sched64_wake_pid(pid);
+            return (uint64_t)(int64_t)rc;
+        }
+
+        if (pid == proc64_current_pid()) {
+            frame_from_args(args, 0, &self);
+            if (signal64_deliver(sig, &self, 0))
+                sched64_resume(&self);                 /* never returns */
+            if (signal64_disposition(pid, sig) == SIG64_DISP_IGNORE)
+                return 0;
+            die_by_signal(sig);
+            return 0;
+        }
+
+        {
+            int rc = signal64_raise(pid, sig);
+            /* And wake it, because a sleeping process never reaches the
+             * boundary where a pending signal is taken. Linux interrupts
+             * a blocking syscall for exactly this reason. */
+            if (rc == 0) sched64_wake_pid(pid);
+            return (uint64_t)(int64_t)rc;
+        }
+    }
+
+    /* tkill(2) and tgkill(2): a signal addressed to one thread.
      *
      * glibc's abort() is raise(SIGABRT), and raise is tgkill(getpid(),
      * gettid(), sig). With no tgkill it got -ENOSYS, and abort's
@@ -3508,48 +5599,90 @@ static uint64_t dispatch(syscall64_args_t* args) {
      * refuses - so a missing syscall arrived two steps later as a
      * general protection fault that halted the machine.
      *
-     * Only the calling thread is a target here. Signalling another
-     * thread needs a pending-signal queue this kernel does not have,
-     * and nothing has asked for it: every tgkill measured in a prefix
-     * run is a thread naming itself. A different target is refused
-     * rather than silently delivered to the wrong one. */
+     * That self-signal was all this used to do: `if (tid !=
+     * proc64_current_pid()) return -ESRCH`, on the reasoning that every
+     * tgkill measured in a prefix run was a thread naming itself. Two
+     * things were wrong with it. A tid is not a pid - gettid(2) returns
+     * a task slot and getpid(2) a process - so the comparison was
+     * between different numbers that happened to agree for a
+     * single-threaded process. And chrome.exe is not single-threaded:
+     * its StackSamplingProfiler calls NtSuspendThread on the main
+     * thread, the wineserver implements that by sending the target
+     * SIGUSR1 and then asking it for its register context, and -ESRCH
+     * to that tgkill left the server believing the thread had died -
+     * it clears unix_pid and unix_tid on ESRCH - while the thread
+     * itself ran on, permanently marked suspended. Every wait that
+     * thread then made was answered with STATUS_PENDING by a server
+     * that will not let a suspended thread acquire anything, which is
+     * where chrome.exe stopped: waiting forever on an unowned mutex
+     * that was signalled the whole time.
+     *
+     * So the target is a thread, named by slot, and the signal reaches
+     * that thread and no other. */
     case SYS64_TKILL:
     case SYS64_TGKILL: {
-        int sig = (nr == SYS64_TGKILL) ? (int)(int32_t)a3 : (int)(int32_t)a2;
-        int tid = (nr == SYS64_TGKILL) ? (int)(int32_t)a2 : (int)(int32_t)a1;
+        int tgid = (nr == SYS64_TGKILL) ? (int)(int32_t)a1 : -1;
+        int tid  = (nr == SYS64_TGKILL) ? (int)(int32_t)a2 : (int)(int32_t)a1;
+        int sig  = (nr == SYS64_TGKILL) ? (int)(int32_t)a3 : (int)(int32_t)a2;
+        int slot, tpid;
         registers64_t self;
 
         if (sig < 0 || sig >= 64) return (uint64_t)-22;     /* -EINVAL */
-        if (tid != proc64_current_pid()) return (uint64_t)-3; /* -ESRCH */
+        if (tid <= 0)             return (uint64_t)-22;     /* -EINVAL */
+        if (nr == SYS64_TGKILL && tgid <= 0) return (uint64_t)-22;
+
+        /* A tid here is a task slot counted from one, because that is
+         * what gettid(2) returns. */
+        slot = tid - 1;
+        tpid = sched64_task_pid(slot);
+        if (tpid < 0) return (uint64_t)-3;                  /* -ESRCH */
+
+        /* tgkill's first argument names the thread group the tid must
+         * belong to, and checking it is the whole reason the call
+         * exists alongside tkill: a tid recycled into another process
+         * must not be signalled by a caller that meant the old one.
+         * Every thread of a process answers the same pid here, because
+         * clone(2) gives a new task its creator's - so the group is
+         * expressible and this is a real check rather than a skipped
+         * one. */
+        if (nr == SYS64_TGKILL && tpid != tgid) return (uint64_t)-3;
+
         if (sig == 0) return 0;                  /* the existence check */
 
-        /* Entered as if the signal had arrived on the way out of this
-         * call: the frame is this syscall's, so a handler that returns
-         * resumes after it, and one that does not returns wherever it
-         * decides to. */
-        frame_from_args(args, 0, &self);
-        if (signal64_deliver(sig, &self, 0)) sched64_resume(&self);
+        if (slot == sched64_current() &&
+            (signal64_blocked(slot) & (1ull << sig))) {
+            return (uint64_t)(int64_t)signal64_raise_task(slot, sig);
+        }
 
-        /* Uncaught. The default action for the signals that get here -
-         * SIGABRT among them - is to end the process, which is what
-         * abort() is asking for in the first place. */
-        exit_code = 128 + sig;
-        vfork_release(proc64_current());
-        close_all_files();
-        proc64_exit(proc64_current_pid(), 128 + sig);
-        if (leader_pid >= 0 && proc64_current_pid() == leader_pid) {
-            leader_exited = 1;
-            enter_user_mode64_abort();                 /* never returns */
+        if (slot == sched64_current()) {
+            /* Entered as if the signal had arrived on the way out of
+             * this call: the frame is this syscall's, so a handler that
+             * returns resumes after it, and one that does not returns
+             * wherever it decides to. raise() and abort() want the
+             * handler to have run by the time the call returns, not at
+             * some later syscall. */
+            frame_from_args(args, 0, &self);
+            if (signal64_deliver(sig, &self, 0)) sched64_resume(&self);
+            if (signal64_disposition(tpid, sig) == SIG64_DISP_IGNORE)
+                return 0;
+
+            /* Uncaught. The default action for the signals that get
+             * here - SIGABRT among them - is to end the process, which
+             * is what abort() is asking for in the first place. */
+            die_by_signal(sig);
+            return 0;
         }
+
+        /* Another thread. There is no frame to rewrite - it may be
+         * blocked, or on no CPU at all - so the signal is recorded
+         * against its slot and acted on where that thread next returns
+         * from a syscall, and the thread is woken so that it reaches
+         * that point. See the delivery in syscall64_dispatch. */
         {
-            registers64_t next; vmspace64_t ns; uint64_t nfs;
-            if (sched64_exit_current(&next, &ns, &nfs)) {
-                vmspace64_switch(&ns);
-                write_msr(0xC0000100u, nfs);
-                sched64_resume(&next);                 /* never returns */
-            }
+            int rc = signal64_raise_task(slot, sig);
+            if (rc == 0) sched64_wake_tid(slot);
+            return (uint64_t)(int64_t)rc;
         }
-        return 0;
     }
 
     /* sched_yield(2).
@@ -3933,6 +6066,22 @@ static uint64_t dispatch(syscall64_args_t* args) {
 
         thread_exits++;
 
+        /* clear_child_tid, now that this thread will never run in ring 3
+         * again: zero the word and wake whoever is joining. Linux does
+         * it in mm_release, at the same point and for the same reason. */
+        {
+            int t = sched64_current();
+            if (t >= 0 && t < SCHED64_MAX_TASKS && clear_child_tid[t]) {
+                uint64_t w = clear_child_tid[t];
+                clear_child_tid[t] = 0;
+                if (user_range_ok(w, 4)) {
+                    *(volatile uint32_t*)w = 0;
+                    futex_wakes += (uint64_t)sched64_wake_futex(
+                                       w, 1, 0xFFFFFFFFu, proc64_current_pid());
+                }
+            }
+        }
+
         /* Whether this is a thread ending or a process ending, asked of
          * the one table that knows.
          *
@@ -3976,6 +6125,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
              * though it were neither. */
             if (leader_pid >= 0 && proc64_current_pid() == leader_pid) {
                 leader_exited = 1;
+                leader_leaves_scheduler();
                 enter_user_mode64_abort();             /* never returns */
             }
             if (parent) sched64_wake(PROC64_WAIT_KEY(parent),
@@ -4003,6 +6153,13 @@ static uint64_t dispatch(syscall64_args_t* args) {
         uint64_t next_fs;
 
         exit_code = a1;
+        if (leader_pid >= 0) {
+            serial64_puts("NOVARIS64: [exit] pid ");
+            serial64_putdec((uint64_t)proc64_current_pid());
+            serial64_puts(" status ");
+            serial64_putdec(a1 & 0xFF);
+            serial64_putc('\n');
+        }
         {
             proc64_t* me = proc64_current();
             int parent = me ? me->parent : 0;
@@ -4020,6 +6177,7 @@ static uint64_t dispatch(syscall64_args_t* args) {
             if (leader_pid >= 0 && proc64_current_pid() == leader_pid) {
                 exit_code     = a1;
                 leader_exited = 1;
+                leader_leaves_scheduler();
                 enter_user_mode64_abort();             /* never returns */
             }
             /* A parent blocked in wait4 is waiting on exactly this. */
@@ -4138,5 +6296,241 @@ static uint64_t dispatch(syscall64_args_t* args) {
 }
 
 uint64_t syscall64_count(void)     { return call_count; }
+
+void syscall64_reset_calls(void) {
+    for (int i = 0; i < PROC64_MAX; i++) { calls_by_slot[i] = 0; pid_of_slot[i] = 0; }
+    for (int i = 0; i < 512; i++) { calls_by_nr[i] = 0; cycles_by_nr[i] = 0; }
+    for (int i = 0; i < MAPK_N; i++) mapk_cycles[i] = mapk_calls[i] = mapk_pages[i] = 0;
+    calls_reset_tsc = tsc64();
+    kmain64_fault_stats(&faults_at_reset[0], &faults_at_reset[1],
+                        &faults_at_reset[2]);
+    kmain64_segv_reset();
+}
+
+/* Who called, and what. Printed at the end of a layer rather than as it
+ * happens, because the point is the shape of the run and not any one
+ * call - and because printing per call is the syscall trace, which is
+ * what made the run too slow to finish in the first place. */
+/* For every thread parked on a pipe, whether what it waits for is
+ * already in that pipe.
+ *
+ * This is the question a list of blocked threads cannot answer and the
+ * one that decides where to look: a reader waiting on an empty pipe is
+ * behaving correctly and the fault is upstream, in whoever should have
+ * written. A reader waiting on a pipe that already holds bytes was
+ * never woken, and the fault is here.
+ *
+ * chrome.exe's run ends with every Wine client blocked on a pipe and
+ * only the wineserver runnable, so this says which of the two it is. */
+void syscall64_report_pipe_waits(void) {
+    int said = 0;
+
+    for (int i = 0; i < SCHED64_MAX_TASKS; i++) {
+        uint64_t key = sched64_blocked_on(i);
+        int p;
+
+        if (!key) continue;
+        if ((key & 0xF000000000000000ULL) != 0x3000000000000000ULL) continue;
+        p = (int)(key - 0x3000000000000000ULL);
+        if (p < 0 || p >= PIPE64_MAX) continue;
+
+        if (!said) {
+            serial64_puts("NOVARIS64: [pipewait] who is waiting on what\n");
+            said = 1;
+        }
+        serial64_puts("NOVARIS64: [pipewait] pid ");
+        serial64_putdec((uint64_t)sched64_blocked_pid(i));
+        serial64_puts(" on pipe ");
+        serial64_putdec((uint64_t)p);
+        serial64_puts(": ");
+        serial64_putdec(pipe64_available(p));
+        serial64_puts(" ready, ");
+        serial64_putdec((uint64_t)pipe64_writers(p));
+        serial64_puts(" writers, ");
+        serial64_putdec((uint64_t)pipe64_readers(p));
+        serial64_puts(" readers");
+        if (pipe64_available(p) > 0)
+            serial64_puts("   <- DATA IS THERE AND IT IS ASLEEP");
+        serial64_putc('\n');
+    }
+}
+
+/* Every pipe that has bytes nobody has taken.
+ *
+ * The pipe-wait report says what blocked readers are waiting for, and
+ * found all of them waiting on empty pipes. That answers half the
+ * question: the readers are correct and somebody upstream did not
+ * write. The other half is whether anything was written that nobody
+ * read - a request sitting unread in a pipe is a server that is not
+ * listening, and it looks identical from the client side to a server
+ * that heard and did not answer.
+ *
+ * So: every pipe with data in it, and whether any thread is parked on
+ * it. Data with a waiter is a wakeup that has not happened yet. Data
+ * with no waiter is somebody who should be reading and is not. */
+void syscall64_report_unread_pipes(void) {
+    int said = 0;
+
+    for (int p = 0; p < PIPE64_MAX; p++) {
+        uint64_t avail = pipe64_available(p);
+        int waiter = 0;
+
+        if (!avail) continue;
+
+        for (int i = 0; i < SCHED64_MAX_TASKS; i++)
+            if (sched64_blocked_on(i) == PIPE64_WAIT_KEY(p)) { waiter = 1; break; }
+
+        if (!said) {
+            serial64_puts("NOVARIS64: [unread] pipes holding bytes nobody"
+                          " has taken\n");
+            said = 1;
+        }
+        serial64_puts("NOVARIS64: [unread] pipe ");
+        serial64_putdec((uint64_t)p);
+        serial64_puts(": ");
+        serial64_putdec(avail);
+        serial64_puts(" bytes, ");
+        serial64_putdec((uint64_t)pipe64_writers(p));
+        serial64_puts(" writers, ");
+        serial64_putdec((uint64_t)pipe64_readers(p));
+        serial64_puts(" readers");
+        serial64_puts(waiter ? "   <- a thread is parked on it"
+                             : "   <- NOBODY IS WAITING FOR IT");
+        serial64_putc('\n');
+    }
+    if (!said)
+        serial64_puts("NOVARIS64: [unread] every pipe in the system is"
+                      " empty\n");
+}
+
+void syscall64_report_calls(void) {
+    uint64_t total = 0;
+
+    for (int i = 0; i < PROC64_MAX; i++) total += calls_by_slot[i];
+    if (!total) return;
+
+    serial64_puts("NOVARIS64: [calls] ");
+    serial64_putdec(total);
+    serial64_puts(" total, by pid:");
+    for (int i = 0; i < PROC64_MAX; i++) {
+        if (!calls_by_slot[i]) continue;
+        serial64_puts(" ");
+        serial64_putdec((uint64_t)pid_of_slot[i]);
+        serial64_puts("=");
+        serial64_putdec(calls_by_slot[i]);
+        /* Percent, because the absolute numbers are large and the
+         * question is which process owns the machine. */
+        serial64_puts("(");
+        serial64_putdec(calls_by_slot[i] * 100 / total);
+        serial64_puts("%)");
+    }
+    serial64_puts("\n");
+
+    /* The five busiest syscall numbers. A spin shows up here as one
+     * number with most of the run in it. */
+    serial64_puts("NOVARIS64: [calls] busiest syscalls:");
+    for (int k = 0; k < 5; k++) {
+        int best = -1;
+        uint64_t bestn = 0;
+        static int taken[512];
+        if (k == 0) for (int i = 0; i < 512; i++) taken[i] = 0;
+        for (int i = 0; i < 512; i++) {
+            if (taken[i] || calls_by_nr[i] <= bestn) continue;
+            bestn = calls_by_nr[i]; best = i;
+        }
+        if (best < 0) break;
+        taken[best] = 1;
+        serial64_puts(" ");
+        serial64_putdec((uint64_t)best);
+        serial64_puts("x");
+        serial64_putdec(bestn);
+    }
+    serial64_puts("\n");
+
+    /* And where the kernel's time went: the share of the layer spent
+     * inside syscalls, then the costliest numbers by total cycles, each
+     * as nr:calls:cycles-per-call. The rest of the layer is the
+     * programs' own work, page faults, and waiting. */
+    {
+        uint64_t elapsed = tsc64() - calls_reset_tsc, in_sys = 0;
+        for (int i = 0; i < 512; i++) in_sys += cycles_by_nr[i];
+        serial64_puts("NOVARIS64: [cycles] ");
+        serial64_putdec(elapsed / 1000000u);
+        serial64_puts("M elapsed, ");
+        serial64_putdec(in_sys / 1000000u);
+        serial64_puts("M in syscalls (");
+        serial64_putdec(elapsed ? in_sys * 100 / elapsed : 0);
+        serial64_puts("%); costliest:");
+        static int took[512];
+        for (int i = 0; i < 512; i++) took[i] = 0;
+        for (int k = 0; k < 6; k++) {
+            int best = -1;
+            uint64_t bestc = 0;
+            for (int i = 0; i < 512; i++) {
+                if (took[i] || cycles_by_nr[i] <= bestc) continue;
+                bestc = cycles_by_nr[i]; best = i;
+            }
+            if (best < 0) break;
+            took[best] = 1;
+            serial64_puts(" ");
+            serial64_putdec((uint64_t)best);
+            serial64_puts(":");
+            serial64_putdec(calls_by_nr[best]);
+            serial64_puts(":");
+            serial64_putdec(calls_by_nr[best] ? bestc / calls_by_nr[best] : 0);
+            serial64_puts("(");
+            serial64_putdec(elapsed ? bestc * 100 / elapsed : 0);
+            serial64_puts("%)");
+        }
+        serial64_puts("\n");
+
+        /* Faults taken during the layer, and every syscall made at least
+         * 5,000 times rather than only the top few. */
+        {
+            uint64_t f, c, g;
+            kmain64_fault_stats(&f, &c, &g);
+            serial64_puts("NOVARIS64: [faults] ");
+            serial64_putdec((uint32_t)f - (uint32_t)faults_at_reset[0]);
+            serial64_puts(" page faults, ");
+            serial64_putdec(c - faults_at_reset[1]);
+            serial64_puts(" copy-on-write, ");
+            serial64_putdec(g - faults_at_reset[2]);
+            serial64_puts(" SIGSEGV; calls >= 5000:");
+            for (int i = 0; i < 512; i++) {
+                if (calls_by_nr[i] < 5000) continue;
+                serial64_puts(" ");
+                serial64_putdec((uint64_t)i);
+                serial64_puts("x");
+                serial64_putdec(calls_by_nr[i]);
+            }
+            serial64_puts("\n");
+            kmain64_segv_report();
+        }
+
+        /* mmap and munmap by kind, as kind:calls:pages:cycles-per-page,
+         * then how the reservation list held up. */
+        serial64_puts("NOVARIS64: [maps] resv-peak ");
+        serial64_putdec(uspace64_resv_peak());
+        serial64_puts(" spilled ");
+        serial64_putdec(uspace64_resv_spilled());
+        serial64_puts(" first-touch ");
+        serial64_putdec(uspace64_lazy_faults());
+        for (int k = 0; k < MAPK_N; k++) {
+            if (!mapk_calls[k]) continue;
+            serial64_puts(" ");
+            serial64_puts(mapk_name[k]);
+            serial64_puts(":");
+            serial64_putdec(mapk_calls[k]);
+            serial64_puts(":");
+            serial64_putdec(mapk_pages[k]);
+            serial64_puts(":");
+            serial64_putdec(mapk_pages[k] ? mapk_cycles[k] / mapk_pages[k] : 0);
+            serial64_puts("(");
+            serial64_putdec(elapsed ? mapk_cycles[k] * 100 / elapsed : 0);
+            serial64_puts("%)");
+        }
+        serial64_puts("\n");
+    }
+}
 uint64_t syscall64_last_arg(void)  { return last_arg; }
 uint64_t syscall64_exit_code(void) { return exit_code; }

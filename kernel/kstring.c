@@ -1,9 +1,20 @@
 #include "kstring.h"
 
+/* A machine word at a time, then the tail - movsl or movsq, since this
+ * file is built for both kernels. It was a byte loop, which is every page
+ * the 32-bit fork copies and every file a mapping makes page-aligned: a
+ * first wineboot moves hundreds of megabytes through here. */
 void kmemcpy(void* dst, const void* src, size_t n) {
-    uint8_t* d = (uint8_t*)dst;
-    const uint8_t* s = (const uint8_t*)src;
-    for (size_t i = 0; i < n; i++) d[i] = s[i];
+    size_t words = n / sizeof(long), rest = n % sizeof(long);
+#if defined(__x86_64__)
+    __asm__ __volatile__("cld; rep movsq"
+                         : "+D"(dst), "+S"(src), "+c"(words) : : "memory");
+#else
+    __asm__ __volatile__("cld; rep movsl"
+                         : "+D"(dst), "+S"(src), "+c"(words) : : "memory");
+#endif
+    __asm__ __volatile__("rep movsb"
+                         : "+D"(dst), "+S"(src), "+c"(rest) : : "memory");
 }
 
 void kmemmove(void* dst, const void* src, size_t n) {
@@ -17,9 +28,22 @@ void kmemmove(void* dst, const void* src, size_t n) {
     }
 }
 
+/* A word at a time, like kmemcpy above, and for the same reason: this is
+ * what zeroes every fresh page a process is given, and under emulation a
+ * byte loop over 4096 bytes cost about 350,000 cycles a page - 27% of a
+ * whole 64-bit wineboot, which maps a quarter of a million of them. */
 void kmemset(void* dst, uint8_t value, size_t n) {
-    uint8_t* d = (uint8_t*)dst;
-    for (size_t i = 0; i < n; i++) d[i] = value;
+    unsigned long pattern = (unsigned long)value * (~0UL / 0xFF);
+    size_t words = n / sizeof(long), rest = n % sizeof(long);
+#if defined(__x86_64__)
+    __asm__ __volatile__("cld; rep stosq"
+                         : "+D"(dst), "+c"(words) : "a"(pattern) : "memory");
+#else
+    __asm__ __volatile__("cld; rep stosl"
+                         : "+D"(dst), "+c"(words) : "a"(pattern) : "memory");
+#endif
+    __asm__ __volatile__("rep stosb"
+                         : "+D"(dst), "+c"(rest) : "a"(pattern) : "memory");
 }
 
 int kmemcmp(const void* a, const void* b, size_t n) {

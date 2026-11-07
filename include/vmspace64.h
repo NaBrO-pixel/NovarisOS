@@ -40,6 +40,11 @@ int  vmspace64_create(vmspace64_t* vs);
  * ownership stays with whoever mapped them. */
 void vmspace64_destroy(vmspace64_t* vs);
 
+/* How many spaces exist now, and the sweep that gives back every one no
+ * task is standing in (in_use is sched64_space_in_use); see vmspace64.c. */
+int  vmspace64_live_count(void);
+int  vmspace64_reclaim_unused(int (*in_use)(uint64_t pml4_phys));
+
 /* Copies the CURRENT address space's low half into `dst`, which must be
  * a space fresh from vmspace64_create.
  *
@@ -81,6 +86,24 @@ int  vmspace64_break_cow(uint64_t va);
  * is recorded in PAGE64_COW_RW - which is precisely the bit break_cow
  * consults to tell a page it should copy from a page that is genuinely
  * read-only. */
+/* The first page in [va, end) of the current space that has a present
+ * PTE, or `end` if none does. Walks the tables rather than the pages, so
+ * a range with no tables behind it - a reservation, a hole - costs one
+ * test per missing table instead of one per page. */
+uint64_t vmspace64_next_mapped(uint64_t va, uint64_t end);
+
+/* A store into a space that need not be loaded, breaking copy-on-write
+ * for it as the space's own write would; see vmspace64.c. */
+int  vmspace64_write_u32(vmspace64_t* vs, uint64_t va, uint32_t value);
+
+/* The frame behind a user address in a space that need not be loaded,
+ * for the kernel to read, or to write (breaking copy-on-write for that
+ * space); 0 if not there or not allowed. And a fresh frame put where
+ * nothing is mapped. See vmspace64.c. */
+uint64_t vmspace64_user_frame(vmspace64_t* vs, uint64_t va, int write);
+int      vmspace64_install(vmspace64_t* vs, uint64_t va, uint64_t frame,
+                           uint64_t flags);
+
 int  vmspace64_set_writable(uint64_t va, int writable);
 
 void vmspace64_switch(const vmspace64_t* vs);

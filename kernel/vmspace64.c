@@ -36,6 +36,45 @@ void vmspace64_switch(const vmspace64_t* vs) {
     write_cr3(vs->pml4_phys);
 }
 
+/* Every space vmspace64_create has handed out and vmspace64_destroy has
+ * not yet taken back, by PML4.
+ *
+ * A space is described by a vmspace64_t that is copied freely - into the
+ * process, the scheduler, a layer's local variable - and destroying one
+ * copy leaves the others holding the address of a PML4 that has gone
+ * back to the allocator. execve destroys the image it replaces through a
+ * copy, and so does exit_group; the descriptor the test layer that
+ * started the program holds still names it. Destroying that one too
+ * would free the frame twice, and the second free would be of whatever
+ * the frame had become in between.
+ *
+ * So destroy asks here first, and a PML4 that is not live is not freed
+ * again. And the layer sweep below asks here which spaces exist at all,
+ * which no other table in the kernel could answer.
+ *
+ * A space created past the end of this table is not tracked; destroy then
+ * refuses it, which leaks it rather than risking a double free. */
+#define LIVE_MAX 1024
+static uint64_t live[LIVE_MAX];
+static int      nlive;
+static uint64_t live_untracked;
+
+static void live_add(uint64_t pml4) {
+    if (nlive < LIVE_MAX) live[nlive++] = pml4;
+    else live_untracked++;
+}
+
+static int live_remove(uint64_t pml4) {
+    for (int i = 0; i < nlive; i++) {
+        if (live[i] != pml4) continue;
+        live[i] = live[--nlive];
+        return 1;
+    }
+    return 0;
+}
+
+int vmspace64_live_count(void) { return nlive; }
+
 int vmspace64_create(vmspace64_t* vs) {
     /* Low on purpose, unlike the pages this space will hold: a PML4 is a
      * kernel structure, and keeping page tables out of the high pool
@@ -69,6 +108,7 @@ int vmspace64_create(vmspace64_t* vs) {
 
     paging64_unmap(SCRATCH_VA);
     vs->pml4_phys = frame;
+    live_add(frame);
     return 1;
 }
 
@@ -311,6 +351,13 @@ int vmspace64_clone_cow(uint64_t src_pml4, vmspace64_t* dst) {
                         continue;
                     }
 
+                    /* A MAP_SHARED page stays shared: one more owner,
+                     * and the same page table entry on both sides. */
+                    if ((pte & PAGE64_SHARED) && pmm64_ref_frame(frame)) {
+                        *dpte = pte;
+                        continue;
+                    }
+
                     if (pmm64_ref_frame(frame)) {
                         uint64_t shared = share_flags(pte);
                         /* Both sides, because a parent that kept its
@@ -339,6 +386,59 @@ int vmspace64_clone_cow(uint64_t src_pml4, vmspace64_t* dst) {
      * here: fork has just touched an unbounded number of pages. */
     write_cr3(read_cr3());
     return 1;
+}
+
+/* Destroys every live space that `in_use` says nothing is standing in,
+ * other than the one loaded now. Returns how many went. For the start of
+ * a bring-up layer, when whatever the previous layers left behind - the
+ * program each one ran, which ended the layer by ending - is no longer
+ * anybody's. */
+int vmspace64_reclaim_unused(int (*in_use)(uint64_t pml4_phys)) {
+    uint64_t cur = read_cr3() & ADDR_MASK;
+    int n = 0;
+
+    for (int i = 0; i < nlive; ) {
+        vmspace64_t vs = { live[i] };
+        if (vs.pml4_phys == cur || in_use(vs.pml4_phys)) { i++; continue; }
+        vmspace64_destroy(&vs);           /* removes live[i]; do not step */
+        n++;
+    }
+    return n;
+}
+
+uint64_t vmspace64_next_mapped(uint64_t va, uint64_t end) {
+    uint64_t* pml4 = table_at(read_cr3() & ADDR_MASK);
+
+    va &= ~(PAGE64_SIZE - 1);
+    while (va < end) {
+        uint64_t e, *t;
+        uint64_t skip;
+
+        e = pml4[(va >> 39) & 511];
+        skip = 1ULL << 39;
+        if (!(e & PAGE64_PRESENT)) goto next;
+        t = table_at(e & ADDR_MASK);
+
+        e = t[(va >> 30) & 511];
+        skip = 1ULL << 30;
+        if (!(e & PAGE64_PRESENT)) goto next;
+        if (e & PAGE64_HUGE) return va;
+        t = table_at(e & ADDR_MASK);
+
+        e = t[(va >> 21) & 511];
+        skip = 1ULL << 21;
+        if (!(e & PAGE64_PRESENT)) goto next;
+        if (e & PAGE64_HUGE) return va;
+        t = table_at(e & ADDR_MASK);
+
+        skip = PAGE64_SIZE;
+        if (t[(va >> 12) & 511] & PAGE64_PRESENT) return va;
+    next:
+        /* To the start of the next table's span, not va + skip: va is
+         * not aligned to it after the first step down. */
+        va = (va & ~(skip - 1)) + skip;
+    }
+    return end;
 }
 
 /* A write to a shared page. Returns 1 if it dealt with it, 0 if this was
@@ -386,6 +486,74 @@ int vmspace64_set_writable(uint64_t va, int writable) {
     return 1;
 }
 
+/* The frame behind `va` in a space that need not be the loaded one,
+ * ready for the kernel to read or - with `write` - to write through the
+ * direct map. Returns 0 for a page that is not there, not user memory,
+ * or (for a write) not writable.
+ *
+ * A write to a page shared copy-on-write does what the space's own first
+ * write would: takes a frame of its own if anyone else still owns this
+ * one, or simply keeps it if nobody does. That is what lets fork write
+ * the child's tid into the child's copy of the parent's memory, and the
+ * wineserver write into a Windows process with WriteProcessMemory. */
+uint64_t vmspace64_user_frame(vmspace64_t* vs, uint64_t va, int write) {
+    uint64_t* pte;
+    uint64_t e, frame, flags;
+
+    if (!vs || !vs->pml4_phys) return 0;
+    if (va >= 0x0000800000000000ULL) return 0;          /* not user */
+    pte = pte_for(vs->pml4_phys, va & ~(PAGE64_SIZE - 1), 0);
+    if (!pte) return 0;
+    e = *pte;
+    if (!(e & PAGE64_PRESENT) || !(e & PAGE64_USER)) return 0;
+    frame = e & ADDR_MASK;
+    if (!write) return frame;
+
+    if (frame == uspace64_zero_frame()) return 0;       /* a reservation */
+    if (e & PAGE64_COW) {
+        if (!(e & PAGE64_COW_RW)) return 0;             /* never writable */
+        flags = ((e & ~ADDR_MASK) & ~(PAGE64_COW | PAGE64_COW_RW))
+              | PAGE64_WRITE;
+        if (pmm64_frame_owners(frame) > 1) {
+            uint64_t fresh = pmm64_alloc_user();
+            if (!fresh) return 0;
+            kmemcpy(phys64_to_virt(fresh),
+                    (const void*)phys64_to_virt(frame), PAGE64_SIZE);
+            pmm64_free_frame(frame);    /* drops this space's ownership */
+            frame = fresh;
+        }
+        *pte = frame | flags;
+        if ((read_cr3() & ADDR_MASK) == vs->pml4_phys)
+            __asm__ __volatile__("invlpg (%0)" :: "r"(va) : "memory");
+    } else if (!(e & PAGE64_WRITE)) {
+        return 0;
+    }
+    return frame;
+}
+
+/* Puts `frame` at `va` in a space that need not be the loaded one, where
+ * nothing is mapped now - backing another process's demand-paged memory.
+ * Returns 1 if it did. */
+int vmspace64_install(vmspace64_t* vs, uint64_t va, uint64_t frame,
+                      uint64_t flags) {
+    uint64_t* pte;
+    if (!vs || !vs->pml4_phys || va >= 0x0000800000000000ULL) return 0;
+    pte = pte_for(vs->pml4_phys, va & ~(PAGE64_SIZE - 1), 1);
+    if (!pte || (*pte & PAGE64_PRESENT)) return 0;
+    *pte = (frame & ADDR_MASK) | flags | PAGE64_PRESENT;
+    return 1;
+}
+
+int vmspace64_write_u32(vmspace64_t* vs, uint64_t va, uint32_t value) {
+    uint64_t frame;
+    if (va & 3) return 0;
+    frame = vmspace64_user_frame(vs, va, 1);
+    if (!frame) return 0;
+    *(volatile uint32_t*)((uint8_t*)phys64_to_virt(frame)
+                          + (va & (PAGE64_SIZE - 1))) = value;
+    return 1;
+}
+
 int vmspace64_break_cow(uint64_t va) {
     uint64_t pml4 = read_cr3() & ADDR_MASK;
     uint64_t* pte = pte_for(pml4, va & ~(PAGE64_SIZE - 1), 0);
@@ -403,7 +571,7 @@ int vmspace64_break_cow(uint64_t va) {
     flags = ((e & ~ADDR_MASK) & ~(PAGE64_COW | PAGE64_COW_RW)) | PAGE64_WRITE;
 
     if (pmm64_frame_owners(frame) > 1) {
-        uint64_t fresh = pmm64_alloc_high();
+        uint64_t fresh = pmm64_alloc_user();
         if (!fresh) return 0;
 
         kmemcpy(phys64_to_virt(fresh),
@@ -505,6 +673,13 @@ void vmspace64_destroy(vmspace64_t* vs) {
     /* Destroying the space you are standing in would unmap the tables
      * being walked partway through walking them. */
     if ((saved & ADDR_MASK) == vs->pml4_phys) return;
+
+    /* Already destroyed through another copy of this descriptor, or
+     * never ours to destroy: forget it rather than free it again. */
+    if (!live_remove(vs->pml4_phys)) {
+        vs->pml4_phys = 0;
+        return;
+    }
 
     write_cr3(vs->pml4_phys);
     free_low_half_tables();

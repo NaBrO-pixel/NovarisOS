@@ -46,8 +46,16 @@
  * 128, sized against the host: the same wineboot -u under strace peaks
  * at 99 threads and processes alive at once. The table is walked in
  * order on every switch, which is O(n) and fine at this size, and it
- * costs about 250 bytes a task. */
-#define SCHED64_MAX_TASKS 128
+ * costs about 250 bytes a task.
+ *
+ * And then a headless Chromium filled all 128 - "8 runnable, 120
+ * blocked" - and its next CreateThread failed, which Chromium reports as
+ * running out of memory: two processes died with exception 0xe0000008,
+ * base's OOM code, on a machine with 3GB free. Chromium is a dozen
+ * threads in each of several processes, beside the wineserver and the
+ * prefix's services. 1024 is under a megabyte of table (a task is ~800
+ * bytes with its FPU state), and the walk stays cheap beside a switch. */
+#define SCHED64_MAX_TASKS 1024
 
 void sched64_init(void);
 
@@ -85,9 +93,20 @@ int  sched64_add_frame(const registers64_t* regs, const vmspace64_t* space,
  * in the graph, not in any one thread. */
 void sched64_dump_blocked(void);
 
+/* What task slot `i` is blocked on, 0 if it is runnable or unused, and
+ * which process it belongs to. For a caller that can interpret the wait
+ * keys - syscall64.c owns PIPE64_WAIT_KEY and the rest. */
+uint64_t sched64_blocked_on(int i);
+int      sched64_task_peek(int i, int* pid, uint64_t* wait, uint64_t* gs,
+                          uint64_t* rsp, vmspace64_t* space);
+int      sched64_blocked_pid(int i);
+
 int  sched64_pid_tasks(int pid);
 
 int  sched64_space_in_use(uint64_t pml4_phys);
+
+/* Removes every task of `pid` without switching; see sched64.c. */
+int sched64_remove_pid(int pid);
 
 int  sched64_exit_process(int pid, registers64_t* out_regs,
                           vmspace64_t* out_space, uint64_t* out_fs_base);
@@ -133,6 +152,66 @@ int sched64_yield_current(const registers64_t* regs, registers64_t* out_regs,
                           vmspace64_t* out_space, uint64_t* out_fs_base);
 
 int sched64_wake(uint64_t addr, int max);
+
+/* The same, releasing only waiters whose FUTEX_WAIT_BITSET mask shares a
+ * bit with `bits`. sched64_wake is this with every bit set. */
+int sched64_wake_bits(uint64_t addr, int max, uint32_t bits);
+
+/* The same, and if `pid` is not -1 only among that process's threads -
+ * what a private futex's address means. Shared futexes pass -1. */
+int sched64_wake_futex(uint64_t addr, int max, uint32_t bits, int pid);
+
+/* The address threads park on when what they wait for cannot be named
+ * by one address - a poll(2) over several descriptors, or a wait that
+ * has only a deadline. Never a user virtual address and never a futex
+ * key: the top of the address space is not mappable. Every
+ * sched64_wake releases these, because the only correct answer to
+ * "something changed somewhere" is to let them look again. */
+#define SCHED64_COND_KEY 0xFFFFFFFFFFFFFF01ULL
+
+/* Block with a deadline in ticks, 0 for none.
+ *
+ * If nothing else is runnable and something is waiting on the clock,
+ * the machine halts until an interrupt rather than declaring deadlock -
+ * which is what lets a timed wait sleep instead of spinning around a
+ * loop to watch for its own timeout. */
+int sched64_block_until(const registers64_t* regs, uint64_t addr,
+                        uint64_t wake_rax, uint64_t deadline,
+                        registers64_t* out_regs, vmspace64_t* out_space,
+                        uint64_t* out_fs_base);
+
+/* block_until with what a deadline returns kept apart from what a wake
+ * returns, and a FUTEX_WAIT_BITSET mask. block_until is this with
+ * timeout_rax = wake_rax and every bit set. */
+int sched64_block_until_ex(const registers64_t* regs, uint64_t addr,
+                           uint64_t wake_rax, uint64_t timeout_rax,
+                           uint64_t deadline, uint32_t bits,
+                           registers64_t* out_regs, vmspace64_t* out_space,
+                           uint64_t* out_fs_base);
+
+/* Wake every blocked thread of a process, whatever it waits on - what a
+ * signal does to a wait, so that a sleeping target can reach the point
+ * where a pending signal is taken. Returns how many were woken. */
+int sched64_wake_pid(int pid);
+
+/* The next block by this thread resumes past its syscall; if a signal
+ * ends it, re-run syscall `nr` instead so the signal is delivered. */
+void sched64_signal_restart(uint64_t nr);
+
+/* The pid a task slot belongs to, or -1 if the slot is not in use.
+ *
+ * clone(2) gives a new thread a slot of its own and its creator's pid,
+ * so this is what makes a thread group expressible here: every task
+ * that answers the same pid is a thread of the same process. tgkill(2)
+ * checks its tgid argument against exactly that. */
+int sched64_task_pid(int tid);
+
+/* Wake one blocked task by slot, rather than every thread of a process.
+ * Returns 1 if it was blocked and is now runnable, 0 otherwise.
+ *
+ * A thread-directed signal has one target, and waking its siblings
+ * would return them from blocking calls they have no reason to leave. */
+int sched64_wake_tid(int tid);
 
 /* Enters a saved thread directly. Never returns. Implemented in
  * syscall64.s, and it depends on registers64_t's exact layout. */

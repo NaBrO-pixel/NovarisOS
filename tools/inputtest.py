@@ -52,12 +52,28 @@ def monitor_command(sock_path, command, settle=0.35, timeout=30.0):
             return ""
 
 
-def wait_for(path, needle, timeout):
-    """Waits for a line to appear in the serial log."""
+# A cap on a hang, not an estimate of the duration. Bring-up ends by running
+# wineboot to completion, which takes minutes, so the 60 seconds this used to
+# be allowed failed on the clock rather than on anything the kernel did.
+BOOT_TIMEOUT = float(os.environ.get("NOVARIS_TEST_TIMEOUT", "900"))
+
+
+def wait_for(path, needle, timeout=None):
+    """Waits for a line to appear at the end of the serial log.
+
+    Reads the tail rather than the whole file: with the syscall trace on
+    the log is hundreds of megabytes, this is polled four times a second,
+    and every marker it waits for is printed at the end.
+    """
+    if timeout is None:
+        timeout = BOOT_TIMEOUT
+    needle = needle.encode() if isinstance(needle, str) else needle
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            with open(path, "r", errors="replace") as f:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 65536))
                 if needle in f.read():
                     return True
         except FileNotFoundError:
@@ -89,7 +105,7 @@ def main():
     try:
         # The watch loop only exists after the whole bring-up, so there
         # is no point typing before it.
-        if not wait_for(serial, "---- input watch ----", 60):
+        if not wait_for(serial, "---- input watch ----"):
             print("FAIL: the kernel never reached the input watch")
             return 1
 

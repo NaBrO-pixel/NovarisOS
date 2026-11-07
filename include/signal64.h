@@ -20,11 +20,28 @@
  */
 
 #define SIG64_TRAP    5
+#define SIG64_KILLSIG 9
 #define SIG64_SEGV   11
+#define SIG64_TERM   15
+#define SIG64_CHLD   17
+#define SIG64_CONT   18
+#define SIG64_STOP   19
+#define SIG64_TSTP   20
+#define SIG64_TTIN   21
+#define SIG64_TTOU   22
+#define SIG64_URG    23
+#define SIG64_WINCH  28
 
 #define SA_SIGINFO   0x00000004
 #define SA_ONSTACK   0x08000000
 #define SA_RESTORER  0x04000000
+#define SA_NODEFER   0x40000000
+#define SA_RESETHAND 0x80000000
+
+/* rt_sigprocmask's `how`. */
+#define SIG64_BLOCK   0
+#define SIG64_UNBLOCK 1
+#define SIG64_SETMASK 2
 
 /* sigaltstack(2)'s stack_t, in Linux's layout. */
 typedef struct {
@@ -118,7 +135,80 @@ int  signal64_sigreturn(uint64_t user_rsp, registers64_t* out);
  * the transcript. */
 void signal64_set_trace(int on);
 
+/* --- kill(2): a signal from one process to another ------------------
+ *
+ * Everything above this point is synchronous: a fault, delivered to the
+ * thread that caused it, at the moment it causes it. kill(2) is the
+ * other kind. The sender is not the target, so there is no frame to
+ * rewrite when the call is made - the target may not even be on a CPU.
+ * So the signal is recorded against the target and acted on when that
+ * process next returns from a syscall, which is where Linux acts on one
+ * too.
+ */
+
+/* Record `sig` against `pid`. Returns 0, or a negative errno. */
+int  signal64_raise(int pid, int sig);
+
+/* The same, addressed to one thread by tid rather than to a process.
+ * tgkill(2)'s delivery; see the note on pending_by_task in signal64.c
+ * for why the two sets cannot be one. */
+int  signal64_raise_task(int tid, int sig);
+int  signal64_has_pending_task(int tid);
+int  signal64_take_pending_task(int tid);
+void signal64_clear_task(int tid);
+
+/* The pending sets themselves, read without taking anything: a call
+ * about to block asks these whether a signal is waiting. */
+uint64_t signal64_pending_set(int pid);
+uint64_t signal64_pending_set_task(int tid);
+
+/* Whether anything is recorded against this process. */
+int  signal64_has_pending(int pid);
+
+/* The lowest-numbered signal recorded against it, removed from the set.
+ * 0 when there is none. Lowest-first because that is the order Linux
+ * delivers in, and it puts SIGKILL ahead of most things. */
+int  signal64_take_pending(int pid);
+
+/* Signal masks, per thread. The has/take/pending_set calls above answer
+ * for the calling thread and leave out what it blocks.
+ *
+ * sigprocmask takes and returns user sigset_t words; sigpending is the
+ * caller's pending-and-blocked set in the same form. task_start gives a
+ * new task its creator's mask (from_tid < 0: an empty one) and nothing
+ * pending. */
+int      signal64_sigprocmask(int how, const uint64_t* set, uint64_t* oldset,
+                              uint64_t setsize);
+uint64_t signal64_sigpending(void);
+uint64_t signal64_blocked(int tid);
+void     signal64_task_start(int tid, int from_tid);
+void     signal64_task_inherit_altstack(int tid, int from_tid);
+
+/* rt_sigsuspend and ppoll: replace the calling thread's mask for the
+ * length of a call (push; idempotent across the call's restarts), and
+ * put it back (pop; returns 0 if nothing was pushed). A handler entered
+ * in between takes the saved mask into its frame instead. */
+void     signal64_push_mask(uint64_t user_set);
+
+/* rt_sigtimedwait's dequeue: takes the lowest pending signal in
+ * `user_set` (a user sigset_t word) for the calling thread, blocked or
+ * not, and says whether it was thread-directed and who sent it. */
+int      signal64_take_in_set(uint64_t user_set, int* to_thread, int* sender);
+int      signal64_pending_in_set(uint64_t user_set);
+int      signal64_pop_mask(void);
+
+/* What this process would do with `sig` as things stand. The caller
+ * cannot work this out from signal64_deliver's return value, because
+ * that answers 0 both for "nothing is installed" and for "SIG_IGN" -
+ * which is right for a fault, where either way the process dies, and
+ * badly wrong for kill(2), where one of them means discard it. */
+#define SIG64_DISP_TERM     0   /* default action: end the process     */
+#define SIG64_DISP_IGNORE   1   /* discard it                          */
+#define SIG64_DISP_HANDLER  2   /* enter the installed handler         */
+int  signal64_disposition(int pid, int sig);
+
 uint64_t signal64_delivered(void);
 uint64_t signal64_returns(void);
+uint64_t signal64_raised(void);
 
 #endif

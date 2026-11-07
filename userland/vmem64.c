@@ -34,6 +34,8 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
+#include <stdlib.h>
 
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
@@ -97,6 +99,15 @@ static int write_faults(volatile unsigned char *p)
     caught = 0;
     if (sigsetjmp(jump, 1) == 0)
         *p = 0x5A;
+    return caught;
+}
+
+/* The same question for a read. */
+static int read_faults(volatile unsigned char *p)
+{
+    caught = 0;
+    if (sigsetjmp(jump, 1) == 0)
+        (void)*p;
     return caught;
 }
 
@@ -183,6 +194,152 @@ int main(void)
     ok("and the page really is writable again", !write_faults(area));
 
     munmap(area, SPAN);
+
+    /* --- reservations ------------------------------------------------- *
+     *
+     * A PROT_NONE anonymous range is a list entry in the kernel, not page
+     * tables. Everything that used to be true because the pages were
+     * there - the range reads as taken, munmap gives it back - has to
+     * stay true without them, and the one thing that used to be wrong -
+     * touching it did not fault - should now be right. Wine commits
+     * memory by mprotecting pieces of a reservation, so that is tested
+     * on a piece from the middle, which splits the range in three. */
+
+    area = mmap(NULL, SPAN, PROT_NONE,
+                MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    ok("a PROT_NONE reservation", area != MAP_FAILED);
+    ok("reading a reserved page faults", read_faults(area + 4096));
+
+    errno = 0;
+    got = mmap(area + SPAN - 4096, 4096, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANON | MAP_FIXED_NOREPLACE, -1, 0);
+    ok("MAP_FIXED_NOREPLACE over a reservation is refused",
+       got == MAP_FAILED && errno == EEXIST);
+
+    ok("mprotect of its middle to read-write",
+       mprotect(area + 4 * 4096, 4 * 4096, PROT_READ | PROT_WRITE) == 0);
+    ok("and the committed pages read as zero",
+       all_bytes_are(area + 4 * 4096, 0, 4 * 4096));
+    ok("and take a write", !write_faults(area + 5 * 4096));
+    ok("while the pages either side are still reserved",
+       read_faults(area + 3 * 4096) && read_faults(area + 8 * 4096));
+
+    /* Decommitting is a fixed PROT_NONE mapping over committed pages,
+     * and what comes back on recommitting is zeros, not the old data. */
+    got = mmap(area + 5 * 4096, 4096, PROT_NONE,
+               MAP_PRIVATE | MAP_ANON | MAP_FIXED | MAP_NORESERVE, -1, 0);
+    ok("a fixed reservation over a committed page", got == area + 5 * 4096);
+    ok("and that page faults again", read_faults(area + 5 * 4096));
+    mprotect(area + 5 * 4096, 4096, PROT_READ | PROT_WRITE);
+    ok("and recommitted it reads as zero, not as what was written",
+       area[5 * 4096] == 0);
+
+    munmap(area, SPAN);
+    got = mmap(area, SPAN, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANON | MAP_FIXED_NOREPLACE, -1, 0);
+    ok("after munmap the whole range is free again", got == area);
+    munmap(area, SPAN);
+
+    /* --- a mapping the kernel places never lands on one already there -- *
+     *
+     * Wine places most of its mappings with MAP_FIXED, and the kernel
+     * used to place the rest from a bump pointer that knew nothing of
+     * them - so an ordinary mmap could come back on top of live memory,
+     * zero it, and leave Wine with two views of one range. */
+    {
+        char *one = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        char *mark = MAP_FAILED, *big = MAP_FAILED;
+        int clear = 1;
+
+        if (one != MAP_FAILED)
+            mark = mmap(one + 16 * 4096, 4096, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        ok("a page placed by hand just past an ordinary one",
+           one != MAP_FAILED && mark == one + 16 * 4096);
+        if (mark != MAP_FAILED) {
+            strcpy(mark, "still here");
+            big = mmap(NULL, 64 * 4096, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (big != MAP_FAILED)
+                clear = mark + 4096 <= big || mark >= big + 64 * 4096;
+            ok("an mmap the kernel places goes around it",
+               big != MAP_FAILED && clear);
+            ok("and what was there is untouched", !strcmp(mark, "still here"));
+        }
+        if (big != MAP_FAILED) munmap(big, 64 * 4096);
+        if (mark != MAP_FAILED) munmap(mark, 4096);
+        if (one != MAP_FAILED) munmap(one, 4096);
+    }
+
+    /* --- /proc/meminfo ------------------------------------------------- *
+     *
+     * Wine's only source for free memory on Linux. Without it Wine
+     * reports none available, and a headless Chromium believed it was
+     * under critical memory pressure and killed its own renderers. */
+    {
+        FILE *f = fopen("/proc/meminfo", "r");
+        unsigned long long total = 0, freek = 0, avail = 0, v;
+        char line[128];
+
+        ok("/proc/meminfo opens", f != NULL);
+        while (f && fgets(line, sizeof(line), f)) {
+            if (sscanf(line, "MemTotal: %llu kB", &v) == 1) total = v;
+            else if (sscanf(line, "MemFree: %llu kB", &v) == 1) freek = v;
+            else if (sscanf(line, "MemAvailable: %llu kB", &v) == 1) avail = v;
+        }
+        if (f) fclose(f);
+        ok("and says how much memory there is", total > 0);
+        ok("and how much of it is free", freek > 0 && freek <= total);
+        ok("and available", avail > 0 && avail <= total);
+    }
+
+    /* --- running out of memory ------------------------------------------ *
+     *
+     * A process that touches more memory than the machine has is killed
+     * with SIGKILL, as Linux's OOM killer would, and the machine and
+     * everybody else carry on with the memory it held. This kernel used
+     * to call it a SIGSEGV - which Wine's handler retries, and which ends
+     * the run in a layer with no handler at all. Only where the machine
+     * is small enough to fill in a reasonable time. */
+    {
+        FILE *f = fopen("/proc/meminfo", "r");
+        unsigned long long total = 0, v;
+        char line[128];
+        while (f && fgets(line, sizeof(line), f))
+            if (sscanf(line, "MemTotal: %llu kB", &v) == 1) total = v;
+        if (f) fclose(f);
+
+        if (total && total <= 4ULL * 1024 * 1024) {
+            int status = 0;
+            pid_t kid = fork();
+            if (kid == 0) {
+                size_t span = 64ULL << 30;
+                volatile char *p = mmap(NULL, span, PROT_READ | PROT_WRITE,
+                                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                                        -1, 0);
+                if (p == MAP_FAILED) _exit(2);
+                for (size_t o = 0; o < span; o += 4096) p[o] = 1;
+                _exit(3);              /* touched 64GB: not this machine */
+            }
+            ok("a process that fills memory is killed with SIGKILL",
+               waitpid(kid, &status, 0) == kid && WIFSIGNALED(status) &&
+               WTERMSIG(status) == SIGKILL);
+            {
+                size_t span = 64 << 20;
+                char *q = mmap(NULL, span, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                int good = q != MAP_FAILED;
+                for (size_t o = 0; good && o < span; o += 4096) q[o] = 7;
+                ok("and its memory comes back for the next one", good);
+                if (q != MAP_FAILED) munmap(q, span);
+            }
+        }
+        /* Skipped silently otherwise: the suite runs this same binary on
+         * the build host and requires every line the host prints to
+         * appear in the guest's transcript too, and a host line carrying
+         * the host's memory size never would. */
+    }
 
     printf("vmem64: %d failures\n", failures);
     return failures ? 1 : 101;

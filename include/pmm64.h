@@ -32,6 +32,16 @@ uint64_t pmm64_alloc_frame(void);
  * ends. */
 uint64_t pmm64_alloc_high(void);
 
+/* A frame for a process's own memory - a page touched for the first
+ * time, a copy-on-write copy. The same as pmm64_alloc_high except that it
+ * refuses while fewer than PMM64_USER_RESERVE frames are free, so the
+ * kernel can still build page tables and allocate from its heap while it
+ * deals with the process that ran the machine out. A refusal is recorded;
+ * pmm64_take_user_oom reads and clears it. */
+#define PMM64_USER_RESERVE 2048          /* 8MB */
+uint64_t pmm64_alloc_user(void);
+int      pmm64_take_user_oom(void);
+
 /* A frame at or above min_phys, or 0 if there is none. Exists so a test
  * can obtain high memory deliberately rather than hoping for it. */
 uint64_t pmm64_alloc_above(uint64_t min_phys);
@@ -40,6 +50,7 @@ void     pmm64_reserve_region(uint64_t start_addr, uint64_t end_addr);
 
 uint64_t pmm64_total_frames(void);
 uint64_t pmm64_free_frames(void);
+uint64_t pmm64_free_frames_scanned(void);
 uint64_t pmm64_used_frames(void);
 uint64_t pmm64_double_frees(void);
 

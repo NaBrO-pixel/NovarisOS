@@ -119,6 +119,57 @@ extern const unsigned char scm64_elf[];
 extern const unsigned long scm64_elf_len;
 extern const unsigned char shm64_elf[];
 extern const unsigned long shm64_elf_len;
+extern const unsigned char clock64_elf[];
+extern const unsigned long clock64_elf_len;
+/* What Wine is told to report.
+ *
+ * The default is the middle setting: everything Wine considers an error
+ * or an unimplemented path, nothing it considers a trace. +all is
+ * unusable here - a hundred megabytes of serial.
+ *
+ * An investigation can ask for more without editing this file. In
+ * particular `trace+server` makes ntdll start the wineserver with -d,
+ * and the server then prints every request it handles and every
+ * "*wakeup* signaled=" - which is how to find out what a thread is
+ * waiting on when it never wakes:
+ *
+ *   make -f Makefile.amd64 \
+ *     CFLAGS_EXTRA='-DWINE64_DEBUG_STR=\"WINEDEBUG=err+all,fixme+all,trace+server\"' ...
+ *
+ * The backslashes are not decoration: make hands the value to a shell,
+ * which eats an unescaped pair, and gcc then sees a -D whose value is
+ * not a string at all. Written the obvious way it fails to compile.
+ */
+#ifndef WINE64_DEBUG_STR
+#define WINE64_DEBUG_STR \
+    "WINEDEBUG=err+all,fixme+all,trace-all,warn-all,warn+winstation"
+#endif
+
+/* Whether the Wine layers print every syscall to COM1 - the trace that
+ * ends each line "[call pid N] nr(...) = r".
+ *
+ * Off unless asked for. Every line is a few dozen bytes through an
+ * emulated UART, and a first wineboot makes 1.3 million syscalls: with
+ * the trace on it wrote a 139MB log and ran out its 300-second budget
+ * without finishing, winegui took 56s instead of 4, and bring-up took
+ * 503s instead of 130. The per-process and per-syscall summary each
+ * layer prints at its end is always there; this is for when one call
+ * needs to be seen.
+ *
+ *   make -f Makefile.amd64 CFLAGS_EXTRA=-DWINE64_TRACE=1 ...
+ */
+#ifndef WINE64_TRACE
+#define WINE64_TRACE 0
+#endif
+
+extern const unsigned char kill64_elf[];
+extern const unsigned long kill64_elf_len;
+extern const unsigned char wait64_elf[];
+extern const unsigned long wait64_elf_len;
+extern const unsigned char prctl64_elf[];
+extern const unsigned long prctl64_elf_len;
+extern const unsigned char tgkill64_elf[];
+extern const unsigned long tgkill64_elf_len;
 extern const unsigned char cwd64_elf[];
 extern const unsigned long cwd64_elf_len;
 extern const unsigned char fbdraw64_elf[];
@@ -171,6 +222,7 @@ static void protection_fault_handler(registers64_t* r) {
     if ((r->cs & 3) == 3) {
         int sig = (r->int_no == 6) ? 4 /* SIGILL */ : SIG64_SEGV;
         if (signal64_deliver(sig, r, r->rip)) return;
+        syscall64_fault_kill(sig, r->rip, r->rip);   /* one process, if it can */
 
         /* Nobody caught it. The run ends the way an uncaught page fault
          * already ends it - reported, with the shell's code for a fatal
@@ -251,11 +303,111 @@ static volatile uint64_t pf_killed;
 extern void enter_user_mode64_abort(void) __attribute__((noreturn));
 
 static uint64_t cow_breaks;
+static uint64_t segv_delivered;
+
+/* Which faults those SIGSEGVs are: a small open-addressed table of
+ * (rip, page, error code), so that millions of them can be told apart
+ * from millions of one. A sample that finds the table full is counted
+ * as "other". Reset with the syscall counts. */
+#define SEGV_SLOTS 64
+static struct { uint64_t rip, page, err, n; } segv_tab[SEGV_SLOTS];
+static uint64_t segv_other;
+
+static void segv_sample(uint64_t rip, uint64_t addr, uint64_t err) {
+    uint64_t page = addr & ~0xFFFULL;
+    uint64_t h = ((rip ^ (page >> 12) ^ err) * 0x9E3779B97F4A7C15ULL) >> 58;
+    for (int i = 0; i < SEGV_SLOTS; i++) {
+        int k = (int)((h + i) % SEGV_SLOTS);
+        if (segv_tab[k].n == 0) {
+            segv_tab[k].rip = rip; segv_tab[k].page = page;
+            segv_tab[k].err = err; segv_tab[k].n = 1;
+            return;
+        }
+        if (segv_tab[k].rip == rip && segv_tab[k].page == page &&
+            segv_tab[k].err == err) {
+            segv_tab[k].n++;
+            return;
+        }
+    }
+    segv_other++;
+}
+
+void kmain64_segv_reset(void) {
+    for (int i = 0; i < SEGV_SLOTS; i++) segv_tab[i].n = 0;
+    segv_other = 0;
+}
+
+/* The commonest few, as rip/page/err x count. */
+void kmain64_segv_report(void) {
+    static int took[SEGV_SLOTS];
+    for (int i = 0; i < SEGV_SLOTS; i++) took[i] = 0;
+    serial64_puts("NOVARIS64: [segv] commonest:");
+    for (int k = 0; k < 8; k++) {
+        int best = -1;
+        for (int i = 0; i < SEGV_SLOTS; i++)
+            if (!took[i] && segv_tab[i].n &&
+                (best < 0 || segv_tab[i].n > segv_tab[best].n)) best = i;
+        if (best < 0) break;
+        took[best] = 1;
+        serial64_puts(" ");
+        serial64_puthex(segv_tab[best].rip);
+        serial64_puts("/");
+        serial64_puthex(segv_tab[best].page);
+        serial64_puts("/");
+        serial64_puthex(segv_tab[best].err);
+        serial64_puts("x");
+        serial64_putdec(segv_tab[best].n);
+    }
+    serial64_puts(" other ");
+    serial64_putdec(segv_other);
+    serial64_putc('\n');
+}
+
+/* For the end-of-layer report in syscall64.c: every page fault, the
+ * ones that were copy-on-write, and the ones handed to the program as
+ * SIGSEGV. Time outside syscalls is partly time in here. */
+void kmain64_fault_stats(uint64_t* faults, uint64_t* cow, uint64_t* segv) {
+    *faults = (uint64_t)pf_hits;
+    *cow    = cow_breaks;
+    *segv   = segv_delivered;
+}
 
 static void page_fault_handler(registers64_t* r) {
+    /* Only this fault's own refusal may count as running out. */
+    (void)pmm64_take_user_oom();
     pf_hits++;
     pf_cr2 = read_cr2();
     pf_err = r->err_code;
+
+    /* Anonymous memory touched for the first time: a page that is not
+     * there (bit 0 clear), in a range the process holds, gets a frame of
+     * its own and the instruction runs again. Before everything else,
+     * and for either ring - a syscall writing into a buffer the program
+     * never touched is the same first touch. Bit 1 is "it was a write". */
+    if (!(r->err_code & 0x1) &&
+        uspace64_fault(pf_cr2, (r->err_code & 0x2) != 0)) {
+        /* One in 20,000, with who and where: what is touching memory
+         * says where a program's memory goes. */
+        if (uspace64_lazy_faults() % 20000 == 0) {
+            proc64_t* me = proc64_current();
+            serial64_puts("NOVARIS64: [touch] #");
+            serial64_putdec(uspace64_lazy_faults());
+            serial64_puts(" pid ");
+            serial64_putdec((uint64_t)proc64_current_pid());
+            serial64_puts(" ");
+            serial64_puts(me ? me->comm : "?");
+            serial64_puts(" va=");
+            serial64_puthex(pf_cr2);
+            serial64_puts(" rip=");
+            serial64_puthex(r->rip);
+            serial64_puts((r->cs & 3) ? " user" : " kernel");
+            serial64_puts((r->err_code & 0x2) ? " write" : " read");
+            serial64_puts(" free=");
+            serial64_putdec(pmm64_free_frames());
+            serial64_putc('\n');
+        }
+        return;
+    }
 
     /* A write to a page fork shared (Milestone 69). First, and before
      * the diagnostic and the signal both: this is not an error, it is
@@ -277,11 +429,78 @@ static void page_fault_handler(registers64_t* r) {
         return;
     }
 
+    /* Either of those failing for want of a frame is not a fault in the
+     * program, and neither ring gets a SIGSEGV for it: the process is
+     * out of memory and ends the way Linux ends it, with SIGKILL. A
+     * kernel-mode access to a user page lands here too - a syscall
+     * writing into a buffer never touched - and is the same process's
+     * problem, not the kernel's. */
+    if (pmm64_take_user_oom() && pf_cr2 < 0x0000800000000000ULL &&
+        proc64_current_pid() >= 0)
+        syscall64_oom_kill(pf_cr2);
+
     /* A ring-3 fault with a handler installed is the program's business,
      * not a kernel failure - it is how Wine turns a bad access into a
      * Windows exception. Tried before the diagnostic below, so that a
      * fault with no handler still reports rather than vanishing. */
-    if (signal64_deliver(SIG64_SEGV, r, pf_cr2)) return;
+    {
+        /* Taken before delivery, which points rip at the handler. */
+        uint64_t fault_rip = r->rip, fault_rsp = r->rsp;
+        uint64_t n = segv_delivered;
+        static uint8_t seen_by_pid[512];
+        int cpid = proc64_current_pid();
+        int first = cpid >= 0 && seen_by_pid[cpid & 511] < 3;
+        if (first) seen_by_pid[cpid & 511]++;
+        /* Each process's first three in full, then one in half a
+         * million: enough to say which process, how its run of faults
+         * began, and whether its thread pointer is sane. */
+        if (first || n % 500000 == 0) {
+            uint32_t lo, hi, glo, ghi;
+            __asm__ __volatile__("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000100u));
+            __asm__ __volatile__("rdmsr" : "=a"(glo), "=d"(ghi) : "c"(0xC0000101u));
+            serial64_puts("NOVARIS64: [segv#");
+            serial64_putdec(n);
+            serial64_puts("] pid ");
+            serial64_putdec((uint64_t)proc64_current_pid());
+            serial64_puts(" rip=");   serial64_puthex(fault_rip);
+            serial64_puts(" cr2=");   serial64_puthex(pf_cr2);
+            serial64_puts(" rsp=");   serial64_puthex(fault_rsp);
+            serial64_puts(" fs=");    serial64_puthex(((uint64_t)hi << 32) | lo);
+            serial64_puts(" gs=");    serial64_puthex(((uint64_t)ghi << 32) | glo);
+            serial64_puts(" err=");   serial64_puthex(pf_err);
+            serial64_puts(" exe=");
+            {
+                proc64_t* me = proc64_current();
+                serial64_puts(me ? me->exe_path : "?");
+                serial64_puts(" comm=");
+                serial64_puts(me ? me->comm : "?");
+            }
+            /* The top of the stack, for the first faults of a process
+             * only: after a call through a null pointer - rip 0 - the
+             * word at rsp is the return address, which is the only
+             * thing left that says who made the call. */
+            if (first) {
+                serial64_puts("\nNOVARIS64:   stack:");
+                for (int w = 0; w < 8; w++) {
+                    uint64_t va = fault_rsp + (uint64_t)w * 8, phys;
+                    if (paging64_translate(va & ~0xFFFULL, &phys) != PAGING64_OK)
+                        break;
+                    serial64_putc(' ');
+                    serial64_puthex(*(volatile uint64_t*)va);
+                }
+            }
+            serial64_putc('\n');
+        }
+        if (signal64_deliver(SIG64_SEGV, r, pf_cr2)) {
+            segv_delivered++;
+            segv_sample(fault_rip, pf_cr2, pf_err);
+            return;
+        }
+    }
+
+    /* Not handled, by a process that is one of several: it alone ends,
+     * as Linux would end it. */
+    if ((r->cs & 3) == 3) syscall64_fault_kill(SIG64_SEGV, r->rip, pf_cr2);
 
     if (pf_diagnose) {
         serial64_puts("\nNOVARIS64: *** page fault in the program\n");
@@ -318,6 +537,262 @@ static void page_fault_handler(registers64_t* r) {
      * returning unchanged would re-run it and fault forever. Send
      * execution to the recovery label instead. */
     r->rip = pf_resume_rip;
+}
+
+/* The start of a bring-up layer, and the end of whatever the layers
+ * before it left behind.
+ *
+ * Each layer runs a program and checks what it did, and nothing took the
+ * program's address space back afterwards: the layer's own descriptor
+ * went out of scope, and an exit that ended the run had gone straight
+ * back to the layer rather than through the teardown every other exit
+ * takes. So every program the bring-up ran stayed in memory until the
+ * machine stopped, and its process slot with it.
+ *
+ * Swept here rather than at the end of each layer because a layer's
+ * checks may still look at its program's memory after it returns; by the
+ * next layer's start nothing can. The sweep frees every space no task is
+ * standing in (vmspace64 knows which exist and refuses to free one
+ * twice), and every exited process nobody is left to reap. */
+static void reclaim_finished(const char* when) {
+    uint64_t before = pmm64_free_frames();
+    int spaces = vmspace64_reclaim_unused(sched64_space_in_use);
+    int slots  = proc64_release_orphans();
+
+    if (!spaces && !slots) return;
+    serial64_puts("NOVARIS64: [reclaim ");
+    serial64_puts(when);
+    serial64_puts("] ");
+    serial64_putdec((uint64_t)spaces);
+    serial64_puts(" spaces, ");
+    serial64_putdec(pmm64_free_frames() - before);
+    serial64_puts(" frames, ");
+    serial64_putdec((uint64_t)slots);
+    serial64_puts(" process slots; free=");
+    serial64_putdec(pmm64_free_frames());
+    serial64_puts(", spaces left ");
+    serial64_putdec((uint64_t)vmspace64_live_count());
+    serial64_putc('\n');
+}
+
+static void layer(const char* name) {
+    reclaim_finished("layer");
+    serial64_puts("NOVARIS64: -- ");
+    serial64_puts(name);
+    serial64_puts(" --\n");
+}
+
+/* The address space of a run's leader that has exited, given back, and
+ * its process slot with it.
+ *
+ * Every other process's space goes when it ends - exit_group and a fatal
+ * signal destroy it on the way to resuming somebody else. The leader's
+ * ending ends the run instead, straight back to the layer, so nothing
+ * did: each Wine layer kept its program's whole space until the machine
+ * stopped. And its slot: a leader has no parent to reap it, so the slot
+ * stayed in use as a zombie for good.
+ *
+ * Only for a leader that really exited. One that ran out of budget is
+ * still running in that space. And only if no task still stands in it -
+ * a vfork child shares its parent's space until it execs. Called with
+ * the kernel's own space loaded, which vmspace64_destroy insists on. */
+static void reclaim_leader(int pid) {
+    proc64_t* lp = proc64_get(pid);
+    uint64_t before, pml4;
+
+    if (!syscall64_leader_exited() || !lp || !lp->exited) return;
+    pml4 = lp->space.pml4_phys;
+    if (!pml4 || sched64_space_in_use(pml4)) return;
+
+    before = pmm64_free_frames();
+    vmspace64_destroy(&lp->space);
+    serial64_puts("NOVARIS64: [reclaim leader] pid ");
+    serial64_putdec((uint64_t)pid);
+    serial64_puts(" gave back ");
+    serial64_putdec(pmm64_free_frames() - before);
+    serial64_puts(" frames, free=");
+    serial64_putdec(pmm64_free_frames());
+    serial64_putc('\n');
+
+    /* Parent 0 is what a leader has; reaping by it frees the slot. */
+    proc64_reap_child_pid(0, pid, 0);
+}
+
+/* Run one Windows program under the Wine this layer has already started.
+ *
+ * Milestone 89 ran winegui64.exe as a one-off; Milestone 90 wanted
+ * chrome.exe as well, and two copies of this would have been two places
+ * to get the scheduler slot wrong. Everything is passed in because the
+ * prefix, the session and the wineserver belong to the caller's layer
+ * and none of it may be reset here.
+ *
+ * `program` is an absolute unix path, not a bare name:
+ * usr/bin/x86_64-windows is where Wine looks for a *builtin module*, not
+ * for an application, so a bare name sends Wine to ShellExecuteEx and it
+ * reports 0x6d about a document association. Z: maps to /, so an
+ * absolute path resolves.
+ */
+/* `trace` prints every syscall the program makes. It is how nearly
+ * everything in this file was diagnosed, and it is not free: a traced
+ * run spends most of its budget in serial64_puts, and the run that first
+ * loaded chrome.dll wrote 136MB of trace and still timed out before
+ * chrome.exe reached the load. Turning it off does not make the run
+ * silent - Wine's own err:/fixme: lines and Chromium's LOG output go to
+ * stderr, which is a different path - so a program too big to trace is
+ * still a program that says what went wrong. */
+static void run_wine_program(const void* image, uint64_t len,
+                             const void* ld_image, uint64_t ld_len,
+                             const char* const* env, vmspace64_t* kspace,
+                             const char* label, const char* success,
+                             const char* program,
+                             const char* const* args, uint64_t budget,
+                             int trace)
+{
+    const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+    const uint64_t STACK_PAGES = 128;
+    const uint64_t EXE_BIAS    = 0x0000555555554000ULL;
+    const uint64_t INTERP_BASE = 0x00007FFFF7000000ULL;
+    /* uspace64_build_stack copies sixteen argv entries; two are wine and
+     * the program, so fourteen are left for the program's own. */
+    const char* argv[17];
+    int nargs = 0;
+    elf64_info_t exe, interp;
+    uint64_t rsp = 0, i;
+    int rc, stack_ok = 1, pid, slot;
+    proc64_t* p;
+
+    argv[0] = "/usr/bin/wine";
+    argv[1] = program;
+    while (args && args[nargs] && nargs < 14) {
+        argv[2 + nargs] = args[nargs];
+        nargs++;
+    }
+    argv[2 + nargs] = 0;
+
+    serial64_puts("NOVARIS64: --- ");
+    serial64_puts(label);
+    serial64_puts(" ---\n");
+
+    if (ramfs64_lookup(program) < 0) {
+        serial64_puts("NOVARIS64: ");
+        serial64_puts(label);
+        serial64_puts(" = not staged, skipped\n");
+        return;
+    }
+
+    pid = proc64_create();
+    /* Which pid, and what else is still alive. A pid handed out while
+     * its previous owner is still running would make set_leader watch
+     * the wrong process, and a session with no wineserver left in it
+     * cannot serve a second client however well this one starts. */
+    serial64_puts("NOVARIS64: [");
+    serial64_puts(label);
+    serial64_puts("] pid ");
+    serial64_putdec((uint64_t)pid);
+    serial64_puts(", live pids");
+    for (int q = 0; q < PROC64_MAX; q++) {
+        if (sched64_pid_tasks(q) > 0) {
+            serial64_putc(' ');
+            serial64_putdec((uint64_t)q);
+            serial64_putc('/');
+            serial64_putdec((uint64_t)sched64_pid_tasks(q));
+        }
+    }
+    serial64_puts(" (pid/tasks)\n");
+
+    proc64_set_current(pid);
+    p = proc64_current();
+    syscall64_open_std();
+
+    rc = vmspace64_create(&p->space) != 0 ? ELF64_OK : -1;
+    if (rc == ELF64_OK) {
+        syscall64_set_exe_path("/usr/bin/wine");
+        rc = elf64_load_at(image, len, &p->space, EXE_BIAS, &exe);
+    }
+    if (rc == ELF64_OK)
+        rc = elf64_load_at(ld_image, ld_len, &p->space, INTERP_BASE, &interp);
+
+    if (rc == ELF64_OK) {
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&p->space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        uspace64_reset(&p->space, exe.brk_start);
+        rsp = uspace64_build_stack(&p->space, STACK_TOP, STACK_PAGES,
+                                   argv, &exe, INTERP_BASE, env);
+    }
+
+    if (rc == ELF64_OK && stack_ok && rsp) {
+        registers64_t first;
+        for (i = 0; i < sizeof(first) / 8; i++) ((uint64_t*)&first)[i] = 0;
+        /* The slot it actually went into. Not 0: the wineserver and the
+         * services wineboot started are still in the table, and telling
+         * the scheduler that slot 0 is current would resume one of them
+         * here. */
+        slot = sched64_add_frame_for(&first, &p->space, 0, pid);
+        /* A run's first task is nobody's thread: nothing blocked, and
+         * nothing left over from whatever had this slot before. */
+        if (slot >= 0) signal64_task_start(slot, -1);
+        if (slot >= 0) sched64_set_current(slot);
+
+        syscall64_set_leader(pid);
+        syscall64_set_run_ticks(budget);
+        syscall64_reset_calls();
+        syscall64_set_trace(trace && WINE64_TRACE);
+        register_interrupt_handler64(32, sched_timer_handler);
+        idt64_irq_set_mask(0, 0);
+
+        vmspace64_switch(&p->space);
+        enter_user_mode64(interp.entry, rsp, 0);
+        vmspace64_switch(kspace);
+
+        idt64_irq_set_mask(0, 1);
+        syscall64_set_trace(0);
+        syscall64_set_run_ticks(0);
+        syscall64_set_leader(-1);
+        reclaim_leader(pid);
+    }
+
+    syscall64_report_calls();
+
+    /* A run that used up its budget without the program exiting: say
+     * what every thread was doing when the clock ran out.
+     *
+     * "It ran out of time" does not distinguish a program that is slow
+     * from one that is stuck, and chrome.exe turned out to be the
+     * second: six times the budget bought it 42,581 syscalls against
+     * 42,000, and it stopped at the same instruction. A thread that is
+     * merely slow is runnable; a thread that is stuck is blocked on
+     * something, and the wait address says on what. */
+    if (!syscall64_leader_exited() && syscall64_run_expired()) {
+        sched64_dump_blocked();
+        syscall64_report_futex_waits();
+        syscall64_report_leader_stacks();
+        syscall64_report_pipe_waits();
+        syscall64_report_unread_pipes();
+    }
+
+    serial64_puts("NOVARIS64: --- end of ");
+    serial64_puts(label);
+    serial64_puts(" ---\nNOVARIS64: ");
+    serial64_puts(label);
+    serial64_puts(" = ");
+    if (rc != ELF64_OK || !stack_ok || !rsp) {
+        serial64_puts("could not be laid out\n");
+    } else if (!syscall64_leader_exited()) {
+        serial64_puts("did not exit, run ");
+        serial64_puts(syscall64_run_expired() ? "timed out\n" : "ended\n");
+    } else {
+        serial64_puts("exit= ");
+        serial64_putdec(syscall64_exit_code());
+        serial64_puts(" (0 = ");
+        serial64_puts(success);
+        serial64_puts(")\n");
+    }
 }
 
 void kernel_main(uint32_t magic, void* mbi) {
@@ -494,6 +969,10 @@ void kernel_main(uint32_t magic, void* mbi) {
         check("a second frame was allocated", f2 != 0);
         check("the two are different frames", f1 != f2);
         check("frames are page aligned", (f1 % PMM64_FRAME_SIZE) == 0);
+    /* The free count is kept as frames change hands rather than counted;
+     * it has to be the number the bitmap itself gives. */
+    check("the running free count is the bitmap's",
+          pmm64_free_frames() == pmm64_free_frames_scanned());
         /* The first megabyte and the kernel's own image are the two things
          * that must never be handed out; a bug in the reserve pass shows
          * up here rather than as corruption three milestones later. */
@@ -1049,7 +1528,7 @@ void kernel_main(uint32_t magic, void* mbi) {
     }
 
     /* --- layer 10: ring 3, and a syscall that comes back ------------ */
-    serial64_puts("NOVARIS64: -- ring 3 --\n");
+    layer("ring 3");
     {
         /* PML4 slot 224. Not one of the low addresses: slot 0 is still
          * the boot identity map, built from 2MB pages, so anything under
@@ -1118,7 +1597,7 @@ void kernel_main(uint32_t magic, void* mbi) {
     }
 
     /* --- layer 11: two address spaces ------------------------------- */
-    serial64_puts("NOVARIS64: -- address spaces --\n");
+    layer("address spaces");
     {
         /* PML4 slot 192: the low half, so it belongs to the space rather
          * than to the kernel, which is the whole point of the test. */
@@ -1199,7 +1678,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * This is both at once, which is what a process actually is - user
      * pages that exist only in its own low half, kernel reachable from
      * inside it because the high half is shared. */
-    serial64_puts("NOVARIS64: -- a program in its own space --\n");
+    layer("a program in its own space");
     {
         const uint64_t UCODE_VA  = 0x0000700000000000ULL;
         const uint64_t USTACK_VA = 0x0000700000010000ULL;
@@ -1250,7 +1729,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * on one property of the interrupt path: by the time a handler runs,
      * the whole user-visible state of the interrupted task is already a
      * registers64_t in memory, so switching tasks is copying structs. */
-    serial64_puts("NOVARIS64: -- preemption --\n");
+    layer("preemption");
     {
         const uint64_t UCODE_VA  = 0x0000700000000000ULL;
         const uint64_t USTACK_VA = 0x0000700000010000ULL;
@@ -1355,7 +1834,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * what this kernel implements is Linux's ABI rather than a private
      * convention shaped like it. That property is the whole reason the
      * 32-bit tree can run real glibc and real Wine. */
-    serial64_puts("NOVARIS64: -- a real Linux binary --\n");
+    layer("a real Linux binary");
     {
         /* Slot 255: the top of the low half, well clear of wherever ld
          * decided to put the program. */
@@ -1435,7 +1914,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * a buffered stdio stream. Every one of those is a demand on this
      * kernel's ABI, and glibc was compiled long before Novaris existed,
      * so none of them are negotiable. */
-    serial64_puts("NOVARIS64: -- real glibc --\n");
+    layer("real glibc");
     {
         /* 64KB of stack: glibc's startup uses far more of it than a
          * hand-written program does. */
@@ -1517,7 +1996,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * kernel32, linked at a Windows image base, and never told what it
      * would run on - the same relationship the glibc binary above has
      * with Linux. */
-    serial64_puts("NOVARIS64: -- a 64-bit Windows PE --\n");
+    layer("a 64-bit Windows PE");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 8;
@@ -1600,7 +2079,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * library beside it. Two things get proved here that layer 16 could
      * not - resolving an import against a real export table, and moving
      * an image away from the base it was linked at. */
-    serial64_puts("NOVARIS64: -- a PE with its own DLL --\n");
+    layer("a PE with its own DLL");
     {
         /* Forced, not incidental. Loading the DLL where it asked would
          * leave the relocation code untested, and the first image that
@@ -1679,7 +2158,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * file, gets back a module, and finds a function in it - which is
      * what LoadLibrary is, and the shape chrome.exe depends on:
      * chrome_elf.dll *loads* chrome.dll rather than importing it. */
-    serial64_puts("NOVARIS64: -- LoadLibrary from a file --\n");
+    layer("LoadLibrary from a file");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 8;
@@ -1757,7 +2236,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * threads in ONE address space, which is what makes it different
      * from Milestone 49's two tasks: those had a space each and could
      * not have shared a variable if they wanted to. */
-    serial64_puts("NOVARIS64: -- threads --\n");
+    layer("threads");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 16;
@@ -1842,7 +2321,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * matters: a kernel implementing FUTEX_WAIT as "return 0" would
      * still pass that test - the parent would loop again - and cannot
      * pass this one, because there is no loop to fall back into. */
-    serial64_puts("NOVARIS64: -- futex --\n");
+    layer("futex");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 16;
@@ -1917,7 +2396,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * saved registers out of the ucontext, write RIP back, carry on.
      * Every layer before this treated a ring-3 fault as the end of the
      * program. */
-    serial64_puts("NOVARIS64: -- signals --\n");
+    layer("signals");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 16;
@@ -1977,7 +2456,7 @@ void kernel_main(uint32_t magic, void* mbi) {
     /* Milestone 54's initrd could be read. This one can be written to,
      * which is the difference that matters: a Wine prefix is thousands
      * of files Wine *creates*. */
-    serial64_puts("NOVARIS64: -- a writable filesystem --\n");
+    layer("a writable filesystem");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 16;
@@ -1996,6 +2475,56 @@ void kernel_main(uint32_t magic, void* mbi) {
          * adds writing rather than replacing reading. */
         check("and the initrd's contents were carried into it",
               ramfs64_lookup("/dlllib64.dll") >= 0);
+
+        /* A file bigger than any single heap block.
+         *
+         * The kernel heap is 256MB in total and ensure_capacity doubles
+         * a kmalloc64 until the file fits, so every file used to have a
+         * ceiling well under that - and a file over it was created,
+         * stored nowhere, and reported as zero bytes to everyone who
+         * asked. Chromium's 332MB chrome.dll found that the expensive
+         * way. Written here in chunks that straddle the threshold, so
+         * what is tested is both the large case and the migration from
+         * a heap block to frames, then read back at the far end where a
+         * file that only pretended to be written has nothing. */
+        {
+            static uint8_t pat[65536];
+            const uint64_t BIG = RAMFS64_CONTIGUOUS_MAX + (8ull << 20);
+            int big = ramfs64_create("/big.bin", 0);
+            uint64_t off = 0;
+            int wrote_all = 1;
+
+            for (i = 0; i < sizeof(pat); i++) pat[i] = (uint8_t)(i * 7 + 3);
+            check("a file larger than one heap block can be created", big >= 0);
+            while (big >= 0 && off < BIG) {
+                uint64_t run = BIG - off;
+                if (run > sizeof(pat)) run = sizeof(pat);
+                if (ramfs64_write(big, off, pat, run) != (int64_t)run) {
+                    wrote_all = 0;
+                    break;
+                }
+                off += run;
+            }
+            check("and every write of it was accepted", wrote_all);
+            check("and it is as long as what was written",
+                  big >= 0 && ramfs64_size(big) == BIG);
+            {
+                static uint8_t back[4096];
+                int same = 1;
+                uint64_t at = BIG - sizeof(back);
+                if (big < 0 || ramfs64_read(big, at, back, sizeof(back))
+                        != (int64_t)sizeof(back)) same = 0;
+                else for (i = 0; i < sizeof(back); i++)
+                    if (back[i] != pat[(at + i) % sizeof(pat)]) { same = 0; break; }
+                check("and its last page reads back what was put there", same);
+            }
+            /* It is stored in frames, so it has no single pointer - and
+             * ramfs64_data has to say so rather than hand back a stale
+             * one, because execve believes it. */
+            check("and a framed file offers no contiguous pointer",
+                  big < 0 || ramfs64_data(big) == 0);
+            if (big >= 0) ramfs64_unlink("/big.bin");
+        }
 
         vmspace64_kernel_space(&kspace);
         check("a space for it", vmspace64_create(&space) != 0);
@@ -2043,7 +2572,7 @@ void kernel_main(uint32_t magic, void* mbi) {
     /* How a loader loads. ld.so maps an ELF's segments and Wine maps a
      * PE's; every image this kernel has run so far was copied in by the
      * kernel rather than mapped by the program. */
-    serial64_puts("NOVARIS64: -- file-backed mmap --\n");
+    layer("file-backed mmap");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 16;
@@ -2105,7 +2634,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * at its smallest: load a dynamic program, hand control to its
      * interpreter, and see how far it gets. Tracing is ON - what this
      * layer is for is finding out what ld.so asks for. */
-    serial64_puts("NOVARIS64: -- the dynamic loader --\n");
+    layer("the dynamic loader");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         /* 512KB. ld.so uses far more stack than a hand-written program:
@@ -2237,7 +2766,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * Milestone 62 made runnable; whether it gets anywhere is a
      * different question, and this layer exists to read the answer
      * rather than to assert one. Tracing is ON. */
-    serial64_puts("NOVARIS64: -- Wine's loader --\n");
+    layer("Wine's loader");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 128;
@@ -2351,7 +2880,7 @@ void kernel_main(uint32_t magic, void* mbi) {
     /* The shape every shell has, and the one Wine's architecture is
      * built on: a process copies itself, the copy becomes a different
      * program, and the original waits to be told how it went. */
-    serial64_puts("NOVARIS64: -- fork and execve --\n");
+    layer("fork and execve");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 32;
@@ -2445,7 +2974,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * children, and rmdir refusing a directory that still holds
      * something. A Wine prefix is a deep tree Wine walks, so this is
      * the difference between a simplification and a lie. */
-    serial64_puts("NOVARIS64: -- a directory tree --\n");
+    layer("a directory tree");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 32;
@@ -2538,7 +3067,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * questions before mapping it and drawing - which is the shape of
      * every display driver that would ever sit above this kernel,
      * Wine's included. */
-    serial64_puts("NOVARIS64: -- a process draws --\n");
+    layer("a process draws");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 32;
@@ -2636,7 +3165,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * AT_REMOVEDIR, newfstatat) and this kernel answers whichever it
      * picks. The host runs the same file, and the two outputs are
      * compared byte for byte. */
-    serial64_puts("NOVARIS64: -- a working directory --\n");
+    layer("a working directory");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 32;
@@ -2813,7 +3342,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * both produce exactly its output, which is the point: correctness
      * is what it checks. The difference is a cost, and a cost is only
      * visible from here, by counting frames across the fork itself. */
-    serial64_puts("NOVARIS64: -- fork that shares --\n");
+    layer("fork that shares");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 64;
@@ -2941,7 +3470,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * tools/inputtest.py does that part, with real keystrokes from the
      * QEMU monitor, and it is the one that would catch a driver that
      * decoded perfectly and never received anything. */
-    serial64_puts("NOVARIS64: -- keyboard and mouse --\n");
+    layer("keyboard and mouse");
     {
         input64_event_t evs[8];
         uint64_t got;
@@ -3108,7 +3637,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * write fault on memory the program just asked to be made writable.
      * That distance is the reason this layer exists rather than a
      * comment saying the calls are handled. */
-    serial64_puts("NOVARIS64: -- the address space --\n");
+    layer("the address space");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 64;
@@ -3186,7 +3715,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      *
      * The program below execs /tmp/forkchild64, which the initrd already
      * stages for the fork/exec layer. */
-    serial64_puts("NOVARIS64: -- starting another program --\n");
+    layer("starting another program");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 64;
@@ -3278,7 +3807,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * getting -EPIPE; get the reference counting wrong - across dup, and
      * across fork, which duplicates every descriptor - and neither side
      * ever finds out. That failure is a hang, not an error. */
-    serial64_puts("NOVARIS64: -- pipes and socketpairs --\n");
+    layer("pipes and socketpairs");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 64;
@@ -3352,8 +3881,9 @@ void kernel_main(uint32_t magic, void* mbi) {
         serial64_puts(" pipes, ");
         serial64_putdec(syscall64_socketpairs() - pairs_before);
         serial64_puts(" socketpairs\n");
-        check("three pipes and one socketpair were made",
-              syscall64_pipes() - pipes_before == 3 &&
+        /* Four: the fourth carries the write larger than a pipe holds. */
+        check("four pipes and one socketpair were made",
+              syscall64_pipes() - pipes_before == 4 &&
               syscall64_socketpairs() - pairs_before == 1);
 
         /* And every one of them was given back. This is the leak the
@@ -3382,7 +3912,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * moment there were two. The program below connects twice and
      * asserts that what one client sends does *not* arrive on the other
      * connection. */
-    serial64_puts("NOVARIS64: -- a socket with a name --\n");
+    layer("a socket with a name");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 64;
@@ -3483,7 +4013,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * the assertions are about identity rather than arrival. A test that
      * only checked "a descriptor appeared" would pass on an
      * implementation that sent the integer. */
-    serial64_puts("NOVARIS64: -- passing a descriptor --\n");
+    layer("passing a descriptor");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 64;
@@ -3606,7 +4136,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * map is how a program gets anonymous shared memory out of a
      * filesystem, and it is what Wine does for every shared mapping it
      * makes; neither half is any use without the other. */
-    serial64_puts("NOVARIS64: -- shared memory --\n");
+    layer("shared memory");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 64;
@@ -3676,9 +4206,440 @@ void kernel_main(uint32_t magic, void* mbi) {
         serial64_puts("NOVARIS64: shared  = ");
         serial64_putdec(syscall64_shared_maps() - shared_before);
         serial64_puts(" mappings\n");
-        check("three shared mappings were made",
-              syscall64_shared_maps() - shared_before == 3);
+        /* Five: those three, and the whole file and the view from its
+         * second page. */
+        check("five shared mappings were made",
+              syscall64_shared_maps() - shared_before == 5);
     }
+
+    /* --- layer 37b: the clocks (Milestone 86) ------------------------ */
+    /* Two syscalls that take an argument saying which behaviour is
+     * wanted, and used to ignore it. clock_gettime read the clock id off
+     * a list that had 8 in it where it should have had 5, so
+     * CLOCK_REALTIME_COARSE - the clock Wine reports every date from -
+     * was answered from the uptime counter and every date Wine had was
+     * 1970. clock_nanosleep never looked at its flags, so TIMER_ABSTIME
+     * became a relative sleep, which turns "wake at 09:15" into a sleep
+     * of fifty-six years.
+     *
+     * Nothing in the prefix calls clock_nanosleep at all - measured, a
+     * full run makes zero of them - which is exactly why it is tested
+     * here rather than left to be found by the first caller that needs
+     * it. */
+    layer("the clocks");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 64;
+        vmspace64_t kspace;
+        elf64_info_t info;
+        uint64_t i, rsp;
+        int rc, stack_ok = 1, pid;
+        proc64_t* p;
+        static const char* const clock_argv[] = { "/clock64", 0 };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        syscall64_reset_files();
+        signal64_reset();
+        sched64_init();
+        proc64_init();
+        pipe64_init();
+        sock64_init();
+        vmspace64_kernel_space(&kspace);
+
+        pid = proc64_create();
+        proc64_set_current(pid);
+        p = proc64_current();
+
+        check("a space for it", vmspace64_create(&p->space) != 0);
+        rc = elf64_load(clock64_elf, clock64_elf_len, &p->space, &info);
+        check("the clock program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&p->space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&p->space, info.brk_start);
+        rsp = uspace64_build_stack(&p->space, STACK_TOP, STACK_PAGES,
+                                   clock_argv, &info, 0, 0);
+
+        {
+            registers64_t first;
+            for (i = 0; i < sizeof(first) / 8; i++)
+                ((uint64_t*)&first)[i] = 0;
+            sched64_add_frame_for(&first, &p->space, 0, pid);
+            sched64_set_current(0);
+        }
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        /* The timer, for the same reason the wineserver layer needs it:
+         * a sleep is a deadline, and a deadline is reached by the tick
+         * counter advancing. IRQ0 is masked for most of bring-up so the
+         * layers above are deterministic, and with it masked a sleep of
+         * fifty milliseconds is not a short wait, it is a permanent one.
+         * Masked again afterwards so nothing below sees a tick. */
+        register_interrupt_handler64(32, sched_timer_handler);
+        idt64_irq_set_mask(0, 0);
+
+        vmspace64_switch(&p->space);
+        enter_user_mode64(info.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+
+        idt64_irq_set_mask(0, 1);
+        pf_diagnose = 0;
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("the clocks behaved as Linux's do",
+              syscall64_exit_code() == 127);
+    }
+
+    /* --- kill(2), one process signalling another (Milestone 93) ------ *
+     *
+     * Everything this kernel could do with a signal before now was
+     * synchronous: a fault, delivered to the thread that caused it. Its
+     * only signal calls were tkill and tgkill, and both begin by
+     * refusing any tid but the caller's - so nothing could signal
+     * anything but itself, and chrome.exe asking for kill(2) got
+     * -ENOSYS twice in a run.
+     *
+     * This layer forks, signals across the gap, and checks the answers
+     * against Linux's. It needs the timer for the same reason the clock
+     * layer does: the child waits in nanosleep, and a sleep ends when
+     * the tick counter says so. */
+    layer("kill");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 64;
+        vmspace64_t kspace;
+        elf64_info_t info;
+        uint64_t i, rsp;
+        int rc, stack_ok = 1, pid;
+        proc64_t* p;
+        static const char* const kill_argv[] = { "/kill64", 0 };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        syscall64_reset_files();
+        signal64_reset();
+        sched64_init();
+        proc64_init();
+        pipe64_init();
+        sock64_init();
+        vmspace64_kernel_space(&kspace);
+
+        pid = proc64_create();
+        proc64_set_current(pid);
+        p = proc64_current();
+
+        check("a space for it", vmspace64_create(&p->space) != 0);
+        rc = elf64_load(kill64_elf, kill64_elf_len, &p->space, &info);
+        check("the kill program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&p->space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&p->space, info.brk_start);
+        rsp = uspace64_build_stack(&p->space, STACK_TOP, STACK_PAGES,
+                                   kill_argv, &info, 0, 0);
+
+        {
+            registers64_t first;
+            int slot;
+            for (i = 0; i < sizeof(first) / 8; i++)
+                ((uint64_t*)&first)[i] = 0;
+            slot = sched64_add_frame_for(&first, &p->space, 0, pid);
+            if (slot >= 0) sched64_set_current(slot);
+        }
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        register_interrupt_handler64(32, sched_timer_handler);
+        idt64_irq_set_mask(0, 0);
+
+        /* A leader, so that a child dying of a fault it did not handle
+         * ends the child and not the layer - the mask tests below make
+         * one on purpose. */
+        syscall64_set_leader(pid);
+        vmspace64_switch(&p->space);
+        enter_user_mode64(info.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+        syscall64_set_leader(-1);
+
+        idt64_irq_set_mask(0, 1);
+        pf_diagnose = 0;
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("kill(2) behaved as Linux's does",
+              syscall64_exit_code() == 127);
+        check("and something was actually signalled across processes",
+              signal64_raised() > 0);
+    }
+
+    /* --- wait4's pid and options (Milestone 94) ---------------------- *
+     *
+     * Both were read and discarded, which left one call doing the work
+     * of three: WNOHANG blocked, a named pid reaped whichever child
+     * happened to be first, and a process group was answered as though
+     * it had been asked about. The first is the one a poll loop
+     * notices; the second is the one that silently destroys a status.
+     *
+     * Needs the timer, because every assertion below is about a child
+     * that has or has not finished yet, and "yet" is the tick counter. */
+    layer("wait4");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 64;
+        vmspace64_t kspace;
+        elf64_info_t info;
+        uint64_t i, rsp;
+        int rc, stack_ok = 1, pid;
+        proc64_t* p;
+        static const char* const wait_argv[] = { "/wait64", 0 };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        syscall64_reset_files();
+        signal64_reset();
+        sched64_init();
+        proc64_init();
+        pipe64_init();
+        sock64_init();
+        vmspace64_kernel_space(&kspace);
+
+        pid = proc64_create();
+        proc64_set_current(pid);
+        p = proc64_current();
+
+        check("a space for it", vmspace64_create(&p->space) != 0);
+        rc = elf64_load(wait64_elf, wait64_elf_len, &p->space, &info);
+        check("the wait program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&p->space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&p->space, info.brk_start);
+        rsp = uspace64_build_stack(&p->space, STACK_TOP, STACK_PAGES,
+                                   wait_argv, &info, 0, 0);
+
+        {
+            registers64_t first;
+            int slot;
+            for (i = 0; i < sizeof(first) / 8; i++)
+                ((uint64_t*)&first)[i] = 0;
+            slot = sched64_add_frame_for(&first, &p->space, 0, pid);
+            if (slot >= 0) sched64_set_current(slot);
+        }
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        register_interrupt_handler64(32, sched_timer_handler);
+        idt64_irq_set_mask(0, 0);
+
+        vmspace64_switch(&p->space);
+        enter_user_mode64(info.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+
+        idt64_irq_set_mask(0, 1);
+        pf_diagnose = 0;
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("wait4 behaved as Linux's does",
+              syscall64_exit_code() == 127);
+    }
+
+    /* --- prctl's PR_SET_NAME (Milestone 95) -------------------------- *
+     *
+     * chrome.exe asked for prctl three times and got -ENOSYS each time.
+     * Two of Wine's three call sites are PR_SET_NAME, and the preloader
+     * is the one that checks the answer. */
+    layer("prctl");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 64;
+        vmspace64_t kspace;
+        elf64_info_t info;
+        uint64_t i, rsp;
+        int rc, stack_ok = 1, pid;
+        proc64_t* p;
+        static const char* const prctl_argv[] = { "/prctl64", 0 };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        syscall64_reset_files();
+        signal64_reset();
+        sched64_init();
+        proc64_init();
+        pipe64_init();
+        sock64_init();
+        vmspace64_kernel_space(&kspace);
+
+        pid = proc64_create();
+        proc64_set_current(pid);
+        p = proc64_current();
+
+        check("a space for it", vmspace64_create(&p->space) != 0);
+        rc = elf64_load(prctl64_elf, prctl64_elf_len, &p->space, &info);
+        check("the prctl program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&p->space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&p->space, info.brk_start);
+        rsp = uspace64_build_stack(&p->space, STACK_TOP, STACK_PAGES,
+                                   prctl_argv, &info, 0, 0);
+
+        {
+            registers64_t first;
+            int slot;
+            for (i = 0; i < sizeof(first) / 8; i++)
+                ((uint64_t*)&first)[i] = 0;
+            slot = sched64_add_frame_for(&first, &p->space, 0, pid);
+            if (slot >= 0) sched64_set_current(slot);
+        }
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        register_interrupt_handler64(32, sched_timer_handler);
+        idt64_irq_set_mask(0, 0);
+
+        vmspace64_switch(&p->space);
+        enter_user_mode64(info.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+
+        idt64_irq_set_mask(0, 1);
+        pf_diagnose = 0;
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("prctl behaved as Linux's does",
+              syscall64_exit_code() == 127);
+    }
+
+    /* --- tgkill's thread target (Milestone 96) ----------------------- *
+     *
+     * tkill and tgkill both began `if (tid != proc64_current_pid())
+     * return -ESRCH`, which compares a task slot against a process id
+     * and refuses every thread but the caller. Nothing here could
+     * signal a sibling thread at all.
+     *
+     * That is where chrome.exe stopped. Chromium's sampling profiler
+     * suspends the main thread; Wine does that by sending the target
+     * SIGUSR1; -ESRCH left the wineserver believing the thread had
+     * died while the thread ran on marked suspended - and a suspended
+     * thread is never allowed to acquire anything, so every wait it
+     * made afterwards was answered PENDING. The visible end of it was
+     * chrome.exe waiting forever on a mutex it had just created
+     * unowned.
+     *
+     * Needs the timer: the second thread sleeps in read(2) and the
+     * point of the layer is that a signal reaches it there. */
+    layer("tgkill");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 64;
+        vmspace64_t kspace;
+        elf64_info_t info;
+        uint64_t i, rsp;
+        int rc, stack_ok = 1, pid;
+        proc64_t* p;
+        static const char* const tgkill_argv[] = { "/tgkill64", 0 };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        syscall64_reset_files();
+        signal64_reset();
+        sched64_init();
+        proc64_init();
+        pipe64_init();
+        sock64_init();
+        vmspace64_kernel_space(&kspace);
+
+        pid = proc64_create();
+        proc64_set_current(pid);
+        p = proc64_current();
+
+        check("a space for it", vmspace64_create(&p->space) != 0);
+        rc = elf64_load(tgkill64_elf, tgkill64_elf_len, &p->space, &info);
+        check("the tgkill program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&p->space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&p->space, info.brk_start);
+        rsp = uspace64_build_stack(&p->space, STACK_TOP, STACK_PAGES,
+                                   tgkill_argv, &info, 0, 0);
+
+        {
+            registers64_t first;
+            int slot;
+            for (i = 0; i < sizeof(first) / 8; i++)
+                ((uint64_t*)&first)[i] = 0;
+            slot = sched64_add_frame_for(&first, &p->space, 0, pid);
+            if (slot >= 0) sched64_set_current(slot);
+        }
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        register_interrupt_handler64(32, sched_timer_handler);
+        idt64_irq_set_mask(0, 0);
+
+        vmspace64_switch(&p->space);
+        enter_user_mode64(info.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+
+        idt64_irq_set_mask(0, 1);
+        pf_diagnose = 0;
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("tgkill behaved as Linux's does",
+              syscall64_exit_code() == 127);
+    }
+
+    /* Everything that draws has drawn.
+     *
+     * tools/fbtest.py takes a QEMU screendump and compares sixteen
+     * pixels against what layers 6c and 21 put on the screen. It used to
+     * wait for "bring-up complete", which was the end of the run and
+     * also, from Milestone 89, five minutes after the last drawing layer
+     * and on the far side of a Wine desktop: winegui64.exe now really
+     * paints its window, the driver blits straight to the framebuffer,
+     * and a white client area landed on the red block. That is the
+     * system working, not a fault, so the screendump moved rather than
+     * the window - it is taken here, while the picture under test is the
+     * picture on the screen.
+     *
+     * fbtest boots its own qemu and stops it at this line, so it also
+     * stops paying for a Wine prefix it never looks at. */
+    serial64_puts("NOVARIS64: ---- display settled ----\n");
 
     /* --- layer 38: a Wine prefix (Milestone 71) ---------------------- */
     /* Milestone 68 removed every reason a prefix could not exist here -
@@ -3695,7 +4656,7 @@ void kernel_main(uint32_t magic, void* mbi) {
      * prefix was measured to load 93 of them (tools/wine_prefix_modules
      * .txt), which is 174MB in the build tree and 58MB stripped.
      */
-    serial64_puts("NOVARIS64: -- a Wine prefix --\n");
+    layer("a Wine prefix");
     {
         const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
         const uint64_t STACK_PAGES = 128;
@@ -3730,7 +4691,7 @@ void kernel_main(uint32_t magic, void* mbi) {
              * serial), so this is the middle setting: everything Wine
              * considers an error or an unimplemented path, nothing it
              * considers a trace. */
-            "WINEDEBUG=err+all,fixme+all,trace-all,warn-all,warn+winstation",
+            WINE64_DEBUG_STR,
             /* Where the builtin PE modules are.
              *
              * Not decoration, and not something the staging could fix.
@@ -3773,6 +4734,14 @@ void kernel_main(uint32_t magic, void* mbi) {
 
         ramfs64_init();
         ramfs64_seed_from_initrd();
+        /* Asserted, not assumed. chrome.dll is 332MB and this
+         * filesystem used to accept it, store none of it, and report it
+         * to every reader as a file of zero bytes that was definitely
+         * there; the first thing to notice was Chromium, calling it a
+         * bad EXE four layers away. A file the image shipped that did
+         * not survive being loaded is a failed boot, so say so here. */
+        check("every file in the image was stored",
+              ramfs64_seed_failures() == 0);
         syscall64_reset_files();
         signal64_reset();
         sched64_init();
@@ -3868,8 +4837,9 @@ void kernel_main(uint32_t magic, void* mbi) {
                 serial64_puts(" frames before wineboot\n");
                 serial64_puts("NOVARIS64: --- wineboot ---\n");
                 pf_diagnose = 1;
-                syscall64_set_trace(1);
-                signal64_set_trace(1);
+                syscall64_reset_calls();
+                syscall64_set_trace(WINE64_TRACE);
+                signal64_set_trace(WINE64_TRACE);
 
                 /* End the run when wineboot finishes, not when the last
                  * process does. wineboot starts the wineserver, and a
@@ -3900,8 +4870,13 @@ void kernel_main(uint32_t magic, void* mbi) {
                 syscall64_set_run_ticks(0);
                 syscall64_set_trace(0);
                 signal64_set_trace(0);
+                reclaim_leader(pid);
                 pf_diagnose = 0;
                 serial64_puts("NOVARIS64: --- end ---\n");
+                /* Where wineboot's syscalls went, by process and by
+                 * number - the same report run_wine_program() gives the
+                 * layers after it, which this one never had. */
+                syscall64_report_calls();
             }
 
             /* What actually happened, reported rather than asserted.
@@ -4014,9 +4989,123 @@ void kernel_main(uint32_t magic, void* mbi) {
                                                       : "ended on its own");
                 serial64_putc('\n');
             }
+
+        /* How long chrome.exe is given, in seconds.
+ *
+ * A finished run - the page printed, Chromium exited 0 - takes about 210
+ * seconds of guest time from exec to exit under TCG, against 22 on the
+ * Linux host. 300 was the budget while every run stopped short for some
+ * other reason, and it leaves too little room now that one finishes: 900
+ * is the difference between a slow run and a failed one.
+ *
+ * What it took to get here, each found by a run that stopped and fixed
+ * in the kernel rather than worked around: futex wakes that crossed
+ * processes, no NETLINK_ROUTE socket (winedevice crashed holding the
+ * adapter-list lock), pipe writes over 64KB returning short, MAP_SHARED
+ * refusing an offset, and mmap handing out ranges Wine had already
+ * mapped. See ROADMAP.md. A guest needs 12G for it - Makefile.amd64
+ * says why. */
+#ifndef CHROME64_BUDGET_SECS
+#define CHROME64_BUDGET_SECS 900u
+#endif
+
+/* What chrome.exe is asked to do: render one page headless and print its
+ * DOM to stdout, which here is COM1. A finished run's transcript then
+ * contains the page - "<p>novaris</p>" inside <body> - and that, not the
+ * exit code alone, is what says Chromium worked.
+ *
+ * --no-sandbox because Chromium's sandbox is a Windows security feature
+ * Wine does not provide; --disable-gpu because there is no GPU. Run on
+ * the Linux host under the same Wine, with its null display driver, this
+ * exact command prints the page and exits 0 in 22 seconds. */
+#ifndef CHROME64_URL
+#define CHROME64_URL "data:text/html,<p>novaris</p>"
+#endif
+static const char* const chrome_args[] = {
+    "--headless", "--no-sandbox", "--disable-gpu",
+    /* And as few processes as Chromium will run in: the GPU and network
+     * services in the browser process, and no crash reporter. Every
+     * Chromium process holds its own copy of chrome.dll's code - Wine
+     * cannot mmap a PE whose sections are 0x200-aligned in the file, so
+     * it reads them, here exactly as on Linux - and that is ~320MB a
+     * process. All three flags were checked on the Linux host to change
+     * nothing about the page printed. --single-process is not one of
+     * them: Chromium itself fails a CHECK with it. */
+    "--in-process-gpu", "--enable-features=NetworkServiceInProcess2",
+    "--disable-breakpad",
+    /* A child process gives the browser 15 seconds to finish the mojo
+     * handshake and then exits with status 0 - "Terminating current
+     * process after 15 seconds with no connection". Under emulation the
+     * browser is not done with its own startup by then: the storage
+     * service and every renderer quit cleanly and the browser waited on
+     * them forever. The switch is Chromium's own and is passed on to the
+     * children it starts. */
+    "--ipc-connection-timeout=600",
+    /* The same lesson for the hang monitor, which kills a renderer that
+     * has not answered an input or visual-properties update in thirty
+     * seconds. Under TCG a renderer for the toolbar's omnibox popup can
+     * take longer than that just to start - one lived 32 seconds and
+     * made 40,391 syscalls before the browser killed it, so it was busy,
+     * not stuck. The browser counted it (Renderer.Unresponsive,
+     * BrowserRenderProcessHost.ChildKills), rejected the messages it
+     * still had in flight - "Message 2 rejected by interface
+     * blink.mojom.Widget", UpdateScreenRects' reply - and closed the
+     * popup with reason kCrash, three times a run. Chromium's own switch,
+     * checked on the Linux host to change nothing about the page. */
+    "--disable-hang-monitor",
+#ifdef CHROME64_VERBOSE
+    /* Chromium's own account of itself, children included: 616 lines
+     * for a whole successful run on the Linux host, so the serial port
+     * can carry it, and it can be read against that run line by line. */
+    "--enable-logging=stderr", "--v=1",
+#endif
+#ifdef CHROME64_VMODULE
+    "--vmodule=" CHROME64_VMODULE,
+#endif
+    "--dump-dom", CHROME64_URL, 0
+};
+
+    /* --- and then Windows programs, in the prefix just built --- *
+             *
+             * Both run in the prefix wineboot has just built, in the
+             * session whose wineserver is still up: no ramfs64_init, no
+             * sched64_init, nothing reset. Every other layer in this
+             * file starts by wiping the filesystem, and doing that here
+             * would throw away the thing being tested. */
+            run_wine_program(image, len, ld_image, ld_len, boot_env, &kspace,
+                             "winegui", "a window was created and drawn",
+                             "/usr/bin/x86_64-windows/winegui64.exe",
+                             0, 60u * CLOCK64_HZ, 1);
+
+            /* Before chrome, the questions chrome_elf asks. Cheap, and
+             * it means a failing chrome run is read against measured
+             * answers rather than against a guess about which CHECK
+             * fired. */
+            run_wine_program(image, len, ld_image, ld_len, boot_env, &kspace,
+                             "chromeprobe", "every question answered",
+                             "/usr/bin/x86_64-windows/chromeprobe64.exe",
+                             0, 240u * CLOCK64_HZ, 1);
+
+            /* And then the one this tree is aimed at.
+             *
+             * chrome.exe is 3MB and chrome_elf.dll, which it imports, is
+             * 1.5MB. Between them they need fifteen DLLs and 368
+             * functions and Wine has an export for all but two -
+             * AddConditionalAce and
+             * DeriveAppContainerSidFromAppContainerName, both
+             * delay-loaded, so neither costs anything unless it is
+             * called. That is a far smaller surface than the 1316
+             * functions Milestone 45 measured chrome.dll importing,
+             * because chrome.exe is only the launcher: chrome_elf loads
+             * chrome.dll, and chrome.dll is 332MB. */
+            run_wine_program(image, len, ld_image, ld_len, boot_env, &kspace,
+                             "chrome", "headless Chromium printed the page",
+                             "/opt/chromium/chrome.exe", chrome_args,
+                             CHROME64_BUDGET_SECS * CLOCK64_HZ, 0);
         }
     }
 
+    reclaim_finished("end");
     serial64_puts("NOVARIS64: ---- bring-up complete ----\n");
 
     /* --- the input watch (Milestone 70) ------------------------------

@@ -123,6 +123,14 @@ PEDIR=$ROOT/usr/lib/wine/i386-windows
 BINDIR=$ROOT/usr/bin
 DATADIR=$ROOT/usr/share/wine
 
+# From empty, every time. The Makefile reruns this script whenever it
+# changes, into a staging directory it does not otherwise clear, so a
+# module taken off the lists below stayed installed from the previous
+# run - which is how appwiz.cpl, removed because it holds wineboot at a
+# dialog, was still in the image and still holding it. Only the two
+# directories that are Wine's and nobody else's.
+rm -rf "$ROOT/usr/lib/wine" "$DATADIR"
+
 mkdir -p "$UNIXDIR" "$PEDIR" "$BINDIR" "$DATADIR/nls" \
          "$ROOT/lib" "$ROOT/lib32" "$ROOT/etc"
 
@@ -224,6 +232,84 @@ for p in $PE_PROGS; do
     fi
 done
 
+# And what a prefix actually loads, which the lists above are not.
+#
+# They were written for the programs this OS runs, and they are enough
+# for those - but wineboot starts services, and a service is a module
+# nothing imports: the SCM opens it by name, so no dependency walk from
+# the programs ever reaches it. rpcss.exe was not here, so the RpcSs
+# service could not start, so every out-of-process COM call failed
+# ("err:ole:start_rpcss Failed to open RpcSs service", then
+# CoMarshalInterface with E_NOINTERFACE). atl100.dll was not here, so
+# every fake DLL wine.inf registers failed with "failed to create
+# IRegistrar". And svchost, plugplay, winedevice and the kernel drivers
+# were not here, so services.exe never finished starting its autostart
+# services and wineboot sat out Wine's whole five-minute boot timeout on
+# every fresh prefix ("run_wineboot boot event wait timed out").
+#
+# That was settled on the host, not in the emulator: the staged tree run
+# in a chroot on Linux shows every one of those errors, the full Wine
+# tree shows none of the three, and the difference in what loads is
+# this list.
+#
+# tools/wine_prefix_modules.txt is the 64-bit side's measured list,
+# closed under PE imports (tools/close_wine_modules.py), and it names
+# modules rather than architectures: every entry in it exists in the
+# i386 tree. The kernel drivers go in by extension for the same reason
+# stage_wine.sh gives. The last few are what the i386 run loads beyond
+# that list, measured the same way - and hal.dll, which i386's
+# ntoskrnl.exe imports and x86_64's does not, so a list closed under the
+# 64-bit tree's imports cannot have it. Without it ntoskrnl does not
+# load, so no driver does, so Winedevice never starts and wineboot waits
+# out its timeout for it. Checked by reading every staged module's
+# imports: with it, nothing staged imports a module the tree could
+# supply and does not.
+#
+# Not appwiz.cpl, although the i386 run loads it. It is the Add/Remove
+# Programs applet, and the one thing wineboot uses it for is
+# `control.exe appwiz.cpl install_mono` and its Gecko equivalent: a
+# dialog asking whether to download Wine Mono. Under a display driver
+# that dialog opens on the Wine desktop and waits for a click, and
+# wineboot waits for it - the first boot stopped there, every task
+# parked, until the run was killed. On the host it fails at once for
+# want of a display, which is why the reference run never showed it.
+# Without the applet the call fails the same way it does on the 64-bit
+# side, whose list has never had it, and the prefix finishes without
+# Mono and Gecko - which is the only outcome available on a machine
+# with nowhere to download them from.
+LIST="$(dirname "$0")/wine_prefix_modules.txt"
+find_pe() {
+    b=${1%.*}
+    for p in "$WINE_BUILD/dlls/$1/i386-windows/$1" \
+             "$WINE_BUILD/dlls/$b/i386-windows/$1" \
+             "$WINE_BUILD/programs/$b/i386-windows/$1"; do
+        [ -f "$p" ] && { echo "$p"; return 0; }
+    done
+    return 1
+}
+EXTRA_PE="hal.dll wineps.drv l3codecx.ax imaadp32.acm l3codeca.acm
+          msadp32.acm msg711.acm msgsm32.acm"
+for name in $(grep -v '^#' "$LIST" | grep -v '^[[:space:]]*$') $EXTRA_PE; do
+    [ -f "$PEDIR/$name" ] && continue
+    if src=$(find_pe "$name"); then
+        cp "$src" "$PEDIR/$name"
+    else
+        MISSING_DLLS="$MISSING_DLLS $name"
+    fi
+done
+for f in "$WINE_BUILD"/dlls/*.sys/i386-windows/*.sys; do
+    [ -f "$f" ] && cp "$f" "$PEDIR/$(basename "$f")"
+done
+# Every unix half the tree built, whichever module it belongs to: a PE
+# module with its unix half missing fails its process attach, which is
+# the c0000142 that ZwLoadDriver reported for mountmgr and nsiproxy on
+# the 64-bit side. They are small, and a list would be one more thing to
+# keep in step.
+for f in "$WINE_BUILD"/dlls/*/*.so; do
+    case $(basename "$f") in ntdll.so) continue ;; esac
+    cp "$f" "$UNIXDIR/$(basename "$f")"
+done
+
 # --- the display driver -------------------------------------------------
 #
 # Without one, every program with a window gets
@@ -290,24 +376,68 @@ if [ -d "$WINE_BUILD/fonts" ]; then
     cp "$WINE_BUILD"/fonts/*.ttf "$DATADIR/fonts/" 2>/dev/null || true
 fi
 
-# And the rasteriser, which is not in any binary's NEEDED list because
-# win32u dlopen()s it by SONAME - so the "ask the binaries" loop below
-# cannot find it. Named here, with what it needs, because a library
-# nothing links against is exactly the kind that gets forgotten.
-for lib in libfreetype.so.6 libz.so.1 libbz2.so.1.0 libpng16.so.16 \
-           libbrotlidec.so.1 libbrotlicommon.so.1; do
-    for dir in "$HOST_LIB32" /usr/lib/i386-linux-gnu; do
-        if [ -f "$dir/$lib" ]; then
-            cp "$dir/$lib" "$ROOT/lib32/$lib"
-            break
+# And the libraries win32u dlopen()s by SONAME, which are in no binary's
+# NEEDED list - so the "ask the binaries" loop below cannot find them.
+#
+# This was a hand-written list naming FreeType and what FreeType needs,
+# and it was wrong the moment a Wine was configured with fontconfig as
+# well: win32u then dlopens libfontconfig.so.1, finds FreeType without
+# it, and crashes in its font setup. That crash is inside init_user(),
+# before winstation_init(), so no process ever gets a window station -
+# what it looks like is "Cannot get server thread queue" and "failed to
+# create desktop window", with nothing anywhere naming a font. The
+# 64-bit side measured the same thing in Milestone 89: FreeType alone was
+# 865 segfaults, FreeType with fontconfig was 13.
+#
+# So the list is Wine's own config.h, as tools/stage_wine.sh does it: one
+# SONAME_* line per library this tree will dlopen, each resolved to the
+# host's i386 copy and closed under ldd, because a dlopen that fails on
+# a dependency is the same silence as one that fails on the library.
+CFG="$WINE_BUILD/include/config.h"
+if [ -f "$CFG" ]; then
+    staged=0 skipped=""
+    for so in $(sed -n 's/^#define SONAME_[A-Z0-9_]*  *"\(.*\)"/\1/p' "$CFG"); do
+        # ldconfig lists both architectures; "(libc6)" alone is i386.
+        path=$(ldconfig -p 2>/dev/null |
+               awk -v s="$so" '$1==s && $2=="(libc6)" {print $NF; exit}')
+        if [ -z "$path" ] || [ ! -f "$path" ]; then
+            skipped="$skipped $so"
+            continue
         fi
+        for pair in "$so|$path" $(ldd "$path" 2>/dev/null |
+                        sed -n 's/^[[:space:]]*\([^ ]*\) => \([^ ]*\).*/\1|\2/p'); do
+            name=${pair%%|*}
+            file=${pair#*|}
+            case "$name" in
+                # Staged below from HOST_LIB32, with the ld.so they match.
+                libc.so.6|libm.so.6|libgcc_s.so.1|ld-linux*) continue ;;
+            esac
+            [ -f "$file" ] || continue
+            cp "$file" "$ROOT/lib32/$name" && staged=$((staged+1))
+        done
     done
-done
+    echo "  $staged dlopen libraries and dependencies, from config.h"
+    [ -n "$skipped" ] && echo "  not on this host:$skipped"
+else
+    echo "  no config.h at $CFG - no dlopen libraries staged" >&2
+fi
+
 # The NLS tables, whole rather than hand-picked: wineserver calls
 # fatal_error() if it cannot load l_intl.nls, and kernelbase's
 # init_locale walks sortdefault.nls without checking that it got it. A
 # missing table does not announce itself.
 cp "$WINE_BUILD"/nls/*.nls "$DATADIR/nls/"
+# The Windows Runtime metadata, which wine.inf's [WineSourceDirs] copies
+# into system32\winmetadata from <data dir>/winmd. A Wine built in its
+# own tree keeps them under include/, so nothing put them where the copy
+# looks - and the copy does not give up. rundll32 spent every run after
+# atl100.dll was staged statting windows.applicationmodel.winmd in a
+# loop, at full CPU, which is how a fresh prefix stopped finishing at
+# all. The 64-bit side found the same loop first (tools/stage_wine.sh).
+mkdir -p "$DATADIR/winmd"
+for f in "$WINE_BUILD"/include/*.winmd; do
+    [ -f "$f" ] && cp "$f" "$DATADIR/winmd/"
+done
 
 # --- the host's C library ----------------------------------------------
 #
@@ -337,6 +467,25 @@ done | sort -u | while read -r lib; do
     echo "  + $lib (needed by a Wine binary)"
     cp "$HOST_LIB32/$lib" "$ROOT/lib32/$lib"
 done
+
+# --- fontconfig's configuration --------------------------------------
+#
+# win32u dlopens fontconfig (see the dlopen libraries above), and
+# fontconfig with no /etc/fonts/fonts.conf says so on stderr - "Cannot
+# load default config file" - once per process. Several processes share
+# the serial port, so that line lands in the middle of other programs'
+# output: test-wine-persist failed on "argv[Fontconfig error: ..." with
+# the program's own line cut in two. The fonts it should know about are
+# Wine's own, staged above, and its cache has nowhere persistent to go.
+mkdir -p "$ROOT/etc/fonts"
+cat > "$ROOT/etc/fonts/fonts.conf" <<'FONTSCONF'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <dir>/usr/share/wine/fonts</dir>
+  <cachedir>/tmp/fontconfig</cachedir>
+</fontconfig>
+FONTSCONF
 
 # --- the two files glibc's getpwuid() needs -----------------------------
 #

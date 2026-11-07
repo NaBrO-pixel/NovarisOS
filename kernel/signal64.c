@@ -4,7 +4,9 @@
 #include "kstring.h"
 #include "serial64.h"
 #include "proc64.h"
+#include "sched64.h"
 #include "paging64.h"
+#include "uspace64.h"
 
 #define NSIG 64
 
@@ -48,7 +50,339 @@ static ksigaction64_t* handlers_of(int slot) {
 }
 
 #define handlers (handlers_of(proc64_current_slot()))
-static uint64_t delivered, returns;
+static uint64_t delivered, returns, raised;
+
+/* What kill(2) has recorded and the target has not acted on yet, one
+ * bit per signal, indexed by process slot exactly as the handler table
+ * is. A set rather than a queue: this is the non-realtime behaviour,
+ * where a second SIGTERM arriving before the first is taken does not
+ * produce two SIGTERMs. Linux does the same for signals below 32. */
+static uint64_t pending_by_slot[PROC64_MAX];
+
+/* The same thing for a signal addressed to one thread rather than to a
+ * process, indexed by task slot - which is what a tid is here.
+ *
+ * Linux keeps these two sets apart and so must this: kill(2) may be
+ * taken by whichever thread reaches the boundary first, but tgkill(2)
+ * names a thread, and the wineserver's use of it depends on that. It
+ * stops a thread by sending it SIGUSR1 and then asks that thread for
+ * its register context; delivered to a sibling, the context handed back
+ * would be the wrong thread's and the suspended one would never stop. */
+static uint64_t pending_by_task[SCHED64_MAX_TASKS];
+
+/* Who raised each pending signal, for the siginfo rt_sigtimedwait hands
+ * back: the pid of the process that called kill or tgkill. One per
+ * signal, like the pending bits - a second raise before the first is
+ * taken overwrites it, as Linux's non-realtime signals coalesce. */
+static int sender_by_slot[PROC64_MAX][NSIG];
+static int sender_by_task[SCHED64_MAX_TASKS][NSIG];
+
+/* Each thread's blocked set, in the same encoding as the pending sets -
+ * bit `sig`, where a user sigset_t has bit sig-1 - and per thread
+ * because that is what a signal mask is on Linux.
+ *
+ * rt_sigprocmask was accepted and ignored, on the reasoning that masking
+ * only matters for asynchronous signals. It matters as much for a fault
+ * in a handler: Linux blocks the signal being handled, so a second
+ * SIGSEGV inside a SIGSEGV handler finds it blocked and kills the
+ * process, where this kernel delivered it again - and again. That is how
+ * one Wine thread whose stack had been freed under it took 5.8 million
+ * SIGSEGVs and spun through the rest of the run instead of dying.
+ *
+ * And Wine leans on masks everywhere else: it blocks its server signals
+ * around every call to the wineserver, and a SIGUSR1 suspend arriving
+ * inside one of those calls has to wait for it to finish. */
+static uint64_t blocked_by_task[SCHED64_MAX_TASKS];
+
+/* The mask a thread had before rt_sigsuspend or ppoll replaced it for
+ * the length of the call, and whether there is one. Linux's
+ * saved_sigmask.
+ *
+ * It is what the call's caller gets back, but not necessarily when the
+ * call returns: if the call ends because a handler is about to run, the
+ * handler runs under the temporary mask (plus its own) and the saved one
+ * goes into the frame, so it comes back at rt_sigreturn. That is the
+ * whole point of sigsuspend - the window in which the signal may arrive
+ * is exactly the call, and nothing between the unblock and the sleep. */
+static uint64_t saved_by_task[SCHED64_MAX_TASKS];
+static uint8_t  has_saved_by_task[SCHED64_MAX_TASKS];
+
+/* SIGKILL and SIGSTOP cannot be blocked; Linux drops them from any mask
+ * it is given rather than refusing the call. */
+#define UNBLOCKABLE ((1ull << SIG64_KILLSIG) | (1ull << SIG64_STOP))
+
+/* Each thread's alternate signal stack - see on_altstack below. */
+static uint64_t sas_sp_by_task[SCHED64_MAX_TASKS];
+static uint64_t sas_size_by_task[SCHED64_MAX_TASKS];
+
+static int my_task(void) {
+    int t = sched64_current();
+    return (t >= 0 && t < SCHED64_MAX_TASKS) ? t : -1;
+}
+
+static uint64_t* my_blocked(void) {
+    int t = sched64_current();
+    static uint64_t none;
+    if (t < 0 || t >= SCHED64_MAX_TASKS) { none = 0; return &none; }
+    return &blocked_by_task[t];
+}
+
+/* A user sigset_t's first word and the kernel's encoding, both ways. */
+static uint64_t from_user_set(uint64_t u) { return (u << 1) & ~UNBLOCKABLE; }
+static uint64_t to_user_set(uint64_t k)   { return k >> 1; }
+
+/* Replaces the calling thread's mask with `user_set` for the length of
+ * a call. A call that parks is re-issued from the start when it wakes,
+ * so this is reached again on every turn; only the first saves, or the
+ * second would save the temporary mask as the one to go back to. */
+void signal64_push_mask(uint64_t user_set) {
+    int t = sched64_current();
+    if (t < 0 || t >= SCHED64_MAX_TASKS) return;
+    if (!has_saved_by_task[t]) {
+        saved_by_task[t] = blocked_by_task[t];
+        has_saved_by_task[t] = 1;
+    }
+    blocked_by_task[t] = from_user_set(user_set);
+}
+
+/* Puts the saved mask back, if there is one. Returns 1 if there was. */
+int signal64_pop_mask(void) {
+    int t = sched64_current();
+    if (t < 0 || t >= SCHED64_MAX_TASKS || !has_saved_by_task[t]) return 0;
+    blocked_by_task[t] = saved_by_task[t];
+    has_saved_by_task[t] = 0;
+    return 1;
+}
+
+uint64_t signal64_blocked(int tid) {
+    if (tid < 0 || tid >= SCHED64_MAX_TASKS) return 0;
+    return blocked_by_task[tid];
+}
+
+int signal64_sigprocmask(int how, const uint64_t* set, uint64_t* oldset,
+                         uint64_t setsize) {
+    uint64_t* b = my_blocked();
+    uint64_t was = *b;
+
+    /* Linux insists on its own sigset_t size, eight bytes, and glibc
+     * always passes it. */
+    if (setsize != 8) return -22;                       /* -EINVAL */
+
+    if (set) {
+        uint64_t k = from_user_set(*set);
+        switch (how) {
+        case SIG64_BLOCK:   *b = was | k;  break;
+        case SIG64_UNBLOCK: *b = was & ~k; break;
+        case SIG64_SETMASK: *b = k;        break;
+        default:            return -22;                 /* -EINVAL */
+        }
+    }
+    if (oldset) *oldset = to_user_set(was);
+    return 0;
+}
+
+/* What is pending for the calling thread, blocked or not - which is the
+ * question rt_sigpending asks. */
+uint64_t signal64_sigpending(void) {
+    int t = sched64_current();
+    int slot = proc64_current_slot();
+    uint64_t k = 0;
+    if (t >= 0 && t < SCHED64_MAX_TASKS) k |= pending_by_task[t];
+    if (slot >= 0 && slot < PROC64_MAX)  k |= pending_by_slot[slot];
+    return to_user_set(k) & *my_blocked() >> 1;
+}
+
+/* A new task's mask: its creator's, as clone and fork give it on Linux,
+ * or empty for a task with no creator - the first one of a run. */
+void signal64_task_start(int tid, int from_tid) {
+    if (tid < 0 || tid >= SCHED64_MAX_TASKS) return;
+    pending_by_task[tid] = 0;
+    blocked_by_task[tid] = (from_tid >= 0 && from_tid < SCHED64_MAX_TASKS)
+                         ? blocked_by_task[from_tid] : 0;
+    /* Inside a sigsuspend is not something a new thread can be. And
+     * clone is never called from inside one, so the creator's own
+     * blocked set is its real mask. */
+    has_saved_by_task[tid] = 0;
+    /* And no alternate stack: a new thread's is wherever it registers
+     * one. fork copies the creator's afterwards - see below. */
+    sas_sp_by_task[tid] = sas_size_by_task[tid] = 0;
+}
+
+/* Whether the default action for a signal is to ignore it.
+ *
+ * The rest end the process, and getting this list wrong is not a
+ * subtle failure: SIGCHLD is sent to every process whose child exits,
+ * and a kernel that treats an uncaught SIGCHLD as fatal would kill
+ * every parent in the system the moment it reaped anything. */
+static int default_is_ignore(int sig) {
+    switch (sig) {
+    case SIG64_CHLD: case SIG64_CONT: case SIG64_URG: case SIG64_WINCH:
+        return 1;
+
+    /* The four stopping signals, recorded and dropped. There is no job
+     * control here - nothing to stop a process into, and nothing to
+     * continue it from - so this is wrong in a way worth naming: a
+     * program sent SIGSTOP keeps running. It is the lesser wrong.
+     * Treating them as fatal would end processes that Linux merely
+     * pauses, which is a difference a test could not recover from. */
+    case SIG64_STOP: case SIG64_TSTP: case SIG64_TTIN: case SIG64_TTOU:
+        return 1;
+
+    default:
+        return 0;
+    }
+}
+
+int signal64_disposition(int pid, int sig) {
+    const ksigaction64_t* h;
+
+    if (sig <= 0 || sig >= NSIG) return SIG64_DISP_IGNORE;
+
+    /* SIGKILL cannot be caught or ignored. Linux refuses to install a
+     * handler for it in sigaction; this kernel's sigaction does not
+     * refuse, so the rule is enforced here, where it is acted on -
+     * otherwise a process could make itself unkillable by installing
+     * one. */
+    if (sig == SIG64_KILLSIG) return SIG64_DISP_TERM;
+
+    h = handlers_of(proc64_slot_of(pid));
+    if (h[sig].handler == SIG64_IGN) return SIG64_DISP_IGNORE;
+    if (h[sig].handler)              return SIG64_DISP_HANDLER;
+    return default_is_ignore(sig) ? SIG64_DISP_IGNORE : SIG64_DISP_TERM;
+}
+
+int signal64_raise(int pid, int sig) {
+    int slot = proc64_slot_of(pid);
+
+    if (sig <= 0 || sig >= NSIG)     return -22;       /* -EINVAL */
+    if (slot < 0 || slot >= PROC64_MAX) return -3;     /* -ESRCH  */
+
+    pending_by_slot[slot] |= 1ull << sig;
+    sender_by_slot[slot][sig] = proc64_current_pid();
+    raised++;
+    return 0;
+}
+
+/* These, and their _task forms below, answer for the calling thread:
+ * what it blocks is not pending as far as it is concerned, and stays
+ * set for a thread that does not block it, or for later. */
+int signal64_has_pending(int pid) {
+    int slot = proc64_slot_of(pid);
+    if (slot < 0 || slot >= PROC64_MAX) return 0;
+    return (pending_by_slot[slot] & ~*my_blocked()) != 0;
+}
+
+int signal64_take_pending(int pid) {
+    int slot = proc64_slot_of(pid);
+    uint64_t set;
+
+    if (slot < 0 || slot >= PROC64_MAX) return 0;
+    set = pending_by_slot[slot] & ~*my_blocked();
+    if (!set) return 0;
+
+    for (int sig = 1; sig < NSIG; sig++) {
+        if (!(set & (1ull << sig))) continue;
+        pending_by_slot[slot] &= ~(1ull << sig);
+        return sig;
+    }
+    return 0;
+}
+
+int signal64_raise_task(int tid, int sig) {
+    if (sig <= 0 || sig >= NSIG)            return -22;  /* -EINVAL */
+    if (tid < 0 || tid >= SCHED64_MAX_TASKS) return -3;  /* -ESRCH  */
+    if (sched64_task_pid(tid) < 0)           return -3;  /* -ESRCH  */
+
+    pending_by_task[tid] |= 1ull << sig;
+    sender_by_task[tid][sig] = proc64_current_pid();
+    raised++;
+    return 0;
+}
+
+int signal64_has_pending_task(int tid) {
+    if (tid < 0 || tid >= SCHED64_MAX_TASKS) return 0;
+    return (pending_by_task[tid] & ~blocked_by_task[tid]) != 0;
+}
+
+int signal64_take_pending_task(int tid) {
+    uint64_t set;
+
+    if (tid < 0 || tid >= SCHED64_MAX_TASKS) return 0;
+    set = pending_by_task[tid] & ~blocked_by_task[tid];
+    if (!set) return 0;
+
+    for (int sig = 1; sig < NSIG; sig++) {
+        if (!(set & (1ull << sig))) continue;
+        pending_by_task[tid] &= ~(1ull << sig);
+        return sig;
+    }
+    return 0;
+}
+
+/* rt_sigtimedwait's dequeue: the lowest signal in `user_set` that is
+ * pending for the calling thread, blocked or not - the thread's own
+ * first, then its process's, as delivery takes them. Taken off the
+ * pending set, and described: whether it was sent to the thread
+ * (tgkill) or the process (kill), and by whom. 0 if none. */
+int signal64_take_in_set(uint64_t user_set, int* to_thread, int* sender) {
+    uint64_t want = from_user_set(user_set);
+    int t = sched64_current();
+    int slot = proc64_current_slot();
+
+    for (int pass = 0; pass < 2; pass++) {
+        uint64_t* set;
+        if (pass == 0) {
+            if (t < 0 || t >= SCHED64_MAX_TASKS) continue;
+            set = &pending_by_task[t];
+        } else {
+            if (slot < 0 || slot >= PROC64_MAX) continue;
+            set = &pending_by_slot[slot];
+        }
+        for (int sig = 1; sig < NSIG; sig++) {
+            if (!(*set & want & (1ull << sig))) continue;
+            *set &= ~(1ull << sig);
+            if (to_thread) *to_thread = pass == 0;
+            if (sender) *sender = pass == 0 ? sender_by_task[t][sig]
+                                            : sender_by_slot[slot][sig];
+            return sig;
+        }
+    }
+    return 0;
+}
+
+/* Is anything in `user_set` pending for the calling thread, blocked or
+ * not? What poll asks of a signalfd. */
+int signal64_pending_in_set(uint64_t user_set) {
+    uint64_t want = from_user_set(user_set), have = 0;
+    int t = sched64_current();
+    int slot = proc64_current_slot();
+    if (t >= 0 && t < SCHED64_MAX_TASKS) have |= pending_by_task[t];
+    if (slot >= 0 && slot < PROC64_MAX)  have |= pending_by_slot[slot];
+    return (have & want) != 0;
+}
+
+/* Task slots are recycled, so a new thread must not inherit what was
+ * addressed to the one that used to live in its slot. clone(2) and
+ * fork(2) call this for the slot they were given. */
+void signal64_clear_task(int tid) {
+    if (tid < 0 || tid >= SCHED64_MAX_TASKS) return;
+    pending_by_task[tid] = 0;
+}
+
+/* What is pending without taking any of it, so that a caller about to
+ * block can ask whether it should return -EINTR instead. */
+uint64_t signal64_pending_set(int pid) {
+    int slot = proc64_slot_of(pid);
+    if (slot < 0 || slot >= PROC64_MAX) return 0;
+    return pending_by_slot[slot] & ~*my_blocked();
+}
+
+uint64_t signal64_pending_set_task(int tid) {
+    if (tid < 0 || tid >= SCHED64_MAX_TASKS) return 0;
+    return pending_by_task[tid] & ~blocked_by_task[tid];
+}
+
+uint64_t signal64_raised(void) { return raised; }
 
 void signal64_reset(void) {
     for (int i = 0; i < NSIG; i++) {
@@ -57,8 +391,22 @@ void signal64_reset(void) {
         handlers[i].restorer = 0;
         handlers[i].mask     = 0;
     }
+    /* Every slot, not just this one. The handler table above is reset
+     * per process because that is what sigaction owns, but a pending
+     * signal belongs to a process that may since have gone: leaving a
+     * bit set means the next process to land in that slot inherits a
+     * SIGTERM nobody sent it. */
+    for (int i = 0; i < PROC64_MAX; i++) pending_by_slot[i] = 0;
+    for (int i = 0; i < SCHED64_MAX_TASKS; i++) {
+        pending_by_task[i] = 0;
+        blocked_by_task[i] = 0;
+        has_saved_by_task[i] = 0;
+        sas_sp_by_task[i] = sas_size_by_task[i] = 0;
+    }
+
     delivered = 0;
     returns = 0;
+    raised = 0;
 }
 
 /* fork(2): the child starts with the parent's handlers.
@@ -69,6 +417,13 @@ void signal64_reset(void) {
 void signal64_fork(int parent_pid, int child_pid) {
     ksigaction64_t* from = handlers_of(proc64_slot_of(parent_pid));
     ksigaction64_t* to   = handlers_of(proc64_slot_of(child_pid));
+    int cslot = proc64_slot_of(child_pid);
+
+    /* The child starts with nothing pending, which is Linux's rule and
+     * is also what stops a recycled slot from carrying a dead process's
+     * signals into a live one. */
+    if (cslot >= 0 && cslot < PROC64_MAX) pending_by_slot[cslot] = 0;
+
     if (from == to) return;
     for (int i = 0; i < NSIG; i++) to[i] = from[i];
 }
@@ -83,6 +438,10 @@ void signal64_fork(int parent_pid, int child_pid) {
  * entitled to keep not caring. */
 void signal64_exec(void) {
     ksigaction64_t* h = handlers_of(proc64_current_slot());
+    int t = my_task();
+
+    /* The alternate stack was an address in the old image. */
+    if (t >= 0) sas_sp_by_task[t] = sas_size_by_task[t] = 0;
     for (int i = 0; i < NSIG; i++) {
         if (h[i].handler == SIG64_IGN) continue;
         h[i].handler  = 0;
@@ -121,43 +480,68 @@ static inline uint64_t read_msr_base(uint32_t msr) {
 static int signal_trace;
 void signal64_set_trace(int on) { signal_trace = on; }
 
-/* Is `sp` inside the alternate stack? A handler that faults again while
- * already running on the alternate stack must not be given a second
+/* The alternate signal stack, per thread - which is what it is on
+ * Linux, and what Wine assumes: every thread it starts registers its own,
+ * inside its own TEB block.
+ *
+ * It was per process, and before that global; the per-process comment
+ * said plainly that this was wrong for multithreaded programs and would
+ * be wrong "in the same direction as before". It was, and this is what it
+ * looked like: winedevice.exe crashing during every first wineboot, at a
+ * different place each run. Each new thread's sigaltstack replaced the
+ * process's, so every thread's signals were delivered onto the last
+ * thread's stack. Two threads taking signals at once wrote their frames
+ * over each other, and rt_sigreturn then restored somebody else's half-
+ * written context: rip 0 in one thread, and rip 0x001b000000000023 - the
+ * ss and cs words of a sigcontext - in another.
+ *
+ * ss_size 0 means none set. */
+/* (sas_sp_by_task and sas_size_by_task are declared with the blocked
+ * sets at the top of the file.) */
+
+/* Is `sp` inside the calling thread's alternate stack? A handler that
+ * faults again while already running on it must not be given a second
  * frame at the same place - Linux keeps delivering on the current stack
  * in that case, and so does this. */
-/* The alternate stack lives on the process, not on this file: three
- * processes register one in a single prefix run, and a global would
- * deliver one process's signal onto another's stack. ss_size 0 means
- * none set. */
 static int on_altstack(uint64_t sp) {
-    proc64_t* p = proc64_current();
-    return p && p->sas_size &&
-           sp >= p->sas_sp && sp < p->sas_sp + p->sas_size;
+    int t = my_task();
+    return t >= 0 && sas_size_by_task[t] &&
+           sp >= sas_sp_by_task[t] && sp < sas_sp_by_task[t] + sas_size_by_task[t];
+}
+
+/* fork and vfork: the child is a copy of the calling thread, alternate
+ * stack included. Called after signal64_task_start, which clears it -
+ * the right answer for a new thread, whose stack is somewhere else. */
+void signal64_task_inherit_altstack(int tid, int from_tid) {
+    if (tid < 0 || tid >= SCHED64_MAX_TASKS) return;
+    if (from_tid < 0 || from_tid >= SCHED64_MAX_TASKS) return;
+    sas_sp_by_task[tid]   = sas_sp_by_task[from_tid];
+    sas_size_by_task[tid] = sas_size_by_task[from_tid];
 }
 
 int signal64_sigaltstack(const altstack64_t* ss, altstack64_t* oss,
                          uint64_t cur_rsp) {
-    proc64_t* p = proc64_current();
+    int t = my_task();
 
-    if (!p) return -22;                                /* -EINVAL */
+    if (t < 0) return -22;                             /* -EINVAL */
     if (oss) {
-        oss->ss_sp    = p->sas_sp;
-        oss->ss_size  = p->sas_size;
+        oss->ss_sp    = sas_sp_by_task[t];
+        oss->ss_size  = sas_size_by_task[t];
         oss->ss_flags = on_altstack(cur_rsp) ? SS_ONSTACK
-                      : (p->sas_size ? 0 : SS_DISABLE);
+                      : (sas_size_by_task[t] ? 0 : SS_DISABLE);
         oss->__pad    = 0;
     }
     if (ss) {
         /* Changing it while running on it is what Linux refuses, and
          * for the obvious reason: the frame under the caller's feet
          * would move. */
-        if (on_altstack(cur_rsp)) return -16;          /* -EPERM/-EBUSY */
+        if (on_altstack(cur_rsp)) return -1;           /* -EPERM */
         if (ss->ss_flags & SS_DISABLE) {
-            p->sas_sp = p->sas_size = 0;
+            sas_sp_by_task[t] = sas_size_by_task[t] = 0;
         } else {
             if (ss->ss_size < 2048) return -12;        /* -ENOMEM */
-            p->sas_sp   = ss->ss_sp;
-            p->sas_size = ss->ss_size;
+            sas_sp_by_task[t]   = ss->ss_sp;
+            sas_size_by_task[t] = ss->ss_size;
         }
     }
     return 0;
@@ -178,17 +562,32 @@ int signal64_sigaltstack(const altstack64_t* ss, altstack64_t* oss,
  * had just run out, on behalf of the fault that said so. */
 static int range_present(uint64_t addr, uint64_t len) {
     uint64_t p, phys;
+    /* A signal stack nobody has written to yet is not there until the
+     * frame is written onto it: back it first. */
     for (p = addr & ~0xFFFULL; p < addr + len; p += 0x1000)
-        if (paging64_translate(p, &phys) != 0) return 0;
+        if (paging64_translate(p, &phys) != 0 && !uspace64_fault(p, 1))
+            return 0;
     return 1;
 }
 
 int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
     const ksigaction64_t* sa;
     rt_sigframe64_t* frame;
-    uint64_t sp;
+    uint64_t sp, fpsp;
 
     if (sig <= 0 || sig >= NSIG) return 0;
+
+    /* Blocked. Every asynchronous caller has already left blocked
+     * signals pending rather than come here, so this is a fault - a
+     * SIGSEGV or SIGTRAP the thread itself caused - and Linux's answer
+     * to a fault the thread is blocking is to kill it (force_sig takes
+     * the block off and resets the handler, and the default ends the
+     * process). Saying "not handled" gives the caller exactly that.
+     *
+     * This is the case that used to loop: a SIGSEGV handler that
+     * faults, with SIGSEGV blocked because the handler is running. */
+    if (*my_blocked() & (1ull << sig)) return 0;
+
     sa = &handlers[sig];
     if (!sa->handler) return 0;
     /* SIG_IGN is the value 1, not an address. Without this the check
@@ -214,13 +613,20 @@ int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
      * corrupt the interrupted function's locals. The alternate stack
      * has no such caller to protect, so the frame starts at its top. */
     {
-        proc64_t* me = proc64_current();
-        if ((sa->flags & SA_ONSTACK) && me && me->sas_size &&
+        int t = my_task();
+        if ((sa->flags & SA_ONSTACK) && t >= 0 && sas_size_by_task[t] &&
             !on_altstack(r->rsp))
-            sp = me->sas_sp + me->sas_size;
+            sp = sas_sp_by_task[t] + sas_size_by_task[t];
         else
             sp = r->rsp - 128;
     }
+    /* The x87/SSE state, in the FXSAVE layout Linux uses, above the
+     * frame and 64-byte aligned. A handler that touches an xmm register
+     * or MXCSR would otherwise hand its leftovers to the code it
+     * interrupted, and Wine - which reads a thread's floating-point
+     * context out of here as uc_mcontext.fpregs - found NULL. */
+    sp = (sp - 512) & ~63ULL;
+    fpsp = sp;
     sp -= sizeof(rt_sigframe64_t);
 
     /* Aligned the way a `call` leaves the stack, not the way a 16-byte
@@ -256,7 +662,7 @@ int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
      * back the fault it was trying to deliver, which reports and halts
      * the machine - the same outcome, minus a kernel-mode page fault
      * on the way to it, and with the original address still in cr2. */
-    if (!range_present(sp, sizeof(rt_sigframe64_t))) return 0;
+    if (!range_present(sp, fpsp + 512 - sp)) return 0;
 
     frame = (rt_sigframe64_t*)sp;
 
@@ -322,6 +728,26 @@ int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
     frame->uc.uc_mcontext.err    = r->err_code;
     frame->uc.uc_mcontext.trapno = r->int_no;
     frame->uc.uc_mcontext.cr2    = fault_addr;
+    /* The kernel is built without SSE, so the registers are still the
+     * interrupted thread's own. */
+    __asm__ __volatile__("fxsave64 (%0)" :: "r"(fpsp) : "memory");
+    frame->uc.uc_mcontext.fpstate = fpsp;
+
+    /* The mask to go back to, where rt_sigreturn will look for it - and
+     * where a handler that wants to change it on return can. */
+    {
+        /* Inside rt_sigsuspend or ppoll, the mask to return to is the
+         * one the call replaced, not the temporary one - and the call is
+         * over, so it is no longer saved anywhere else. */
+        int t = sched64_current();
+        uint64_t back = *my_blocked();
+        if (t >= 0 && t < SCHED64_MAX_TASKS && has_saved_by_task[t]) {
+            back = saved_by_task[t];
+            has_saved_by_task[t] = 0;
+        }
+        frame->uc.uc_sigmask[0]       = to_user_set(back);
+        frame->uc.uc_mcontext.oldmask = frame->uc.uc_sigmask[0];
+    }
 
     /* siginfo: si_signo, si_errno, si_code, then si_addr for a fault.
      * Written as words rather than through a struct because only these
@@ -342,6 +768,21 @@ int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
      * and traps off so a single-stepping debugger does not fire inside
      * the handler's first instruction. */
     r->rflags &= ~((uint64_t)(1 << 10) | (uint64_t)(1 << 8));
+
+    /* For the handler's duration: what sigaction asked to block, and
+     * the signal itself unless SA_NODEFER said otherwise. */
+    *my_blocked() |= from_user_set(sa->mask);
+    if (!(sa->flags & SA_NODEFER)) *my_blocked() |= 1ull << sig;
+    *my_blocked() &= ~UNBLOCKABLE;
+
+    /* SA_RESETHAND: one delivery, then back to the default. */
+    if (sa->flags & SA_RESETHAND) {
+        ksigaction64_t* h = &handlers[sig];
+        h->handler = 0;
+        h->flags = 0;
+        h->restorer = 0;
+        h->mask = 0;
+    }
 
     delivered++;
     return 1;
@@ -382,6 +823,23 @@ int signal64_sigreturn(uint64_t user_rsp, registers64_t* out) {
     out->cs     = 0x23;
     out->ss     = 0x1B;
     out->rflags = (sc->eflags & 0x0CD5ULL) | 0x202ULL;
+
+    /* The mask from before the handler ran - or whatever the handler
+     * wrote there, which is a documented way to change it on return. */
+    *my_blocked() = from_user_set(uc->uc_sigmask[0]);
+
+    /* And the floating-point state the handler may have changed - or
+     * that it changed on purpose, through fpregs, as Wine does when it
+     * resumes a thread in a different context. Copied in and checked
+     * first: FXRSTOR faults in the kernel on an MXCSR with reserved bits
+     * set, and those bits are whatever ring 3 left there. */
+    if (sc->fpstate && !(sc->fpstate & 15) && range_present(sc->fpstate, 512)) {
+        static uint8_t fx[512] __attribute__((aligned(16)));
+        const uint8_t* src = (const uint8_t*)sc->fpstate;
+        for (int i = 0; i < 512; i++) fx[i] = src[i];
+        *(uint32_t*)(fx + 24) &= 0xFFFFu;               /* MXCSR */
+        __asm__ __volatile__("fxrstor64 (%0)" :: "r"(fx) : "memory");
+    }
 
     returns++;
     return 1;

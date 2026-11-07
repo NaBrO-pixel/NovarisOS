@@ -72,11 +72,22 @@ static uint64_t alloc_hint;              /* where the last upward scan left off 
 static uint64_t high_hint;               /* and the downward one */
 static int      ready;
 
+/* How many of the frame_count frames are marked used, kept as the bits
+ * change rather than counted when asked. Counting meant reading the
+ * whole bitmap - 400KB in a 12G machine - and the out-of-memory reserve
+ * asks on every page a process touches: a headless Chromium run went
+ * from 25 minutes to over an hour on that alone. */
+static uint64_t used_count;
+
 static inline void bitmap_set(uint64_t bit) {
-    bitmap[bit >> 3] |= (uint8_t)(1u << (bit & 7));
+    uint8_t m = (uint8_t)(1u << (bit & 7));
+    if (!(bitmap[bit >> 3] & m) && bit < frame_count) used_count++;
+    bitmap[bit >> 3] |= m;
 }
 static inline void bitmap_clear(uint64_t bit) {
-    bitmap[bit >> 3] &= (uint8_t)~(1u << (bit & 7));
+    uint8_t m = (uint8_t)(1u << (bit & 7));
+    if ((bitmap[bit >> 3] & m) && bit < frame_count) used_count--;
+    bitmap[bit >> 3] &= (uint8_t)~m;
 }
 static inline int bitmap_test(uint64_t bit) {
     return bitmap[bit >> 3] & (uint8_t)(1u << (bit & 7));
@@ -218,6 +229,7 @@ void pmm64_init(const multiboot_info_t* mbi,
      * The reverse - assume free, mark the exceptions - hands out MMIO and
      * firmware whenever the map has a hole nobody described. */
     for (uint64_t i = 0; i < bitmap_size_bytes; i++) bitmap[i] = 0xFF;
+    used_count = frame_count;
     for_each_available(mbi, free_region);
 
     /* The first megabyte is never ours: real-mode IVT, BDA, VGA, and the
@@ -252,6 +264,11 @@ uint64_t pmm64_alloc_frame(void) {
         uint64_t start = pass == 0 ? alloc_hint : 0;
         uint64_t stop  = pass == 0 ? frame_count : alloc_hint;
         for (uint64_t f = start; f < stop; f++) {
+            /* A byte with every frame taken is passed in one test. */
+            if ((f & 7) == 0 && f + 8 <= stop && bitmap[f >> 3] == 0xFF) {
+                f += 7;
+                continue;
+            }
             if (!bitmap_test(f)) {
                 bitmap_set(f);
                 watch_report("ALLOCATED to a new owner", f);
@@ -278,6 +295,22 @@ uint64_t pmm64_alloc_frame(void) {
  * more than a single test that reaches high memory on purpose: the claim
  * "where a frame lives no longer matters" is only believable if the
  * ordinary path is the one exercising it. */
+static int user_oom;
+
+uint64_t pmm64_alloc_user(void) {
+    uint64_t f;
+    if (pmm64_free_frames() < PMM64_USER_RESERVE) { user_oom = 1; return 0; }
+    f = pmm64_alloc_high();
+    if (!f) user_oom = 1;
+    return f;
+}
+
+int pmm64_take_user_oom(void) {
+    int was = user_oom;
+    user_oom = 0;
+    return was;
+}
+
 uint64_t pmm64_alloc_high(void) {
     if (!ready) return 0;
     if (high_hint > frame_count) high_hint = frame_count;
@@ -286,6 +319,12 @@ uint64_t pmm64_alloc_high(void) {
         uint64_t start = pass == 0 ? high_hint : frame_count;
         uint64_t stop  = pass == 0 ? 0 : high_hint;
         for (uint64_t f = start; f-- > stop; ) {
+            /* Walking down: at the top bit of a full byte, skip to the
+             * byte below - one test for eight taken frames. */
+            if ((f & 7) == 7 && f >= stop + 7 && bitmap[f >> 3] == 0xFF) {
+                f -= 7;
+                continue;
+            }
             if (!bitmap_test(f)) {
                 bitmap_set(f);
                 watch_report("ALLOCATED to a new owner", f);
@@ -365,12 +404,34 @@ void pmm64_free_frame(uint64_t phys) {
 
 uint64_t pmm64_total_frames(void) { return ready ? frame_count : 0; }
 
+/* Counted rather than tracked, as before, so it cannot drift from the
+ * bitmap - but a byte at a time instead of a bit at a time. A bit at a
+ * time over half a million frames was 9.6 million cycles a call, and
+ * statfs answers with it: Wine asks how much room a drive has every time
+ * it looks at one, 4,606 times in a first wineboot, which made fstatfs
+ * 12% of the whole boot. A used byte - the common case at the bottom of
+ * memory - costs one test, and the rest a table lookup. */
 uint64_t pmm64_free_frames(void) {
-    uint64_t n = 0;
     if (!ready) return 0;
-    for (uint64_t f = 0; f < frame_count; f++)
-        if (!bitmap_test(f)) n++;
-    return n;
+    return frame_count - used_count;
+}
+
+/* The same number counted from the bitmap itself, which is what the
+ * running count above has to agree with - the bring-up checks it. */
+uint64_t pmm64_free_frames_scanned(void) {
+    static const uint8_t used_bits[16] = {
+        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4
+    };
+    uint64_t used = 0, whole = frame_count / 8;
+    if (!ready) return 0;
+    for (uint64_t b = 0; b < whole; b++) {
+        uint8_t v = bitmap[b];
+        if (v == 0xFF) { used += 8; continue; }
+        used += used_bits[v & 0xF] + used_bits[v >> 4];
+    }
+    for (uint64_t f = whole * 8; f < frame_count; f++)
+        if (bitmap_test(f)) used++;
+    return frame_count - used;
 }
 
 uint64_t pmm64_used_frames(void) {

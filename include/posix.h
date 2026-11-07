@@ -41,6 +41,7 @@
 #define SYS_open             5
 #define SYS_close            6
 #define SYS_waitpid          7
+#define SYS_link             9
 #define SYS_unlink          10
 #define SYS_chdir           12
 #define SYS_rename          38
@@ -130,6 +131,8 @@
 #define SYS_getrusage       77
 #define SYS_gettimeofday    78
 #define SYS_symlink         83
+#define SYS_fadvise64_64   272
+#define SYS_linkat         303
 #define SYS_symlinkat      304
 /* Setting a file's times. Milestone 35: Wine's setupapi sets them on
  * every file it copies into a prefix, and -ENOSYS there turned each copy
@@ -494,6 +497,11 @@ int      posix_fd_install_socket(struct socket* s);
 struct socket* posix_fd_socket(int fd);
 uint32_t posix_fd_export(int fd);
 int      posix_fd_import(uint32_t token);
+/* Releases a token that will never be imported - see posix.c. */
+void     posix_fd_discard(uint32_t token);
+/* For the F12 dump: queued descriptors naming `sock`, and in all. */
+int      posix_in_flight_refs(struct socket* sock);
+int      posix_in_flight_used(void);
 
 /* "Do not return from this syscall yet - park the task on `addr` and run
  * the whole call again when something wakes it." The retry is what makes

@@ -224,5 +224,7 @@ int posix_proc_count(void);
 
 /* Iteration, for the shell. Returns null past the end. */
 posix_proc_t* posix_proc_at(int index);
+/* Any slot, in use or not - for the F12 dump only. */
+posix_proc_t* posix_proc_slot(int index);
 
 #endif

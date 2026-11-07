@@ -44,6 +44,13 @@
 #define PAGE64_COW       (1ULL << 9)
 #define PAGE64_COW_RW    (1ULL << 10)
 
+/* A page of a MAP_SHARED mapping. fork keeps it shared - one more owner,
+ * writable on both sides - where every other page goes copy-on-write.
+ * Linux does the same: a child's write through a shared mapping it
+ * inherited is a write its parent sees. Bit 11 is another the CPU
+ * ignores. */
+#define PAGE64_SHARED    (1ULL << 11)
+
 #define PAGE64_NX        (1ULL << 63)
 
 #define PAGING64_OK            0

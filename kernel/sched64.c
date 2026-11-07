@@ -1,6 +1,8 @@
 /* sched64.c - round-robin preemption, done inside the timer interrupt. */
 
 #include "sched64.h"
+#include "clock64.h"
+#include "idt64.h"
 #include "gdt64.h"
 #include "serial64.h"
 
@@ -19,6 +21,34 @@ typedef struct {
      * *restarts* needs its own number back there instead, or the
      * re-executed `syscall` invokes whatever call 0 happens to be. */
     uint64_t      wake_rax;
+
+    /* What rax becomes when the deadline below ends the wait instead -
+     * which futex needs to tell apart from being woken (-ETIMEDOUT
+     * against 0). Everything else that sleeps is re-issued on waking
+     * and asks the clock itself, so for it the two are the same. */
+    uint64_t      timeout_rax;
+
+    /* FUTEX_WAIT_BITSET's mask: a FUTEX_WAKE_BITSET releases this
+     * thread only if the two masks share a bit. All ones for every
+     * other kind of wait, which any wake matches. */
+    uint32_t      wait_bits;
+
+    /* The tick this thread stops waiting at, or 0 for "no deadline".
+     *
+     * Without it a wait that has a timeout cannot sleep: it has to
+     * reach ring 3 to notice its own deadline, so it yields around a
+     * loop instead. That is what a poll(2) with nothing ready did -
+     * 13,870,656 times in one chrome.exe run, 99% of every syscall the
+     * machine made, while chrome's own processes got 0.3% and timed
+     * out. */
+    uint64_t      deadline;
+
+    /* For a wait that resumes past its syscall rather than re-running it
+     * - futex, whose wake is a return value - the syscall number to
+     * re-run it with if a *signal* is what ends the wait. 0 for the
+     * waits that are re-run anyway. See sched64_signal_restart. */
+    uint64_t      signal_restart;
+
     int           pid;       /* the process this thread belongs to      */
     int           blocked;
     int           used;
@@ -185,6 +215,35 @@ void sched64_dump_blocked(void) {
     serial64_puts(" runnable\n");
 }
 
+/* Enough of a task to read its stacks from outside: its process, what
+ * it waits on, its GS base - a Wine thread's TEB - its ring-3 stack
+ * pointer and its address space. 0 if the slot is empty. */
+int sched64_task_peek(int i, int* pid, uint64_t* wait, uint64_t* gs,
+                      uint64_t* rsp, vmspace64_t* space) {
+    if (i < 0 || i >= SCHED64_MAX_TASKS || !tasks[i].used) return 0;
+    *pid   = tasks[i].pid;
+    *wait  = tasks[i].blocked ? tasks[i].wait_addr : 0;
+    *gs    = tasks[i].gs_base;
+    *rsp   = tasks[i].regs.rsp;
+    *space = tasks[i].space;
+    return 1;
+}
+
+/* What slot `i` is blocked on, or 0 if it is not blocked. Lets a layer
+ * that knows what the wait keys mean - syscall64.c owns PIPE64_WAIT_KEY
+ * - say something useful about them. */
+uint64_t sched64_blocked_on(int i) {
+    if (i < 0 || i >= SCHED64_MAX_TASKS) return 0;
+    if (!tasks[i].used || !tasks[i].blocked) return 0;
+    return tasks[i].wait_addr;
+}
+
+int sched64_blocked_pid(int i) {
+    if (i < 0 || i >= SCHED64_MAX_TASKS) return -1;
+    if (!tasks[i].used || !tasks[i].blocked) return -1;
+    return tasks[i].pid;
+}
+
 int sched64_pid_tasks(int pid) {
     int n = 0;
     for (int i = 0; i < SCHED64_MAX_TASKS; i++)
@@ -317,6 +376,12 @@ _Static_assert(__builtin_offsetof(registers64_t, rflags) == 152, "rflags");
 _Static_assert(__builtin_offsetof(registers64_t, rsp)    == 160, "rsp");
 _Static_assert(__builtin_offsetof(registers64_t, ss)     == 168, "ss");
 
+/* Defined with the rest of the idle machinery further down; needed
+ * here because a thread can exit while every one of its siblings is
+ * asleep on the clock. */
+static int any_deadline(void);
+static int idle_until_runnable(void);
+
 int sched64_exit_current(registers64_t* out_regs, vmspace64_t* out_space,
                          uint64_t* out_fs_base) {
     int next;
@@ -339,7 +404,24 @@ int sched64_exit_current(registers64_t* out_regs, vmspace64_t* out_space,
      * fixed on sight rather than left for the run that finds it. */
     for (next = 0; next < SCHED64_MAX_TASKS; next++)
         if (tasks[next].used && !tasks[next].blocked) break;
-    if (next == SCHED64_MAX_TASKS) { current = -1; return 0; }
+
+    /* Nothing runnable at this instant is not the same as nothing left
+     * to run: a sibling asleep on the clock becomes runnable when the
+     * timer says so. Without this, a thread that exits while every
+     * other thread of its process is in nanosleep ends the whole run -
+     * measured in the tgkill differential as a program that stopped
+     * printing the moment its second thread finished, having passed
+     * every assertion up to that one.
+     *
+     * The guard is the one the blocking path uses: halting is safe only
+     * while the timer can still interrupt and something is genuinely
+     * waiting on it. Otherwise there really is nothing to come back
+     * for. */
+    if (next == SCHED64_MAX_TASKS && !idt64_irq_is_masked(0) &&
+        any_deadline())
+        next = idle_until_runnable();
+
+    if (next < 0 || next >= SCHED64_MAX_TASKS) { current = -1; return 0; }
 
     /* Nothing to save: the task that was running has ended. */
     current = next;
@@ -350,6 +432,21 @@ int sched64_exit_current(registers64_t* out_regs, vmspace64_t* out_space,
     if (out_fs_base)  *out_fs_base  = tasks[next].fs_base;
     proc64_set_current(tasks[next].pid);
     return 1;
+}
+
+/* Every task of `pid` out of the table, without choosing a successor:
+ * for a process ending when there is nothing to hand the CPU to - the
+ * leader of a run, whose ending ends the run. Returns how many went. */
+int sched64_remove_pid(int pid) {
+    int n = 0;
+    for (int i = 0; i < SCHED64_MAX_TASKS; i++) {
+        if (!tasks[i].used || tasks[i].pid != pid) continue;
+        tasks[i].used = 0;
+        if (task_total > 0) task_total--;
+        if (i == current) current = -1;
+        n++;
+    }
+    return n;
 }
 
 int sched64_exit_process(int pid, registers64_t* out_regs,
@@ -367,10 +464,17 @@ int sched64_exit_process(int pid, registers64_t* out_regs,
         if (task_total > 0) task_total--;
     }
 
-    /* Runnable, for the same reason as above. */
+    /* Runnable, for the same reason as above - and idle rather than
+     * give up, for the same reason as above too: one process ending
+     * while another sleeps on the clock is not the end of the run. */
     for (next = 0; next < SCHED64_MAX_TASKS; next++)
         if (tasks[next].used && !tasks[next].blocked) break;
-    if (next == SCHED64_MAX_TASKS) { current = -1; return 0; }
+
+    if (next == SCHED64_MAX_TASKS && !idt64_irq_is_masked(0) &&
+        any_deadline())
+        next = idle_until_runnable();
+
+    if (next < 0 || next >= SCHED64_MAX_TASKS) { current = -1; return 0; }
 
     /* Nothing to save: every thread of that process has ended. */
     current = next;
@@ -385,6 +489,71 @@ int sched64_exit_process(int pid, registers64_t* out_regs,
 
 /* A blocked task is not a candidate: it is waiting on a futex and has
  * nothing to run until somebody wakes it. */
+/* True while the machine has nothing to run and is waiting for an
+ * interrupt. `current` still names the thread that parked, and its
+ * frame is already saved, so the timer must not try to switch away from
+ * it: there is no live task frame to save over. */
+static volatile int idling;
+
+static int first_runnable(void) {
+    for (int i = 0; i < SCHED64_MAX_TASKS; i++)
+        if (tasks[i].used && !tasks[i].blocked) return i;
+    return -1;
+}
+
+/* Whether anything is waiting on the clock rather than on an event.
+ *
+ * This is the difference between idle and deadlock. If some thread has
+ * a deadline then the timer will release it and the machine has a
+ * future; if none has, and nothing is runnable, then nothing will ever
+ * happen and halting would be a hang. */
+static int any_deadline(void) {
+    for (int i = 0; i < SCHED64_MAX_TASKS; i++)
+        if (tasks[i].used && tasks[i].blocked && tasks[i].deadline) return 1;
+    return 0;
+}
+
+/* Release every blocked thread whose deadline has passed. The clock
+ * notices the timeout, which is what lets the thread sleep through it
+ * rather than spin to watch for it. A thread woken early re-checks what
+ * it was waiting for and parks again, so waking one costs a re-check. */
+static void expire_deadlines(void) {
+    uint64_t now = clock64_ticks();
+
+    for (int i = 0; i < SCHED64_MAX_TASKS; i++) {
+        if (!tasks[i].used || !tasks[i].blocked) continue;
+        if (!tasks[i].deadline || now < tasks[i].deadline) continue;
+        tasks[i].blocked   = 0;
+        tasks[i].wait_addr = 0;
+        tasks[i].deadline  = 0;
+        tasks[i].regs.rax  = tasks[i].timeout_rax;
+    }
+}
+
+/* Halt until an interrupt makes something runnable.
+ *
+ * Syscalls run with interrupts off - FMASK clears IF on entry and the
+ * stub never turns it back on - so a kernel with nothing to run must
+ * enable them itself or the tick that would end the wait can never
+ * arrive. `sti; hlt` is one unit on x86: sti defers enabling by one
+ * instruction precisely so that the halt cannot be missed. cli again on
+ * the way out, because the caller is still inside a syscall and the
+ * rest of it expects interrupts off. */
+static int idle_until_runnable(void) {
+    int n;
+
+    idling = 1;
+    for (;;) {
+        __asm__ __volatile__("sti; hlt; cli");
+        expire_deadlines();
+        n = first_runnable();
+        if (n >= 0) break;
+        if (!any_deadline()) { n = -1; break; }
+    }
+    idling = 0;
+    return n;
+}
+
 static int next_task(int from) {
     for (int n = 1; n <= SCHED64_MAX_TASKS; n++) {
         int i = (from + n) % SCHED64_MAX_TASKS;
@@ -397,6 +566,51 @@ int sched64_block_current(const registers64_t* regs, uint64_t addr,
                           uint64_t wake_rax,
                           registers64_t* out_regs, vmspace64_t* out_space,
                           uint64_t* out_fs_base) {
+    return sched64_block_until(regs, addr, wake_rax, 0,
+                               out_regs, out_space, out_fs_base);
+}
+
+int sched64_block_until(const registers64_t* regs, uint64_t addr,
+                        uint64_t wake_rax, uint64_t deadline,
+                        registers64_t* out_regs, vmspace64_t* out_space,
+                        uint64_t* out_fs_base) {
+    return sched64_block_until_ex(regs, addr, wake_rax, wake_rax, deadline,
+                                  0xFFFFFFFFu, out_regs, out_space,
+                                  out_fs_base);
+}
+
+static uint64_t next_signal_restart;
+
+void sched64_signal_restart(uint64_t nr) { next_signal_restart = nr; }
+
+/* A thread woken by a signal, rather than by what it waited for.
+ *
+ * Most waits resume by re-running their syscall, and the re-run sees the
+ * signal and returns -EINTR, with the delivery at the end of the call.
+ * A futex wait cannot work that way - a wake that leaves the word
+ * unchanged has to return 0, not sleep again - so it resumes past the
+ * syscall, and a signal that woke it went straight back to ring 3 with
+ * nothing delivering it. The thread ran on to its next syscall, and a
+ * SIGKILL'd child calling _exit() exited with its own status instead of
+ * dying. Pointed back at its syscall instead, the re-run is what takes
+ * the signal. */
+static void woken_by_signal(int i) {
+    tasks[i].blocked   = 0;
+    tasks[i].wait_addr = 0;
+    if (tasks[i].signal_restart) {
+        tasks[i].regs.rip -= 2;                 /* the syscall instruction */
+        tasks[i].regs.rax  = tasks[i].signal_restart;
+        tasks[i].signal_restart = 0;
+    } else {
+        tasks[i].regs.rax = tasks[i].wake_rax;
+    }
+}
+
+int sched64_block_until_ex(const registers64_t* regs, uint64_t addr,
+                           uint64_t wake_rax, uint64_t timeout_rax,
+                           uint64_t deadline, uint32_t bits,
+                           registers64_t* out_regs, vmspace64_t* out_space,
+                           uint64_t* out_fs_base) {
     int next;
 
     if (current < 0 || !tasks[current].used) return 0;
@@ -416,17 +630,44 @@ int sched64_block_current(const registers64_t* regs, uint64_t addr,
     tasks[current].fs_base   = read_fs_base();
     tasks[current].regs      = *regs;
     tasks[current].blocked   = 1;
-    tasks[current].wait_addr = addr;
-    tasks[current].wake_rax  = wake_rax;
+    tasks[current].wait_addr   = addr;
+    tasks[current].wake_rax    = wake_rax;
+    tasks[current].timeout_rax = timeout_rax;
+    tasks[current].wait_bits   = bits;
+    tasks[current].deadline    = deadline;
+    tasks[current].signal_restart = next_signal_restart;
+    next_signal_restart = 0;
 
     next = next_task(current);
     if (next == current || tasks[next].blocked) {
-        /* Nothing else can run. Really this is a deadlock, and Linux
-         * would simply block forever; unblocking the caller and letting
-         * it see -EDEADLK is more useful than a machine that stops. */
-        tasks[current].blocked   = 0;
-        tasks[current].wait_addr = 0;
-        return 0;
+        /* Nothing else can run *right now*.
+         *
+         * That used to mean deadlock, and it was a fair reading while
+         * every wait was a yield-loop: a waiting thread stayed
+         * runnable, so "nobody else can run" really did mean nobody
+         * ever would. Once waits sleep, a parent waiting on a sleeping
+         * child is this, and it is ordinary.
+         *
+         * So: halt and let the clock decide. Only when something is
+         * actually waiting on the clock - otherwise nothing will ever
+         * happen and halting is a hang, and the old answer is the
+         * honest one. The timer being masked says the same thing: most
+         * bring-up layers run with IRQ0 off on purpose, and there the
+         * deadline would never arrive. */
+        if (idt64_irq_is_masked(0) || !any_deadline()) {
+            tasks[current].blocked   = 0;
+            tasks[current].wait_addr = 0;
+            tasks[current].deadline  = 0;
+            return 0;
+        }
+
+        next = idle_until_runnable();
+        if (next < 0) {
+            tasks[current].blocked   = 0;
+            tasks[current].wait_addr = 0;
+            tasks[current].deadline  = 0;
+            return 0;
+        }
     }
 
     tasks[current].gs_base = read_gs_base();
@@ -484,12 +725,64 @@ int sched64_yield_current(const registers64_t* regs, registers64_t* out_regs,
     return 1;
 }
 
+/* Wake every blocked thread of one process, whatever it is waiting on.
+ *
+ * This is what a signal does to a wait. A thread blocked in read(2) on
+ * an empty pipe, or in wait4, or in an untimed futex, never reaches the
+ * boundary where a pending signal is taken - so without this, kill(2)
+ * to a process that is asleep is a signal nothing will ever deliver.
+ * Linux interrupts a blocking syscall for exactly this reason.
+ *
+ * The woken thread re-runs its syscall, and the delivery point at the
+ * end of syscall64_dispatch is where the signal is taken. */
+int sched64_wake_pid(int pid) {
+    int woken = 0;
+
+    for (int i = 0; i < SCHED64_MAX_TASKS; i++) {
+        if (!tasks[i].used || !tasks[i].blocked) continue;
+        if (tasks[i].pid != pid) continue;
+        woken_by_signal(i);
+        woken++;
+    }
+    return woken;
+}
+
+int sched64_task_pid(int tid) {
+    if (tid < 0 || tid >= SCHED64_MAX_TASKS) return -1;
+    if (!tasks[tid].used) return -1;
+    return tasks[tid].pid;
+}
+
+int sched64_wake_tid(int tid) {
+    if (tid < 0 || tid >= SCHED64_MAX_TASKS) return 0;
+    if (!tasks[tid].used || !tasks[tid].blocked) return 0;
+    woken_by_signal(tid);
+    return 1;
+}
+
 int sched64_wake(uint64_t addr, int max) {
+    return sched64_wake_bits(addr, max, 0xFFFFFFFFu);
+}
+
+int sched64_wake_bits(uint64_t addr, int max, uint32_t bits) {
+    return sched64_wake_futex(addr, max, bits, -1);
+}
+
+int sched64_wake_futex(uint64_t addr, int max, uint32_t bits, int pid) {
     int woken = 0;
 
     for (int i = 0; i < SCHED64_MAX_TASKS && woken < max; i++) {
         if (!tasks[i].used || !tasks[i].blocked) continue;
         if (tasks[i].wait_addr != addr) continue;
+        /* A private futex is an address in one process, and the same
+         * number in another process is a different word. Without this a
+         * FUTEX_WAKE(addr, 1) could spend its one wake on a thread of
+         * some other process parked at the same address - which Wine
+         * makes common, since ntdll sits at the same place in every Wine
+         * process - and that thread re-checks its own word, sleeps
+         * again, and the waiter the wake was for never hears of it. */
+        if (pid >= 0 && tasks[i].pid != pid) continue;
+        if (!(tasks[i].wait_bits & bits)) continue;   /* a different bitset */
         tasks[i].blocked   = 0;
         tasks[i].wait_addr = 0;
         /* futex(2) returns 0 to a waiter that was woken. The value goes
@@ -497,11 +790,34 @@ int sched64_wake(uint64_t addr, int max) {
         tasks[i].regs.rax = tasks[i].wake_rax;
         woken++;
     }
+
+    /* Any wake at all also releases the threads parked on the shared
+     * condition key, uncounted. A poll(2) cannot name one address - it
+     * waits for whichever descriptor becomes ready first - so it parks
+     * on one key and re-checks its whole set when anything anywhere
+     * changes. Wider than it needs to be, and still far cheaper than
+     * the spin it replaces; a spurious wake costs one re-check. */
+    for (int i = 0; i < SCHED64_MAX_TASKS; i++) {
+        if (!tasks[i].used || !tasks[i].blocked) continue;
+        if (tasks[i].wait_addr != SCHED64_COND_KEY) continue;
+        tasks[i].blocked   = 0;
+        tasks[i].wait_addr = 0;
+        tasks[i].deadline  = 0;
+        tasks[i].regs.rax  = tasks[i].wake_rax;
+    }
     return woken;
 }
 
 void sched64_tick(registers64_t* frame) {
     int next;
+
+    expire_deadlines();
+
+    /* While idling there is no running task whose frame this is - it is
+     * the idle loop's - so switching would save the halt over a parked
+     * thread's continuation. idle_until_runnable picks the successor
+     * itself once expire_deadlines above has produced one. */
+    if (idling) return;
 
     if (current < 0 || task_total < 2) return;
 

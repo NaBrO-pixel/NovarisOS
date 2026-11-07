@@ -43,6 +43,14 @@
 #define SYS64_PREAD64         17
 #define SYS64_PWRITE64        18
 #define SYS64_ACCESS          21
+/* wait4's options. WNOHANG is the only one this kernel can act on;
+ * the other two ask about stopped and continued children and there is
+ * no job control here to produce either. */
+#define WAIT64_NOHANG         1
+#define WAIT64_UNTRACED       2
+#define WAIT64_CONTINUED      8
+
+#define SYS64_KILL            62
 #define SYS64_TKILL           200
 #define SYS64_TGKILL          234
 #define SYS64_SCHED_YIELD      24
@@ -237,6 +245,21 @@ typedef struct {
 #define SYS64_RT_SIGACTION    13
 #define SYS64_RT_SIGPROCMASK  14
 #define SYS64_RT_SIGRETURN    15
+#define SYS64_RT_SIGPENDING   127
+#define SYS64_RT_SIGTIMEDWAIT 128
+#define SYS64_FSYNC           74
+#define SYS64_FDATASYNC       75
+#define SYS64_TIMES           100
+#define SYS64_PROCESS_VM_READV  310
+#define SYS64_PROCESS_VM_WRITEV 311
+#define SYS64_GETCPU          309
+#define SYS64_MADVISE         28
+#define SYS64_MSYNC           26
+#define SYS64_RT_SIGSUSPEND   130
+#define SYS64_PSELECT6        270
+#define SYS64_SIGNALFD        282
+#define SYS64_SIGNALFD4       289
+#define SYS64_PPOLL           271
 #define SYS64_IOCTL           16
 #define SYS64_WRITEV          20
 #define SYS64_READV           19
@@ -253,7 +276,16 @@ typedef struct {
 #define SYS64_GETEGID         108
 #define SYS64_CLONE           56
 #define SYS64_GETTID          186
+#define SYS64_PRCTL           157
 #define SYS64_ARCH_PRCTL      158
+
+/* The prctl options this kernel answers. Everything else is EINVAL,
+ * which is what Linux says about an option it does not know - including
+ * PR_SET_PTRACER, the Yama one Wine asks for, which a kernel without
+ * Yama refuses in exactly the same way. Measured on the host. */
+#define PRCTL64_SET_NAME      15
+#define PRCTL64_GET_NAME      16
+#define PRCTL64_COMM_LEN      16
 #define SYS64_FUTEX           202
 #define SYS64_SET_TID_ADDRESS 218
 #define SYS64_EXIT_GROUP      231
@@ -270,12 +302,18 @@ typedef struct {
 #define FUTEX_WAIT          0
 #define FUTEX_WAKE          1
 #define FUTEX_PRIVATE_FLAG  128
+#define FUTEX_WAIT_BITSET   9
+#define FUTEX_WAKE_BITSET   10
+#define FUTEX_CLOCK_REALTIME 256
 
 /* clone() flag bits, Linux's values. Only these are acted on. */
 #define CLONE_VM      0x00000100
 #define CLONE_VFORK   0x00004000
 #define CLONE_THREAD  0x00010000
 #define CLONE_SETTLS  0x00080000
+#define CLONE_PARENT_SETTID  0x00100000
+#define CLONE_CHILD_CLEARTID 0x00200000
+#define CLONE_CHILD_SETTID   0x01000000
 
 /* One Novaris-private number, well above anything Linux uses, kept for
  * the bring-up test that has no way to print. */
@@ -326,6 +364,25 @@ extern uint8_t task_count_code_end[];
 
 /* What the dispatcher saw. */
 uint64_t syscall64_count(void);
+
+/* Per-process and per-syscall accounting, reset at the start of a layer
+ * and reported at the end. It answers the question a global count
+ * cannot: whether a program that ran out of time was doing the work or
+ * being starved by something else that was. */
+void     syscall64_reset_calls(void);
+void     syscall64_report_calls(void);
+
+/* For every thread parked on a pipe, whether the bytes it waits for are
+ * already there - which separates "nobody wrote" from "somebody wrote
+ * and this thread was never woken". */
+void     syscall64_report_pipe_waits(void);
+void     syscall64_report_futex_waits(void);
+void     syscall64_report_leader_stacks(void);
+
+/* Every pipe holding bytes nobody has taken, and whether any thread is
+ * parked on it - which separates "a wakeup is owed" from "somebody who
+ * should be reading is not". */
+void     syscall64_report_unread_pipes(void);
 uint64_t syscall64_last_arg(void);
 uint64_t syscall64_exit_code(void);
 uint64_t syscall64_bytes_written(void);
@@ -422,5 +479,15 @@ int  syscall64_run_expired(void);
  * after a timed-out run is whatever the last process to exit happened to
  * return - a number that looks like an answer and is not. */
 int  syscall64_leader_exited(void);
+
+/* An uncaught ring-3 fault in a run of several processes: ends the
+ * faulting process (not the leader) by the signal and does not return.
+ * Returns 0 when that does not apply, and the caller ends the run. */
+int syscall64_fault_kill(int sig, uint64_t rip, uint64_t addr);
+
+/* Ends the current process with SIGKILL because there was no memory to
+ * back a page it was entitled to - see syscall64.c. Does not return. */
+void syscall64_oom_kill(uint64_t addr);
+uint64_t syscall64_oom_kills(void);
 
 #endif

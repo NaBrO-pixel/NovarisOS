@@ -45,6 +45,21 @@ uint64_t uspace64_brk(uint64_t addr);
  * or make it writable has to recognise it - see uspace64.c. */
 uint64_t uspace64_zero_frame(void);
 
+/* Reservation bookkeeping, for the end-of-layer report: pages that went
+ * to the zero page because a process's region list was full (should be
+ * 0), and the most regions any one process has held. */
+uint64_t uspace64_resv_spilled(void);
+uint32_t uspace64_resv_peak(void);
+
+/* A fault on a page that is not there: backs it if it is the first touch
+ * of anonymous memory the process holds and the access is allowed, and
+ * returns 1; returns 0 for any other fault. From the page-fault handler,
+ * in either ring, and from anything in the kernel about to touch user
+ * memory it has checked page by page. */
+int      uspace64_fault(uint64_t va, int write);
+int      uspace64_back_in(int pid, uint64_t va, int write);
+uint64_t uspace64_lazy_faults(void);
+
 /* Maps frames belonging to somebody else - a file's - into this
  * process, taking a reference on each so that unmapping releases the
  * reference rather than the frame. This is what makes a MAP_SHARED file
@@ -65,6 +80,10 @@ uint64_t uspace64_map_frames_cow(uint64_t addr, int fixed,
 uint64_t uspace64_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                        uint64_t flags);
 uint64_t uspace64_munmap(uint64_t addr, uint64_t length);
+
+/* madvise(MADV_DONTNEED/MADV_FREE): give back the anonymous pages in the
+ * range; they read as zeros when next touched. */
+void     uspace64_discard(uint64_t addr, uint64_t length);
 
 /* Narrows an existing mapping's permissions. Used by the file-mapping
  * path: the kernel has to write the file's bytes in, so the pages are

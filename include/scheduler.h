@@ -35,7 +35,17 @@
  * connection per client and a request pipe per thread - and a set larger
  * than this simply falls back to the one-tick re-test that every poll
  * used before. */
-#define PROC_WAIT_MAX 12
+/* 256, from 12. poll() waits on a set, and a set larger than this is
+ * registered only in part - every descriptor past the limit is noticed by
+ * re-testing on a timer, not by a wake. The wineserver polls one
+ * descriptor per client thread and more besides: 186 of them partway
+ * through a first wineboot, with 12 registered. A client whose request
+ * pipe was not among the twelve wrote its request and then waited for the
+ * server's next timed re-test to be noticed, and a first boot makes tens
+ * of thousands of requests. That, not the CPU, was where its minutes
+ * went (Shift+F12's per-syscall cycle count: 71 million retried reads in
+ * one boot, every task but one parked at every sample). */
+#define PROC_WAIT_MAX 256
 
 typedef enum {
     PROC_READY,
@@ -412,5 +422,12 @@ void scheduler_terminate_all(void);
  * active. A no-op otherwise. `regs` is the interrupted process's saved
  * register frame, exactly as isr.s's shared stub built it. */
 void scheduler_tick(registers_t* regs);
+
+/* Prints every task's state and what it waits on to COM1. Called from
+ * the keyboard interrupt when F12 is pressed; see scheduler.c. */
+void scheduler_dump_tasks(void);
+
+/* Blocked tasks parked on `addr`; see scheduler.c. */
+int scheduler_waiters_on(uint32_t addr);
 
 #endif
