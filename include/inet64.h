@@ -83,6 +83,7 @@ int  inet64_dgram_ready(int s);
 int  inet64_sockets_open(void);
 uint32_t inet64_ip(void);
 uint32_t inet64_netmask(void);
+uint32_t inet64_dns(void);       /* the server DHCP named, 0 for none */
 const uint8_t* inet64_mac(void);
 
 /* The ifreq ioctls (SIOCGIFFLAGS, SIOCGIFHWADDR, ...), SIOCGIFCONF,

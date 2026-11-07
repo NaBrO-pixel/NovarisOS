@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <netdb.h>
 #include <net/if_arp.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
@@ -346,6 +347,104 @@ static void http_fetch(void) {
     close(c);
 }
 
+/* The resolver, end to end: getaddrinfo reads /etc/nsswitch.conf and
+ * /etc/resolv.conf, asks the server DHCP named - QEMU's forwarder - and
+ * QEMU asks the helper on the build machine, which says novaris.test is
+ * 10.0.2.2. Then the page, fetched by name. */
+static void resolve_and_fetch(void) {
+    struct addrinfo hints, *res = 0;
+    char ip[32] = "";
+    int c = -1, n = 0;
+    static char page[4096];
+    const char* req = "GET /novaris.txt HTTP/1.0\r\nHost: novaris.test\r\n\r\n";
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    ok(getaddrinfo("novaris.test", "18780", &hints, &res) == 0 && res,
+       "getaddrinfo resolves novaris.test through DNS (guest only)");
+    if (res) inet_ntop(AF_INET, &((struct sockaddr_in*)res->ai_addr)->sin_addr, ip, sizeof(ip));
+    ok(!strcmp(ip, "10.0.2.2"), "to 10.0.2.2 (guest only)");
+    if (res) {
+        c = socket(AF_INET, SOCK_STREAM, 0);
+        if (connect(c, res->ai_addr, res->ai_addrlen) == 0) {
+            write_all(c, req, (int)strlen(req));
+            n = read_all(c, page, sizeof(page) - 1);
+        }
+        page[n > 0 ? n : 0] = 0;
+        close(c);
+        freeaddrinfo(res);
+    }
+    ok(strstr(page, "served to NovarisOS over TCP") != 0,
+       "and the file fetched by name (guest only)");
+    {
+        struct addrinfo* none = 0;
+        ok(getaddrinfo("no-such-name.invalid", 0, &hints, &none) != 0,
+           "a name nobody knows does not resolve (guest only)");
+        if (none) freeaddrinfo(none);
+    }
+}
+
+/* 2MB from the host, every byte checked. The rate is printed, not
+ * asserted: it is what the TCP underneath is measured by. */
+static void bulk_fetch(void) {
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in to = addr_of("10.0.2.2", HOST_HTTP_PORT);
+    const char* req = "GET /big.bin HTTP/1.0\r\n\r\n";
+    static unsigned char buf[2 * 1024 * 1024 + 4096];
+    struct timespec t0, t1;
+    int n, body = -1, good = 1;
+    long ms;
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (connect(c, (struct sockaddr*)&to, sizeof(to)) == 0) {
+        write_all(c, req, (int)strlen(req));
+        n = read_all(c, (char*)buf, (int)sizeof(buf));
+    } else n = 0;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    close(c);
+    for (int i = 0; i + 3 < n; i++)
+        if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+            body = i + 4; break;
+        }
+    if (body < 0 || n - body != 2 * 1024 * 1024) good = 0;
+    for (int i = 0; good && i < 2 * 1024 * 1024; i++)
+        if (buf[body + i] != (unsigned char)((i * 7 + i / 251) & 0xFF)) good = 0;
+    ok(good, "2MB from the host arrive intact (guest only)");
+    ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    printf("inet64: 2MB in %ld ms, %ld KB/s (guest only)\n", ms,
+           ms > 0 ? 2048L * 1000 / ms : 0);
+}
+
+/* And 2MB the other way: what the guest's own TCP sends, which is the
+ * direction a stop-and-wait sender holds back. */
+static void bulk_upload(void) {
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in to = addr_of("10.0.2.2", HOST_HTTP_PORT);
+    static unsigned char body[2 * 1024 * 1024];
+    char head[128], reply[512];
+    struct timespec t0, t1;
+    int n = 0;
+    long ms;
+
+    for (int i = 0; i < (int)sizeof(body); i++) body[i] = (unsigned char)((i * 7 + i / 251) & 0xFF);
+    snprintf(head, sizeof(head), "PUT /upload HTTP/1.0\r\nContent-Length: %d\r\n\r\n",
+             (int)sizeof(body));
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (connect(c, (struct sockaddr*)&to, sizeof(to)) == 0) {
+        write_all(c, head, (int)strlen(head));
+        write_all(c, (char*)body, (int)sizeof(body));
+        n = read_all(c, reply, sizeof(reply) - 1);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    reply[n > 0 ? n : 0] = 0;
+    close(c);
+    ok(strstr(reply, "intact 2097152") != 0, "2MB to the host arrive intact (guest only)");
+    ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    printf("inet64: 2MB up in %ld ms, %ld KB/s (guest only)\n", ms,
+           ms > 0 ? 2048L * 1000 / ms : 0);
+}
+
 static void dns_query(void) {
     int u = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in to = addr_of("10.0.2.2", HOST_DNS_PORT);
@@ -413,6 +512,9 @@ int main(int argc, char** argv) {
     interfaces(external);
     if (external) {
         http_fetch();
+        resolve_and_fetch();
+        bulk_fetch();
+        bulk_upload();
         dns_query();
         accept_from_host();
     }

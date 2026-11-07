@@ -190,6 +190,7 @@ int inet64_init(void) {
 int inet64_card_up(void) { return card && net_config()->configured; }
 uint32_t inet64_ip(void) { return card ? net_config()->ip : 0; }
 uint32_t inet64_netmask(void) { return card ? net_config()->netmask : 0; }
+uint32_t inet64_dns(void) { return card ? net_config()->dns : 0; }
 const uint8_t* inet64_mac(void) { return card ? netdev_get()->mac : 0; }
 
 /* --- the pump ----------------------------------------------------------- */

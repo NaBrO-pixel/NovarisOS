@@ -1,6 +1,7 @@
 /* ramfs64.c - files and directories, kept in the kernel heap. */
 
 #include "ramfs64.h"
+#include "inet64.h"
 #include "kheap64.h"
 #include "kstring.h"
 #include "initrd64.h"
@@ -393,7 +394,7 @@ void ramfs64_init(void) {
     {
         static const char passwd[] = "root:x:0:0:root:/root:/bin/sh\n";
         static const char nsswitch[] =
-            "passwd: files\ngroup: files\nshadow: files\nhosts: files\n";
+            "passwd: files\ngroup: files\nshadow: files\nhosts: files dns\n";
         int n;
 
         /* glibc looks the user up to answer getpwuid, and Wine asks it
@@ -405,19 +406,29 @@ void ramfs64_init(void) {
         if (n >= 0) ramfs64_write(n, 0, nsswitch, sizeof(nsswitch) - 1);
     }
 
-    /* The network's (Milestone 95). localhost has to resolve for a
-     * program to reach the loopback by name, and that comes from the
-     * hosts file, since nsswitch says "files". resolv.conf names QEMU's
-     * user-mode DNS forwarder, for anything that asks the resolver
-     * directly. */
+    /* The network's (Milestones 95, 97). localhost comes from the hosts
+     * file; anything else from DNS ("hosts: files dns" above), at the
+     * server DHCP named - QEMU's forwarder, 10.0.2.3, under its user-mode
+     * network, which is also the answer before the card is up. */
     {
         static const char hosts[] =
             "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost\n";
-        static const char resolv[] = "nameserver 10.0.2.3\n";
-        int n = ramfs64_create("/etc/hosts", 0);
+        char resolv[64], *o = resolv;
+        uint32_t dns = inet64_dns();
+        int n;
+        if (!dns) dns = 0x0A000203u;
+        for (const char* p = "nameserver "; *p; p++) *o++ = *p;
+        for (int b = 3; b >= 0; b--) {
+            uint32_t v = (dns >> (b * 8)) & 0xFF;
+            if (v >= 100) *o++ = (char)('0' + v / 100);
+            if (v >= 10)  *o++ = (char)('0' + (v / 10) % 10);
+            *o++ = (char)('0' + v % 10);
+            *o++ = b ? '.' : '\n';
+        }
+        n = ramfs64_create("/etc/hosts", 0);
         if (n >= 0) ramfs64_write(n, 0, hosts, sizeof(hosts) - 1);
         n = ramfs64_create("/etc/resolv.conf", 0);
-        if (n >= 0) ramfs64_write(n, 0, resolv, sizeof(resolv) - 1);
+        if (n >= 0) ramfs64_write(n, 0, resolv, (uint64_t)(o - resolv));
     }
 }
 
