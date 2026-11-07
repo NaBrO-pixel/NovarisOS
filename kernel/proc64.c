@@ -3,6 +3,7 @@
 #include "proc64.h"
 #include "serial64.h"
 #include "pipe64.h"
+#include "inet64.h"
 #include "ramfs64.h"
 #include "kstring.h"
 
@@ -113,6 +114,7 @@ int proc64_fork_from(int pid) {
             pipe64_ref(parent->fds[f].rx, 1, 0);
             pipe64_ref(parent->fds[f].tx, 0, 1);
         }
+        if (parent->fds[f].kind == FD64_INET) inet64_ref(parent->fds[f].sock);
     }
     child->brk_base    = parent->brk_base;
     child->brk_current = parent->brk_current;

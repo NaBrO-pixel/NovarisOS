@@ -46,7 +46,13 @@ ISO       = novaris64.iso
 CFLAGS = -std=gnu99 -ffreestanding -fno-builtin -fno-stack-protector \
          -fno-pic -fno-pie -m64 -mcmodel=kernel -mno-red-zone \
          -mno-sse -mno-mmx \
-         -Wall -Wextra -O2 -Iinclude -MMD -MP $(CFLAGS_EXTRA)
+         -Wall -Wextra -O2 -Iinclude -MMD -MP $(NET64_SIZES) $(CFLAGS_EXTRA)
+
+# The network stack's tables (kernel/net.c, tcp.c), which are sized for
+# the 32-bit kernel's one shell command at a time. A browser opens more
+# than four connections.
+NET64_SIZES = -DTCP_MAX_CONNECTIONS=48 -DTCP_RECV_BUFFER=16384 \
+              -DTCP_MAX_LISTEN=16 -DUDP_PORTS=32 -DUDP_QUEUE=16
 
 # Anything extra a one-off run wants to define, without editing source.
 # Used for the chrome.exe budget, which `make test` cannot afford to
@@ -95,6 +101,12 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/ramfs64.o \
        $(BUILD_DIR)/pipe64.o \
        $(BUILD_DIR)/sock64.o \
+       $(BUILD_DIR)/inet64.o \
+       $(BUILD_DIR)/net.o \
+       $(BUILD_DIR)/tcp.o \
+       $(BUILD_DIR)/dhcp.o \
+       $(BUILD_DIR)/pci.o \
+       $(BUILD_DIR)/rtl8139_64.o \
        $(BUILD_DIR)/clock64.o \
        $(BUILD_DIR)/rtc.o \
        $(BUILD_DIR)/proc64.o \
@@ -114,6 +126,7 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/scm64_blob.o \
        $(BUILD_DIR)/shm64_blob.o \
        $(BUILD_DIR)/novac64_blob.o \
+       $(BUILD_DIR)/inet64_blob.o \
        $(BUILD_DIR)/initrd64.o \
        $(BUILD_DIR)/hello64_blob.o \
        $(BUILD_DIR)/glibc64_blob.o \
@@ -372,6 +385,19 @@ $(BUILD_DIR)/socktest64_blob.c: $(BUILD_DIR)/socktest64.elf userland/embed64.py
 	python3 userland/embed64.py $< $@ socktest64_elf
 
 $(BUILD_DIR)/socktest64_blob.o: $(BUILD_DIR)/socktest64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# TCP/IP (Milestone 95). Not inet64 in the build for the usual reason:
+# kernel/inet64.c is the implementation.
+$(BUILD_DIR)/inettest64.elf: userland/inet64.c | $(BUILD_DIR)
+	gcc -static -O2 -o $@ $< 2>&1 | grep -v "statically linked" || true
+	@file $@ | grep -q "statically linked" \
+	    || (echo "ERROR: $@ is not static"; false)
+
+$(BUILD_DIR)/inet64_blob.c: $(BUILD_DIR)/inettest64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ inet64_elf
+
+$(BUILD_DIR)/inet64_blob.o: $(BUILD_DIR)/inet64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Passing a descriptor to another process (Milestone 76) - Wine's handle
@@ -820,9 +846,24 @@ run: iso
 # for a run that never gets there, which is a real failure - it is not the
 # expected duration, and the run stops as soon as bring-up says it is done.
 TEST_TIMEOUT ?= 900
+
+# The inet layer's network: an RTL8139 on QEMU's user-mode network, with
+# the guest's port 8080 forwarded to NET64_FWD here, and the servers the
+# guest talks to (tools/net64_helper.py) on the ports userland/inet64.c
+# has compiled in.
+NET64_HTTP = 18780
+NET64_DNS  = 18781
+NET64_FWD  = 18782
+NET64_QEMU = -netdev user,id=n0,hostfwd=tcp:127.0.0.1:$(NET64_FWD)-:8080 \
+             -device rtl8139,netdev=n0
+
 test: iso
-	@rm -f $(BUILD_DIR)/serial.log
-	@qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -display none \
+	@rm -f $(BUILD_DIR)/serial.log $(BUILD_DIR)/net64.status
+	@python3 tools/net64_helper.py --http $(NET64_HTTP) --dns $(NET64_DNS) \
+	    --connect $(NET64_FWD) --status $(BUILD_DIR)/net64.status & \
+	  hpid=$$!; \
+	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -display none \
+	    $(NET64_QEMU) \
 	    -serial file:$(BUILD_DIR)/serial.log -no-reboot >/dev/null 2>&1 & \
 	  qpid=$$!; waited=0; \
 	  while [ $$waited -lt $(TEST_TIMEOUT) ]; do \
@@ -830,7 +871,8 @@ test: iso
 	      kill -0 $$qpid 2>/dev/null || break; \
 	      sleep 1; waited=$$((waited+1)); \
 	  done; \
-	  kill $$qpid 2>/dev/null; wait $$qpid 2>/dev/null || true
+	  kill $$qpid 2>/dev/null; wait $$qpid 2>/dev/null || true; \
+	  kill $$hpid 2>/dev/null; wait $$hpid 2>/dev/null || true
 	@# The log is hundreds of megabytes with the syscall trace on, so show
 	@# the end of it rather than all of it. The assertions below read the
 	@# file, not this excerpt.
@@ -1197,6 +1239,28 @@ test: iso
 	@grep -q "ok    libNovaC's target test passed on NovarisOS" $(BUILD_DIR)/serial.log \
 	    || (echo "FAIL: libNovaC's target test did not exit 131 in the guest"; exit 1)
 	@echo "PASS: libNovaC behaves the same, and exits 131, on both"
+	@# TCP/IP. The loopback half is an ordinary Linux program, so it runs
+	@# here too and every line has to match; the rest went to the
+	@# servers tools/net64_helper.py ran, and the helper says whether the
+	@# guest accepted its connection.
+	@timeout 60 ./$(BUILD_DIR)/inettest64.elf > $(BUILD_DIR)/inet64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/inet64.host.status
+	@while read -r line; do \
+	    grep -qF "$$line" $(BUILD_DIR)/serial.log \
+	        || (echo "FAIL: the guest never printed: $$line"; exit 1) \
+	        || exit 1; \
+	done < $(BUILD_DIR)/inet64.host.txt
+	@[ "`cat $(BUILD_DIR)/inet64.host.status`" = "0" ] \
+	    || (echo "FAIL: the host run of the inet test did not exit 0"; exit 1)
+	@grep -q "ok    TCP and UDP worked" $(BUILD_DIR)/serial.log \
+	    || (echo "FAIL: the inet test did not pass in the guest"; exit 1)
+	@echo "PASS: TCP and UDP over the loopback behave the same on both"
+	@grep -q "\[ok\] HTTP/1.0 200 from the host (guest only)" $(BUILD_DIR)/serial.log \
+	    && grep -q "\[ok\] example.com is 192.0.2.1 (guest only)" $(BUILD_DIR)/serial.log \
+	    || (echo "FAIL: the guest did not reach the host's HTTP and DNS servers"; exit 1)
+	@grep -q connected $(BUILD_DIR)/net64.status 2>/dev/null \
+	    || (echo "FAIL: the host could not connect to a socket in the guest"; exit 1)
+	@echo "PASS: TCP and UDP through an RTL8139 to this machine, both directions"
 
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR) $(ISO)

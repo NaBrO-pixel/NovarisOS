@@ -10618,6 +10618,100 @@ with `kill` or `tgkill` reached its handler with `siginfo` saying
 
 `make -f Makefile.amd64 WINE64_INSTALL=1 test` is 27/27 with it in.
 
+## Milestone 95 - TCP/IP in the 64-bit kernel
+
+Until now `socket(AF_INET, ...)` on the 64-bit kernel was
+`-EAFNOSUPPORT`: the only sockets were AF_UNIX streams and the netlink
+answer that lists `lo`. It now has IPv4 TCP and UDP, over the loopback
+always and over an RTL8139 when QEMU provides one.
+
+**The protocols are the 32-bit kernel's.** `kernel/net.c` (Ethernet,
+ARP, IPv4, ICMP, UDP), `tcp.c` and `dhcp.c` compile unchanged into the
+64-bit kernel, with their tables made overridable and sized up there
+(48 TCP connections, 32 UDP ports). Shared changes, which the 32-bit
+`test-inet` and `test-listen` still pass with:
+
+- A loopback. A packet for 127/8 or the machine's own address is queued
+  and delivered by the next `net_poll()` rather than sent. Delivering
+  it from inside the send would run TCP's receive path over the
+  sender's half-built state, since the sender and receiver are often
+  the same TCP. TCP's checksum and the IP header use the right source
+  address for it (`net_source_ip`).
+- `tcp_send` no longer reports 0 for a segment that was recorded but
+  could not leave yet (ARP still resolving). The caller then sent the
+  same bytes again once the first copy was acknowledged, so the stream
+  held them twice. It also sends in `CLOSE_WAIT`, because a peer that
+  has finished sending can still receive.
+- `tcp_tx_idle()`, so a FIN is never sent over a data segment still in
+  flight: `tcp_close` reuses the one retransmission slot.
+
+**New for 64 bits:**
+
+- `kernel/rtl8139_64.c` is a polled driver. The ring and transmit
+  buffers are static arrays in the kernel image, whose physical address
+  is fixed below 16MB by `linker64.ld`; that is the contiguous, 32-bit
+  DMA memory the card needs, and the frame allocator cannot provide it.
+  It uses no interrupt: the stack is polled once a millisecond from the
+  timer and from every system call on an inet socket.
+- `kernel/inet64.c` is the socket layer. A connected TCP socket is a
+  pair of `pipe64` pipes plus a pump that moves bytes between them and
+  TCP. Read, write, poll, `pselect`, fork, dup, `SCM_RIGHTS` and close
+  are therefore the descriptor layer that already worked. End of file is
+  the pump dropping its writer on the receive pipe after the peer's
+  FIN. The FIN goes out when the last descriptor closes, or on
+  `shutdown(SHUT_WR)`, once the send pipe has drained. Each pipe also
+  has an anchor reference, held until the socket is freed, so a
+  descriptor can take its ends late without the pipe being freed under
+  it. Listening sockets, connects in progress and UDP are answered
+  directly.
+- `syscall64.c`: AF_INET `socket`, `bind`, `listen`, `connect`
+  (blocking, and non-blocking with `EINPROGRESS`, `POLLOUT` and
+  `SO_ERROR`), `accept`/`accept4` with the peer's address,
+  `getsockname`, `getpeername` (new; Unix sockets answer it too),
+  `sendto`/`recvfrom`, `sendmsg`/`recvmsg`, `sendmmsg` (glibc's
+  resolver), `shutdown`, `getsockopt` (`SO_ERROR`, `SO_TYPE`, ...),
+  `FIONREAD`/`FIONBIO`, and `fstat` as `S_IFSOCK`.
+- The scheduler's "every task is blocked and nothing has a deadline, so
+  nothing can ever wake them" rule now has an exception: while sockets
+  are open, the network can wake a task (`sched64_external_wakers`).
+  Without it, a lone process blocked reading a TCP socket got `-EAGAIN`.
+- Netlink lists `eth0` (index 2, its MAC and DHCP address) beside `lo`
+  once the card is up, so `getifaddrs`, and through it Wine's
+  `nsiproxy`, see it.
+
+The card is brought up by the new "inet" bring-up layer, because DHCP
+waits and that needs the timer with interrupts on. It stays up for every
+layer after it. The layer runs `userland/inet64.c`, a static glibc
+program:
+
+- Over the loopback: TCP accept/connect with addresses, a 192KB
+  transfer with `shutdown`, `ECONNREFUSED`, non-blocking connect, accept
+  and read, and UDP `sendto`/`recvfrom`/connected `send`. This half is
+  run on the host too, and `make test` requires the guest to print
+  every line the host does.
+- With `--external`: an HTTP GET and a DNS question to servers
+  `tools/net64_helper.py` runs on the build machine (10.0.2.2 from the
+  guest), and an `accept` of a connection the helper makes to the
+  guest's port 8080 through a QEMU host forward.
+
+`make -f Makefile.amd64 test` now gives QEMU
+`-netdev user,... -device rtl8139` and starts the helper. QEMU runs
+without that NIC (`make run`, the framebuffer and input tests) get the
+loopback only.
+
+Not done: no IPv6 (`AF_INET6` is still `-EAFNOSUPPORT`); TCP is
+stop-and-wait (one segment in flight, no reassembly), from the 32-bit
+stack; `/etc/nsswitch.conf` still says `hosts: files`, so `getaddrinfo`
+answers from the new `/etc/hosts` (localhost) and does not ask DNS,
+though `/etc/resolv.conf` names QEMU's forwarder, 10.0.2.3, for
+anything that asks the resolver directly; and `MSG_PEEK` on UDP takes
+the datagram.
+
+`make -f Makefile.amd64 WINE64_INSTALL=1 test` prints 30 PASS lines and
+no FAIL, the two new ones included. With Chromium staged, headless
+Chromium still prints the page (exit 0) with eth0 up. The 32-bit
+`test-inet` and `test-listen` pass on the shared protocol code.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the

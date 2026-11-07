@@ -169,6 +169,13 @@ int sched64_wake_futex(uint64_t addr, int max, uint32_t bits, int pid);
  * "something changed somewhere" is to let them look again. */
 #define SCHED64_COND_KEY 0xFFFFFFFFFFFFFF01ULL
 
+/* Something outside the machine can still wake a task: an open network
+ * socket, whose data arrives on the timer. While it is set, every task
+ * being blocked is a reason to halt and wait rather than a deadlock to
+ * report - the "nothing can ever wake this" rule below assumes that only
+ * tasks wake tasks. Set by inet64.c. */
+extern volatile int sched64_external_wakers;
+
 /* Block with a deadline in ticks, 0 for none.
  *
  * If nothing else is runnable and something is waiting on the clock,

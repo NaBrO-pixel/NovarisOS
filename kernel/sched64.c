@@ -494,6 +494,7 @@ int sched64_exit_process(int pid, registers64_t* out_regs,
  * frame is already saved, so the timer must not try to switch away from
  * it: there is no live task frame to save over. */
 static volatile int idling;
+volatile int sched64_external_wakers;
 
 static int first_runnable(void) {
     for (int i = 0; i < SCHED64_MAX_TASKS; i++)
@@ -548,7 +549,7 @@ static int idle_until_runnable(void) {
         expire_deadlines();
         n = first_runnable();
         if (n >= 0) break;
-        if (!any_deadline()) { n = -1; break; }
+        if (!any_deadline() && !sched64_external_wakers) { n = -1; break; }
     }
     idling = 0;
     return n;
@@ -654,7 +655,8 @@ int sched64_block_until_ex(const registers64_t* regs, uint64_t addr,
          * honest one. The timer being masked says the same thing: most
          * bring-up layers run with IRQ0 off on purpose, and there the
          * deadline would never arrive. */
-        if (idt64_irq_is_masked(0) || !any_deadline()) {
+        if (idt64_irq_is_masked(0) ||
+            (!any_deadline() && !sched64_external_wakers)) {
             tasks[current].blocked   = 0;
             tasks[current].wait_addr = 0;
             tasks[current].deadline  = 0;

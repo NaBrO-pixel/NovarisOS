@@ -6,6 +6,7 @@
 #include "kstring.h"
 #include "ramfs64.h"
 #include "proc64.h"
+#include "inet64.h"
 
 typedef struct {
     fdpass64_t fds[8];
@@ -32,6 +33,8 @@ static pipe64_t pipes[PIPE64_MAX];
 static void drop_inflight(const fdpass64_t* f);
 
 void pipe64_init(void) {
+    /* Sockets hold pipes; they go with them. */
+    inet64_reset();
     for (int i = 0; i < PIPE64_MAX; i++) {
         /* The buffer is deliberately not freed here. pipe64_init runs at
          * the top of every layer in kmain64, which resets the world; the
@@ -136,6 +139,7 @@ static void drop_inflight(const fdpass64_t* f) {
         pipe64_unref(f->rx, 1, 0);
         pipe64_unref(f->tx, 0, 1);
     }
+    if (f->kind == FD64_INET) inet64_unref(f->sock);
 }
 
 int pipe64_send_fds(int p, const fdpass64_t* in, int n) {

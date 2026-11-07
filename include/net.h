@@ -136,6 +136,16 @@ typedef struct {
 const net_stats_t* net_stats(void);
 
 /* The one-line internet checksum, exposed because TCP needs it too. */
+/* Whether a packet for this address stays on this machine - 127/8, or
+ * the machine's own address - and the source address a packet to it is
+ * sent from. Local packets are queued and delivered by the next
+ * net_poll() rather than sent: the TCP that sends one is often the TCP
+ * that receives it, and delivering it from inside the send would run the
+ * receive path over the sender's own half-built state. */
+int      net_is_local(uint32_t ip);
+uint32_t net_source_ip(uint32_t dest_ip);
+uint32_t net_loopback_packets(void);
+
 uint16_t net_checksum(const void* data, uint32_t len, uint32_t initial);
 
 #endif /* NET_H */

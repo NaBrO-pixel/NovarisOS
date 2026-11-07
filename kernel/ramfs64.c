@@ -404,6 +404,21 @@ void ramfs64_init(void) {
         n = ramfs64_create("/etc/nsswitch.conf", 0);
         if (n >= 0) ramfs64_write(n, 0, nsswitch, sizeof(nsswitch) - 1);
     }
+
+    /* The network's (Milestone 95). localhost has to resolve for a
+     * program to reach the loopback by name, and that comes from the
+     * hosts file, since nsswitch says "files". resolv.conf names QEMU's
+     * user-mode DNS forwarder, for anything that asks the resolver
+     * directly. */
+    {
+        static const char hosts[] =
+            "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost\n";
+        static const char resolv[] = "nameserver 10.0.2.3\n";
+        int n = ramfs64_create("/etc/hosts", 0);
+        if (n >= 0) ramfs64_write(n, 0, hosts, sizeof(hosts) - 1);
+        n = ramfs64_create("/etc/resolv.conf", 0);
+        if (n >= 0) ramfs64_write(n, 0, resolv, sizeof(resolv) - 1);
+    }
 }
 
 int ramfs64_lookup(const char* path) {

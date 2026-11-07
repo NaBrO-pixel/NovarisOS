@@ -46,6 +46,7 @@
 #include "pipe64.h"
 #include "sock64.h"
 #include "clock64.h"
+#include "inet64.h"
 
 static int failures = 0;
 
@@ -164,6 +165,8 @@ extern const unsigned long clock64_elf_len;
 
 extern const unsigned char kill64_elf[];
 extern const unsigned char novac64_elf[];
+extern const unsigned char inet64_elf[];
+extern const unsigned long inet64_elf_len;
 extern const unsigned long novac64_elf_len;
 extern const unsigned long kill64_elf_len;
 extern const unsigned char wait64_elf[];
@@ -284,12 +287,17 @@ static void timer_handler(registers64_t* r) {
     (void)r;
     timer_ticks++;
     clock64_tick();
+    inet64_timer();
 }
 
 /* The same interrupt, once there is something to schedule. */
 static void sched_timer_handler(registers64_t* r) {
     timer_ticks++;
     clock64_tick();
+    /* The network is polled, not interrupt-driven: here, once a
+     * millisecond, before the scheduler picks who runs next - so a task
+     * the pump just woke is a candidate already. */
+    inet64_timer();
     sched64_tick(r);
 }
 
@@ -4469,6 +4477,101 @@ void kernel_main(uint32_t magic, void* mbi) {
 
         check("libNovaC's target test passed on NovarisOS",
               syscall64_exit_code() == 131);
+    }
+
+    /* --- TCP/IP (Milestone 95) --------------------------------------- *
+     *
+     * AF_INET, from the 32-bit kernel's protocols (net.c, tcp.c, dhcp.c)
+     * under a socket layer of this kernel's own (inet64.c): a polled
+     * RTL8139 if QEMU gave us one, and the loopback either way.
+     *
+     * The card is brought up here rather than at boot because DHCP
+     * waits, and waiting needs the timer and interrupts on - which this
+     * is the first place to have both with nothing else running. Once
+     * up it stays up for every layer after this one: Wine and Chromium
+     * see eth0 with its address.
+     *
+     * Then userland/inet64.c, the same static binary make test runs on
+     * the host: TCP and UDP over the loopback always, and with a card
+     * an HTTP fetch, a DNS answer and an accepted connection from the
+     * build machine through QEMU's user-mode network. */
+    layer("inet");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 64;
+        vmspace64_t kspace;
+        elf64_info_t info;
+        uint64_t i, rsp, flags;
+        int rc, stack_ok = 1, pid, card;
+        proc64_t* p;
+        static const char* const inet_argv[]     = { "/inet64", 0 };
+        static const char* const inet_ext_argv[] = { "/inet64", "--external", 0 };
+
+        register_interrupt_handler64(32, timer_handler);
+        idt64_irq_set_mask(0, 0);
+        __asm__ __volatile__("pushfq; pop %0; sti" : "=r"(flags) :: "memory");
+        card = inet64_init();
+        __asm__ __volatile__("push %0; popfq" :: "r"(flags) : "memory", "cc");
+        idt64_irq_set_mask(0, 1);
+        if (card)
+            check("the card has an address", inet64_card_up());
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        syscall64_reset_files();
+        signal64_reset();
+        sched64_init();
+        proc64_init();
+        pipe64_init();
+        sock64_init();
+        vmspace64_kernel_space(&kspace);
+
+        pid = proc64_create();
+        proc64_set_current(pid);
+        p = proc64_current();
+
+        check("a space for it", vmspace64_create(&p->space) != 0);
+        rc = elf64_load(inet64_elf, inet64_elf_len, &p->space, &info);
+        check("the inet program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&p->space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&p->space, info.brk_start);
+        rsp = uspace64_build_stack(&p->space, STACK_TOP, STACK_PAGES,
+                                   inet64_card_up() ? inet_ext_argv : inet_argv,
+                                   &info, 0, 0);
+
+        {
+            registers64_t first;
+            int slot;
+            for (i = 0; i < sizeof(first) / 8; i++)
+                ((uint64_t*)&first)[i] = 0;
+            slot = sched64_add_frame_for(&first, &p->space, 0, pid);
+            if (slot >= 0) sched64_set_current(slot);
+        }
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        register_interrupt_handler64(32, sched_timer_handler);
+        idt64_irq_set_mask(0, 0);
+        syscall64_set_leader(pid);
+        vmspace64_switch(&p->space);
+        enter_user_mode64(info.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+        syscall64_set_leader(-1);
+        idt64_irq_set_mask(0, 1);
+        pf_diagnose = 0;
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("TCP and UDP worked, over the loopback and any card",
+              syscall64_exit_code() == 0);
     }
 
     /* --- wait4's pid and options (Milestone 94) ---------------------- *

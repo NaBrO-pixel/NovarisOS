@@ -123,6 +123,8 @@
 #define SYS64_SENDTO      44
 #define SYS64_RECVFROM    45
 #define SYS64_SHUTDOWN    48
+#define SYS64_GETPEERNAME 52
+#define SYS64_SENDMMSG    307
 #define SYS64_BIND        49
 #define SYS64_LISTEN      50
 #define SYS64_GETSOCKNAME 51

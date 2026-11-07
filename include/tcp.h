@@ -29,8 +29,14 @@
  * and the sender retransmits).
  */
 
+/* Overridable so the 64-bit kernel, which has processes rather than one
+ * shell command at a time, can have a bigger table. */
+#ifndef TCP_MAX_CONNECTIONS
 #define TCP_MAX_CONNECTIONS 4
+#endif
+#ifndef TCP_RECV_BUFFER
 #define TCP_RECV_BUFFER     65536
+#endif
 #define TCP_MSS             1460
 
 typedef enum {
@@ -110,6 +116,10 @@ uint16_t tcp_peer_port(int handle);
 
 /* Called by net_poll(): retransmits, and finishes closing. */
 void tcp_tick(void);
+
+/* Nothing in flight: the next tcp_send will be taken, and a FIN sent now
+ * will not overwrite a data segment still waiting to be acknowledged. */
+int tcp_tx_idle(int handle);
 
 /* Wires tcp_input into kernel/net.c. Called once by net_init(). */
 void tcp_init(void);
