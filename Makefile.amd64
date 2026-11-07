@@ -860,7 +860,8 @@ NET64_QEMU = -netdev user,id=n0,hostfwd=tcp:127.0.0.1:$(NET64_FWD)-:8080 \
 test: iso
 	@rm -f $(BUILD_DIR)/serial.log $(BUILD_DIR)/net64.status
 	@python3 tools/net64_helper.py --http $(NET64_HTTP) --dns $(NET64_DNS) \
-	    --connect $(NET64_FWD) --status $(BUILD_DIR)/net64.status & \
+	    --connect $(NET64_FWD) --status $(BUILD_DIR)/net64.status \
+	    --log $(BUILD_DIR)/net64.http.log & \
 	  hpid=$$!; \
 	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -display none \
 	    $(NET64_QEMU) \
