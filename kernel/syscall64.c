@@ -4455,6 +4455,22 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                 serial64_puts(rc == 0 ? " ok\n" : rc == -115 ? " started\n"
                                                          : " failed\n");
             }
+            /* A non-blocking TCP connect never finishes in the call on
+             * Linux, however fast the handshake: it is EINPROGRESS, and
+             * poll's POLLOUT says when it is done. Here the handshake
+             * can complete inside the call - QEMU's network answers in
+             * microseconds - and returning 0 for that is what stopped
+             * Chromium's first page load. Wine's server takes an
+             * immediate 0 as "connected" and posts no FD_CONNECT, and
+             * Chromium, which had already been told WSAEWOULDBLOCK by
+             * its own non-blocking connect, waited on the event, found
+             * no FD_CONNECT bit in it, and hit NOTREACHED in
+             * tcp_socket_win.cc. */
+            if (rc == 0 && !was && fds[a1].nonblock &&
+                inet64_type(fds[a1].sock) == INET64_STREAM) {
+                inet_fd_sync((int)a1);
+                return (uint64_t)-115;                 /* -EINPROGRESS */
+            }
             if (rc == -115) {
                 /* A second connect on a non-blocking socket still
                  * shaking hands is -EALREADY, the first -EINPROGRESS. */
