@@ -2887,6 +2887,16 @@ void kernel_main(uint32_t magic, void* mbi) {
             check("no Wine to run, which is not a failure", 1);
     }
 
+#ifdef NOVARIS64_FAST
+    /* A run for one experiment with Wine and Chromium (make chrome-net):
+     * everything from here to the network layer, and from there to the
+     * Wine prefix, is a self-contained test that resets what it uses.
+     * Skipping them saves minutes a run under emulation; make test never
+     * builds this way. */
+    serial64_puts("NOVARIS64: fast: skipping to the network layer\n");
+    goto fast_inet;
+#endif
+
     /* --- layer 26: fork, execve, wait ------------------------------- */
     /* The shape every shell has, and the one Wine's architecture is
      * built on: a process copies itself, the copy becomes a different
@@ -4480,6 +4490,9 @@ void kernel_main(uint32_t magic, void* mbi) {
               syscall64_exit_code() == 131);
     }
 
+#ifdef NOVARIS64_FAST
+fast_inet:
+#endif
     /* --- TCP/IP (Milestone 95) --------------------------------------- *
      *
      * AF_INET, from the 32-bit kernel's protocols (net.c, tcp.c, dhcp.c)
@@ -4574,6 +4587,11 @@ void kernel_main(uint32_t magic, void* mbi) {
         check("TCP and UDP worked, over the loopback and any card",
               syscall64_exit_code() == 0);
     }
+
+#ifdef NOVARIS64_FAST
+    serial64_puts("NOVARIS64: fast: skipping to the Wine prefix\n");
+    goto fast_wine;
+#endif
 
     /* --- wait4's pid and options (Milestone 94) ---------------------- *
      *
@@ -4829,6 +4847,9 @@ void kernel_main(uint32_t magic, void* mbi) {
      * stops paying for a Wine prefix it never looks at. */
     serial64_puts("NOVARIS64: ---- display settled ----\n");
 
+#ifdef NOVARIS64_FAST
+fast_wine:
+#endif
     /* --- layer 38: a Wine prefix (Milestone 71) ---------------------- */
     /* Milestone 68 removed every reason a prefix could not exist here -
      * the node ceiling, the name and path ceilings, the missing links,

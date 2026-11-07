@@ -2373,6 +2373,22 @@ static int trace_this_process(void) {
 static uint64_t syscall64_dispatch_inner(syscall64_args_t* args) {
     uint64_t r;
 
+#ifdef CHROME64_STALL_SECS
+    /* An experiment's shortcut (make chrome-net): a run whose connection
+     * has carried nothing for this long is stuck, so end it now - the
+     * deadline report below then runs at once rather than at the end of
+     * the budget. Checked once a second, not on every call. */
+    {
+        static uint64_t next_check;
+        uint64_t now = clock64_ticks();
+        if (run_deadline && now >= next_check) {
+            next_check = now + CLOCK64_HZ;
+            if (inet64_stalled((uint64_t)CHROME64_STALL_SECS * CLOCK64_HZ))
+                run_deadline = 1;
+        }
+    }
+#endif
+
     if (run_deadline && clock64_ticks() > run_deadline) {
         run_expired = 1;
         run_deadline = 0;
@@ -2874,8 +2890,34 @@ static uint64_t dispatch(syscall64_args_t* args) {
     uint64_t nr = args->nr;
     uint64_t t0 = tsc64();
     uint64_t r;
+#ifdef CHROME64_STALL_SECS
+    /* For make chrome-net: every call on a TCP socket to another machine,
+     * by whom and with what result, for the first few hundred. A call
+     * that parks is not seen returning; the next one is. */
+    int watched = fd_is_inet(args->a1) && inet64_watched(fds[args->a1].sock);
+#endif
     mmap_kind = -1;
     r = dispatch_body(args);
+#ifdef CHROME64_STALL_SECS
+    if (watched) {
+        static int lines;
+        if (lines++ < 400) {
+            serial64_puts("NOVARIS64: [inet-call] pid ");
+            serial64_putdec((uint64_t)proc64_current_pid());
+            serial64_puts(" nr ");
+            serial64_putdec(nr);
+            serial64_puts(" fd ");
+            serial64_putdec(args->a1);
+            serial64_puts(" a2 ");
+            serial64_puthex(args->a2);
+            serial64_puts(" a3 ");
+            serial64_puthex(args->a3);
+            serial64_puts(" -> ");
+            serial64_puthex(r);
+            serial64_putc('\n');
+        }
+    }
+#endif
     if (nr < 512) cycles_by_nr[nr] += tsc64() - t0;
     if ((nr == SYS64_MMAP || nr == SYS64_MUNMAP) && mmap_kind >= 0) {
         int k = nr == SYS64_MUNMAP ? MAPK_UNMAP : mmap_kind;
@@ -5001,6 +5043,17 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                     fds[nfd].tx       = got[k].tx;
                     fds[nfd].sock     = got[k].kind == FD64_INET
                                       ? got[k].sock : -1;
+#ifdef CHROME64_STALL_SECS
+                    if (got[k].kind == FD64_INET && inet64_watched(got[k].sock)) {
+                        serial64_puts("NOVARIS64: [inet-pass] pid ");
+                        serial64_putdec((uint64_t)proc64_current_pid());
+                        serial64_puts(" received sock ");
+                        serial64_putdec((uint64_t)got[k].sock);
+                        serial64_puts(" as fd ");
+                        serial64_putdec((uint64_t)nfd);
+                        serial64_puts(got[k].rx >= 0 ? " with its pipes\n" : " without pipes\n");
+                    }
+#endif
                     fds[nfd].nonblock = 0;
                     fds[nfd].cloexec  = (a3 & MSG_CMSG_CLOEXEC_) ? 1 : 0;
                     fds[nfd].used     = 1;

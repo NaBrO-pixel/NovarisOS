@@ -57,6 +57,18 @@ CFLAGS = -std=gnu99 -ffreestanding -fno-builtin -fno-stack-protector \
 NET64_SIZES = -DTCP_MAX_CONNECTIONS=128 -DTCP_RECV_BUFFER=16384 \
               -DTCP_MAX_LISTEN=32 -DUDP_PORTS=128 -DUDP_QUEUE=8
 
+# The flags every kernel object was compiled with, as a file whose
+# contents change when they do, and which every kernel object depends
+# on. Without it a change to CFLAGS_EXTRA - or to the sizes above -
+# rebuilt nothing, so `make chrome-net`, which compiles in a fast mode,
+# would have left that mode in the objects for the next `make test`.
+# $(file) rather than the shell, so the quotes in a -D value survive.
+CFLAGS_STAMP := $(BUILD_DIR)/cflags.stamp
+ifneq ($(file <$(CFLAGS_STAMP)),$(CFLAGS))
+$(shell mkdir -p $(BUILD_DIR))
+$(file >$(CFLAGS_STAMP),$(CFLAGS))
+endif
+
 # Anything extra a one-off run wants to define, without editing source.
 # Used for the chrome.exe budget, which `make test` cannot afford to
 # raise but an investigation needs to:
@@ -591,7 +603,7 @@ $(BUILD_DIR)/loader64_blob.c: $(BUILD_DIR)/loader64.exe userland/embed64.py
 $(BUILD_DIR)/loader64_blob.o: $(BUILD_DIR)/loader64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/%.o: kernel/%.c | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: kernel/%.c $(CFLAGS_STAMP) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(KERNEL): $(OBJS) linker64.ld
@@ -689,9 +701,18 @@ INITRD_CONFIG_TEXT = WINE64_INSTALL=$(WINE64_INSTALL) \
     WINE64_LOADER=$(abspath $(WINE64_LOADER)) \
     WINE64_NTDLL=$(abspath $(WINE64_NTDLL)) \
     CHROMIUM64_DIR=$(CHROMIUM64_DIR) CHROMIUM64_FILES=$(CHROMIUM64_FILES)
+# Only when this make is building the image. It used to be rewritten by
+# every invocation, so compiling one object without the Wine and
+# Chromium variables - `make -f Makefile.amd64 build64/inet64.o` - wrote
+# an empty configuration, and the next real run re-staged the whole
+# 500MB initrd for nothing: three minutes a run.
+INITRD_GOALS := $(if $(MAKECMDGOALS),$(filter all iso run test \
+    $(BUILD_DIR)/initrd64.img $(ISO),$(MAKECMDGOALS)),all)
+ifneq ($(INITRD_GOALS),)
 $(shell mkdir -p $(BUILD_DIR); \
     [ "`cat $(INITRD_CONFIG) 2>/dev/null`" = "$(INITRD_CONFIG_TEXT)" ] \
     || echo "$(INITRD_CONFIG_TEXT)" > $(INITRD_CONFIG))
+endif
 
 # tools/stage_wine.sh and its module list are prerequisites because they
 # decide what goes *into* the image. Without them here, editing the list
@@ -1265,6 +1286,50 @@ test: iso
 	@grep -q connected $(BUILD_DIR)/net64.status 2>/dev/null \
 	    || (echo "FAIL: the host could not connect to a socket in the guest"; exit 1)
 	@echo "PASS: TCP and UDP through an RTL8139 to this machine, both directions"
+
+# One headless Chromium page load over the network, as fast as this
+# machine can do it: the kernel built with NOVARIS64_FAST (the test
+# layers that do not lead to Wine skipped), Chromium pointed at
+# CHROME_NET_URL - by default the page tools/net64_helper.py serves -
+# and a run that ends as soon as a connection has carried nothing for
+# CHROME_NET_STALL seconds. Prints the requests the helper saw, what
+# Chromium printed of the page, and the socket report. Needs
+# CHROMIUM64_DIR and CHROMIUM64_FILES as for a Chromium `make test`.
+# Not a test: nothing here is asserted.
+CHROME_NET_URL    ?= http://10.0.2.2:$(NET64_HTTP)/page.html
+CHROME_NET_BUDGET ?= 300
+CHROME_NET_STALL  ?= 30
+CHROME_NET_FLAGS   = -DNOVARIS64_FAST -DCHROME64_VERBOSE \
+    -DCHROME64_URL=\"$(CHROME_NET_URL)\" \
+    -DCHROME64_BUDGET_SECS=$(CHROME_NET_BUDGET)u \
+    -DCHROME64_STALL_SECS=$(CHROME_NET_STALL)
+
+.PHONY: chrome-net
+chrome-net:
+	@[ -n "$(CHROMIUM64_DIR)" ] || (echo "chrome-net needs CHROMIUM64_DIR"; false)
+	@$(MAKE) -f Makefile.amd64 WINE64_INSTALL=1 \
+	    CFLAGS_EXTRA='$(CHROME_NET_FLAGS) $(CFLAGS_EXTRA)' iso
+	@rm -f $(BUILD_DIR)/serial.log $(BUILD_DIR)/net64.status $(BUILD_DIR)/net64.http.log
+	@python3 tools/net64_helper.py --http $(NET64_HTTP) --dns $(NET64_DNS) \
+	    --connect $(NET64_FWD) --status $(BUILD_DIR)/net64.status \
+	    --log $(BUILD_DIR)/net64.http.log & \
+	  hpid=$$!; \
+	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -display none \
+	    $(NET64_QEMU) \
+	    -serial file:$(BUILD_DIR)/serial.log -no-reboot >/dev/null 2>&1 & \
+	  qpid=$$!; waited=0; \
+	  while [ $$waited -lt $(TEST_TIMEOUT) ]; do \
+	      grep -q "bring-up complete" $(BUILD_DIR)/serial.log 2>/dev/null && break; \
+	      kill -0 $$qpid 2>/dev/null || break; \
+	      sleep 1; waited=$$((waited+1)); \
+	  done; \
+	  kill $$qpid 2>/dev/null; wait $$qpid 2>/dev/null || true; \
+	  kill $$hpid 2>/dev/null; wait $$hpid 2>/dev/null || true; \
+	  echo "--- after $$waited seconds; requests the host saw:"; \
+	  cat $(BUILD_DIR)/net64.http.log 2>/dev/null; \
+	  echo "--- the guest:"; \
+	  grep -a "chrome = \|\[inet\] pid .* tcp\|\[inet\] sock .* tcp\|\[inet\] [0-9]* sockets\|nothing sent or received\|Page load\|<p id=" \
+	      $(BUILD_DIR)/serial.log | cut -c1-240 | tail -40
 
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR) $(ISO)

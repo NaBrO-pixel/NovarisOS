@@ -72,6 +72,7 @@ typedef struct {
     uint64_t bytes_out, bytes_in;
     uint32_t polls, polls_out_wanted, polls_out_given;
     int      last_poll_pid;
+    uint64_t connected_at;  /* clock64 tick it reached S_CONNECTED */
 } isock_t;
 
 static isock_t socks[INET64_MAX];
@@ -269,6 +270,7 @@ static int pump_one(isock_t* k) {
                 k->state = S_DONE;
             } else {
                 k->state = S_CONNECTED;
+                k->connected_at = clock64_ticks();
             }
             wake_all();
             return 1;
@@ -598,6 +600,7 @@ int inet64_accept(int s) {
         return -23;
     }
     socks[n].state = S_CONNECTED;
+    socks[n].connected_at = clock64_ticks();
     socks[n].tcp = h;
     socks[n].lip = k->lip;
     socks[n].lport = k->lport;
@@ -1007,4 +1010,36 @@ void inet64_note_poll(int s, int pid, int want_out, int gave_out) {
     socks[s].last_poll_pid = pid;
     if (want_out) socks[s].polls_out_wanted++;
     if (gave_out) socks[s].polls_out_given++;
+}
+
+/* A TCP connection that has been established for `ticks` without a byte
+ * either way: the shape of a page load whose request never left. Says
+ * so once, which lets a run that is stuck end now instead of waiting out
+ * its whole budget. */
+int inet64_stalled(uint64_t ticks) {
+    static int said;
+    uint64_t now = clock64_ticks();
+    if (said) return 0;
+    for (int i = 0; i < INET64_MAX; i++) {
+        isock_t* k = &socks[i];
+        if (k->state != S_CONNECTED || k->type != INET64_STREAM) continue;
+        if (k->bytes_out || k->bytes_in) continue;
+        if (now - k->connected_at < ticks) continue;
+        said = 1;
+        serial64_puts("NOVARIS64: [inet] sock ");
+        serial64_putdec((uint64_t)i);
+        serial64_puts(" has been connected to ");
+        say_ip(k->rip);
+        serial64_putc(':');
+        serial64_putdec(k->rport);
+        serial64_puts(" with nothing sent or received - ending the run\n");
+        return 1;
+    }
+    return 0;
+}
+
+/* A TCP socket with a peer that is not this machine. */
+int inet64_watched(int s) {
+    return inet64_valid(s) && socks[s].type == INET64_STREAM &&
+           socks[s].rport && !net_is_local(socks[s].rip);
 }
