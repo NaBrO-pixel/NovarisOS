@@ -39,5 +39,8 @@ int     pipe2(int fds[2], int flags);
 pid_t   fork(void);
 unsigned int sleep(unsigned int seconds);
 _Noreturn void _exit(int status);
+int     execve(const char *path, char *const argv[], char *const envp[]);
+int     execv(const char *path, char *const argv[]);
+int     execvp(const char *file, char *const argv[]);
 NOVAC_END_DECLS
 #endif

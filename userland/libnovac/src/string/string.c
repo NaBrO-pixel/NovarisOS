@@ -143,6 +143,10 @@ char *strerror(int e)
     case 0:         m = "Success"; break;
     case EPERM:     m = "Operation not permitted"; break;
     case ENOENT:    m = "No such file or directory"; break;
+    case ESRCH:     m = "No such process"; break;
+    case ETXTBSY:   m = "Text file busy"; break;
+    case EDEADLK:   m = "Resource deadlock avoided"; break;
+    case ENOLCK:    m = "No locks available"; break;
     case EIO:       m = "I/O error"; break;
     case EBADF:     m = "Bad file descriptor"; break;
     case ENOMEM:    m = "Out of memory"; break;

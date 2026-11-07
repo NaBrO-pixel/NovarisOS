@@ -4,7 +4,7 @@
 #include "../internal/exit_hook.h"
 
 #define NOVAC_ATEXIT_MAX   32
-#define NOVAC_ABORT_STATUS 134   /* conventional 128 + SIGABRT; see README */
+#define NOVAC_ABORT_STATUS 134   /* 128 + SIGABRT: the fallback if SIGABRT did not end us */
 
 static void (*handlers[NOVAC_ATEXIT_MAX])(void);
 static size_t handler_count;
@@ -30,4 +30,15 @@ _Noreturn void exit(int status)
 
 _Noreturn void _Exit(int status) { novac_sys_exit(status); }
 
-_Noreturn void abort(void) { novac_sys_exit(NOVAC_ABORT_STATUS); }
+/* abort() raises SIGABRT where the signal module is linked - the real
+ * target - so a parent's wait() sees a death by SIGABRT, as POSIX says.
+ * The portable core (and the host unit tests, which have no signals) links
+ * without it; the weak reference is then null and the conventional exit
+ * status is all there is. */
+extern void novac__raise_abort(void) __attribute__((weak));
+
+_Noreturn void abort(void)
+{
+    if (novac__raise_abort) novac__raise_abort();
+    novac_sys_exit(NOVAC_ABORT_STATUS);
+}
