@@ -109,6 +109,7 @@
 #define FD64_SOCKET 2
 #define FD64_SIGNALFD 3   /* signalfd(2): reads the reader's own signals */
 #define FD64_NETLINK  4   /* AF_NETLINK, NETLINK_ROUTE: the interface list */
+#define FD64_INET     5   /* AF_INET: `sock` is the socket in inet64.c */
 
 typedef struct {
     int      kind;      /* FD64_FILE, FD64_PIPE, FD64_SOCKET, FD64_SIGNALFD */

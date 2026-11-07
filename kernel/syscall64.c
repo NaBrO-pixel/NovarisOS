@@ -30,6 +30,7 @@
 #include "pmm64.h"
 #include "input64.h"
 #include "fb64.h"
+#include "inet64.h"
 
 #define IA32_EFER   0xC0000080u
 #define IA32_STAR   0xC0000081u
@@ -324,7 +325,8 @@ static void fd_adopt_pipe(int fd, int rx, int tx, int sock,
  * three things the descriptor layer makes are the same thing. */
 static int fd_is_stream(int fd) {
     return fds[fd].kind == FD64_PIPE ||
-           (fds[fd].kind == FD64_SOCKET && (fds[fd].rx >= 0 || fds[fd].tx >= 0));
+           ((fds[fd].kind == FD64_SOCKET || fds[fd].kind == FD64_INET) &&
+            (fds[fd].rx >= 0 || fds[fd].tx >= 0));
 }
 
 /* Closing a descriptor, from close(2) and from dup2 replacing one.
@@ -346,6 +348,7 @@ static void fd_take_ref(int fd) {
     } else {
         pipe64_ref(fds[fd].rx, 1, 0);
         pipe64_ref(fds[fd].tx, 0, 1);
+        if (fds[fd].kind == FD64_INET) inet64_ref(fds[fd].sock);
     }
 }
 
@@ -385,9 +388,74 @@ static void fd_release(int fd) {
         if (rx >= 0) sched64_wake(PIPE64_WAIT_KEY(rx), SCHED64_MAX_TASKS);
         if (tx >= 0) sched64_wake(PIPE64_WAIT_KEY(tx), SCHED64_MAX_TASKS);
     }
+    /* After the pipes, so the pump that runs next sees this descriptor's
+     * ends gone along with its name. */
+    if (fds[fd].kind == FD64_INET) {
+        int s = fds[fd].sock;
+        fds[fd].sock = -1;
+        inet64_unref(s);
+        inet64_poll();
+    }
     fds[fd].used = 0;
     fds[fd].rx   = -1;
     fds[fd].tx   = -1;
+}
+
+/* --- AF_INET descriptors ------------------------------------------- *
+ *
+ * An inet descriptor names a socket in inet64.c by `sock`. Once that
+ * socket is connected it has a pair of pipes, and the descriptor takes
+ * its own ends of them the first time it is used afterwards - so a
+ * connected socket is, to read, write and poll, a stream like any other.
+ * `pos` remembers that it has, so a descriptor that shut one end down
+ * does not quietly take it back. Every copy of the descriptor - dup,
+ * fork, SCM_RIGHTS - copies `pos` and the ends together. */
+static int user_range_ok(uint64_t addr, uint64_t len);
+
+static void inet_fd_sync(int fd) {
+    int s = fds[fd].sock;
+    inet64_poll();
+    if (fds[fd].pos || inet64_rx(s) < 0) return;
+    fds[fd].rx  = inet64_rx(s);
+    fds[fd].tx  = inet64_tx(s);
+    fds[fd].pos = 1;
+    pipe64_ref(fds[fd].rx, 1, 0);
+    pipe64_ref(fds[fd].tx, 0, 1);
+}
+
+static int fd_is_inet(uint64_t fd) {
+    return fd < FD_MAX && fds[fd].used && fds[fd].kind == FD64_INET;
+}
+
+/* struct sockaddr_in, both ways. Addresses and ports are host order
+ * inside the kernel and network order in the structure. */
+static int64_t inet_addr_in(uint64_t addr, uint64_t len, uint32_t* ip,
+                            uint16_t* port) {
+    const uint8_t* a = (const uint8_t*)addr;
+    if (!addr || len < 8 || !user_range_ok(addr, 8)) return -22;
+    if (*(const uint16_t*)a != 2) return -97;          /* -EAFNOSUPPORT */
+    *port = (uint16_t)((a[2] << 8) | a[3]);
+    *ip   = ((uint32_t)a[4] << 24) | ((uint32_t)a[5] << 16) |
+            ((uint32_t)a[6] << 8)  |  (uint32_t)a[7];
+    return 0;
+}
+
+static int64_t inet_addr_out(uint64_t addr, uint64_t lenp, uint32_t ip,
+                             uint16_t port) {
+    uint8_t sa[16] = { 0 };
+    uint32_t room;
+    if (!addr || !lenp) return 0;
+    if (!user_range_ok(lenp, 4)) return -14;
+    room = *(uint32_t*)lenp;
+    sa[0] = 2;
+    sa[2] = (uint8_t)(port >> 8); sa[3] = (uint8_t)port;
+    sa[4] = (uint8_t)(ip >> 24);  sa[5] = (uint8_t)(ip >> 16);
+    sa[6] = (uint8_t)(ip >> 8);   sa[7] = (uint8_t)ip;
+    if (room > 16) room = 16;
+    if (room && !user_range_ok(addr, room)) return -14;
+    kmemcpy((void*)addr, sa, room);
+    *(uint32_t*)lenp = 16;
+    return 0;
 }
 
 /* --- which clock is which ------------------------------------------ *
@@ -622,6 +690,62 @@ static uint64_t wait_restart(const syscall64_args_t* args, uint64_t nr,
     return 0;
 }
 
+/* Parks a connect, accept or UDP receive until the network has news,
+ * then runs the call again from the start. The deadline is a backstop:
+ * the pump wakes INET64_WAIT_KEY on every event it sees. */
+static uint64_t inet_block(const syscall64_args_t* args, uint64_t nr) {
+    registers64_t self, next;
+    vmspace64_t next_space;
+    uint64_t next_fs;
+
+    if (signal_interrupts_wait()) return (uint64_t)-4;     /* -EINTR */
+    frame_from_args(args, nr, &self);
+    self.rip = args->ret_rip - 2;
+    if (!sched64_block_until(&self, INET64_WAIT_KEY, nr,
+                             clock64_ticks() + 1000,
+                             &next, &next_space, &next_fs))
+        return (uint64_t)-11;
+    vmspace64_switch(&next_space);
+    write_msr(0xC0000100u, next_fs);
+    sched64_resume(&next);                             /* never returns */
+    return 0;
+}
+
+/* A datagram or a byte stream, read with nothing else to say about it:
+ * read(2), recv(2), recvfrom(2) without an address. */
+static int64_t inet_dgram_read(const syscall64_args_t* args, uint64_t nr,
+                               int fd, void* buf, uint64_t n, int dontwait,
+                               uint32_t* ip, uint16_t* port) {
+    int64_t r = inet64_recvfrom(fds[fd].sock, buf, n, 0, ip, port);
+    if (r == -11 && !fds[fd].nonblock && !dontwait)
+        return (int64_t)inet_block(args, nr);
+    return r;
+}
+
+/* sendmsg(2) on a UDP socket: the vectors gathered into one datagram,
+ * to msg_name or to the connected peer. */
+static int64_t inet_sendmsg_dgram(int fd, const msghdr64_t* msg) {
+    static uint8_t dg[1472];
+    uint64_t len = 0;
+    uint32_t ip = 0;
+    uint16_t port = 0;
+
+    for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
+        const iovec64_t* v = &msg->msg_iov[i];
+        if (!v->iov_len) continue;
+        if (len + v->iov_len > sizeof(dg)) return -90;     /* -EMSGSIZE */
+        if (!user_range_ok((uint64_t)v->iov_base, v->iov_len)) return -14;
+        kmemcpy(dg + len, v->iov_base, v->iov_len);
+        len += v->iov_len;
+    }
+    if (msg->msg_name) {
+        int64_t e = inet_addr_in((uint64_t)msg->msg_name, msg->msg_namelen,
+                                 &ip, &port);
+        if (e) return e;
+    }
+    return inet64_sendto(fds[fd].sock, dg, len, ip, port);
+}
+
 /* Everything this process still had open, given back.
  *
  * Linux closes a process's descriptors when it exits, and until
@@ -832,8 +956,8 @@ static int64_t do_pipe_read(const syscall64_args_t* args, uint64_t nr,
  * in that call when the run ended, and the browser's main thread was
  * waiting behind them on a Mojo channel.
  *
- * This machine's only interface is the loopback, so that is the answer:
- * lo, index 1, 127.0.0.1/8. The answer is the same every time, so the
+ * The loopback is always there: lo, index 1, 127.0.0.1/8. With a card
+ * brought up by inet64.c, eth0 is index 2 with its DHCP address. The answer is the same every time, so the
  * descriptor keeps only the request it is answering - its type and
  * sequence number, in `pos` - and the reply is built when it is read.
  * Nothing is shared, so fork and dup need nothing. A socket bound to
@@ -861,44 +985,81 @@ static uint32_t nl_attr(uint8_t* out, uint32_t at, uint16_t type,
     return at + ((len + 3u) & ~3u);
 }
 
-/* The reply to one dump request, into `out`. Returns its length. */
+/* One interface in an RTM_NEWLINK message at `at`; returns the end. */
+static uint32_t nl_link(uint8_t* out, uint32_t at, uint32_t seq, uint32_t pid,
+                        int index, uint16_t arptype, uint32_t flags,
+                        const char* name, const uint8_t* mac,
+                        const uint8_t* bcast, uint32_t mtu) {
+    nlhdr64_t* h = (nlhdr64_t*)(out + at);
+    uint32_t start = at;
+    at += sizeof(*h);
+    /* ifinfomsg: family, pad, type, index, flags, change. */
+    out[at] = 0; out[at + 1] = 0;
+    *(uint16_t*)(out + at + 2) = arptype;
+    *(int32_t*)(out + at + 4)  = index;
+    *(uint32_t*)(out + at + 8) = flags;
+    *(uint32_t*)(out + at + 12) = 0;
+    at += 16;
+    at = nl_attr(out, at, 3, name, (uint16_t)(kstrlen(name) + 1)); /* IFLA_IFNAME */
+    at = nl_attr(out, at, 1, mac, 6);           /* IFLA_ADDRESS  */
+    at = nl_attr(out, at, 2, bcast, 6);         /* IFLA_BROADCAST*/
+    at = nl_attr(out, at, 4, &mtu, 4);          /* IFLA_MTU      */
+    h->len = at - start; h->type = RTM_NEWLINK_; h->flags = NLM_F_MULTI_;
+    h->seq = seq; h->pid = pid;
+    return at;
+}
+
+/* One IPv4 address in an RTM_NEWADDR message at `at`. */
+static uint32_t nl_addr(uint8_t* out, uint32_t at, uint32_t seq, uint32_t pid,
+                        int index, uint8_t prefix, uint8_t scope,
+                        const uint8_t ip[4], const char* label) {
+    nlhdr64_t* h = (nlhdr64_t*)(out + at);
+    uint32_t start = at;
+    at += sizeof(*h);
+    /* ifaddrmsg: AF_INET, prefix, IFA_F_PERMANENT, scope, index. */
+    out[at] = 2; out[at + 1] = prefix; out[at + 2] = 0x80; out[at + 3] = scope;
+    *(uint32_t*)(out + at + 4) = (uint32_t)index;
+    at += 8;
+    at = nl_attr(out, at, 1, ip, 4);            /* IFA_ADDRESS */
+    at = nl_attr(out, at, 2, ip, 4);            /* IFA_LOCAL   */
+    at = nl_attr(out, at, 3, label, (uint16_t)(kstrlen(label) + 1)); /* IFA_LABEL */
+    h->len = at - start; h->type = RTM_NEWADDR_; h->flags = NLM_F_MULTI_;
+    h->seq = seq; h->pid = pid;
+    return at;
+}
+
+/* The reply to one dump request, into `out`. Returns its length.
+ *
+ * The loopback always; eth0 as well once inet64.c has a card with an
+ * address, index 2 as on any Linux machine with one card. */
 static uint32_t nl_reply(uint16_t type, uint32_t seq, uint32_t pid,
                          uint8_t* out) {
+    static const uint8_t zero6[6] = { 0 };
+    static const uint8_t ones6[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+    int eth = inet64_card_up();
     uint32_t at = 0;
     nlhdr64_t* h;
 
     if (type == RTM_GETLINK_) {
-        static const uint8_t zero6[6] = { 0 };
-        uint32_t mtu = 65536;
-        h = (nlhdr64_t*)out;
-        at = sizeof(*h);
-        /* ifinfomsg: family, pad, type ARPHRD_LOOPBACK, index, flags
-         * IFF_UP|IFF_LOOPBACK|IFF_RUNNING|IFF_LOWER_UP, change. */
-        out[at] = 0; out[at + 1] = 0;
-        *(uint16_t*)(out + at + 2) = 772;
-        *(int32_t*)(out + at + 4)  = 1;
-        *(uint32_t*)(out + at + 8) = 0x1u | 0x8u | 0x40u | 0x10000u;
-        *(uint32_t*)(out + at + 12) = 0;
-        at += 16;
-        at = nl_attr(out, at, 3, "lo", 3);          /* IFLA_IFNAME   */
-        at = nl_attr(out, at, 1, zero6, 6);         /* IFLA_ADDRESS  */
-        at = nl_attr(out, at, 2, zero6, 6);         /* IFLA_BROADCAST*/
-        at = nl_attr(out, at, 4, &mtu, 4);          /* IFLA_MTU      */
-        h->len = at; h->type = RTM_NEWLINK_; h->flags = NLM_F_MULTI_;
-        h->seq = seq; h->pid = pid;
+        /* IFF_UP|IFF_LOOPBACK|IFF_RUNNING|IFF_LOWER_UP */
+        at = nl_link(out, at, seq, pid, 1, 772, 0x1u | 0x8u | 0x40u | 0x10000u,
+                     "lo", zero6, zero6, 65536);
+        /* IFF_UP|IFF_BROADCAST|IFF_RUNNING|IFF_MULTICAST|IFF_LOWER_UP */
+        if (eth)
+            at = nl_link(out, at, seq, pid, 2, 1,
+                         0x1u | 0x2u | 0x40u | 0x1000u | 0x10000u,
+                         "eth0", inet64_mac(), ones6, 1500);
     } else if (type == RTM_GETADDR_) {
         static const uint8_t lo4[4] = { 127, 0, 0, 1 };
-        h = (nlhdr64_t*)out;
-        at = sizeof(*h);
-        /* ifaddrmsg: AF_INET, /8, IFA_F_PERMANENT, RT_SCOPE_HOST, lo. */
-        out[at] = 2; out[at + 1] = 8; out[at + 2] = 0x80; out[at + 3] = 254;
-        *(uint32_t*)(out + at + 4) = 1;
-        at += 8;
-        at = nl_attr(out, at, 1, lo4, 4);           /* IFA_ADDRESS */
-        at = nl_attr(out, at, 2, lo4, 4);           /* IFA_LOCAL   */
-        at = nl_attr(out, at, 3, "lo", 3);          /* IFA_LABEL   */
-        h->len = at; h->type = RTM_NEWADDR_; h->flags = NLM_F_MULTI_;
-        h->seq = seq; h->pid = pid;
+        at = nl_addr(out, at, seq, pid, 1, 8, 254, lo4, "lo");
+        if (eth) {
+            uint32_t ip = inet64_ip(), mask = inet64_netmask();
+            uint8_t ip4[4] = { (uint8_t)(ip >> 24), (uint8_t)(ip >> 16),
+                               (uint8_t)(ip >> 8), (uint8_t)ip };
+            uint8_t prefix = 0;
+            while (prefix < 32 && (mask & (0x80000000u >> prefix))) prefix++;
+            at = nl_addr(out, at, seq, pid, 2, prefix, 0, ip4, "eth0");
+        }
     }
     /* Every dump ends the same way, including one for a table this
      * machine has nothing in. */
@@ -983,6 +1144,11 @@ static int64_t fd_write_bytes(uint64_t fd, const char* buf, uint64_t n) {
         if (fd >= FD_MAX || !fds[fd].used) return -9;  /* -EBADF */
         if (fd_is_stream((int)fd)) return do_pipe_write((int)fd, buf, n);
         if (fds[fd].kind == FD64_SOCKET) return -107;  /* -ENOTCONN */
+        if (fds[fd].kind == FD64_INET) {
+            if (inet64_type(fds[fd].sock) == INET64_DGRAM)
+                return inet64_sendto(fds[fd].sock, buf, n, 0, 0);
+            return -107;
+        }
         if (fds[fd].kind == FD64_SIGNALFD) return -22; /* -EINVAL, as Linux */
         if (fds[fd].kind == FD64_NETLINK) return nl_send((int)fd, buf, n);
         /* /dev/null takes everything and keeps none of it; the console
@@ -1053,6 +1219,11 @@ static int64_t fd_read_bytes(const syscall64_args_t* args, uint64_t nr,
     if (fd_is_stream((int)fd))
         return do_pipe_read(args, nr, (int)fd, buf, n);
     if (fds[fd].kind == FD64_SOCKET) return -107;      /* -ENOTCONN */
+    if (fds[fd].kind == FD64_INET) {
+        if (inet64_type(fds[fd].sock) == INET64_DGRAM)
+            return inet_dgram_read(args, nr, (int)fd, buf, n, 0, 0, 0);
+        return -107;
+    }
     if (fds[fd].kind == FD64_SIGNALFD)
         return signalfd_read(args, nr, (int)fd, buf, n);
     if (fds[fd].kind == FD64_NETLINK)
@@ -2717,7 +2888,26 @@ static uint64_t do_poll(const syscall64_args_t* args, uint64_t nr,
         if (fd >= FD_MAX || !fds[fd].used) { pfds[i].revents = POLL64_NVAL;
                                              ready++; continue; }
 
-        if (fds[fd].kind == FD64_SIGNALFD) {
+        if (fds[fd].kind == FD64_INET) {
+            int s = fds[fd].sock;
+            inet_fd_sync(fd);
+            if (inet64_type(s) == INET64_DGRAM) {
+                if (inet64_dgram_ready(s)) got |= POLL64_IN;
+                got |= POLL64_OUT;
+            } else if (inet64_is_listening(s)) {
+                if (inet64_accept_ready(s)) got |= POLL64_IN;
+            } else if (fd_is_stream(fd)) {
+                int rx = fds[fd].rx, tx = fds[fd].tx;
+                if (rx >= 0 && (pipe64_available(rx) > 0 ||
+                                pipe64_writers(rx) == 0)) got |= POLL64_IN;
+                if (tx >= 0 && pipe64_space(tx) > 0)      got |= POLL64_OUT;
+                if (tx >= 0 && pipe64_readers(tx) == 0)   got |= POLL64_HUP;
+            } else if (!inet64_connecting(s)) {
+                /* Never connected, or a connect that failed: Linux says
+                 * writable and hung up, and an error if there is one. */
+                got |= POLL64_OUT | POLL64_HUP | 0x008;     /* POLLERR */
+            }
+        } else if (fds[fd].kind == FD64_SIGNALFD) {
             /* Readable while a signal it reports is pending for the
              * poller; never writable. */
             if (signal64_pending_in_set(fds[fd].sigmask)) got |= POLL64_IN;
@@ -2743,7 +2933,7 @@ static uint64_t do_poll(const syscall64_args_t* args, uint64_t nr,
             got |= POLL64_IN | POLL64_OUT;
         }
 
-        got &= (short)(want | POLL64_HUP | POLL64_NVAL);
+        got &= (short)(want | POLL64_HUP | POLL64_NVAL | 0x008);
         if (got) { pfds[i].revents = got; ready++; }
     }
 
@@ -2783,6 +2973,11 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         }
         return win32_64_call(nr, a1, a2, a3, args->a4);
     }
+
+    /* An inet descriptor catches up with its socket before anything is
+     * asked of it - see inet_fd_sync. Every call whose first argument
+     * names one, which costs one comparison for the rest. */
+    if (fd_is_inet(a1)) inet_fd_sync((int)a1);
 
     switch (nr) {
     case SYS64_WRITE:
@@ -3514,6 +3709,21 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         return 0;
 
     case SYS64_IOCTL: {
+        if (fd_is_inet(a1) && (a2 == 0x541B || a2 == 0x5421)) {
+            if (!a3 || !user_range_ok(a3, 4)) return (uint64_t)-14;
+            if (a2 == 0x5421) {                        /* FIONBIO */
+                fds[a1].nonblock = *(const int*)a3 != 0;
+                return 0;
+            }
+            /* FIONREAD: what a read would return now. For UDP the size
+             * of the next datagram is not known without taking it, and
+             * the largest one is the safe answer for sizing a buffer. */
+            if (inet64_type(fds[a1].sock) == INET64_DGRAM)
+                *(int*)a3 = inet64_dgram_ready(fds[a1].sock) ? 1472 : 0;
+            else
+                *(int*)a3 = fds[a1].rx >= 0 ? (int)pipe64_available(fds[a1].rx) : 0;
+            return 0;
+        }
         /* The two fbdev queries, with Linux's own structure layouts -
          * offsets taken from <linux/fb.h> for x86-64. A program asks the
          * driver what the screen is rather than being told out of band,
@@ -3630,6 +3840,11 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
          * the file it has just opened, sees something unmappable with no
          * length, and gives up without ever mapping libc - which
          * presents much later as an undefined symbol. */
+        if (fd_is_inet(a1)) {
+            *(uint32_t*)(st + 24) = 0140777u;          /* S_IFSOCK */
+            *(uint64_t*)(st + 56) = 4096;
+            return 0;
+        }
         if (a1 >= 3) {
             if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
             fill_ids(st, fds[a1].node);
@@ -4078,6 +4293,27 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
             fds[fd].used     = 1;
             return (uint64_t)fd;
         }
+        if (a1 == 2) {                                 /* AF_INET */
+            int type = (int)(a2 & 0xFF);
+            if (type != 1 && type != 2) return (uint64_t)-94; /* -ESOCKTNOSUPPORT */
+            if (a3 != 0 && !(type == 1 && a3 == 6) && !(type == 2 && a3 == 17))
+                return (uint64_t)-93;                  /* -EPROTONOSUPPORT */
+            s = inet64_socket(type == 1 ? INET64_STREAM : INET64_DGRAM);
+            if (s < 0) return (uint64_t)(int64_t)s;
+            fd = fd_alloc(3);
+            if (fd < 0) { inet64_unref(s); return (uint64_t)-24; }
+            fds[fd].kind     = FD64_INET;
+            fds[fd].node     = -1;
+            fds[fd].pos      = 0;
+            fds[fd].rx       = -1;
+            fds[fd].tx       = -1;
+            fds[fd].sock     = s;
+            fds[fd].sigmask  = 0;
+            fds[fd].nonblock = (a2 & O_NONBLOCK) != 0;
+            fds[fd].cloexec  = (a2 & O_CLOEXEC) != 0;
+            fds[fd].used     = 1;
+            return (uint64_t)fd;
+        }
         if (a1 != AF_UNIX_) return (uint64_t)-97;      /* -EAFNOSUPPORT */
         if ((int)(a2 & 0xFF) != SOCK_STREAM_) return (uint64_t)-94;
 
@@ -4103,6 +4339,12 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         int node;
 
         if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind == FD64_INET) {
+            uint32_t ip; uint16_t port;
+            int64_t e2 = inet_addr_in(a2, a3, &ip, &port);
+            if (e2) return (uint64_t)e2;
+            return (uint64_t)(int64_t)inet64_bind(fds[a1].sock, ip, port);
+        }
         if (fds[a1].kind == FD64_NETLINK) {
             /* The groups are remembered and nothing is ever sent to
              * them; the port is always the process's own pid. */
@@ -4132,6 +4374,8 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
 
     case SYS64_LISTEN:
         if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind == FD64_INET)
+            return (uint64_t)(int64_t)inet64_listen(fds[a1].sock);
         if (fds[a1].kind != FD64_SOCKET || fds[a1].sock < 0)
             return (uint64_t)-88;
         return (uint64_t)sock64_listen(fds[a1].sock, (int)a2);
@@ -4151,6 +4395,21 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         int node, listener, rx = -1, tx = -1, rc;
 
         if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind == FD64_INET) {
+            uint32_t ip; uint16_t port;
+            int was = inet64_connecting(fds[a1].sock);
+            int64_t e2 = inet_addr_in(a2, a3, &ip, &port);
+            if (e2) return (uint64_t)e2;
+            rc = inet64_connect(fds[a1].sock, ip, port);
+            if (rc == -115) {
+                /* A second connect on a non-blocking socket still
+                 * shaking hands is -EALREADY, the first -EINPROGRESS. */
+                if (fds[a1].nonblock) return (uint64_t)(was ? -114 : -115);
+                return inet_block(args, nr);
+            }
+            if (rc == 0) inet_fd_sync((int)a1);
+            return (uint64_t)(int64_t)rc;
+        }
         if (fds[a1].kind != FD64_SOCKET || fds[a1].sock < 0)
             return (uint64_t)-88;
         if (!addr || addr->sun_family != AF_UNIX_) return (uint64_t)-22;
@@ -4192,10 +4451,38 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         uint64_t next_fs;
 
         if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        flags = (nr == SYS64_ACCEPT4) ? (int)args->a4 : 0;
+        if (fds[a1].kind == FD64_INET) {
+            int ns = inet64_accept(fds[a1].sock);
+            uint32_t ip = 0; uint16_t port = 0;
+            if (ns == -11) {
+                if (fds[a1].nonblock) return (uint64_t)-11;
+                return inet_block(args, nr);
+            }
+            if (ns < 0) return (uint64_t)(int64_t)ns;
+            nfd = fd_alloc(3);
+            if (nfd < 0) { inet64_unref(ns); return (uint64_t)-24; }
+            fds[nfd].kind     = FD64_INET;
+            fds[nfd].node     = -1;
+            fds[nfd].pos      = 0;
+            fds[nfd].rx       = -1;
+            fds[nfd].tx       = -1;
+            fds[nfd].sock     = ns;
+            fds[nfd].sigmask  = 0;
+            fds[nfd].nonblock = (flags & O_NONBLOCK) != 0;
+            fds[nfd].cloexec  = (flags & O_CLOEXEC) != 0;
+            fds[nfd].used     = 1;
+            inet_fd_sync(nfd);
+            inet64_peer(ns, &ip, &port);
+            if (a2 && a3) {
+                int64_t e2 = inet_addr_out(a2, a3, ip, port);
+                if (e2) return (uint64_t)e2;
+            }
+            return (uint64_t)nfd;
+        }
         if (fds[a1].kind != FD64_SOCKET || fds[a1].sock < 0)
             return (uint64_t)-88;
 
-        flags = (nr == SYS64_ACCEPT4) ? (int)args->a4 : 0;
         rc = sock64_accept(fds[a1].sock, &rx, &tx);
 
         if (rc == -11) {                               /* -EAGAIN */
@@ -4254,6 +4541,18 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
      * them too on Linux, but nothing here has asked. */
     case SYS64_SENDTO:
         if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind == FD64_INET && inet64_type(fds[a1].sock) == INET64_DGRAM) {
+            uint32_t ip = 0; uint16_t port = 0;
+            if (args->a5) {
+                int64_t e2 = inet_addr_in(args->a5, args->a6, &ip, &port);
+                if (e2) return (uint64_t)e2;
+            }
+            if (a3 && !user_range_ok(a2, a3)) return (uint64_t)-14;
+            return (uint64_t)inet64_sendto(fds[a1].sock, (const void*)a2, a3,
+                                           ip, port);
+        }
+        if (fds[a1].kind == FD64_INET && !fd_is_stream((int)a1))
+            return (uint64_t)-107;                     /* -ENOTCONN */
         if (fds[a1].kind == FD64_NETLINK)
             return (uint64_t)nl_send((int)a1, (const void*)a2, a3);
         /* A connected stream socket ignores the address, and send(2) is
@@ -4272,6 +4571,20 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         uint32_t nlen = 0;
         int64_t r;
         if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind == FD64_INET && inet64_type(fds[a1].sock) == INET64_DGRAM) {
+            uint32_t ip = 0; uint16_t port = 0;
+            int64_t rr;
+            if (a3 && !user_range_ok(a2, a3)) return (uint64_t)-14;
+            rr = inet_dgram_read(args, nr, (int)a1, (void*)a2, a3,
+                                 (args->a4 & 0x40) != 0, &ip, &port);
+            if (rr >= 0 && args->a5) {
+                int64_t e2 = inet_addr_out(args->a5, args->a6, ip, port);
+                if (e2) return (uint64_t)e2;
+            }
+            return (uint64_t)rr;
+        }
+        if (fds[a1].kind == FD64_INET && !fd_is_stream((int)a1))
+            return (uint64_t)-107;
         /* recv(2) is recvfrom with no address, and on a connected stream
          * socket it is read(2) with flags - end of file included, which
          * is how a peer learns the other end died. */
@@ -4309,6 +4622,10 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                 return (uint64_t)-22;
             return (uint64_t)nl_send((int)a1, msg->msg_iov[0].iov_base,
                                      msg->msg_iov[0].iov_len);
+        }
+        if (fd_is_inet(a1) && inet64_type(fds[a1].sock) == INET64_DGRAM) {
+            if (!msg || !user_range_ok(a2, sizeof(*msg))) return (uint64_t)-14;
+            return (uint64_t)inet_sendmsg_dgram((int)a1, msg);
         }
 
         /* Said out loud while tracing, because "bad file descriptor" is
@@ -4383,6 +4700,10 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                         carried[ncarried].pos  = fds[sfd].pos;
                         carried[ncarried].rx   = fds[sfd].rx;
                         carried[ncarried].tx   = fds[sfd].tx;
+                        carried[ncarried].sock = fds[sfd].kind == FD64_INET
+                                               ? fds[sfd].sock : -1;
+                        if (fds[sfd].kind == FD64_INET)
+                            inet64_ref(fds[sfd].sock);
                         /* Referenced for the receiver now. The sender is
                          * free to close its own copy the moment this
                          * returns - and does - so a reference taken only
@@ -4414,6 +4735,7 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                     pipe64_unref(carried[k].rx, 1, 0);
                     pipe64_unref(carried[k].tx, 0, 1);
                 }
+                if (carried[k].kind == FD64_INET) inet64_unref(carried[k].sock);
             }
             /* Worth a line whether or not tracing is on. Wine's
              * send_fd() treats anything but success as fatal, and the
@@ -4443,11 +4765,59 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         return (uint64_t)total;
     }
 
+    /* sendmmsg(fd, msgvec, vlen, flags): glibc's resolver sends the A
+     * and AAAA questions together with it. UDP only - it is what
+     * anything here would use it for. */
+    case SYS64_SENDMMSG: {
+        typedef struct { msghdr64_t hdr; uint32_t len; uint32_t pad; } mmsg64_t;
+        mmsg64_t* v = (mmsg64_t*)a2;
+        uint64_t sent = 0;
+        if (!fd_is_inet(a1) || inet64_type(fds[a1].sock) != INET64_DGRAM)
+            return (uint64_t)-38;                      /* -ENOSYS */
+        if (a3 > 1024) a3 = 1024;
+        if (a3 && !user_range_ok(a2, a3 * sizeof(mmsg64_t))) return (uint64_t)-14;
+        for (uint64_t i = 0; i < a3; i++) {
+            int64_t w = inet_sendmsg_dgram((int)a1, &v[i].hdr);
+            if (w < 0) return sent ? sent : (uint64_t)w;
+            v[i].len = (uint32_t)w;
+            sent++;
+        }
+        return sent;
+    }
+
     case SYS64_RECVMSG: {
         msghdr64_t* msg = (msghdr64_t*)a2;
         fdpass64_t got[8];
         int ngot, installed = 0;
         int64_t total = 0;
+
+        if (fd_is_inet(a1) && inet64_type(fds[a1].sock) == INET64_DGRAM) {
+            static uint8_t dg[1472];
+            uint32_t ip = 0; uint16_t port = 0;
+            int64_t rr, left;
+            if (!msg || !user_range_ok(a2, sizeof(*msg))) return (uint64_t)-14;
+            rr = inet_dgram_read(args, nr, (int)a1, dg, sizeof(dg),
+                                 (a3 & 0x40) != 0, &ip, &port);
+            if (rr < 0) return (uint64_t)rr;
+            left = rr;
+            for (uint64_t i = 0; i < msg->msg_iovlen && left > 0; i++) {
+                uint64_t take = msg->msg_iov[i].iov_len;
+                if (take > (uint64_t)left) take = (uint64_t)left;
+                if (take && !user_range_ok((uint64_t)msg->msg_iov[i].iov_base, take))
+                    return (uint64_t)-14;
+                kmemcpy(msg->msg_iov[i].iov_base, dg + (rr - left), take);
+                left -= (int64_t)take;
+            }
+            if (msg->msg_name) {
+                uint32_t nl = msg->msg_namelen;
+                inet_addr_out((uint64_t)msg->msg_name, (uint64_t)&nl, ip, port);
+                msg->msg_namelen = nl;
+            }
+            msg->msg_controllen = 0;
+            msg->msg_flags = left > 0 ? 0x20 : 0;          /* MSG_TRUNC */
+            return (uint64_t)(rr - left);
+        }
+        if (fd_is_inet(a1) && !fd_is_stream((int)a1)) return (uint64_t)-107;
 
         if (a1 < FD_MAX && fds[a1].used && fds[a1].kind == FD64_NETLINK) {
             uint32_t nlen, mflags = 0;
@@ -4536,6 +4906,7 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                 for (int k = 0; k < ngot; k++) {
                     pipe64_unref(got[k].rx, 1, 0);
                     pipe64_unref(got[k].tx, 0, 1);
+                    if (got[k].kind == FD64_INET) inet64_unref(got[k].sock);
                 }
                 msg->msg_flags = MSG_CTRUNC_;
                 msg->msg_controllen = 0;
@@ -4545,6 +4916,7 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                     if (nfd < 0) {
                         pipe64_unref(got[k].rx, 1, 0);
                         pipe64_unref(got[k].tx, 0, 1);
+                        if (got[k].kind == FD64_INET) inet64_unref(got[k].sock);
                         msg->msg_flags = MSG_CTRUNC_;
                         continue;
                     }
@@ -4555,7 +4927,8 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                     fds[nfd].pos      = got[k].pos;
                     fds[nfd].rx       = got[k].rx;
                     fds[nfd].tx       = got[k].tx;
-                    fds[nfd].sock     = -1;
+                    fds[nfd].sock     = got[k].kind == FD64_INET
+                                      ? got[k].sock : -1;
                     fds[nfd].nonblock = 0;
                     fds[nfd].cloexec  = (a3 & MSG_CMSG_CLOEXEC_) ? 1 : 0;
                     fds[nfd].used     = 1;
@@ -4583,6 +4956,10 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
     case SYS64_SHUTDOWN: {
         int rx, tx;
         if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        /* The socket's, not this descriptor's: shutdown says the
+         * connection is finished sending, however many names it has. */
+        if (fds[a1].kind == FD64_INET)
+            return (uint64_t)(int64_t)inet64_shutdown(fds[a1].sock, (int)a2);
         if (!fd_is_stream(a1)) return (uint64_t)-88;
 
         rx = fds[a1].rx;
@@ -4612,15 +4989,52 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
 
     case SYS64_GETSOCKOPT:
         if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind == FD64_INET && args->a4 && args->a5) {
+            int v = 0, s2 = fds[a1].sock;
+            if (!user_range_ok(args->a4, 4) || !user_range_ok(args->a5, 4))
+                return (uint64_t)-14;
+            if (a2 == 1) {                             /* SOL_SOCKET */
+                if (a3 == 4)  v = inet64_take_error(s2);     /* SO_ERROR */
+                if (a3 == 3)  v = inet64_type(s2);           /* SO_TYPE  */
+                if (a3 == 39) v = 2;                         /* SO_DOMAIN */
+                if (a3 == 30) v = inet64_is_listening(s2);   /* SO_ACCEPTCONN */
+                if (a3 == 7 || a3 == 8) v = 65536;           /* SNDBUF/RCVBUF */
+            }
+            *(int*)args->a4 = v;
+            *(uint32_t*)args->a5 = sizeof(int);
+            return 0;
+        }
         if (args->a4 && args->a5) {
             *(int*)args->a4 = 0;
             *(uint32_t*)args->a5 = sizeof(int);
         }
         return 0;
 
+    case SYS64_GETPEERNAME:
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind == FD64_INET) {
+            uint32_t ip; uint16_t port;
+            int e2 = inet64_peer(fds[a1].sock, &ip, &port);
+            if (e2) return (uint64_t)(int64_t)e2;
+            return (uint64_t)inet_addr_out(a2, a3, ip, port);
+        }
+        if (fds[a1].kind != FD64_SOCKET) return (uint64_t)-88;
+        if (!fd_is_stream((int)a1)) return (uint64_t)-107;
+        if (a2 && a3 && user_range_ok(a2, 2) && user_range_ok(a3, 4)) {
+            *(uint16_t*)a2 = AF_UNIX_;
+            *(uint32_t*)a3 = 2;
+        }
+        return 0;
+
     case SYS64_GETSOCKNAME: {
         sockaddr_un64_t* addr = (sockaddr_un64_t*)a2;
         if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind == FD64_INET) {
+            uint32_t ip; uint16_t port;
+            int e2 = inet64_local(fds[a1].sock, &ip, &port);
+            if (e2) return (uint64_t)(int64_t)e2;
+            return (uint64_t)inet_addr_out(a2, a3, ip, port);
+        }
         if (fds[a1].kind == FD64_NETLINK) {
             uint8_t* nl = (uint8_t*)a2;
             if (!a2 || !a3 || !user_range_ok(a2, 12) || !user_range_ok(a3, 4))

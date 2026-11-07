@@ -78,7 +78,9 @@ static uint16_t   next_port = 49152;
 /* Ports with something listening on them. A flat array rather than a
  * structure with a queue, because the queue is the connection table -
  * see the note in tcp.h. */
+#ifndef TCP_MAX_LISTEN
 #define TCP_MAX_LISTEN 4
+#endif
 static uint16_t   listening[TCP_MAX_LISTEN];
 static uint32_t   bytes_received;
 static uint32_t   retransmits;
@@ -150,7 +152,7 @@ static int send_segment(tcp_conn_t* c, uint8_t flags, uint32_t seq,
     if (len) kmemcpy(segment + sizeof(tcp_header_t), data, len);
 
     uint32_t total = sizeof(tcp_header_t) + len;
-    th->checksum = htons(segment_checksum(net_config()->ip, c->remote_ip,
+    th->checksum = htons(segment_checksum(net_source_ip(c->remote_ip), c->remote_ip,
                                           segment, total));
 
     return net_send_ip(c->remote_ip, IP_PROTO_TCP, segment, total);
@@ -196,7 +198,7 @@ static void send_reset(uint32_t dest_ip, uint16_t dest_port,
     th->seq = htonl(seq);
     th->data_offset = (sizeof(tcp_header_t) / 4) << 4;
     th->flags = TCP_RST;
-    th->checksum = htons(segment_checksum(net_config()->ip, dest_ip,
+    th->checksum = htons(segment_checksum(net_source_ip(dest_ip), dest_ip,
                                           segment, sizeof(segment)));
     net_send_ip(dest_ip, IP_PROTO_TCP, segment, sizeof(segment));
 }
@@ -390,7 +392,7 @@ void tcp_init(void) {
 }
 
 int tcp_connect(uint32_t dest_ip, uint16_t dest_port) {
-    if (!net_config()->configured) return -1;
+    if (!net_config()->configured && !net_is_local(dest_ip)) return -1;
 
     for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
         tcp_conn_t* c = &conns[i];
@@ -448,11 +450,18 @@ int tcp_connect_wait(uint32_t dest_ip, uint16_t dest_port, uint32_t ticks) {
 
 int tcp_send(int handle, const uint8_t* data, uint32_t len) {
     tcp_conn_t* c = handle_conn(handle);
-    if (!c || c->state != TCP_ESTABLISHED) return -1;
+    /* CLOSE_WAIT too: the peer has finished sending, not receiving. */
+    if (!c || (c->state != TCP_ESTABLISHED && c->state != TCP_CLOSE_WAIT))
+        return -1;
     if (c->pending_len || c->pending_flags) return 0;   /* one in flight */
 
     uint32_t take = len < TCP_MSS ? len : TCP_MSS;
-    if (send_tracked(c, TCP_ACK | TCP_PSH, data, take) < 0) return 0;
+    /* Taken even if it did not leave yet (the next hop's MAC still being
+     * resolved, the transmitter busy): send_tracked has recorded it and
+     * moved snd_next past it, so the retransmission timer will send it.
+     * Reporting 0 here made the caller send the same bytes again after
+     * the first copy was acknowledged - the stream then held them twice. */
+    send_tracked(c, TCP_ACK | TCP_PSH, data, take);
     return (int)take;
 }
 
@@ -509,6 +518,11 @@ int tcp_eof(int handle) {
     tcp_conn_t* c = handle_conn(handle);
     if (!c) return 1;
     return c->peer_finished && c->recv_tail == c->recv_head;
+}
+
+int tcp_tx_idle(int handle) {
+    tcp_conn_t* c = handle_conn(handle);
+    return c && !c->pending_len && !c->pending_flags;
 }
 
 void tcp_close(int handle) {

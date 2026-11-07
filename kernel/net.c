@@ -259,14 +259,57 @@ static int next_hop_mac(uint32_t dest_ip, uint8_t mac_out[ETH_ALEN]) {
     return net_arp_lookup(hop, mac_out);
 }
 
+/* --- loopback ---------------------------------------------------------- */
+
+#ifndef LOOPBACK_QUEUE
+#define LOOPBACK_QUEUE 32
+#endif
+
+typedef struct {
+    uint32_t len;
+    uint8_t  data[ETH_MTU];
+} loop_packet_t;
+
+static loop_packet_t loop_q[LOOPBACK_QUEUE];
+static uint32_t      loop_head, loop_tail, loop_packets;
+
+int net_is_local(uint32_t ip) {
+    return (ip >> 24) == 127 || (config.configured && ip == config.ip);
+}
+
+uint32_t net_source_ip(uint32_t dest_ip) {
+    return (dest_ip >> 24) == 127 ? dest_ip : config.ip;
+}
+
+uint32_t net_loopback_packets(void) { return loop_packets; }
+
+static void ip_receive(const uint8_t* data, uint32_t len);
+
+/* Delivers what was queued before this call, not what delivering it
+ * queues: an answer goes out on the next poll, so one poll cannot turn
+ * into an unbounded conversation with itself. */
+static void loopback_drain(void) {
+    uint32_t n = (loop_head - loop_tail) % LOOPBACK_QUEUE;
+    while (n--) {
+        static uint8_t copy[ETH_MTU];
+        loop_packet_t* p = &loop_q[loop_tail];
+        uint32_t len = p->len;
+        kmemcpy(copy, p->data, len);
+        loop_tail = (loop_tail + 1) % LOOPBACK_QUEUE;
+        stats.rx_ip++;
+        ip_receive(copy, len);
+    }
+}
+
 int net_send_ip(uint32_t dest_ip, uint8_t protocol,
                 const uint8_t* payload, uint32_t len) {
     static uint8_t packet[ETH_MTU];
     uint8_t mac[ETH_ALEN];
+    int local = net_is_local(dest_ip);
 
-    if (!dev) return -1;
+    if (!dev && !local) return -1;
     if (len + sizeof(ip_header_t) > ETH_MTU) return -1;
-    if (!next_hop_mac(dest_ip, mac)) return -2;   /* ARP pending: retry */
+    if (!local && !next_hop_mac(dest_ip, mac)) return -2;   /* ARP pending */
 
     ip_header_t* ih = (ip_header_t*)packet;
     ih->version_ihl = 0x45;         /* IPv4, 5 dwords of header */
@@ -277,11 +320,22 @@ int net_send_ip(uint32_t dest_ip, uint8_t protocol,
     ih->ttl = 64;
     ih->protocol = protocol;
     ih->checksum = 0;
-    ih->src = htonl(config.ip);
+    ih->src = htonl(net_source_ip(dest_ip));
     ih->dest = htonl(dest_ip);
     ih->checksum = htons(net_checksum(ih, sizeof(*ih), 0));
 
     kmemcpy(packet + sizeof(ip_header_t), payload, len);
+
+    if (local) {
+        uint32_t next = (loop_head + 1) % LOOPBACK_QUEUE;
+        if (next == loop_tail) return -1;      /* full: dropped, like a wire */
+        loop_q[loop_head].len = (uint32_t)sizeof(ip_header_t) + len;
+        kmemcpy(loop_q[loop_head].data, packet, loop_q[loop_head].len);
+        loop_head = next;
+        loop_packets++;
+        stats.tx_ip++;
+        return 0;
+    }
 
     int r = eth_send(mac, ETH_P_IP, packet, sizeof(ip_header_t) + len);
     if (r == 0) stats.tx_ip++;
@@ -310,8 +364,12 @@ int net_send_udp(uint32_t dest_ip, uint16_t src_port, uint16_t dest_port,
 
 /* --- UDP delivery ------------------------------------------------------- */
 
+#ifndef UDP_PORTS
 #define UDP_PORTS 8
+#endif
+#ifndef UDP_QUEUE
 #define UDP_QUEUE 4
+#endif
 
 typedef struct {
     uint16_t port;
@@ -496,6 +554,7 @@ static void ip_receive(const uint8_t* data, uint32_t len) {
 
     /* Ours, broadcast, or not for us. No forwarding: this is a host. */
     if (config.configured && dest != config.ip && dest != 0xFFFFFFFFu &&
+        (dest >> 24) != 127 &&
         !(config.netmask && (dest | ~config.netmask) == 0xFFFFFFFFu)) {
         return;
     }
@@ -576,8 +635,8 @@ void net_set_config(uint32_t ip, uint32_t mask, uint32_t gw, uint32_t dns) {
 int net_available(void) { return dev != 0 && dev->up; }
 
 int net_init(void) {
+    tcp_init();          /* first: the loopback needs TCP with no card */
     if (!rtl8139_init()) return 0;
-    tcp_init();
     return net_available();
 }
 
@@ -587,5 +646,6 @@ void net_poll(void) {
      * one idea and a caller that remembered one and forgot the other
      * would have a stack that receives and never recovers. */
     rtl8139_poll();
+    loopback_drain();
     tcp_tick();
 }

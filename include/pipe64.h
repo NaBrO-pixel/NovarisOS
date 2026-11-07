@@ -73,6 +73,7 @@ typedef struct {
     int      node;
     uint64_t pos;
     int      rx, tx;
+    int      sock;              /* FD64_INET: the socket in inet64.c */
 } fdpass64_t;
 
 void pipe64_init(void);
