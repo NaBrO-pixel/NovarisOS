@@ -122,6 +122,13 @@ int  signal64_sigaction(int sig, const ksigaction64_t* act,
  * faulting thread's own stack. Returns 0 if there is no handler, in
  * which case the caller must treat the fault as fatal. */
 int  signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr);
+/* The same, for a signal that was sent (kill, tgkill) rather than raised
+ * by a fault: siginfo carries si_code (SI_USER 0 / SI_TKILL -6) and the
+ * sender's pid instead of a fault address. */
+int  signal64_deliver_from(int sig, registers64_t* r, int code, int pid);
+/* How the signal the last take_pending/take_pending_task returned was
+ * sent, and by whom. */
+void signal64_last_taken(int* code, int* pid);
 
 /* rt_sigreturn: rebuild a register set from the frame the handler is
  * returning off. `user_rsp` is the thread's rsp at the syscall, which

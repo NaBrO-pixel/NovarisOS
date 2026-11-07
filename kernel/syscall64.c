@@ -1127,6 +1127,48 @@ static void refresh_meminfo(void) {
     ramfs64_write(node, 0, text, (uint64_t)(o - text));
 }
 
+/* Why a name could not be created: its parent is missing (ENOENT) or is
+ * not a directory (ENOTDIR). 0 when the parent is a directory, and the
+ * failure was something else. Linux reports these and ramfs64_create's -1
+ * does not say which, so a failed mkdir used to be ENOSPC whatever went
+ * wrong - which libNovaC's target test, the first program here to ask,
+ * found. */
+static int64_t parent_error(const char* path) {
+    char parent[PROC64_PATH_MAX];
+    int64_t i, last = -1;
+    int node;
+
+    for (i = 0; path[i] && i < PROC64_PATH_MAX - 1; i++)
+        if (path[i] == '/') last = i;
+    if (last < 0) return 0;
+    if (last == 0) { parent[0] = '/'; parent[1] = 0; }
+    else {
+        for (i = 0; i < last; i++) parent[i] = path[i];
+        parent[last] = 0;
+    }
+    node = ramfs64_lookup(parent);
+    if (node < 0) return -2;                           /* -ENOENT  */
+    if (!ramfs64_is_dir(node)) return -20;             /* -ENOTDIR */
+    return 0;
+}
+
+/* mkdir(2) and mkdirat(2): EEXIST for a name that is there - a directory
+ * or anything else - and the parent's error for one whose parent is not.
+ * It used to succeed on an existing path, because ramfs64_create hands
+ * back what is already there. The mode is kept: the wineserver creates
+ * its socket directory 0700 and refuses to start if stat says otherwise. */
+static uint64_t do_mkdir(const char* path, uint32_t mode) {
+    int64_t pe;
+    int node;
+    if (ramfs64_lookup_nofollow(path) >= 0) return (uint64_t)-17;  /* -EEXIST */
+    pe = parent_error(path);
+    if (pe) return (uint64_t)pe;
+    node = ramfs64_create(path, 1);
+    if (node < 0) return (uint64_t)-28;                /* -ENOSPC */
+    ramfs64_set_mode(node, mode);
+    return 0;
+}
+
 static uint64_t do_open(const char* path, uint64_t flags, uint32_t mode) {
     if (kstrcmp(path, "/proc/meminfo") == 0) refresh_meminfo();
     int node = ramfs64_lookup(path);
@@ -1135,10 +1177,20 @@ static uint64_t do_open(const char* path, uint64_t flags, uint32_t mode) {
     if (node < 0) {
         if (!(flags & O_CREAT)) return (uint64_t)-2;   /* -ENOENT */
         node = ramfs64_create(path, 0);
-        if (node < 0) return (uint64_t)-28;            /* -ENOSPC */
+        if (node < 0) {
+            int64_t pe = parent_error(path);
+            return (uint64_t)(pe ? pe : -28);          /* -ENOSPC */
+        }
         ramfs64_set_mode(node, mode);
-    } else if (flags & O_TRUNC) {
-        ramfs64_truncate(node);
+    } else {
+        /* O_CREAT|O_EXCL is "create, or fail": the name being there is
+         * the failure. And O_DIRECTORY is "only if this is a directory",
+         * which is how opendir(3) tells a directory from a file without
+         * a separate stat - libNovaC's does exactly that. Both were
+         * ignored, so both opens succeeded. */
+        if ((flags & O_CREAT) && (flags & 0x0080)) return (uint64_t)-17;  /* O_EXCL: -EEXIST */
+        if ((flags & 0x10000) && !ramfs64_is_dir(node)) return (uint64_t)-20; /* O_DIRECTORY: -ENOTDIR */
+        if (flags & O_TRUNC) ramfs64_truncate(node);
     }
 
     for (fd = 3; fd < FD_MAX; fd++) if (!fds[fd].used) break;
@@ -1761,7 +1813,9 @@ static void deliver_pending(registers64_t* self) {
         if (disp == SIG64_DISP_IGNORE) continue;
 
         if (disp == SIG64_DISP_HANDLER) {
-            if (signal64_deliver(sig, self, 0))
+            int code, from;
+            signal64_last_taken(&code, &from);
+            if (signal64_deliver_from(sig, self, code, from))
                 sched64_resume(self);                  /* never returns */
             /* Fell through: a handler is installed but no frame could
              * be built for it. Treated as uncaught, which is what
@@ -5573,7 +5627,7 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
 
         if (pid == proc64_current_pid()) {
             frame_from_args(args, 0, &self);
-            if (signal64_deliver(sig, &self, 0))
+            if (signal64_deliver_from(sig, &self, 0, pid))    /* SI_USER */
                 sched64_resume(&self);                 /* never returns */
             if (signal64_disposition(pid, sig) == SIG64_DISP_IGNORE)
                 return 0;
@@ -5662,7 +5716,8 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
              * handler to have run by the time the call returns, not at
              * some later syscall. */
             frame_from_args(args, 0, &self);
-            if (signal64_deliver(sig, &self, 0)) sched64_resume(&self);
+            if (signal64_deliver_from(sig, &self, -6, tpid))   /* SI_TKILL */
+                sched64_resume(&self);
             if (signal64_disposition(tpid, sig) == SIG64_DISP_IGNORE)
                 return 0;
 
@@ -5998,15 +6053,8 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
     case SYS64_MKDIR: {
         char path[PROC64_PATH_MAX];
         int64_t e = abs_path((const char*)a1, path);
-        int node;
         if (e) return (uint64_t)e;
-        node = ramfs64_create(path, 1);
-        if (node < 0) return (uint64_t)-28;
-        /* The mode argument, which used to be discarded. The wineserver
-         * creates its socket directory 0700 and refuses to start if
-         * stat says otherwise. */
-        ramfs64_set_mode(node, (uint32_t)a2);
-        return 0;
+        return do_mkdir(path, (uint32_t)a2);
     }
 
     case SYS64_MKDIRAT: {
@@ -6016,12 +6064,7 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
             && ((const char*)a2)[0] != '/') return (uint64_t)-9;
         e = abs_path((const char*)a2, path);
         if (e) return (uint64_t)e;
-        {
-            int node = ramfs64_create(path, 1);
-            if (node < 0) return (uint64_t)-28;
-            ramfs64_set_mode(node, (uint32_t)a3);
-            return 0;
-        }
+        return do_mkdir(path, (uint32_t)a3);
     }
 
     case SYS64_UNLINK: {
