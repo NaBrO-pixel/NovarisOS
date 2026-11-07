@@ -91,6 +91,7 @@ int  inet64_ifreq(uint64_t cmd, uint8_t* ifr);
 int  inet64_ifconf(uint8_t* buf, int len);
 int  inet64_proc_route(char* out);
 int  inet64_proc_dev(char* out);
-void inet64_report(void);         /* every socket, for the deadline */
+void inet64_report(void);
+void inet64_note_poll(int s, int pid, int want_out, int gave_out);         /* every socket, for the deadline */
 
 #endif

@@ -2928,6 +2928,8 @@ static uint64_t do_poll(const syscall64_args_t* args, uint64_t nr,
                  * writable and hung up, and an error if there is one. */
                 got |= POLL64_OUT | POLL64_HUP | 0x008;     /* POLLERR */
             }
+            inet64_note_poll(s, proc64_current_pid(), (want & POLL64_OUT) != 0,
+                             (want & got & POLL64_OUT) != 0);
         } else if (fds[fd].kind == FD64_SIGNALFD) {
             /* Readable while a signal it reports is pending for the
              * poller; never writable. */

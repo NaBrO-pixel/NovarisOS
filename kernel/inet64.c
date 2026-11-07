@@ -66,6 +66,12 @@ typedef struct {
     int      fin_sent;
     uint64_t linger_until;  /* closed and waiting for the peer: give up then */
     int      udp_bound;     /* holds net.c's port for lport */
+
+    /* For the deadline report: bytes each way through the pump, and
+     * what poll was asked about this socket and answered. */
+    uint64_t bytes_out, bytes_in;
+    uint32_t polls, polls_out_wanted, polls_out_given;
+    int      last_poll_pid;
 } isock_t;
 
 static isock_t socks[INET64_MAX];
@@ -294,6 +300,7 @@ static int pump_one(isock_t* k) {
             n = tcp_recv(h, buf, room);
             if (n <= 0) break;
             pipe64_write(k->rx, buf, (uint64_t)n);
+            k->bytes_in += (uint64_t)n;
             sched64_wake(PIPE64_WAIT_KEY_(k->rx), SCHED64_MAX_TASKS);
         } else {
             n = tcp_recv(h, buf, sizeof(buf));
@@ -315,6 +322,7 @@ static int pump_one(isock_t* k) {
             int64_t n = pipe64_read(k->tx, buf, sizeof(buf));
             if (n <= 0) break;
             tcp_send(h, buf, (uint32_t)n);
+            k->bytes_out += (uint64_t)n;
             sched64_wake(PIPE64_WAIT_KEY_(k->tx), SCHED64_MAX_TASKS);
             moved = 1;
             /* Let the segment go out and the stack answer before the
@@ -964,6 +972,20 @@ void inet64_report(void) {
             serial64_putdec((uint64_t)pipe64_writers(k->tx));
         }
         if (k->err) { serial64_puts(" err "); serial64_putdec((uint64_t)k->err); }
+        if (k->type == INET64_STREAM) {
+            serial64_puts(" out ");
+            serial64_putdec(k->bytes_out);
+            serial64_puts(" in ");
+            serial64_putdec(k->bytes_in);
+            serial64_puts(" polls ");
+            serial64_putdec(k->polls);
+            serial64_puts(" wantout ");
+            serial64_putdec(k->polls_out_wanted);
+            serial64_puts(" gaveout ");
+            serial64_putdec(k->polls_out_given);
+            serial64_puts(" lastpid ");
+            serial64_putdec((uint64_t)k->last_poll_pid);
+        }
         serial64_putc('\n');
     }
     serial64_puts("NOVARIS64: [inet] ");
@@ -977,4 +999,12 @@ void inet64_report(void) {
     serial64_puts(", arp entries ");
     serial64_putdec(net_arp_entries());
     serial64_putc('\n');
+}
+
+void inet64_note_poll(int s, int pid, int want_out, int gave_out) {
+    if (!inet64_valid(s)) return;
+    socks[s].polls++;
+    socks[s].last_poll_pid = pid;
+    if (want_out) socks[s].polls_out_wanted++;
+    if (gave_out) socks[s].polls_out_given++;
 }
