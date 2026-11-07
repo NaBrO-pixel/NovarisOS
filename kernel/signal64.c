@@ -74,6 +74,7 @@ static uint64_t pending_by_task[SCHED64_MAX_TASKS];
  * back: the pid of the process that called kill or tgkill. One per
  * signal, like the pending bits - a second raise before the first is
  * taken overwrites it, as Linux's non-realtime signals coalesce. */
+static int taken_code, taken_pid;
 static int sender_by_slot[PROC64_MAX][NSIG];
 static int sender_by_task[SCHED64_MAX_TASKS][NSIG];
 
@@ -283,6 +284,8 @@ int signal64_take_pending(int pid) {
     for (int sig = 1; sig < NSIG; sig++) {
         if (!(set & (1ull << sig))) continue;
         pending_by_slot[slot] &= ~(1ull << sig);
+        taken_code = 0;                                  /* SI_USER  */
+        taken_pid  = sender_by_slot[slot][sig];
         return sig;
     }
     return 0;
@@ -314,6 +317,8 @@ int signal64_take_pending_task(int tid) {
     for (int sig = 1; sig < NSIG; sig++) {
         if (!(set & (1ull << sig))) continue;
         pending_by_task[tid] &= ~(1ull << sig);
+        taken_code = -6;                                 /* SI_TKILL */
+        taken_pid  = sender_by_task[tid][sig];
         return sig;
     }
     return 0;
@@ -570,7 +575,28 @@ static int range_present(uint64_t addr, uint64_t len) {
     return 1;
 }
 
+/* Who sent the signal the last take_pending call handed out, and how:
+ * SI_TKILL (-6) for one sent to a thread, SI_USER (0) for one sent to the
+ * process. Read straight after the take, by deliver_pending. */
+void signal64_last_taken(int* code, int* pid) { *code = taken_code; *pid = taken_pid; }
+
+static int deliver_frame(int sig, registers64_t* r, uint64_t fault_addr,
+                         int sent, int code, int pid);
+
 int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
+    return deliver_frame(sig, r, fault_addr, 0, 0, 0);
+}
+
+/* A signal somebody sent, rather than one a fault raised: its siginfo
+ * says how it was sent and by whom, which is what Linux puts there and
+ * what a handler reading si_code or si_pid expects. It used to say
+ * SEGV_MAPERR, whatever the signal - libNovaC's target test found it. */
+int signal64_deliver_from(int sig, registers64_t* r, int code, int pid) {
+    return deliver_frame(sig, r, 0, 1, code, pid);
+}
+
+static int deliver_frame(int sig, registers64_t* r, uint64_t fault_addr,
+                         int sent, int code, int pid) {
     const ksigaction64_t* sa;
     rt_sigframe64_t* frame;
     uint64_t sp, fpsp;
@@ -756,6 +782,12 @@ int signal64_deliver(int sig, registers64_t* r, uint64_t fault_addr) {
     ((uint32_t*)frame->info)[1] = 0;                  /* si_errno */
     ((uint32_t*)frame->info)[2] = 1;                  /* si_code = SEGV_MAPERR */
     frame->info[2]              = fault_addr;         /* si_addr   */
+    if (sent) {
+        ((int32_t*)frame->info)[2]  = code;              /* si_code   */
+        frame->info[2]              = 0;
+        ((int32_t*)frame->info)[4]  = pid;               /* si_pid    */
+        ((uint32_t*)frame->info)[5] = 0;                 /* si_uid    */
+    }
 
     /* Enter the handler. The System V arguments are (signo, siginfo*,
      * ucontext*) - the third is what makes resuming elsewhere possible. */
