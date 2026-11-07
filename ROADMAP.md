@@ -10510,7 +10510,7 @@ through an inherited shared mapping), `sock64` (`if_nameindex`,
 placed mapping goes around one placed by hand).
 
 With all of it in, `make -f Makefile.amd64 WINE64_INSTALL=1 test` is
-still 26/26 PASS (verified at `51e42ed`), with winegui and chromeprobe
+still 26/26 PASS (verified at `f7f0eb0`), with winegui and chromeprobe
 exiting 0.
 
 To reproduce, with Chromium unpacked beside the tree:
@@ -10975,7 +10975,7 @@ much each would widen what runs:
 
    Nothing is left on the 64-bit open list from this round.
 
-   **Where it stands, verified at `674c22a` and again at `5feb148`:**
+   **Where it stands, verified at `785cb43` and again at `74b013e`:**
    `make -f Makefile.amd64 WINE64_INSTALL=1 test` is 26/26 PASS; the
    bring-up's own checks are 855 `ok` and no `FAIL`, with wineboot,
    winegui and chromeprobe exiting 0 and 0 SIGSEGVs between them; and
@@ -10991,7 +10991,7 @@ much each would widen what runs:
    timing luck.
 
    The project is licensed under the PolyForm Noncommercial License
-   1.0.0 since `c0f26a6` - see `License.md` at the top of the tree.
+   1.0.0 since `ac3be5b` - see `License.md` at the top of the tree.
 
    Two habits that paid for themselves here, worth keeping. A new test
    is booted once against a kernel with the fix taken out, to see it
