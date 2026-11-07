@@ -1292,7 +1292,9 @@ test: iso
 # layers that do not lead to Wine skipped), Chromium pointed at
 # CHROME_NET_URL - by default the page tools/net64_helper.py serves -
 # and a run that ends as soon as a connection has carried nothing for
-# CHROME_NET_STALL seconds. Prints the requests the helper saw, what
+# CHROME_NET_STALL seconds (0: never - Chromium keeps a spare
+# connection open and idle, which this cannot tell from a stuck one,
+# so a run that has already loaded its page can be ended by it). Prints the requests the helper saw, what
 # Chromium printed of the page, and the socket report. Needs
 # CHROMIUM64_DIR and CHROMIUM64_FILES as for a Chromium `make test`.
 # Not a test: nothing here is asserted.

@@ -2386,7 +2386,7 @@ static uint64_t syscall64_dispatch_inner(syscall64_args_t* args) {
     {
         static uint64_t next_check;
         uint64_t now = clock64_ticks();
-        if (run_deadline && now >= next_check) {
+        if (CHROME64_STALL_SECS && run_deadline && now >= next_check) {
             next_check = now + CLOCK64_HZ;
             if (inet64_stalled((uint64_t)CHROME64_STALL_SECS * CLOCK64_HZ))
                 run_deadline = 1;
