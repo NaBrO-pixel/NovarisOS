@@ -220,6 +220,30 @@ int64_t pipe64_read(int p, void* buf, uint64_t n) {
     return (int64_t)got;
 }
 
+/* pipe64_read without taking anything: MSG_PEEK on a connected socket.
+ * Chromium asks whether a connection is still alive by peeking a byte,
+ * and a peek that consumed would hand it the first byte of the reply. */
+int64_t pipe64_peek(int p, void* buf, uint64_t n) {
+    pipe64_t* q;
+    uint8_t*  out = (uint8_t*)buf;
+    uint64_t  got = 0, at;
+
+    if (!pipe64_valid(p)) return -9;
+    q = &pipes[p];
+    if (q->len == 0) return q->writers == 0 ? 0 : -11;
+
+    if (n > q->len) n = q->len;
+    at = q->head;
+    while (got < n) {
+        uint64_t run = PIPE64_BUF - at;
+        if (run > n - got) run = n - got;
+        kmemcpy(out + got, q->buf + at, run);
+        at = (at + run) % PIPE64_BUF;
+        got += run;
+    }
+    return (int64_t)got;
+}
+
 int64_t pipe64_write(int p, const void* buf, uint64_t n) {
     pipe64_t*      q;
     const uint8_t* in = (const uint8_t*)buf;

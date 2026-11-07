@@ -74,6 +74,7 @@ typedef struct {
     uint64_t pos;
     int      rx, tx;
     int      sock;              /* FD64_INET: the socket in inet64.c */
+    int      nonblock;          /* O_NONBLOCK, which travels with it */
 } fdpass64_t;
 
 void pipe64_init(void);
@@ -97,6 +98,7 @@ void pipe64_unref(int p, int reader, int writer);
  * server notice that its client died. A short write is a real answer -
  * the ring is finite - and callers must handle it. */
 int64_t pipe64_read(int p, void* buf, uint64_t n);
+int64_t pipe64_peek(int p, void* buf, uint64_t n);   /* read, leaving it there */
 int64_t pipe64_write(int p, const void* buf, uint64_t n);
 
 uint64_t pipe64_available(int p);   /* bytes ready to read           */

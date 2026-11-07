@@ -31,9 +31,26 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qemu_test import serve_dns  # noqa: E402
 
 
+LOG = None
+
+# A page for a browser: headless Chromium is pointed here with
+# CHROME64_URL=http://10.0.2.2:18780/page.html. The script's paragraph
+# says JavaScript ran; it is in the dumped DOM only if it did.
+PAGE = """<!doctype html>
+<html><head><title>NovarisOS over TCP</title></head>
+<body><p id="served">fetched over TCP from the build machine</p>
+<script>
+document.body.insertAdjacentHTML("beforeend",
+    "<p id=\\"js\\">script ran: " + (6 * 7) + "</p>");
+</script></body></html>
+"""
+
+
 class QuietHandler(http.server.SimpleHTTPRequestHandler):
-    def log_message(self, *args):
-        pass
+    def log_message(self, fmt, *args):
+        if LOG:
+            with open(LOG, "a") as f:
+                f.write("%s %s\n" % (self.client_address[0], fmt % args))
 
 
 def serve_http(port, directory):
@@ -66,11 +83,16 @@ def main():
     ap.add_argument("--dns", type=int, required=True)
     ap.add_argument("--connect", type=int, required=True)
     ap.add_argument("--status", required=True)
+    ap.add_argument("--log", help="append each HTTP request here")
     args = ap.parse_args()
+    global LOG
+    LOG = args.log
 
     www = tempfile.mkdtemp(prefix="net64www")
     with open(os.path.join(www, "novaris.txt"), "w") as f:
         f.write("This file was served to NovarisOS over TCP.\n")
+    with open(os.path.join(www, "page.html"), "w") as f:
+        f.write(PAGE)
 
     serve_http(args.http, www)
     serve_dns(args.dns)

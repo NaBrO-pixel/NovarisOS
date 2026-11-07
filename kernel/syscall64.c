@@ -900,8 +900,8 @@ full:
  * sched64.c's own comment on wake_rax says exactly this: a syscall that
  * restarts needs its own number back there, "or the re-executed
  * `syscall` invokes whatever call 0 happens to be". */
-static int64_t do_pipe_read(const syscall64_args_t* args, uint64_t nr,
-                            int fd, void* buf, uint64_t n) {
+static int64_t do_pipe_read_ex(const syscall64_args_t* args, uint64_t nr,
+                               int fd, void* buf, uint64_t n, int peek) {
     registers64_t self, next;
     vmspace64_t next_space;
     uint64_t next_fs;
@@ -909,7 +909,7 @@ static int64_t do_pipe_read(const syscall64_args_t* args, uint64_t nr,
 
     if (fds[fd].rx < 0) return -9;                     /* -EBADF: write end */
 
-    r = pipe64_read(fds[fd].rx, buf, n);
+    r = peek ? pipe64_peek(fds[fd].rx, buf, n) : pipe64_read(fds[fd].rx, buf, n);
     /* Room has been made, so a writer parked on a full pipe can go on.
      * Same key as the readers': a spurious wake costs one re-check. */
     if (r > 0) sched64_wake(PIPE64_WAIT_KEY(fds[fd].rx), SCHED64_MAX_TASKS);
@@ -939,6 +939,11 @@ static int64_t do_pipe_read(const syscall64_args_t* args, uint64_t nr,
     write_msr(0xC0000100u, next_fs);
     sched64_resume(&next);                             /* never returns */
     return 0;
+}
+
+static int64_t do_pipe_read(const syscall64_args_t* args, uint64_t nr,
+                            int fd, void* buf, uint64_t n) {
+    return do_pipe_read_ex(args, nr, fd, buf, n, 0);
 }
 
 /* --- AF_NETLINK, NETLINK_ROUTE ------------------------------------ *
@@ -1340,8 +1345,29 @@ static uint64_t do_mkdir(const char* path, uint32_t mode) {
     return 0;
 }
 
+/* /proc/net/route and /proc/net/dev, rebuilt on every open like
+ * /proc/meminfo: Wine's nsiproxy reads the routes for the adapters'
+ * gateways and the counters for their statistics. */
+static void refresh_proc_net(const char* path) {
+    static char text[1024];
+    int len, node;
+    if (kstrcmp(path, "/proc/net/route") == 0) len = inet64_proc_route(text);
+    else if (kstrcmp(path, "/proc/net/dev") == 0) len = inet64_proc_dev(text);
+    else return;
+    node = ramfs64_lookup(path);
+    if (node < 0) {
+        ramfs64_mkdirp("/proc/net");
+        node = ramfs64_create(path, 0);
+        if (node < 0) return;
+        ramfs64_set_mode(node, 0444);
+    }
+    ramfs64_truncate(node);
+    ramfs64_write(node, 0, text, (uint64_t)len);
+}
+
 static uint64_t do_open(const char* path, uint64_t flags, uint32_t mode) {
     if (kstrcmp(path, "/proc/meminfo") == 0) refresh_meminfo();
+    refresh_proc_net(path);
     int node = ramfs64_lookup(path);
     int fd;
 
@@ -2352,6 +2378,22 @@ static int trace_this_process(void) {
 static uint64_t syscall64_dispatch_inner(syscall64_args_t* args) {
     uint64_t r;
 
+#ifdef CHROME64_STALL_SECS
+    /* An experiment's shortcut (make chrome-net): a run whose connection
+     * has carried nothing for this long is stuck, so end it now - the
+     * deadline report below then runs at once rather than at the end of
+     * the budget. Checked once a second, not on every call. */
+    {
+        static uint64_t next_check;
+        uint64_t now = clock64_ticks();
+        if (CHROME64_STALL_SECS && run_deadline && now >= next_check) {
+            next_check = now + CLOCK64_HZ;
+            if (inet64_stalled((uint64_t)CHROME64_STALL_SECS * CLOCK64_HZ))
+                run_deadline = 1;
+        }
+    }
+#endif
+
     if (run_deadline && clock64_ticks() > run_deadline) {
         run_expired = 1;
         run_deadline = 0;
@@ -2853,8 +2895,34 @@ static uint64_t dispatch(syscall64_args_t* args) {
     uint64_t nr = args->nr;
     uint64_t t0 = tsc64();
     uint64_t r;
+#ifdef CHROME64_STALL_SECS
+    /* For make chrome-net: every call on a TCP socket to another machine,
+     * by whom and with what result, for the first few hundred. A call
+     * that parks is not seen returning; the next one is. */
+    int watched = fd_is_inet(args->a1) && inet64_watched(fds[args->a1].sock);
+#endif
     mmap_kind = -1;
     r = dispatch_body(args);
+#ifdef CHROME64_STALL_SECS
+    if (watched) {
+        static int lines;
+        if (lines++ < 400) {
+            serial64_puts("NOVARIS64: [inet-call] pid ");
+            serial64_putdec((uint64_t)proc64_current_pid());
+            serial64_puts(" nr ");
+            serial64_putdec(nr);
+            serial64_puts(" fd ");
+            serial64_putdec(args->a1);
+            serial64_puts(" a2 ");
+            serial64_puthex(args->a2);
+            serial64_puts(" a3 ");
+            serial64_puthex(args->a3);
+            serial64_puts(" -> ");
+            serial64_puthex(r);
+            serial64_putc('\n');
+        }
+    }
+#endif
     if (nr < 512) cycles_by_nr[nr] += tsc64() - t0;
     if ((nr == SYS64_MMAP || nr == SYS64_MUNMAP) && mmap_kind >= 0) {
         int k = nr == SYS64_MUNMAP ? MAPK_UNMAP : mmap_kind;
@@ -2907,6 +2975,8 @@ static uint64_t do_poll(const syscall64_args_t* args, uint64_t nr,
                  * writable and hung up, and an error if there is one. */
                 got |= POLL64_OUT | POLL64_HUP | 0x008;     /* POLLERR */
             }
+            inet64_note_poll(s, proc64_current_pid(), (want & POLL64_OUT) != 0,
+                             (want & got & POLL64_OUT) != 0);
         } else if (fds[fd].kind == FD64_SIGNALFD) {
             /* Readable while a signal it reports is pending for the
              * poller; never writable. */
@@ -3709,6 +3779,21 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         return 0;
 
     case SYS64_IOCTL: {
+        /* The interface queries. Asked of any socket on Linux; Wine asks
+         * a UDP one. */
+        if (fd_is_inet(a1) && ((a2 & 0xFF00) == 0x8900 || a2 == 0x8B01)) {
+            if (a2 == 0x8912) {                        /* SIOCGIFCONF */
+                struct { int32_t len; int32_t pad; uint64_t buf; }* ic = (void*)a3;
+                if (!a3 || !user_range_ok(a3, 16)) return (uint64_t)-14;
+                if (!ic->buf) { ic->len = 40 * (inet64_card_up() ? 2 : 1); return 0; }
+                if (ic->len < 0 || !user_range_ok(ic->buf, (uint64_t)ic->len))
+                    return (uint64_t)-14;
+                ic->len = inet64_ifconf((uint8_t*)ic->buf, ic->len);
+                return 0;
+            }
+            if (!a3 || !user_range_ok(a3, 40)) return (uint64_t)-14;
+            return (uint64_t)(int64_t)inet64_ifreq(a2, (uint8_t*)a3);
+        }
         if (fd_is_inet(a1) && (a2 == 0x541B || a2 == 0x5421)) {
             if (!a3 || !user_range_ok(a3, 4)) return (uint64_t)-14;
             if (a2 == 0x5421) {                        /* FIONBIO */
@@ -4401,6 +4486,40 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
             int64_t e2 = inet_addr_in(a2, a3, &ip, &port);
             if (e2) return (uint64_t)e2;
             rc = inet64_connect(fds[a1].sock, ip, port);
+            /* Said once per connection - on the first call, not each
+             * time a blocked connect is run again - because "did the
+             * program even try" is the first question about a network
+             * that seems not to work. */
+            if (!was) {
+                serial64_puts("NOVARIS64: [inet] pid ");
+                serial64_putdec((uint64_t)proc64_current_pid());
+                serial64_puts(inet64_type(fds[a1].sock) == INET64_DGRAM
+                              ? " udp connect " : " tcp connect ");
+                for (int b = 3; b >= 0; b--) {
+                    serial64_putdec((ip >> (b * 8)) & 0xFF);
+                    if (b) serial64_putc('.');
+                }
+                serial64_putc(':');
+                serial64_putdec(port);
+                serial64_puts(rc == 0 ? " ok\n" : rc == -115 ? " started\n"
+                                                         : " failed\n");
+            }
+            /* A non-blocking TCP connect never finishes in the call on
+             * Linux, however fast the handshake: it is EINPROGRESS, and
+             * poll's POLLOUT says when it is done. Here the handshake
+             * can complete inside the call - QEMU's network answers in
+             * microseconds - and returning 0 for that is what stopped
+             * Chromium's first page load. Wine's server takes an
+             * immediate 0 as "connected" and posts no FD_CONNECT, and
+             * Chromium, which had already been told WSAEWOULDBLOCK by
+             * its own non-blocking connect, waited on the event, found
+             * no FD_CONNECT bit in it, and hit NOTREACHED in
+             * tcp_socket_win.cc. */
+            if (rc == 0 && !was && fds[a1].nonblock &&
+                inet64_type(fds[a1].sock) == INET64_STREAM) {
+                inet_fd_sync((int)a1);
+                return (uint64_t)-115;                 /* -EINPROGRESS */
+            }
             if (rc == -115) {
                 /* A second connect on a non-blocking socket still
                  * shaking hands is -EALREADY, the first -EINPROGRESS. */
@@ -4590,16 +4709,19 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
          * is how a peer learns the other end died. */
         if (fds[a1].kind != FD64_NETLINK) {
             int64_t rr;
+            int saved;
             if (!fd_is_stream((int)a1)) return (uint64_t)-88; /* -ENOTSOCK */
-            if (args->a4 & 0x40) {                     /* MSG_DONTWAIT */
-                if (fds[a1].rx < 0) return (uint64_t)-9;
-                rr = pipe64_read(fds[a1].rx, (void*)a2, a3);
-                if (rr > 0) sched64_wake(PIPE64_WAIT_KEY(fds[a1].rx),
-                                         SCHED64_MAX_TASKS);
-                return (uint64_t)rr;
-            }
             if (args->a6 && user_range_ok(args->a6, 4)) *(uint32_t*)args->a6 = 0;
-            return (uint64_t)do_pipe_read(args, nr, (int)a1, (void*)a2, a3);
+            /* MSG_DONTWAIT is this one call non-blocking - and a call
+             * that would block returns here rather than parking, so the
+             * flag is put back on the way out either way. MSG_PEEK
+             * leaves what it read where it was. */
+            saved = fds[a1].nonblock;
+            if (args->a4 & 0x40) fds[a1].nonblock = 1;
+            rr = do_pipe_read_ex(args, nr, (int)a1, (void*)a2, a3,
+                                 (args->a4 & 0x2) != 0);
+            fds[a1].nonblock = saved;
+            return (uint64_t)rr;
         }
         if (args->a6) {
             if (!user_range_ok(args->a6, 4)) return (uint64_t)-14;
@@ -4702,6 +4824,14 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                         carried[ncarried].tx   = fds[sfd].tx;
                         carried[ncarried].sock = fds[sfd].kind == FD64_INET
                                                ? fds[sfd].sock : -1;
+                        /* O_NONBLOCK belongs to the open file on Linux,
+                         * so a passed descriptor arrives with it. Wine's
+                         * server makes its sockets non-blocking and
+                         * hands them to the client, whose first peek
+                         * at a quiet connection blocked forever when it
+                         * arrived without it - and Chromium's request
+                         * was never sent. */
+                        carried[ncarried].nonblock = fds[sfd].nonblock;
                         if (fds[sfd].kind == FD64_INET)
                             inet64_ref(fds[sfd].sock);
                         /* Referenced for the receiver now. The sender is
@@ -4844,15 +4974,23 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
          * takes - so an empty connection blocks and is restarted here
          * exactly as it is there, rather than having a second, subtly
          * different waiting rule. */
-        for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
-            const iovec64_t* v = &msg->msg_iov[i];
-            int64_t r;
-            if (!v->iov_len) continue;
-            r = do_pipe_read(args, nr, (int)a1, v->iov_base, v->iov_len);
-            if (r < 0) return (uint64_t)r;
-            total += r;
-            if (r == 0) break;                          /* end of file */
-            if ((uint64_t)r < v->iov_len) break;
+        /* MSG_DONTWAIT and MSG_PEEK as recvfrom takes them. A peek
+         * fills the first vector only: what Wine's try_recv peeks with
+         * is one byte in one buffer. */
+        {
+            int saved = fds[a1].nonblock, peek = (a3 & 0x2) != 0;
+            if (a3 & 0x40) fds[a1].nonblock = 1;
+            for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
+                const iovec64_t* v = &msg->msg_iov[i];
+                int64_t r;
+                if (!v->iov_len) continue;
+                r = do_pipe_read_ex(args, nr, (int)a1, v->iov_base, v->iov_len, peek);
+                if (r < 0) { fds[a1].nonblock = saved; return (uint64_t)r; }
+                total += r;
+                if (r == 0 || peek) break;              /* end of file */
+                if ((uint64_t)r < v->iov_len) break;
+            }
+            fds[a1].nonblock = saved;
         }
 
         msg->msg_flags = 0;
@@ -4929,7 +5067,18 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                     fds[nfd].tx       = got[k].tx;
                     fds[nfd].sock     = got[k].kind == FD64_INET
                                       ? got[k].sock : -1;
-                    fds[nfd].nonblock = 0;
+#ifdef CHROME64_STALL_SECS
+                    if (got[k].kind == FD64_INET && inet64_watched(got[k].sock)) {
+                        serial64_puts("NOVARIS64: [inet-pass] pid ");
+                        serial64_putdec((uint64_t)proc64_current_pid());
+                        serial64_puts(" received sock ");
+                        serial64_putdec((uint64_t)got[k].sock);
+                        serial64_puts(" as fd ");
+                        serial64_putdec((uint64_t)nfd);
+                        serial64_puts(got[k].rx >= 0 ? " with its pipes\n" : " without pipes\n");
+                    }
+#endif
+                    fds[nfd].nonblock = got[k].nonblock;
                     fds[nfd].cloexec  = (a3 & MSG_CMSG_CLOEXEC_) ? 1 : 0;
                     fds[nfd].used     = 1;
                     out[installed++]  = nfd;

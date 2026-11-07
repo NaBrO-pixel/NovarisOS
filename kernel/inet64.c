@@ -66,6 +66,13 @@ typedef struct {
     int      fin_sent;
     uint64_t linger_until;  /* closed and waiting for the peer: give up then */
     int      udp_bound;     /* holds net.c's port for lport */
+
+    /* For the deadline report: bytes each way through the pump, and
+     * what poll was asked about this socket and answered. */
+    uint64_t bytes_out, bytes_in;
+    uint32_t polls, polls_out_wanted, polls_out_given;
+    int      last_poll_pid;
+    uint64_t connected_at;  /* clock64 tick it reached S_CONNECTED */
 } isock_t;
 
 static isock_t socks[INET64_MAX];
@@ -74,6 +81,37 @@ static int      ready;          /* net_init has run */
 static uint16_t next_ephemeral = 32768;
 static uint64_t last_arp_refresh;
 static uint64_t events;
+
+#ifndef UDP_PORTS
+#define UDP_PORTS 8                 /* net.c's default, if not overridden */
+#endif
+
+/* A table that fills is said once, with how many of each kind are open,
+ * because what the program sees - ENFILE, ENOBUFS - surfaces far away:
+ * Wine could not map ENFILE and Chromium reported a page that failed to
+ * load with error 10014. */
+static void full_once(const char* what, int size) {
+    static int said;
+    int by_state[6] = { 0 };
+    if (said) return;
+    said = 1;
+    for (int i = 0; i < INET64_MAX; i++) by_state[socks[i].state]++;
+    serial64_puts("NOVARIS64: [inet] all ");
+    serial64_putdec((uint64_t)size);
+    serial64_puts(" ");
+    serial64_puts(what);
+    serial64_puts(" in use - sockets new ");
+    serial64_putdec((uint64_t)by_state[S_NEW]);
+    serial64_puts(" listening ");
+    serial64_putdec((uint64_t)by_state[S_LISTEN]);
+    serial64_puts(" connecting ");
+    serial64_putdec((uint64_t)by_state[S_CONNECTING]);
+    serial64_puts(" connected ");
+    serial64_putdec((uint64_t)by_state[S_CONNECTED]);
+    serial64_puts(" done ");
+    serial64_putdec((uint64_t)by_state[S_DONE]);
+    serial64_puts("\n");
+}
 
 static void wake_all(void) {
     events++;
@@ -232,6 +270,7 @@ static int pump_one(isock_t* k) {
                 k->state = S_DONE;
             } else {
                 k->state = S_CONNECTED;
+                k->connected_at = clock64_ticks();
             }
             wake_all();
             return 1;
@@ -263,6 +302,7 @@ static int pump_one(isock_t* k) {
             n = tcp_recv(h, buf, room);
             if (n <= 0) break;
             pipe64_write(k->rx, buf, (uint64_t)n);
+            k->bytes_in += (uint64_t)n;
             sched64_wake(PIPE64_WAIT_KEY_(k->rx), SCHED64_MAX_TASKS);
         } else {
             n = tcp_recv(h, buf, sizeof(buf));
@@ -284,6 +324,7 @@ static int pump_one(isock_t* k) {
             int64_t n = pipe64_read(k->tx, buf, sizeof(buf));
             if (n <= 0) break;
             tcp_send(h, buf, (uint32_t)n);
+            k->bytes_out += (uint64_t)n;
             sched64_wake(PIPE64_WAIT_KEY_(k->tx), SCHED64_MAX_TASKS);
             moved = 1;
             /* Let the segment go out and the stack answer before the
@@ -431,6 +472,7 @@ int inet64_socket(int type) {
         k->rx = k->tx = -1;
         return i;
     }
+    full_once("sockets", INET64_MAX);
     return -23;                                        /* -ENFILE */
 }
 
@@ -489,7 +531,10 @@ static uint16_t ephemeral(int type) {
 static int udp_attach(isock_t* k) {
     if (k->udp_bound) return 0;
     if (!k->lport) k->lport = ephemeral(INET64_DGRAM);
-    if (!k->lport || !net_udp_bind(k->lport)) return -105;   /* -ENOBUFS */
+    if (!k->lport || !net_udp_bind(k->lport)) {
+        full_once("UDP ports", UDP_PORTS);
+        return -105;                                   /* -ENOBUFS */
+    }
     k->udp_bound = 1;
     return 0;
 }
@@ -555,6 +600,7 @@ int inet64_accept(int s) {
         return -23;
     }
     socks[n].state = S_CONNECTED;
+    socks[n].connected_at = clock64_ticks();
     socks[n].tcp = h;
     socks[n].lip = k->lip;
     socks[n].lport = k->lport;
@@ -603,7 +649,10 @@ int inet64_connect(int s, uint32_t ip, uint16_t port) {
 
     h = tcp_connect(ip, port);
     if (h == -1) return -101;
-    if (h < 0) return -105;                            /* table full */
+    if (h < 0) {                                       /* table full */
+        full_once("TCP connections", TCP_MAX_CONNECTIONS);
+        return -105;
+    }
     k->tcp = h;
     k->rip = ip;
     k->rport = port;
@@ -727,4 +776,270 @@ int inet64_sockets_open(void) {
     int n = 0;
     for (int i = 0; i < INET64_MAX; i++) if (socks[i].state != S_FREE) n++;
     return n;
+}
+
+/* --- what Linux tells a program about its interfaces ------------------- *
+ *
+ * Wine's nsiproxy.sys builds the Windows adapter table from these: it
+ * walks if_nameindex() (netlink, in syscall64.c), then asks a UDP socket
+ * SIOCGIFHWADDR, SIOCGIFFLAGS and SIOCGIFMTU about each name, and reads
+ * the routes from /proc/net/route. An interface whose SIOCGIFHWADDR
+ * fails is left out, so without these GetAdaptersAddresses found
+ * nothing and every caller - Chromium's network code among them -
+ * was told ERROR_NOT_SUPPORTED. */
+
+/* Index 1 is lo, 2 is eth0 (when the card is up); 0 for neither. */
+static int if_by_name(const char* name) {
+    if (!kstrcmp(name, "lo")) return 1;
+    if (inet64_card_up() && !kstrcmp(name, "eth0")) return 2;
+    return 0;
+}
+
+static void put_sin(uint8_t* sa, uint32_t ip) {
+    kmemset(sa, 0, 16);
+    sa[0] = 2;                                      /* AF_INET */
+    sa[4] = (uint8_t)(ip >> 24); sa[5] = (uint8_t)(ip >> 16);
+    sa[6] = (uint8_t)(ip >> 8);  sa[7] = (uint8_t)ip;
+}
+
+/* One ifreq ioctl. `ifr` is the caller's struct ifreq, already checked
+ * to be 40 bytes of writable memory: the name, then a 24-byte union. */
+int inet64_ifreq(uint64_t cmd, uint8_t* ifr) {
+    char name[16];
+    int idx;
+    uint8_t* u = ifr + 16;
+
+    if (cmd == 0x8910) {                            /* SIOCGIFNAME */
+        idx = *(int*)u;
+        if (idx == 1) kstrlcpy((char*)ifr, "lo", 16);
+        else if (idx == 2 && inet64_card_up()) kstrlcpy((char*)ifr, "eth0", 16);
+        else return -19;                            /* -ENODEV */
+        return 0;
+    }
+
+    kmemcpy(name, ifr, 16);
+    name[15] = 0;
+    idx = if_by_name(name);
+    if (!idx) return -19;
+
+    switch (cmd) {
+    case 0x8913:                                    /* SIOCGIFFLAGS */
+        /* IFF_UP|IFF_RUNNING, and LOOPBACK or BROADCAST|MULTICAST */
+        *(uint16_t*)u = idx == 1 ? (0x1 | 0x8 | 0x40)
+                                 : (0x1 | 0x2 | 0x40 | 0x1000);
+        return 0;
+    case 0x8927:                                    /* SIOCGIFHWADDR */
+        kmemset(u, 0, 16);
+        *(uint16_t*)u = idx == 1 ? 772 : 1;         /* ARPHRD_LOOPBACK/ETHER */
+        if (idx == 2) kmemcpy(u + 2, inet64_mac(), 6);
+        return 0;
+    case 0x8921:                                    /* SIOCGIFMTU */
+        *(int*)u = idx == 1 ? 65536 : 1500;
+        return 0;
+    case 0x8933:                                    /* SIOCGIFINDEX */
+        *(int*)u = idx;
+        return 0;
+    case 0x8915:                                    /* SIOCGIFADDR */
+        put_sin(u, idx == 1 ? 0x7F000001u : inet64_ip());
+        return 0;
+    case 0x891B:                                    /* SIOCGIFNETMASK */
+        put_sin(u, idx == 1 ? 0xFF000000u : inet64_netmask());
+        return 0;
+    case 0x8919:                                    /* SIOCGIFBRDADDR */
+        put_sin(u, idx == 1 ? 0 : (inet64_ip() | ~inet64_netmask()));
+        return 0;
+    case 0x8B01:                                    /* SIOCGIWNAME */
+        return -95;               /* -EOPNOTSUPP: not a wireless card */
+    default:
+        return -25;                                 /* -ENOTTY */
+    }
+}
+
+/* SIOCGIFCONF: an ifreq with its address for each interface, into the
+ * caller's buffer. Returns the bytes used. */
+int inet64_ifconf(uint8_t* buf, int len) {
+    int used = 0;
+    for (int idx = 1; idx <= (inet64_card_up() ? 2 : 1); idx++) {
+        if (used + 40 > len) break;
+        kmemset(buf + used, 0, 40);
+        kstrlcpy((char*)buf + used, idx == 1 ? "lo" : "eth0", 16);
+        put_sin(buf + used + 16, idx == 1 ? 0x7F000001u : inet64_ip());
+        used += 40;
+    }
+    return used;
+}
+
+static char* put_str(char* o, const char* s) { while (*s) *o++ = *s++; return o; }
+
+static char* put_u(char* o, uint64_t v) {
+    char t[24];
+    int n = 0;
+    do { t[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+    while (n) *o++ = t[--n];
+    return o;
+}
+
+/* An address as /proc/net/route prints it: the network-order bytes read
+ * as a little-endian word, in hex. 10.0.2.2 is 0202000A. */
+static char* put_route_hex(char* o, uint32_t ip) {
+    static const char hex[] = "0123456789ABCDEF";
+    uint32_t le = ((ip & 0xFF) << 24) | ((ip & 0xFF00) << 8) |
+                  ((ip >> 8) & 0xFF00) | (ip >> 24);
+    for (int s = 28; s >= 0; s -= 4) *o++ = hex[(le >> s) & 15];
+    return o;
+}
+
+int inet64_proc_route(char* out) {
+    char* o = out;
+    const net_config_t* c = net_config();
+    o = put_str(o, "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\t"
+                   "Mask\t\tMTU\tWindow\tIRTT\n");
+    if (inet64_card_up()) {
+        if (c->gateway) {
+            o = put_str(o, "eth0\t00000000\t");
+            o = put_route_hex(o, c->gateway);
+            o = put_str(o, "\t0003\t0\t0\t0\t00000000\t0\t0\t0\n");
+        }
+        o = put_str(o, "eth0\t");
+        o = put_route_hex(o, c->ip & c->netmask);
+        o = put_str(o, "\t00000000\t0001\t0\t0\t0\t");
+        o = put_route_hex(o, c->netmask);
+        o = put_str(o, "\t0\t0\t0\n");
+    }
+    return (int)(o - out);
+}
+
+int inet64_proc_dev(char* out) {
+    char* o = out;
+    o = put_str(o, "Inter-|   Receive                                                |  Transmit\n"
+                   " face |bytes    packets errs drop fifo frame compressed multicast|"
+                   "bytes    packets errs colls carrier compressed\n");
+    o = put_str(o, "    lo: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n");
+    if (inet64_card_up()) {
+        const netdev_t* d = netdev_get();
+        o = put_str(o, "  eth0: ");
+        o = put_u(o, d->rx_bytes);   *o++ = ' ';
+        o = put_u(o, d->rx_packets); *o++ = ' ';
+        o = put_u(o, d->rx_errors);  *o++ = ' ';
+        o = put_u(o, d->rx_dropped);
+        o = put_str(o, " 0 0 0 0 ");
+        o = put_u(o, d->tx_bytes);   *o++ = ' ';
+        o = put_u(o, d->tx_packets); *o++ = ' ';
+        o = put_u(o, d->tx_errors);
+        o = put_str(o, " 0 0 0 0 0\n");
+    }
+    return (int)(o - out);
+}
+
+/* Every socket at the deadline: what state the socket layer thinks it
+ * is in, what TCP thinks, and how much is waiting in its pipes. A page
+ * load that never finishes is either a connection that never completed
+ * or one whose news never reached the process polling it, and this says
+ * which. */
+void inet64_report(void) {
+    static const char* const names[] = { "free", "new", "listen", "connecting",
+                                         "connected", "done" };
+    int n = 0;
+    for (int i = 0; i < INET64_MAX; i++) {
+        isock_t* k = &socks[i];
+        if (k->state == S_FREE) continue;
+        n++;
+        serial64_puts("NOVARIS64: [inet] sock ");
+        serial64_putdec((uint64_t)i);
+        serial64_puts(k->type == INET64_DGRAM ? " udp " : " tcp ");
+        serial64_puts(names[k->state]);
+        serial64_puts(" refs ");
+        serial64_putdec((uint64_t)k->refs);
+        serial64_puts(" lport ");
+        serial64_putdec(k->lport);
+        serial64_puts(" peer ");
+        say_ip(k->rip);
+        serial64_putc(':');
+        serial64_putdec(k->rport);
+        if (k->tcp >= 0) {
+            serial64_puts(" tcpstate ");
+            serial64_putdec((uint64_t)tcp_state(k->tcp));
+            serial64_puts(" idle ");
+            serial64_putdec((uint64_t)tcp_tx_idle(k->tcp));
+            serial64_puts(" recvq ");
+            serial64_putdec(tcp_recv_ready(k->tcp));
+        }
+        if (k->rx >= 0) {
+            serial64_puts(" rx ");
+            serial64_putdec(pipe64_available(k->rx));
+            serial64_puts("/r");
+            serial64_putdec((uint64_t)pipe64_readers(k->rx));
+            serial64_puts(" tx ");
+            serial64_putdec(pipe64_available(k->tx));
+            serial64_puts("/w");
+            serial64_putdec((uint64_t)pipe64_writers(k->tx));
+        }
+        if (k->err) { serial64_puts(" err "); serial64_putdec((uint64_t)k->err); }
+        if (k->type == INET64_STREAM) {
+            serial64_puts(" out ");
+            serial64_putdec(k->bytes_out);
+            serial64_puts(" in ");
+            serial64_putdec(k->bytes_in);
+            serial64_puts(" polls ");
+            serial64_putdec(k->polls);
+            serial64_puts(" wantout ");
+            serial64_putdec(k->polls_out_wanted);
+            serial64_puts(" gaveout ");
+            serial64_putdec(k->polls_out_given);
+            serial64_puts(" lastpid ");
+            serial64_putdec((uint64_t)k->last_poll_pid);
+        }
+        serial64_putc('\n');
+    }
+    serial64_puts("NOVARIS64: [inet] ");
+    serial64_putdec((uint64_t)n);
+    serial64_puts(" sockets; frames in ");
+    serial64_putdec(net_stats()->rx_frames);
+    serial64_puts(" out ");
+    serial64_putdec(net_stats()->tx_frames);
+    serial64_puts(", tcp retransmits ");
+    serial64_putdec(tcp_retransmits());
+    serial64_puts(", arp entries ");
+    serial64_putdec(net_arp_entries());
+    serial64_putc('\n');
+}
+
+void inet64_note_poll(int s, int pid, int want_out, int gave_out) {
+    if (!inet64_valid(s)) return;
+    socks[s].polls++;
+    socks[s].last_poll_pid = pid;
+    if (want_out) socks[s].polls_out_wanted++;
+    if (gave_out) socks[s].polls_out_given++;
+}
+
+/* A TCP connection that has been established for `ticks` without a byte
+ * either way: the shape of a page load whose request never left. Says
+ * so once, which lets a run that is stuck end now instead of waiting out
+ * its whole budget. */
+int inet64_stalled(uint64_t ticks) {
+    static int said;
+    uint64_t now = clock64_ticks();
+    if (said) return 0;
+    for (int i = 0; i < INET64_MAX; i++) {
+        isock_t* k = &socks[i];
+        if (k->state != S_CONNECTED || k->type != INET64_STREAM) continue;
+        if (k->bytes_out || k->bytes_in) continue;
+        if (now - k->connected_at < ticks) continue;
+        said = 1;
+        serial64_puts("NOVARIS64: [inet] sock ");
+        serial64_putdec((uint64_t)i);
+        serial64_puts(" has been connected to ");
+        say_ip(k->rip);
+        serial64_putc(':');
+        serial64_putdec(k->rport);
+        serial64_puts(" with nothing sent or received - ending the run\n");
+        return 1;
+    }
+    return 0;
+}
+
+/* A TCP socket with a peer that is not this machine. */
+int inet64_watched(int s) {
+    return inet64_valid(s) && socks[s].type == INET64_STREAM &&
+           socks[s].rport && !net_is_local(socks[s].rip);
 }

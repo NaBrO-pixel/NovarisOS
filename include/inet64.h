@@ -17,7 +17,7 @@
  * Everything here runs with interrupts off: from a system call, or from
  * the timer interrupt through inet64_timer(). */
 
-#define INET64_MAX 64
+#define INET64_MAX 512
 
 /* What a blocked accept, connect or UDP receive waits on. Every event
  * the pump sees wakes it, and the waiters look again. */
@@ -84,5 +84,16 @@ int  inet64_sockets_open(void);
 uint32_t inet64_ip(void);
 uint32_t inet64_netmask(void);
 const uint8_t* inet64_mac(void);
+
+/* The ifreq ioctls (SIOCGIFFLAGS, SIOCGIFHWADDR, ...), SIOCGIFCONF,
+ * and the text of /proc/net/route and /proc/net/dev (under 1KB each). */
+int  inet64_ifreq(uint64_t cmd, uint8_t* ifr);
+int  inet64_ifconf(uint8_t* buf, int len);
+int  inet64_proc_route(char* out);
+int  inet64_proc_dev(char* out);
+void inet64_report(void);
+int  inet64_watched(int s);
+int  inet64_stalled(uint64_t ticks);   /* once: a connection carrying nothing */
+void inet64_note_poll(int s, int pid, int want_out, int gave_out);         /* every socket, for the deadline */
 
 #endif
