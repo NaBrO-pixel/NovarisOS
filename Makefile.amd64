@@ -113,6 +113,7 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/socktest64_blob.o \
        $(BUILD_DIR)/scm64_blob.o \
        $(BUILD_DIR)/shm64_blob.o \
+       $(BUILD_DIR)/novac64_blob.o \
        $(BUILD_DIR)/initrd64.o \
        $(BUILD_DIR)/hello64_blob.o \
        $(BUILD_DIR)/glibc64_blob.o \
@@ -387,6 +388,30 @@ $(BUILD_DIR)/scm64_blob.o: $(BUILD_DIR)/scm64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # A file with no name, shared between two processes (Milestone 78).
+# libNovaC, NovarisOS's own C library (userland/libnovac), built by its own
+# Makefile into build64/libnovac. Its target test is a static program that
+# links nothing but libNovaC - no host libc anywhere - and it runs as a
+# bring-up layer below and on this host, where the two transcripts must
+# match line for line. It execs novac_child, staged at /tmp/novac_child in
+# the initrd. The sub-make runs every time and is incremental; it checks
+# libNovaC's syscall numbers against include/syscall64.h first, so the two
+# cannot drift apart.
+NOVAC_DIR   := userland/libnovac
+NOVAC_BUILD := $(abspath $(BUILD_DIR))/libnovac
+NOVAC_TEST  := $(NOVAC_BUILD)/target/novac_target_test.elf
+NOVAC_CHILD := $(NOVAC_BUILD)/target/novac_child.elf
+
+.PHONY: novac-force
+$(NOVAC_TEST) $(NOVAC_CHILD) &: novac-force | $(BUILD_DIR)
+	@$(MAKE) -s -C $(NOVAC_DIR) BUILD=$(NOVAC_BUILD) check-sysnum
+	@$(MAKE) -s -C $(NOVAC_DIR) BUILD=$(NOVAC_BUILD) $(NOVAC_TEST) child
+
+$(BUILD_DIR)/novac64_blob.c: $(NOVAC_TEST) userland/embed64.py
+	python3 userland/embed64.py $(NOVAC_TEST) $@ novac64_elf
+
+$(BUILD_DIR)/novac64_blob.o: $(BUILD_DIR)/novac64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/shm64.elf: userland/shm64.c | $(BUILD_DIR)
 	gcc -static -O2 -o $@ $<
 	@file $@ | grep -q "statically linked" \
@@ -645,7 +670,7 @@ $(shell mkdir -p $(BUILD_DIR); \
 # the previous list - which costs a build and a boot to notice, and
 # looks exactly like the fix not working.
 $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
-           $(BUILD_DIR)/forkchild64.elf userland/mkinitrd.py \
+           $(BUILD_DIR)/forkchild64.elf $(NOVAC_CHILD) userland/mkinitrd.py \
            $(BUILD_DIR)/winegui64.exe $(BUILD_DIR)/chromeprobe64.exe \
            tools/stage_wine.sh tools/wine_prefix_modules.txt \
            tools/wine_chromium_modules.txt $(INITRD_CONFIG)
@@ -655,6 +680,7 @@ $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
 	cp $(BUILD_DIR)/dynhello64.elf $(INITRD_STAGE)/dynhello64
 	mkdir -p $(INITRD_STAGE)/tmp
 	cp $(BUILD_DIR)/forkchild64.elf $(INITRD_STAGE)/tmp/forkchild64
+	cp $(NOVAC_CHILD) $(INITRD_STAGE)/tmp/novac_child
 	@# At the paths ld.so actually searches, which were read off its own
 	@# trace rather than guessed: it tries /lib/x86_64-linux-gnu first.
 	@# The filesystem matches whole paths, so a file at /libc.so.6 is
@@ -1152,6 +1178,25 @@ test: iso
 	    || (echo "FAIL: the host run of the shm binary did not exit 119"; \
 	        exit 1)
 	@echo "PASS: shared memory behaves the same, and exits 119, on both"
+	@# libNovaC's target test: the same static binary, linked against
+	@# libNovaC and nothing else, run here and inside NovarisOS. Every line
+	@# it prints here has to appear in the guest's transcript, and both
+	@# runs have to end 131.
+	@rm -rf /tmp/novac_t; cp $(NOVAC_CHILD) /tmp/novac_child
+	@timeout 120 $(NOVAC_TEST) > $(BUILD_DIR)/novac64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/novac64.host.status
+	@rm -rf /tmp/novac_t /tmp/novac_child
+	@while read -r line; do \
+	    grep -qF "$$line" $(BUILD_DIR)/serial.log \
+	        || (echo "FAIL: the guest never printed: $$line"; exit 1) \
+	        || exit 1; \
+	done < $(BUILD_DIR)/novac64.host.txt
+	@[ "`cat $(BUILD_DIR)/novac64.host.status`" = "131" ] \
+	    || (echo "FAIL: the host run of libNovaC's target test did not exit 131"; \
+	        exit 1)
+	@grep -q "ok    libNovaC's target test passed on NovarisOS" $(BUILD_DIR)/serial.log \
+	    || (echo "FAIL: libNovaC's target test did not exit 131 in the guest"; exit 1)
+	@echo "PASS: libNovaC behaves the same, and exits 131, on both"
 
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR) $(ISO)
