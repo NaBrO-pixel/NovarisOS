@@ -900,8 +900,8 @@ full:
  * sched64.c's own comment on wake_rax says exactly this: a syscall that
  * restarts needs its own number back there, "or the re-executed
  * `syscall` invokes whatever call 0 happens to be". */
-static int64_t do_pipe_read(const syscall64_args_t* args, uint64_t nr,
-                            int fd, void* buf, uint64_t n) {
+static int64_t do_pipe_read_ex(const syscall64_args_t* args, uint64_t nr,
+                               int fd, void* buf, uint64_t n, int peek) {
     registers64_t self, next;
     vmspace64_t next_space;
     uint64_t next_fs;
@@ -909,7 +909,7 @@ static int64_t do_pipe_read(const syscall64_args_t* args, uint64_t nr,
 
     if (fds[fd].rx < 0) return -9;                     /* -EBADF: write end */
 
-    r = pipe64_read(fds[fd].rx, buf, n);
+    r = peek ? pipe64_peek(fds[fd].rx, buf, n) : pipe64_read(fds[fd].rx, buf, n);
     /* Room has been made, so a writer parked on a full pipe can go on.
      * Same key as the readers': a spurious wake costs one re-check. */
     if (r > 0) sched64_wake(PIPE64_WAIT_KEY(fds[fd].rx), SCHED64_MAX_TASKS);
@@ -939,6 +939,11 @@ static int64_t do_pipe_read(const syscall64_args_t* args, uint64_t nr,
     write_msr(0xC0000100u, next_fs);
     sched64_resume(&next);                             /* never returns */
     return 0;
+}
+
+static int64_t do_pipe_read(const syscall64_args_t* args, uint64_t nr,
+                            int fd, void* buf, uint64_t n) {
+    return do_pipe_read_ex(args, nr, fd, buf, n, 0);
 }
 
 /* --- AF_NETLINK, NETLINK_ROUTE ------------------------------------ *
@@ -4704,16 +4709,19 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
          * is how a peer learns the other end died. */
         if (fds[a1].kind != FD64_NETLINK) {
             int64_t rr;
+            int saved;
             if (!fd_is_stream((int)a1)) return (uint64_t)-88; /* -ENOTSOCK */
-            if (args->a4 & 0x40) {                     /* MSG_DONTWAIT */
-                if (fds[a1].rx < 0) return (uint64_t)-9;
-                rr = pipe64_read(fds[a1].rx, (void*)a2, a3);
-                if (rr > 0) sched64_wake(PIPE64_WAIT_KEY(fds[a1].rx),
-                                         SCHED64_MAX_TASKS);
-                return (uint64_t)rr;
-            }
             if (args->a6 && user_range_ok(args->a6, 4)) *(uint32_t*)args->a6 = 0;
-            return (uint64_t)do_pipe_read(args, nr, (int)a1, (void*)a2, a3);
+            /* MSG_DONTWAIT is this one call non-blocking - and a call
+             * that would block returns here rather than parking, so the
+             * flag is put back on the way out either way. MSG_PEEK
+             * leaves what it read where it was. */
+            saved = fds[a1].nonblock;
+            if (args->a4 & 0x40) fds[a1].nonblock = 1;
+            rr = do_pipe_read_ex(args, nr, (int)a1, (void*)a2, a3,
+                                 (args->a4 & 0x2) != 0);
+            fds[a1].nonblock = saved;
+            return (uint64_t)rr;
         }
         if (args->a6) {
             if (!user_range_ok(args->a6, 4)) return (uint64_t)-14;
@@ -4816,6 +4824,14 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                         carried[ncarried].tx   = fds[sfd].tx;
                         carried[ncarried].sock = fds[sfd].kind == FD64_INET
                                                ? fds[sfd].sock : -1;
+                        /* O_NONBLOCK belongs to the open file on Linux,
+                         * so a passed descriptor arrives with it. Wine's
+                         * server makes its sockets non-blocking and
+                         * hands them to the client, whose first peek
+                         * at a quiet connection blocked forever when it
+                         * arrived without it - and Chromium's request
+                         * was never sent. */
+                        carried[ncarried].nonblock = fds[sfd].nonblock;
                         if (fds[sfd].kind == FD64_INET)
                             inet64_ref(fds[sfd].sock);
                         /* Referenced for the receiver now. The sender is
@@ -4958,15 +4974,23 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
          * takes - so an empty connection blocks and is restarted here
          * exactly as it is there, rather than having a second, subtly
          * different waiting rule. */
-        for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
-            const iovec64_t* v = &msg->msg_iov[i];
-            int64_t r;
-            if (!v->iov_len) continue;
-            r = do_pipe_read(args, nr, (int)a1, v->iov_base, v->iov_len);
-            if (r < 0) return (uint64_t)r;
-            total += r;
-            if (r == 0) break;                          /* end of file */
-            if ((uint64_t)r < v->iov_len) break;
+        /* MSG_DONTWAIT and MSG_PEEK as recvfrom takes them. A peek
+         * fills the first vector only: what Wine's try_recv peeks with
+         * is one byte in one buffer. */
+        {
+            int saved = fds[a1].nonblock, peek = (a3 & 0x2) != 0;
+            if (a3 & 0x40) fds[a1].nonblock = 1;
+            for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
+                const iovec64_t* v = &msg->msg_iov[i];
+                int64_t r;
+                if (!v->iov_len) continue;
+                r = do_pipe_read_ex(args, nr, (int)a1, v->iov_base, v->iov_len, peek);
+                if (r < 0) { fds[a1].nonblock = saved; return (uint64_t)r; }
+                total += r;
+                if (r == 0 || peek) break;              /* end of file */
+                if ((uint64_t)r < v->iov_len) break;
+            }
+            fds[a1].nonblock = saved;
         }
 
         msg->msg_flags = 0;
@@ -5054,7 +5078,7 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                         serial64_puts(got[k].rx >= 0 ? " with its pipes\n" : " without pipes\n");
                     }
 #endif
-                    fds[nfd].nonblock = 0;
+                    fds[nfd].nonblock = got[k].nonblock;
                     fds[nfd].cloexec  = (a3 & MSG_CMSG_CLOEXEC_) ? 1 : 0;
                     fds[nfd].used     = 1;
                     out[installed++]  = nfd;

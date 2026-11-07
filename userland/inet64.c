@@ -213,6 +213,11 @@ static void tcp_nonblocking(void) {
     ok(write(c, "x", 1) == 1, "one byte the other way");
     p.fd = s; p.events = POLLIN; p.revents = 0;
     ok(poll(&p, 1, 5000) == 1 && (p.revents & POLLIN), "poll wakes for the byte");
+    {
+        char pk = 0;
+        ok(recv(s, &pk, 1, MSG_PEEK) == 1 && pk == 'x',
+           "MSG_PEEK sees the byte without taking it");
+    }
     close(c);
     {
         char b[4];
