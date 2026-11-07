@@ -18,6 +18,7 @@
 #include <sys/wait.h>
 #include <dirent.h>
 #include <stdint.h>
+#include <signal.h>
 
 #define ROOT "/tmp/novac_t"
 
@@ -331,6 +332,159 @@ static void test_process(void)
     ok("nothing is left to wait for", wait(&st) == -1 && errno == ECHILD);
 }
 
+/* --- signals -------------------------------------------------------- */
+
+static volatile sig_atomic_t got_sig, got_count, got_code, got_pid_ok;
+
+static void on_sig(int sig) { got_sig = sig; got_count++; }
+
+static void on_info(int sig, siginfo_t *si, void *uc)
+{
+    (void)uc;
+    got_sig = sig;
+    got_count++;
+    got_code = si->si_code;
+    got_pid_ok = si->si_pid == getpid();
+}
+
+static int abort_pipe = -1;
+static void on_abort(int sig) { (void)sig; if (abort_pipe >= 0) write(abort_pipe, "h", 1); }
+
+static void test_signals(void)
+{
+    sigset_t s, old;
+    struct sigaction sa;
+    sighandler_t prev;
+    int st = 0, fds[2];
+    char c;
+    pid_t kid;
+
+    ok("sigemptyset empties", sigemptyset(&s) == 0 && sigismember(&s, SIGUSR1) == 0);
+    ok("sigaddset adds", sigaddset(&s, SIGUSR1) == 0 && sigismember(&s, SIGUSR1) == 1);
+    ok("sigdelset removes", sigdelset(&s, SIGUSR1) == 0 && sigismember(&s, SIGUSR1) == 0);
+    ok("sigfillset fills", sigfillset(&s) == 0 && sigismember(&s, SIGTERM) == 1);
+    errno = 0;
+    ok("signal 0 is not a member of anything", sigaddset(&s, 0) == -1 && errno == EINVAL);
+    errno = 0;
+    ok("nor is signal 65", sigismember(&s, 65) == -1 && errno == EINVAL);
+
+    got_sig = got_count = 0;
+    prev = signal(SIGUSR1, on_sig);
+    ok("signal() installs a handler", prev != SIG_ERR);
+    ok("raise runs it before returning", raise(SIGUSR1) == 0 && got_sig == SIGUSR1 && got_count == 1);
+    ok("and the program carries on after it", got_count == 1);
+    ok("signal() hands back the handler it replaces", signal(SIGUSR1, SIG_DFL) == on_sig);
+
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_info;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    got_sig = got_count = 0;
+    ok("sigaction installs an SA_SIGINFO handler", sigaction(SIGUSR2, &sa, NULL) == 0);
+    raise(SIGUSR2);
+    ok("it is given the signal", got_sig == SIGUSR2 && got_count == 1);
+    ok("si_code says it was sent to a thread (SI_TKILL)", got_code == -6);
+    ok("si_pid says who sent it", got_pid_ok == 1);
+    memset(&sa, 0, sizeof sa);
+    ok("sigaction reports the handler back", sigaction(SIGUSR2, NULL, &sa) == 0 &&
+       sa.sa_sigaction == on_info && (sa.sa_flags & SA_SIGINFO));
+    signal(SIGUSR2, SIG_DFL);
+
+    signal(SIGUSR1, on_sig);
+    got_count = 0;
+    sigemptyset(&s);
+    sigaddset(&s, SIGUSR1);
+    ok("sigprocmask blocks", sigprocmask(SIG_BLOCK, &s, NULL) == 0);
+    raise(SIGUSR1);
+    ok("a blocked signal waits", got_count == 0);
+    ok("and the mask says it is blocked", sigprocmask(SIG_BLOCK, NULL, &old) == 0 && sigismember(&old, SIGUSR1) == 1);
+    ok("unblocking delivers it", sigprocmask(SIG_UNBLOCK, &s, NULL) == 0 && got_count == 1);
+    errno = 0;
+    ok("a bad 'how' is EINVAL", sigprocmask(99, &s, NULL) == -1 && errno == EINVAL);
+
+    signal(SIGUSR1, SIG_IGN);
+    ok("an ignored signal does nothing", raise(SIGUSR1) == 0);
+    signal(SIGUSR1, SIG_DFL);
+
+    fflush(NULL);
+    kid = fork();
+    if (kid == 0) abort();
+    ok("abort() is a death by SIGABRT", waitpid(kid, &st, 0) == kid &&
+       WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT);
+
+    pipe(fds);
+    fflush(NULL);
+    kid = fork();
+    if (kid == 0) {
+        close(fds[0]);
+        abort_pipe = fds[1];
+        signal(SIGABRT, on_abort);
+        abort();
+    }
+    close(fds[1]);
+    ok("abort() runs a SIGABRT handler", read(fds[0], &c, 1) == 1 && c == 'h');
+    ok("and still ends the process with SIGABRT when it returns",
+       waitpid(kid, &st, 0) == kid && WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT);
+    close(fds[0]);
+
+    pipe(fds);
+    fflush(NULL);
+    kid = fork();
+    if (kid == 0) {
+        close(fds[1]);
+        read(fds[0], &c, 1);             /* waits; nothing is ever written */
+        _exit(3);
+    }
+    close(fds[0]);
+    ok("kill sends SIGTERM", kill(kid, SIGTERM) == 0);
+    ok("which ends the child by that signal", waitpid(kid, &st, 0) == kid &&
+       WIFSIGNALED(st) && WTERMSIG(st) == SIGTERM);
+    close(fds[1]);
+    errno = 0;
+    ok("kill to a reaped pid is ESRCH", kill(kid, 0) == -1 && errno == ESRCH);
+    errno = 0;
+    ok("kill with signal 99 is EINVAL", kill(getpid(), 99) == -1 && errno == EINVAL);
+}
+
+/* --- running another program ----------------------------------------- */
+
+#define CHILD "/tmp/novac_child"
+
+static void test_exec(void)
+{
+    int st = 0;
+    pid_t kid;
+    char *args[] = { "novac_child", "hello", NULL };
+    char *bare[] = { "novac_child", NULL };
+
+    errno = 0;
+    ok("execv of a missing file is ENOENT", execv("/nonexistent/novac", args) == -1 && errno == ENOENT);
+
+    fflush(NULL);
+    kid = fork();
+    if (kid == 0) { execv(CHILD, args); _exit(99); }
+    ok("execv runs another program, with its arguments",
+       waitpid(kid, &st, 0) == kid && WIFEXITED(st) && WEXITSTATUS(st) == 42);
+
+    ok("setenv sets", setenv("NOVAC_MARK", "seen", 1) == 0 && getenv("NOVAC_MARK") &&
+       strcmp(getenv("NOVAC_MARK"), "seen") == 0);
+    ok("without overwrite it keeps the old value", setenv("NOVAC_MARK", "other", 0) == 0 &&
+       strcmp(getenv("NOVAC_MARK"), "seen") == 0);
+    errno = 0;
+    ok("a name with '=' is EINVAL", setenv("A=B", "x", 1) == -1 && errno == EINVAL);
+    ok("unsetenv removes", setenv("NOVAC_GONE", "x", 1) == 0 && unsetenv("NOVAC_GONE") == 0 &&
+       getenv("NOVAC_GONE") == NULL);
+
+    ok("PATH can be set", setenv("PATH", "/nonexistent:/tmp", 1) == 0);
+    fflush(NULL);
+    kid = fork();
+    if (kid == 0) { execvp("novac_child", bare); _exit(99); }
+    ok("execvp finds it on PATH, and passes the environment on",
+       waitpid(kid, &st, 0) == kid && WIFEXITED(st) && WEXITSTATUS(st) == 41);
+    errno = 0;
+    ok("execvp of a name on no PATH entry is ENOENT", execvp("novac_nowhere", bare) == -1 && errno == ENOENT);
+}
+
 static void test_time(void)
 {
     struct timespec a, b, req = { 0, 20 * 1000 * 1000 };
@@ -383,6 +537,8 @@ int main(int argc, char **argv)
     test_dirs();
     test_process();
     test_time();
+    test_signals();
+    test_exec();
     test_env(argc, argv);
     printf("novac64: %d failures\n", failures);
     return failures ? 1 : 131;

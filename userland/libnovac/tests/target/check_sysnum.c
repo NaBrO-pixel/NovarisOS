@@ -21,4 +21,8 @@ SAME(exit_group, SYS64_EXIT_GROUP);
 SAME(pipe2, SYS64_PIPE2);         SAME(fork, SYS64_FORK);
 SAME(wait4, SYS64_WAIT4);         SAME(getppid, SYS64_GETPPID);
 SAME(getdents64, SYS64_GETDENTS64);
+SAME(rt_sigaction, SYS64_RT_SIGACTION); SAME(rt_sigprocmask, SYS64_RT_SIGPROCMASK);
+SAME(rt_sigreturn, SYS64_RT_SIGRETURN); SAME(execve, SYS64_EXECVE);
+SAME(kill, SYS64_KILL);           SAME(gettid, SYS64_GETTID);
+SAME(tgkill, SYS64_TGKILL);
 int novac_sysnum_checked;

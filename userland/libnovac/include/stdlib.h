@@ -22,6 +22,8 @@ _Noreturn void exit(int status);
 _Noreturn void _Exit(int status);
 int   atexit(void (*fn)(void));
 char *getenv(const char *name);
+int   setenv(const char *name, const char *value, int overwrite);
+int   unsetenv(const char *name);
 
 int       atoi(const char *s);
 long      atol(const char *s);

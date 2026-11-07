@@ -21,14 +21,15 @@ OUT       ?= $(BUILD)/target/novac_target_test.elf
 
 PORTABLE_SRC := $(wildcard src/string/*.c src/ctype/*.c src/errno/*.c src/assert/*.c src/stdlib/*.c) \
                 src/stdio/format.c src/stdio/snprintf.c
-SYSTEM_SRC   := src/dirent/dirent.c src/stdio/file.c src/unistd/unistd.c src/time/time.c src/sys/novaris/sys.c
+SYSTEM_SRC   := src/dirent/dirent.c src/stdio/file.c src/unistd/unistd.c src/time/time.c src/sys/novaris/sys.c \
+                src/signal/signal.c
 CRT_SRC      := src/arch/x86_64/start.c
 LIB_SRC      := $(PORTABLE_SRC) $(SYSTEM_SRC)
 
 cc-option = $(shell $(1) $(2) -x c -c /dev/null -o /dev/null 2>/dev/null && echo $(2))
 WARN := -Wall -Wextra -Werror -Wshadow -Wstrict-prototypes
 
-.PHONY: lib check-target host-test target-test check-sysnum example clean
+.PHONY: lib child check-target host-test target-test check-sysnum example clean
 
 # ---- NovarisOS target ------------------------------------------------------
 NOVAC_BUILTIN_INC ?= $(shell $(NOVAC_CC) -print-file-name=include 2>/dev/null)
@@ -60,9 +61,19 @@ $(OUT): $(BUILD)/target/crt0.o $(BUILD)/target/tests/target/novac_target_test.o 
 	@mkdir -p $(dir $@)
 	$(NOVAC_LD) -m elf_x86_64 -static -nostdlib -z noexecstack -e _start -o $@ $^
 
-target-test: $(OUT)
+# The program the target test execs, at the path it expects. NovarisOS
+# stages it there in its initrd; on a host it is copied there for the run.
+CHILD := $(BUILD)/target/novac_child.elf
+$(CHILD): $(BUILD)/target/crt0.o $(BUILD)/target/tests/target/novac_child.o $(BUILD)/target/libNovaC.a
+	@mkdir -p $(dir $@)
+	$(NOVAC_LD) -m elf_x86_64 -static -nostdlib -z noexecstack -e _start -o $@ $^
+
+child: $(CHILD)
+
+target-test: $(OUT) $(CHILD)
 	@file $(OUT) | grep -q "statically linked" || { echo "ERROR: $(OUT) is not static"; exit 1; }
-	@./$(OUT); rc=$$?; if [ $$rc -eq 131 ]; then echo "PASS: target test exited 131"; else echo "FAIL: exit $$rc"; exit 1; fi
+	@cp $(CHILD) /tmp/novac_child
+	@./$(OUT); rc=$$?; rm -f /tmp/novac_child; if [ $$rc -eq 131 ]; then echo "PASS: target test exited 131"; else echo "FAIL: exit $$rc"; exit 1; fi
 
 check-sysnum:
 	$(HOSTCC) -std=gnu11 -I../../include -fsyntax-only tests/target/check_sysnum.c

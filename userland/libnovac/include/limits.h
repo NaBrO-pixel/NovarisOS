@@ -36,4 +36,8 @@
 
 #define MB_LEN_MAX 1
 
+/* The longest path, NUL included, that the C library will build for you
+ * (Linux's value; the kernel itself may accept less). */
+#define PATH_MAX 4096
+
 #endif

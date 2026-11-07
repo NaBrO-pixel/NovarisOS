@@ -15,6 +15,7 @@ NOVAC_END_DECLS
  * stores the same number unchanged. */
 #define EPERM       1
 #define ENOENT      2
+#define ESRCH        3
 #define EINTR       4
 #define EIO         5
 #define ENXIO       6
@@ -37,6 +38,7 @@ NOVAC_END_DECLS
 #define EMFILE     24
 #define ENOTTY     25
 #define EFBIG      27
+#define ETXTBSY     26
 #define ENOSPC     28
 #define ESPIPE     29
 #define EROFS      30
@@ -44,7 +46,9 @@ NOVAC_END_DECLS
 #define EPIPE      32
 #define EDOM       33
 #define ERANGE     34
+#define EDEADLK     35
 #define ENAMETOOLONG 36
+#define ENOLCK      37
 #define ENOSYS     38
 #define ENOTEMPTY  39
 #define ELOOP      40

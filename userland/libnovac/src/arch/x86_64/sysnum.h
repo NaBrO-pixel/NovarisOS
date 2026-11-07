@@ -34,5 +34,12 @@
 #define NOVAC_SYS_gettimeofday  96
 #define NOVAC_SYS_clock_gettime 228
 #define NOVAC_SYS_exit_group    231
+#define NOVAC_SYS_rt_sigaction   13
+#define NOVAC_SYS_rt_sigprocmask 14
+#define NOVAC_SYS_rt_sigreturn   15
+#define NOVAC_SYS_execve        59
+#define NOVAC_SYS_kill          62
+#define NOVAC_SYS_gettid        186
+#define NOVAC_SYS_tgkill        234
 
 #endif
