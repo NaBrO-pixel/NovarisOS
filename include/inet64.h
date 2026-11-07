@@ -85,4 +85,11 @@ uint32_t inet64_ip(void);
 uint32_t inet64_netmask(void);
 const uint8_t* inet64_mac(void);
 
+/* The ifreq ioctls (SIOCGIFFLAGS, SIOCGIFHWADDR, ...), SIOCGIFCONF,
+ * and the text of /proc/net/route and /proc/net/dev (under 1KB each). */
+int  inet64_ifreq(uint64_t cmd, uint8_t* ifr);
+int  inet64_ifconf(uint8_t* buf, int len);
+int  inet64_proc_route(char* out);
+int  inet64_proc_dev(char* out);
+
 #endif

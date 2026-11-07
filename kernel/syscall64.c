@@ -1340,8 +1340,29 @@ static uint64_t do_mkdir(const char* path, uint32_t mode) {
     return 0;
 }
 
+/* /proc/net/route and /proc/net/dev, rebuilt on every open like
+ * /proc/meminfo: Wine's nsiproxy reads the routes for the adapters'
+ * gateways and the counters for their statistics. */
+static void refresh_proc_net(const char* path) {
+    static char text[1024];
+    int len, node;
+    if (kstrcmp(path, "/proc/net/route") == 0) len = inet64_proc_route(text);
+    else if (kstrcmp(path, "/proc/net/dev") == 0) len = inet64_proc_dev(text);
+    else return;
+    node = ramfs64_lookup(path);
+    if (node < 0) {
+        ramfs64_mkdirp("/proc/net");
+        node = ramfs64_create(path, 0);
+        if (node < 0) return;
+        ramfs64_set_mode(node, 0444);
+    }
+    ramfs64_truncate(node);
+    ramfs64_write(node, 0, text, (uint64_t)len);
+}
+
 static uint64_t do_open(const char* path, uint64_t flags, uint32_t mode) {
     if (kstrcmp(path, "/proc/meminfo") == 0) refresh_meminfo();
+    refresh_proc_net(path);
     int node = ramfs64_lookup(path);
     int fd;
 
@@ -3709,6 +3730,21 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         return 0;
 
     case SYS64_IOCTL: {
+        /* The interface queries. Asked of any socket on Linux; Wine asks
+         * a UDP one. */
+        if (fd_is_inet(a1) && ((a2 & 0xFF00) == 0x8900 || a2 == 0x8B01)) {
+            if (a2 == 0x8912) {                        /* SIOCGIFCONF */
+                struct { int32_t len; int32_t pad; uint64_t buf; }* ic = (void*)a3;
+                if (!a3 || !user_range_ok(a3, 16)) return (uint64_t)-14;
+                if (!ic->buf) { ic->len = 40 * (inet64_card_up() ? 2 : 1); return 0; }
+                if (ic->len < 0 || !user_range_ok(ic->buf, (uint64_t)ic->len))
+                    return (uint64_t)-14;
+                ic->len = inet64_ifconf((uint8_t*)ic->buf, ic->len);
+                return 0;
+            }
+            if (!a3 || !user_range_ok(a3, 40)) return (uint64_t)-14;
+            return (uint64_t)(int64_t)inet64_ifreq(a2, (uint8_t*)a3);
+        }
         if (fd_is_inet(a1) && (a2 == 0x541B || a2 == 0x5421)) {
             if (!a3 || !user_range_ok(a3, 4)) return (uint64_t)-14;
             if (a2 == 0x5421) {                        /* FIONBIO */
@@ -4401,6 +4437,24 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
             int64_t e2 = inet_addr_in(a2, a3, &ip, &port);
             if (e2) return (uint64_t)e2;
             rc = inet64_connect(fds[a1].sock, ip, port);
+            /* Said once per connection - on the first call, not each
+             * time a blocked connect is run again - because "did the
+             * program even try" is the first question about a network
+             * that seems not to work. */
+            if (!was) {
+                serial64_puts("NOVARIS64: [inet] pid ");
+                serial64_putdec((uint64_t)proc64_current_pid());
+                serial64_puts(inet64_type(fds[a1].sock) == INET64_DGRAM
+                              ? " udp connect " : " tcp connect ");
+                for (int b = 3; b >= 0; b--) {
+                    serial64_putdec((ip >> (b * 8)) & 0xFF);
+                    if (b) serial64_putc('.');
+                }
+                serial64_putc(':');
+                serial64_putdec(port);
+                serial64_puts(rc == 0 ? " ok\n" : rc == -115 ? " started\n"
+                                                         : " failed\n");
+            }
             if (rc == -115) {
                 /* A second connect on a non-blocking socket still
                  * shaking hands is -EALREADY, the first -EINPROGRESS. */

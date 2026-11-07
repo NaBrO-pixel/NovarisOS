@@ -728,3 +728,156 @@ int inet64_sockets_open(void) {
     for (int i = 0; i < INET64_MAX; i++) if (socks[i].state != S_FREE) n++;
     return n;
 }
+
+/* --- what Linux tells a program about its interfaces ------------------- *
+ *
+ * Wine's nsiproxy.sys builds the Windows adapter table from these: it
+ * walks if_nameindex() (netlink, in syscall64.c), then asks a UDP socket
+ * SIOCGIFHWADDR, SIOCGIFFLAGS and SIOCGIFMTU about each name, and reads
+ * the routes from /proc/net/route. An interface whose SIOCGIFHWADDR
+ * fails is left out, so without these GetAdaptersAddresses found
+ * nothing and every caller - Chromium's network code among them -
+ * was told ERROR_NOT_SUPPORTED. */
+
+/* Index 1 is lo, 2 is eth0 (when the card is up); 0 for neither. */
+static int if_by_name(const char* name) {
+    if (!kstrcmp(name, "lo")) return 1;
+    if (inet64_card_up() && !kstrcmp(name, "eth0")) return 2;
+    return 0;
+}
+
+static void put_sin(uint8_t* sa, uint32_t ip) {
+    kmemset(sa, 0, 16);
+    sa[0] = 2;                                      /* AF_INET */
+    sa[4] = (uint8_t)(ip >> 24); sa[5] = (uint8_t)(ip >> 16);
+    sa[6] = (uint8_t)(ip >> 8);  sa[7] = (uint8_t)ip;
+}
+
+/* One ifreq ioctl. `ifr` is the caller's struct ifreq, already checked
+ * to be 40 bytes of writable memory: the name, then a 24-byte union. */
+int inet64_ifreq(uint64_t cmd, uint8_t* ifr) {
+    char name[16];
+    int idx;
+    uint8_t* u = ifr + 16;
+
+    if (cmd == 0x8910) {                            /* SIOCGIFNAME */
+        idx = *(int*)u;
+        if (idx == 1) kstrlcpy((char*)ifr, "lo", 16);
+        else if (idx == 2 && inet64_card_up()) kstrlcpy((char*)ifr, "eth0", 16);
+        else return -19;                            /* -ENODEV */
+        return 0;
+    }
+
+    kmemcpy(name, ifr, 16);
+    name[15] = 0;
+    idx = if_by_name(name);
+    if (!idx) return -19;
+
+    switch (cmd) {
+    case 0x8913:                                    /* SIOCGIFFLAGS */
+        /* IFF_UP|IFF_RUNNING, and LOOPBACK or BROADCAST|MULTICAST */
+        *(uint16_t*)u = idx == 1 ? (0x1 | 0x8 | 0x40)
+                                 : (0x1 | 0x2 | 0x40 | 0x1000);
+        return 0;
+    case 0x8927:                                    /* SIOCGIFHWADDR */
+        kmemset(u, 0, 16);
+        *(uint16_t*)u = idx == 1 ? 772 : 1;         /* ARPHRD_LOOPBACK/ETHER */
+        if (idx == 2) kmemcpy(u + 2, inet64_mac(), 6);
+        return 0;
+    case 0x8921:                                    /* SIOCGIFMTU */
+        *(int*)u = idx == 1 ? 65536 : 1500;
+        return 0;
+    case 0x8933:                                    /* SIOCGIFINDEX */
+        *(int*)u = idx;
+        return 0;
+    case 0x8915:                                    /* SIOCGIFADDR */
+        put_sin(u, idx == 1 ? 0x7F000001u : inet64_ip());
+        return 0;
+    case 0x891B:                                    /* SIOCGIFNETMASK */
+        put_sin(u, idx == 1 ? 0xFF000000u : inet64_netmask());
+        return 0;
+    case 0x8919:                                    /* SIOCGIFBRDADDR */
+        put_sin(u, idx == 1 ? 0 : (inet64_ip() | ~inet64_netmask()));
+        return 0;
+    case 0x8B01:                                    /* SIOCGIWNAME */
+        return -95;               /* -EOPNOTSUPP: not a wireless card */
+    default:
+        return -25;                                 /* -ENOTTY */
+    }
+}
+
+/* SIOCGIFCONF: an ifreq with its address for each interface, into the
+ * caller's buffer. Returns the bytes used. */
+int inet64_ifconf(uint8_t* buf, int len) {
+    int used = 0;
+    for (int idx = 1; idx <= (inet64_card_up() ? 2 : 1); idx++) {
+        if (used + 40 > len) break;
+        kmemset(buf + used, 0, 40);
+        kstrlcpy((char*)buf + used, idx == 1 ? "lo" : "eth0", 16);
+        put_sin(buf + used + 16, idx == 1 ? 0x7F000001u : inet64_ip());
+        used += 40;
+    }
+    return used;
+}
+
+static char* put_str(char* o, const char* s) { while (*s) *o++ = *s++; return o; }
+
+static char* put_u(char* o, uint64_t v) {
+    char t[24];
+    int n = 0;
+    do { t[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+    while (n) *o++ = t[--n];
+    return o;
+}
+
+/* An address as /proc/net/route prints it: the network-order bytes read
+ * as a little-endian word, in hex. 10.0.2.2 is 0202000A. */
+static char* put_route_hex(char* o, uint32_t ip) {
+    static const char hex[] = "0123456789ABCDEF";
+    uint32_t le = ((ip & 0xFF) << 24) | ((ip & 0xFF00) << 8) |
+                  ((ip >> 8) & 0xFF00) | (ip >> 24);
+    for (int s = 28; s >= 0; s -= 4) *o++ = hex[(le >> s) & 15];
+    return o;
+}
+
+int inet64_proc_route(char* out) {
+    char* o = out;
+    const net_config_t* c = net_config();
+    o = put_str(o, "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\t"
+                   "Mask\t\tMTU\tWindow\tIRTT\n");
+    if (inet64_card_up()) {
+        if (c->gateway) {
+            o = put_str(o, "eth0\t00000000\t");
+            o = put_route_hex(o, c->gateway);
+            o = put_str(o, "\t0003\t0\t0\t0\t00000000\t0\t0\t0\n");
+        }
+        o = put_str(o, "eth0\t");
+        o = put_route_hex(o, c->ip & c->netmask);
+        o = put_str(o, "\t00000000\t0001\t0\t0\t0\t");
+        o = put_route_hex(o, c->netmask);
+        o = put_str(o, "\t0\t0\t0\n");
+    }
+    return (int)(o - out);
+}
+
+int inet64_proc_dev(char* out) {
+    char* o = out;
+    o = put_str(o, "Inter-|   Receive                                                |  Transmit\n"
+                   " face |bytes    packets errs drop fifo frame compressed multicast|"
+                   "bytes    packets errs colls carrier compressed\n");
+    o = put_str(o, "    lo: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n");
+    if (inet64_card_up()) {
+        const netdev_t* d = netdev_get();
+        o = put_str(o, "  eth0: ");
+        o = put_u(o, d->rx_bytes);   *o++ = ' ';
+        o = put_u(o, d->rx_packets); *o++ = ' ';
+        o = put_u(o, d->rx_errors);  *o++ = ' ';
+        o = put_u(o, d->rx_dropped);
+        o = put_str(o, " 0 0 0 0 ");
+        o = put_u(o, d->tx_bytes);   *o++ = ' ';
+        o = put_u(o, d->tx_packets); *o++ = ' ';
+        o = put_u(o, d->tx_errors);
+        o = put_str(o, " 0 0 0 0 0\n");
+    }
+    return (int)(o - out);
+}

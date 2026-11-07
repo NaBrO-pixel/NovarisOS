@@ -19,6 +19,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
+#include <net/if.h>
+#include <net/if_arp.h>
+#include <sys/ioctl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -285,6 +288,37 @@ static void interfaces(int external) {
     }
     ok(lo, "getifaddrs lists lo with an IPv4 address");
     if (external) ok(eth, "getifaddrs lists eth0 too (guest only)");
+
+    /* The ioctls Wine's nsiproxy asks a UDP socket about each name. */
+    {
+        int u = socket(AF_INET, SOCK_DGRAM, 0);
+        struct ifreq r;
+        memset(&r, 0, sizeof(r)); strcpy(r.ifr_name, "lo");
+        ok(ioctl(u, SIOCGIFFLAGS, &r) == 0 && (r.ifr_flags & IFF_UP) &&
+           (r.ifr_flags & IFF_LOOPBACK), "SIOCGIFFLAGS: lo is up and a loopback");
+        memset(&r, 0, sizeof(r)); strcpy(r.ifr_name, "lo");
+        ok(ioctl(u, SIOCGIFHWADDR, &r) == 0 &&
+           r.ifr_hwaddr.sa_family == ARPHRD_LOOPBACK, "SIOCGIFHWADDR: lo is ARPHRD_LOOPBACK");
+        memset(&r, 0, sizeof(r)); strcpy(r.ifr_name, "lo");
+        ok(ioctl(u, SIOCGIFINDEX, &r) == 0 && r.ifr_ifindex == (int)if_nametoindex("lo"),
+           "SIOCGIFINDEX agrees with if_nametoindex");
+        memset(&r, 0, sizeof(r)); strcpy(r.ifr_name, "nosuch0");
+        ok(ioctl(u, SIOCGIFFLAGS, &r) < 0 && errno == ENODEV,
+           "an interface that does not exist is ENODEV");
+        if (external) {
+            FILE* f = fopen("/proc/net/route", "r");
+            char line[256];
+            int deflt = 0;
+            memset(&r, 0, sizeof(r)); strcpy(r.ifr_name, "eth0");
+            ok(ioctl(u, SIOCGIFHWADDR, &r) == 0 && r.ifr_hwaddr.sa_family == ARPHRD_ETHER,
+               "SIOCGIFHWADDR: eth0 is Ethernet (guest only)");
+            while (f && fgets(line, sizeof(line), f))
+                if (!strncmp(line, "eth0\t00000000\t0202000A", 22)) deflt = 1;
+            if (f) fclose(f);
+            ok(deflt, "/proc/net/route has the default route via 10.0.2.2 (guest only)");
+        }
+        close(u);
+    }
 }
 
 /* --- through QEMU, to the build machine --------------------------------- */
