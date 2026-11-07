@@ -63,6 +63,26 @@ typedef struct {
     uint8_t     recv[TCP_RECV_BUFFER];
     uint32_t    recv_head, recv_tail;
 
+    /* The send side (Milestone 97). Everything the caller handed over
+     * and the peer has not yet acknowledged, from snd_unacked on: the
+     * byte at sequence number s is sndbuf[(snd_head + s - snd_unacked)
+     * % TCP_SEND_BUFFER]. What is in flight is snd_next - snd_unacked;
+     * the rest has not been sent yet. tcp_output sends while the peer's
+     * window - snd_wnd, which this stack used to ignore - has room, so a
+     * window's worth is in flight at once rather than one segment.
+     *
+     * SYN and FIN keep the one-segment slot above (pending_*): they are
+     * sent only while no data is outstanding, so the two never mix. */
+    uint8_t     sndbuf[TCP_SEND_BUFFER];
+    uint32_t    snd_head;
+    uint32_t    snd_len;
+    uint32_t    snd_wnd;
+    uint32_t    data_rto_deadline;  /* 0: no data timer running */
+    uint32_t    data_rto_ticks;
+    uint32_t    data_tries;
+    int         fin_queued;         /* tcp_close with data still queued */
+    int         output_pending;     /* the receive path saw room open */
+
     int         peer_finished;
     int         ack_pending;
     /* Passive opens only: set once tcp_accept() has handed this out, so
@@ -93,6 +113,8 @@ static uint32_t   tick_calls, ack_ok, ack_failed;
 /* --- sequence arithmetic ------------------------------------------------ */
 
 static int seq_le(uint32_t a, uint32_t b) { return (int32_t)(a - b) <= 0; }
+
+static void tcp_output(tcp_conn_t* c);
 
 /* --- the receive ring --------------------------------------------------- */
 
@@ -240,6 +262,7 @@ static tcp_conn_t* accept_syn(uint32_t src_ip, uint16_t src_port,
         c->remote_port = src_port;
         c->local_port = dest_port;
         c->rcv_next = their_seq + 1;          /* the SYN takes one */
+        c->snd_wnd = TCP_MSS;     /* until the handshake's ACK says */
         c->snd_next = 0x4E560000u + pit_get_ticks() * 64;
         c->snd_unacked = c->snd_next;
 
@@ -300,6 +323,22 @@ static void tcp_receive(uint32_t src_ip, uint32_t dest_ip,
     /* An acknowledgement of what is in flight retires it. */
     if ((th->flags & TCP_ACK) && seq_le(c->snd_unacked, ack) &&
         seq_le(ack, c->snd_next)) {
+        /* Data first: what of the send ring this covers. SYN and FIN are
+         * only ever outstanding with the ring empty, so a delta beyond
+         * the ring's length is theirs. */
+        uint32_t delta = ack - c->snd_unacked;
+        uint32_t data = delta < c->snd_len ? delta : c->snd_len;
+        if (data) {
+            c->snd_head = (c->snd_head + data) % TCP_SEND_BUFFER;
+            c->snd_len -= data;
+            c->data_tries = 0;
+            c->data_rto_ticks = RTO_INITIAL_TICKS;
+            /* Progress restarts the timer; nothing left in flight stops it. */
+            c->data_rto_deadline = (ack != c->snd_next && c->snd_len)
+                ? pit_get_ticks() + c->data_rto_ticks : 0;
+        }
+        c->snd_wnd = ntohs(th->window);
+        c->output_pending = 1;
         c->snd_unacked = ack;
         if (seq_le(c->pending_seq + c->pending_len +
                    ((c->pending_flags & (TCP_SYN | TCP_FIN)) ? 1 : 0), ack)) {
@@ -384,6 +423,54 @@ static void tcp_receive(uint32_t src_ip, uint32_t dest_ip,
     }
 }
 
+/* --- sending what the ring holds ---------------------------------------- */
+
+/* Sends from snd_next while the peer's window has room. Stops, without
+ * moving snd_next, at the first segment that could not leave - the
+ * transmitter busy, ARP still asking - and the next tick tries again. */
+static void tcp_output(tcp_conn_t* c) {
+    static uint8_t seg[TCP_MSS];
+    int sent = 0;
+
+    c->output_pending = 0;
+    if (c->state != TCP_ESTABLISHED && c->state != TCP_CLOSE_WAIT) return;
+
+    for (;;) {
+        uint32_t in_flight = c->snd_next - c->snd_unacked;
+        uint32_t wnd = c->snd_wnd < TCP_SEND_BUFFER ? c->snd_wnd : TCP_SEND_BUFFER;
+        uint32_t avail, room, n;
+
+        if (in_flight >= c->snd_len) break;            /* all of it is out */
+        avail = c->snd_len - in_flight;
+        room = wnd > in_flight ? wnd - in_flight : 0;
+        if (!room) break;                              /* the window is full */
+        n = avail < room ? avail : room;
+        if (n > TCP_MSS) n = TCP_MSS;
+        for (uint32_t i = 0; i < n; i++)
+            seg[i] = c->sndbuf[(c->snd_head + in_flight + i) % TCP_SEND_BUFFER];
+        if (send_segment(c, TCP_ACK | TCP_PSH, c->snd_next, seg, n) != 0) break;
+        c->snd_next += n;
+        c->ack_pending = 0;            /* every segment carries the ACK */
+        sent = 1;
+    }
+    if (sent && !c->data_rto_deadline) {
+        if (!c->data_rto_ticks) c->data_rto_ticks = RTO_INITIAL_TICKS;
+        c->data_rto_deadline = pit_get_ticks() + c->data_rto_ticks;
+    }
+}
+
+/* The FIN, once everything before it has been acknowledged. */
+static void send_fin(tcp_conn_t* c) {
+    c->fin_queued = 0;
+    if (c->state == TCP_ESTABLISHED) {
+        send_tracked(c, TCP_ACK | TCP_FIN, 0, 0);
+        c->state = TCP_FIN_WAIT_1;
+    } else if (c->state == TCP_CLOSE_WAIT) {
+        send_tracked(c, TCP_ACK | TCP_FIN, 0, 0);
+        c->state = TCP_LAST_ACK;
+    }
+}
+
 /* --- the public interface ----------------------------------------------- */
 
 void tcp_init(void) {
@@ -413,6 +500,7 @@ int tcp_connect(uint32_t dest_ip, uint16_t dest_port) {
          * next_port makes unlikely on its own. */
         c->snd_next = 0x4E560000u + pit_get_ticks() * 64;
         c->snd_unacked = c->snd_next;
+        c->snd_wnd = TCP_MSS;     /* until the SYN+ACK says */
 
         if (send_tracked(c, TCP_SYN, 0, 0) < 0) {
             /* No route yet: ARP is resolving. The tick retransmits. */
@@ -453,15 +541,20 @@ int tcp_send(int handle, const uint8_t* data, uint32_t len) {
     /* CLOSE_WAIT too: the peer has finished sending, not receiving. */
     if (!c || (c->state != TCP_ESTABLISHED && c->state != TCP_CLOSE_WAIT))
         return -1;
-    if (c->pending_len || c->pending_flags) return 0;   /* one in flight */
+    if (c->pending_flags) return 0;     /* a SYN or FIN still in flight */
 
-    uint32_t take = len < TCP_MSS ? len : TCP_MSS;
-    /* Taken even if it did not leave yet (the next hop's MAC still being
-     * resolved, the transmitter busy): send_tracked has recorded it and
-     * moved snd_next past it, so the retransmission timer will send it.
-     * Reporting 0 here made the caller send the same bytes again after
-     * the first copy was acknowledged - the stream then held them twice. */
-    send_tracked(c, TCP_ACK | TCP_PSH, data, take);
+    if (c->fin_queued) return -1;                       /* closed for sending */
+
+    /* Into the send ring, as much as fits; tcp_output decides what of it
+     * the window lets go now. Taken means taken: the ring keeps it until
+     * the peer acknowledges it, and the timers resend it if that takes
+     * too long - so a caller never offers the same bytes twice. */
+    uint32_t space = TCP_SEND_BUFFER - c->snd_len;
+    uint32_t take = len < space ? len : space;
+    for (uint32_t i = 0; i < take; i++)
+        c->sndbuf[(c->snd_head + c->snd_len + i) % TCP_SEND_BUFFER] = data[i];
+    c->snd_len += take;
+    tcp_output(c);
     return (int)take;
 }
 
@@ -522,12 +615,22 @@ int tcp_eof(int handle) {
 
 int tcp_tx_idle(int handle) {
     tcp_conn_t* c = handle_conn(handle);
-    return c && !c->pending_len && !c->pending_flags;
+    return c && !c->pending_len && !c->pending_flags && !c->snd_len &&
+           !c->fin_queued;
 }
 
 void tcp_close(int handle) {
     tcp_conn_t* c = handle_conn(handle);
     if (!c) return;
+
+    /* Data still to go: the FIN follows it, from the tick, once the peer
+     * has acknowledged the last byte. Sent now, it would take the
+     * retransmission slot and the data would never be resent. */
+    if ((c->state == TCP_ESTABLISHED || c->state == TCP_CLOSE_WAIT) &&
+        (c->snd_len || c->pending_flags)) {
+        c->fin_queued = 1;
+        return;
+    }
 
     if (c->state == TCP_ESTABLISHED) {
         send_tracked(c, TCP_ACK | TCP_FIN, 0, 0);
@@ -614,6 +717,37 @@ void tcp_tick(void) {
             }
         }
 
+        /* The data timer. Expired with data in flight: go back to the
+         * oldest unacknowledged byte and send from there (go-back-N -
+         * the receiver keeps only in-order data, so anything after a
+         * lost segment was dropped anyway). Expired with nothing in
+         * flight and the window shut: a one-byte probe, which is how a
+         * sender learns the window has reopened if the update was lost. */
+        if (c->snd_len && c->data_rto_deadline && now >= c->data_rto_deadline) {
+            if (++c->data_tries > RTO_MAX_TRIES) {
+                c->state = TCP_CLOSED;
+                continue;
+            }
+            retransmits++;
+            c->snd_next = c->snd_unacked;
+            c->data_rto_ticks *= 2;
+            c->data_rto_deadline = 0;
+            if (!c->snd_wnd) {
+                c->snd_wnd = 1;
+                tcp_output(c);
+                c->snd_wnd = 0;
+            }
+            c->output_pending = 1;
+        }
+        if (c->snd_len && !c->snd_wnd && !c->data_rto_deadline &&
+            c->snd_next == c->snd_unacked) {
+            if (!c->data_rto_ticks) c->data_rto_ticks = RTO_INITIAL_TICKS;
+            c->data_rto_deadline = now + c->data_rto_ticks;    /* persist */
+        }
+        if (c->output_pending || (c->snd_len && c->snd_next - c->snd_unacked < c->snd_len))
+            tcp_output(c);
+        if (c->fin_queued && !c->snd_len && !c->pending_flags) send_fin(c);
+
         if (!c->pending_len && !c->pending_flags) continue;
         if (now < c->rto_deadline) continue;
 
@@ -699,3 +833,11 @@ uint32_t tcp_retransmits(void) { return retransmits; }
 uint32_t tcp_tick_calls(void) { return tick_calls; }
 uint32_t tcp_acks_sent(void) { return ack_ok; }
 uint32_t tcp_acks_failed(void) { return ack_failed; }
+
+uint32_t tcp_send_space(int handle) {
+    tcp_conn_t* c = handle_conn(handle);
+    if (!c || (c->state != TCP_ESTABLISHED && c->state != TCP_CLOSE_WAIT) ||
+        c->fin_queued || c->pending_flags)
+        return 0;
+    return TCP_SEND_BUFFER - c->snd_len;
+}

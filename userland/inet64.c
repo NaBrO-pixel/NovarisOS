@@ -40,6 +40,7 @@
 #define GUEST_LISTEN   8080
 
 static int failures;
+static int external;            /* --external: the guest-only half */
 
 static void ok(int cond, const char* what) {
     printf("%s %s\n", cond ? "[ok]" : "[FAIL]", what);
@@ -156,7 +157,16 @@ static void tcp_loopback(void) {
         line[20] = '!';
         ok(write_all(s, line, 21) == 21, "and answers it");
 
-        n = read_all(s, (char*)bulk, BULK + 1);
+        {
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            n = read_all(s, (char*)bulk, BULK + 1);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            if (external)
+                printf("inet64: loopback 192KB in %ld ms (guest only)\n",
+                       (long)((t1.tv_sec - t0.tv_sec) * 1000 +
+                              (t1.tv_nsec - t0.tv_nsec) / 1000000));
+        }
         for (i = 0; i < BULK && i < n; i++)
             if (bulk[i] != pattern(i)) { good = 0; break; }
         ok(n == BULK && good, "192KB arrive intact, then the end of file");
@@ -502,7 +512,7 @@ static void accept_from_host(void) {
 }
 
 int main(int argc, char** argv) {
-    int external = argc > 1 && !strcmp(argv[1], "--external");
+    external = argc > 1 && !strcmp(argv[1], "--external");
 
     setvbuf(stdout, 0, _IOLBF, 0);
     printf("inet64: TCP/IP from a process\n");
