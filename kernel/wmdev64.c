@@ -30,7 +30,37 @@ typedef struct {
     uint64_t frames[WM64_MAX_FRAMES];
     uint64_t nframes;
     char     title[WM64_DEV_TITLE_MAX];
+    uint64_t damages, pixels;     /* blits asked for, pixels they drew */
+    /* Descriptors that name this window. fork and dup copy a descriptor,
+     * so a window has as many names as its descriptor has copies, and it
+     * may only go when the last one does. Without the count, a child
+     * Chromium forked to start a process exited, closed its inherited
+     * copy, and destroyed the browser's window - freeing the frames the
+     * browser still had mapped and was drawing into. */
+    int      refs;
 } wm64_window_t;
+
+/* Said on the serial port: each window as it opens and, as it closes,
+ * how much it drew. "The program made a window" and "the window ever
+ * reached the screen" are different facts, and a screenshot that shows
+ * nothing does not say which one failed. */
+static void say_window(const char* what, int slot, const wm64_window_t* w) {
+    serial64_puts("NOVARIS64: [wm] ");
+    serial64_puts(what);
+    serial64_puts(" window ");
+    serial64_putdec((uint64_t)slot);
+    serial64_puts(" ");
+    serial64_putdec(w->w);
+    serial64_puts("x");
+    serial64_putdec(w->h);
+    serial64_puts(" \"");
+    serial64_puts(w->title);
+    serial64_puts("\" damages ");
+    serial64_putdec(w->damages);
+    serial64_puts(" pixels ");
+    serial64_putdec(w->pixels);
+    serial64_putc('\n');
+}
 
 static wm64_window_t windows[WM64_MAX_WINDOWS];
 
@@ -115,11 +145,17 @@ int wmdev64_create(const struct wm64_create* req) {
     windows[slot].cap_h  = h;
     windows[slot].bytes  = bytes;
     kstrlcpy(windows[slot].title, req->title, WM64_DEV_TITLE_MAX);
+    windows[slot].damages = 0;
+    windows[slot].pixels = 0;
+    windows[slot].refs = 1;
+    say_window("opened", slot, &windows[slot]);
     return slot;
 }
 
 void wmdev64_close(int win) {
     if (win < 0 || win >= WM64_MAX_WINDOWS || !windows[win].used) return;
+    if (--windows[win].refs > 0) return;          /* another copy still names it */
+    say_window("closed", win, &windows[win]);
     free_window(&windows[win]);
 }
 
@@ -173,6 +209,7 @@ int wmdev64_damage(int win, const struct wm64_rect* r) {
     if (!fb64_ready()) return -19;
 
     box = *r;
+    w->damages++;
     if (box.w <= 0 || box.h <= 0) return 0;        /* nothing changed */
 
     /* Clipped to the window and then to the screen, in that order,
@@ -215,6 +252,7 @@ int wmdev64_damage(int win, const struct wm64_rect* r) {
             px = (const uint32_t*)((uint8_t*)phys64_to_virt(
                      w->frames[poff / PAGE64_SIZE]) + (poff % PAGE64_SIZE));
             fb64_put_pixel(dx, dy, *px);
+            w->pixels++;
         }
         (void)src;
     }
@@ -245,4 +283,14 @@ const uint64_t* wmdev64_frames(int win, uint64_t* nframes, uint64_t* bytes) {
     if (nframes) *nframes = w->nframes;
     if (bytes)   *bytes   = w->bytes;
     return w->frames;
+}
+
+/* Every open window, for the deadline report. */
+void wmdev64_report(void) {
+    for (int i = 0; i < WM64_MAX_WINDOWS; i++)
+        if (windows[i].used) say_window("still open:", i, &windows[i]);
+}
+
+void wmdev64_ref(int win) {
+    if (win >= 0 && win < WM64_MAX_WINDOWS && windows[win].used) windows[win].refs++;
 }

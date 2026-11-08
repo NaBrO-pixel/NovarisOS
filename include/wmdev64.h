@@ -81,4 +81,7 @@ int  wmdev64_poll(int win, struct wm64_event* out);
 /* The frames behind a window's pixels, for mmap. */
 const uint64_t* wmdev64_frames(int win, uint64_t* nframes, uint64_t* bytes);
 
+void wmdev64_report(void);
+void wmdev64_ref(int win);       /* one more descriptor names this window */       /* every open window, on the serial port */
+
 #endif

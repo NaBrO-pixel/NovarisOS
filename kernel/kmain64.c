@@ -786,6 +786,7 @@ static void run_wine_program(const void* image, uint64_t len,
         syscall64_report_pipe_waits();
         syscall64_report_unread_pipes();
         inet64_report();
+        wmdev64_report();
     }
 
     serial64_puts("NOVARIS64: --- end of ");
@@ -5254,7 +5255,10 @@ fast_wine:
 #define CHROME64_URL "https://novaris.test:18783/page.html"
 #endif
 static const char* const chrome_args[] = {
-    "--headless", "--no-sandbox", "--disable-gpu",
+#ifndef CHROME64_WINDOWED
+    "--headless",
+#endif
+    "--no-sandbox", "--disable-gpu",
     /* And as few processes as Chromium will run in: the GPU and network
      * services in the browser process, and no crash reporter. Every
      * Chromium process holds its own copy of chrome.dll's code - Wine
@@ -5297,7 +5301,16 @@ static const char* const chrome_args[] = {
 #ifdef CHROME64_VMODULE
     "--vmodule=" CHROME64_VMODULE,
 #endif
+#ifdef CHROME64_WINDOWED
+    /* A browser window on the desktop instead (make chrome-window): no
+     * --headless, no --dump-dom, the page shown rather than printed.
+     * It does not exit, so the budget ends the run. */
+    "--window-size=900,640", "--window-position=40,40",
+    "--no-first-run", "--no-default-browser-check",
+    CHROME64_URL, 0
+#else
     "--dump-dom", CHROME64_URL, 0
+#endif
 };
 
     /* --- and then Windows programs, in the prefix just built --- *
