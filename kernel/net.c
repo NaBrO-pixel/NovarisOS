@@ -273,6 +273,13 @@ static int next_hop_mac(uint32_t dest_ip, uint8_t mac_out[ETH_ALEN]) {
 #define NET_LOOPBACK_DELAY_TICKS 0
 #endif
 
+/* And a loss: -DNET_LOOPBACK_DROP_EVERY=N throws away every Nth loopback
+ * packet, which is what retransmission, reassembly and congestion control
+ * exist for and what QEMU's network never does. 0 drops nothing. */
+#ifndef NET_LOOPBACK_DROP_EVERY
+#define NET_LOOPBACK_DROP_EVERY 0
+#endif
+
 typedef struct {
     uint32_t len;
     uint32_t stamp;
@@ -341,6 +348,10 @@ int net_send_ip(uint32_t dest_ip, uint8_t protocol,
 
     if (local) {
         uint32_t next = (loop_head + 1) % LOOPBACK_QUEUE;
+#if NET_LOOPBACK_DROP_EVERY
+        static uint32_t seen;
+        if (++seen % NET_LOOPBACK_DROP_EVERY == 0) return 0;   /* "sent" */
+#endif
         if (next == loop_tail) return -1;      /* full: dropped, like a wire */
         loop_q[loop_head].len = (uint32_t)sizeof(ip_header_t) + len;
         loop_q[loop_head].stamp = pit_get_ticks();

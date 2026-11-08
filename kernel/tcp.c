@@ -40,6 +40,11 @@ typedef struct __attribute__((packed)) {
 #define RTO_INITIAL_TICKS 100
 #define RTO_MAX_TRIES     5
 
+/* Out-of-order segments held per connection, waiting for a gap. */
+#ifndef TCP_OOO_SLOTS
+#define TCP_OOO_SLOTS 4
+#endif
+
 typedef struct {
     int         in_use;
     tcp_state_t state;
@@ -48,6 +53,11 @@ typedef struct {
     uint16_t    remote_port, local_port;
 
     uint32_t    snd_next;      /* next sequence number to send */
+    /* The highest sequence number ever sent. A timeout moves snd_next
+     * back to resend; an ACK may still cover far more than that - the
+     * receiver kept what arrived after the gap - and it is valid up to
+     * here, not just up to snd_next. */
+    uint32_t    snd_max;
     uint32_t    snd_unacked;   /* oldest byte not yet acknowledged */
     uint32_t    rcv_next;      /* next sequence number expected */
 
@@ -83,6 +93,31 @@ typedef struct {
     int         fin_queued;         /* tcp_close with data still queued */
     int         output_pending;     /* the receive path saw room open */
 
+    /* Congestion control (Milestone 98), Reno's shape. cwnd is how much
+     * this side lets itself have in flight whatever the peer's window
+     * says: it starts at a few segments and doubles each round trip
+     * (slow start) until ssthresh, then grows a segment per round trip.
+     * A timeout means the network lost things - cwnd back to one segment,
+     * ssthresh to half what was in flight. Three duplicate ACKs mean one
+     * segment was lost and the rest got through: resend just that one
+     * (fast retransmit) and halve rather than collapse. */
+    uint32_t    cwnd, ssthresh;
+    uint32_t    dupacks;
+    uint32_t    recover;            /* snd_next when fast recovery began */
+    int         in_recovery;
+
+    /* Reassembly (Milestone 98): segments that arrived ahead of a gap,
+     * kept until the gap is filled instead of dropped - so one lost
+     * segment costs one retransmission rather than everything after it. */
+    struct {
+        int      used;
+        uint32_t seq, len;
+        uint8_t  data[TCP_MSS];
+    } ooo[TCP_OOO_SLOTS];
+    uint32_t    ooo_fin_seq;        /* a FIN seen ahead of the data before it */
+    uint32_t    dupacks_owed;       /* one per segment that arrived past a gap */
+    int         ooo_fin;
+
     int         peer_finished;
     int         ack_pending;
     /* Passive opens only: set once tcp_accept() has handed this out, so
@@ -113,8 +148,12 @@ static uint32_t   tick_calls, ack_ok, ack_failed;
 /* --- sequence arithmetic ------------------------------------------------ */
 
 static int seq_le(uint32_t a, uint32_t b) { return (int32_t)(a - b) <= 0; }
+static int seq_lt(uint32_t a, uint32_t b) { return (int32_t)(a - b) < 0; }
+static uint32_t ooo_held, fast_retransmits;
+static uint32_t closed_by_reset, closed_by_retries, closed_by_data_retries;
 
 static void tcp_output(tcp_conn_t* c);
+static void retransmit_first(tcp_conn_t* c);
 
 /* --- the receive ring --------------------------------------------------- */
 
@@ -194,6 +233,7 @@ static int send_tracked(tcp_conn_t* c, uint8_t flags,
      * them acknowledgeable. */
     c->snd_next += len;
     if (flags & (TCP_SYN | TCP_FIN)) c->snd_next += 1;
+    if (seq_lt(c->snd_max, c->snd_next)) c->snd_max = c->snd_next;
 
     c->rto_ticks = RTO_INITIAL_TICKS;
     c->rto_deadline = pit_get_ticks() + c->rto_ticks;
@@ -265,11 +305,133 @@ static tcp_conn_t* accept_syn(uint32_t src_ip, uint16_t src_port,
         c->snd_wnd = TCP_MSS;     /* until the handshake's ACK says */
         c->snd_next = 0x4E560000u + pit_get_ticks() * 64;
         c->snd_unacked = c->snd_next;
+        c->snd_max = c->snd_next;
 
         send_tracked(c, TCP_SYN | TCP_ACK, 0, 0);
         return c;
     }
     return 0;
+}
+
+/* --- reassembly --------------------------------------------------------- */
+
+static void ooo_store(tcp_conn_t* c, uint32_t seq, const uint8_t* data,
+                      uint32_t len) {
+    int free_slot = -1;
+    for (int i = 0; i < TCP_OOO_SLOTS; i++) {
+        if (!c->ooo[i].used) { if (free_slot < 0) free_slot = i; continue; }
+        if (c->ooo[i].seq == seq) return;              /* have it already */
+    }
+    if (free_slot < 0) return;     /* full: dropped, and resent later */
+    c->ooo[free_slot].used = 1;
+    c->ooo[free_slot].seq = seq;
+    c->ooo[free_slot].len = len;
+    kmemcpy(c->ooo[free_slot].data, data, len);
+    ooo_held++;
+}
+
+/* Moves into the receive ring whatever the last in-order segment made
+ * contiguous - all of a held segment that starts at rcv_next, or the
+ * tail of one that straddles it - and forgets what is now behind. */
+static void ooo_drain(tcp_conn_t* c) {
+    int progress = 1;
+    while (progress) {
+        progress = 0;
+        for (int i = 0; i < TCP_OOO_SLOTS; i++) {
+            uint32_t end, skip, take;
+            if (!c->ooo[i].used) continue;
+            end = c->ooo[i].seq + c->ooo[i].len;
+            if (seq_le(end, c->rcv_next)) { c->ooo[i].used = 0; continue; }
+            if (seq_lt(c->rcv_next, c->ooo[i].seq)) continue;   /* still a gap */
+            skip = c->rcv_next - c->ooo[i].seq;
+            take = c->ooo[i].len - skip;
+            if (take > recv_free(c)) continue;          /* no room yet */
+            recv_push(c, c->ooo[i].data + skip, take);
+            c->rcv_next += take;
+            bytes_received += take;
+            c->ooo[i].used = 0;
+            progress = 1;
+        }
+    }
+}
+
+/* --- congestion control ------------------------------------------------- */
+
+static uint32_t flight(const tcp_conn_t* c) { return c->snd_next - c->snd_unacked; }
+
+static void cc_init(tcp_conn_t* c) {
+    c->cwnd = 4 * TCP_MSS;              /* RFC 3390's initial window */
+    c->ssthresh = 0xFFFFFFFFu;
+    c->dupacks = 0;
+    c->in_recovery = 0;
+}
+
+/* Every ACK: `data` bytes newly acknowledged, `seg_len` the bytes the
+ * segment itself carried, `wnd` the window it advertised. */
+static void cc_on_ack(tcp_conn_t* c, uint32_t ack, uint32_t data,
+                      uint32_t seg_len, uint32_t wnd) {
+    if (!c->cwnd) cc_init(c);
+
+    if (!data) {
+        /* A duplicate: nothing new acknowledged, no data of its own, the
+         * window unchanged, and something still in flight. */
+        if (ack == c->snd_unacked && !seg_len && wnd == c->snd_wnd &&
+            flight(c) && c->snd_len) {
+            if (++c->dupacks == 3 && !c->in_recovery) {
+                /* Fast retransmit: the segment at snd_unacked is the one
+                 * missing. Resend it alone, now. */
+                uint32_t half = flight(c) / 2;
+                c->ssthresh = half > 2 * TCP_MSS ? half : 2 * TCP_MSS;
+                c->cwnd = c->ssthresh + 3 * TCP_MSS;
+                c->recover = c->snd_next;
+                c->in_recovery = 1;
+                retransmit_first(c);
+                fast_retransmits++;
+            } else if (c->in_recovery) {
+                c->cwnd += TCP_MSS;     /* each one is a segment that left */
+            }
+        }
+        return;
+    }
+
+    c->dupacks = 0;
+    if (c->in_recovery) {
+        if (seq_le(c->recover, ack)) {          /* all of it recovered */
+            c->in_recovery = 0;
+            c->cwnd = c->ssthresh;
+        } else {
+            retransmit_first(c);                /* the next hole */
+        }
+        return;
+    }
+    if (c->cwnd < c->ssthresh) {
+        c->cwnd += data < TCP_MSS ? data : TCP_MSS;     /* slow start */
+    } else {
+        uint32_t inc = TCP_MSS * TCP_MSS / c->cwnd;      /* avoidance */
+        c->cwnd += inc ? inc : 1;
+    }
+    if (c->cwnd > TCP_SEND_BUFFER) c->cwnd = TCP_SEND_BUFFER;
+}
+
+static void cc_on_timeout(tcp_conn_t* c) {
+    uint32_t half = flight(c) / 2;
+    if (!c->cwnd) cc_init(c);
+    c->ssthresh = half > 2 * TCP_MSS ? half : 2 * TCP_MSS;
+    c->cwnd = TCP_MSS;
+    c->dupacks = 0;
+    c->in_recovery = 0;
+}
+
+/* The oldest unacknowledged segment, sent again without moving snd_next. */
+static void retransmit_first(tcp_conn_t* c) {
+    static uint8_t seg[TCP_MSS];
+    uint32_t n = flight(c) < c->snd_len ? flight(c) : c->snd_len;
+    if (n > TCP_MSS) n = TCP_MSS;
+    if (!n) return;
+    for (uint32_t i = 0; i < n; i++)
+        seg[i] = c->sndbuf[(c->snd_head + i) % TCP_SEND_BUFFER];
+    send_segment(c, TCP_ACK | TCP_PSH, c->snd_unacked, seg, n);
+    retransmits++;
 }
 
 static void tcp_receive(uint32_t src_ip, uint32_t dest_ip,
@@ -316,18 +478,23 @@ static void tcp_receive(uint32_t src_ip, uint32_t dest_ip,
     uint32_t data_len = len - hdr_len;
 
     if (th->flags & TCP_RST) {
+        closed_by_reset++;
         c->state = TCP_CLOSED;
         return;
     }
 
     /* An acknowledgement of what is in flight retires it. */
     if ((th->flags & TCP_ACK) && seq_le(c->snd_unacked, ack) &&
-        seq_le(ack, c->snd_next)) {
+        seq_le(ack, c->snd_max)) {
+        /* Acknowledged past where a go-back left snd_next: what it covers
+         * does not need sending again. */
+        if (seq_lt(c->snd_next, ack)) c->snd_next = ack;
         /* Data first: what of the send ring this covers. SYN and FIN are
          * only ever outstanding with the ring empty, so a delta beyond
          * the ring's length is theirs. */
         uint32_t delta = ack - c->snd_unacked;
         uint32_t data = delta < c->snd_len ? delta : c->snd_len;
+        cc_on_ack(c, ack, data, data_len, ntohs(th->window));
         if (data) {
             c->snd_head = (c->snd_head + data) % TCP_SEND_BUFFER;
             c->snd_len -= data;
@@ -398,11 +565,39 @@ static void tcp_receive(uint32_t src_ip, uint32_t dest_ip,
             recv_push(c, data, data_len);
             c->rcv_next += data_len;
             bytes_received += data_len;
+            ooo_drain(c);
+        } else if (seq_lt(c->rcv_next, seq) && data_len <= TCP_MSS &&
+                   seq_lt(seq - c->rcv_next, recv_free(c))) {
+            /* Ahead of a gap and inside the window: keep it. */
+            ooo_store(c, seq, data, data_len);
+            /* One ACK for each of these, not one per tick: three
+             * duplicates are what a sender takes as "one segment lost,
+             * resend it now" rather than waiting out its timer. */
+            if (c->dupacks_owed < 8) c->dupacks_owed++;
+            if (th->flags & TCP_FIN) {
+                c->ooo_fin = 1;
+                c->ooo_fin_seq = seq + data_len;
+            }
         }
+        /* Acknowledged at once, in order or not: a duplicate ACK is what
+         * tells the sender which segment is missing. */
         c->ack_pending = 1;
     }
 
-    if ((th->flags & TCP_FIN) && seq_le(seq, c->rcv_next)) {
+    /* The FIN counts only once everything before it has arrived - its
+     * own segment's data included, or the data a gap held back. It used
+     * to count whenever its segment did not start ahead, so a FIN whose
+     * data was refused for want of room ended the stream short, and a
+     * retransmitted FIN was counted twice. A FIN already counted is
+     * acknowledged again: that is what its sender is asking for. */
+    int fin_now = 0;
+    if ((th->flags & TCP_FIN) && seq + data_len == c->rcv_next) fin_now = 1;
+    if (c->ooo_fin && c->ooo_fin_seq == c->rcv_next) fin_now = 1;
+    if ((th->flags & TCP_FIN) && seq + data_len + 1 == c->rcv_next &&
+        c->peer_finished)
+        c->ack_pending = 1;
+    if (fin_now && !c->peer_finished) {
+        c->ooo_fin = 0;
         c->rcv_next += 1;
         c->peer_finished = 1;
         c->ack_pending = 1;
@@ -438,6 +633,7 @@ static void tcp_output(tcp_conn_t* c) {
     for (;;) {
         uint32_t in_flight = c->snd_next - c->snd_unacked;
         uint32_t wnd = c->snd_wnd < TCP_SEND_BUFFER ? c->snd_wnd : TCP_SEND_BUFFER;
+        if (c->cwnd && wnd > c->cwnd) wnd = c->cwnd;
         uint32_t avail, room, n;
 
         if (in_flight >= c->snd_len) break;            /* all of it is out */
@@ -450,6 +646,7 @@ static void tcp_output(tcp_conn_t* c) {
             seg[i] = c->sndbuf[(c->snd_head + in_flight + i) % TCP_SEND_BUFFER];
         if (send_segment(c, TCP_ACK | TCP_PSH, c->snd_next, seg, n) != 0) break;
         c->snd_next += n;
+        if (seq_lt(c->snd_max, c->snd_next)) c->snd_max = c->snd_next;
         c->ack_pending = 0;            /* every segment carries the ACK */
         sent = 1;
     }
@@ -500,6 +697,7 @@ int tcp_connect(uint32_t dest_ip, uint16_t dest_port) {
          * next_port makes unlikely on its own. */
         c->snd_next = 0x4E560000u + pit_get_ticks() * 64;
         c->snd_unacked = c->snd_next;
+        c->snd_max = c->snd_next;
         c->snd_wnd = TCP_MSS;     /* until the SYN+ACK says */
 
         if (send_tracked(c, TCP_SYN, 0, 0) < 0) {
@@ -705,6 +903,14 @@ void tcp_tick(void) {
          * segment that arrives after that, during send_ack() itself, is
          * covered by the acknowledgement being sent *and* leaves the flag
          * set, which costs one redundant acknowledgement and no data. */
+        /* The duplicates owed for segments past a gap. They are
+         * identical, and that is the point. */
+        while (c->dupacks_owed) {
+            if (!send_ack(c)) break;
+            c->dupacks_owed--;
+            c->ack_pending = 0;
+        }
+
         if (c->ack_pending) {
             c->ack_pending = 0;
             if (send_ack(c)) {
@@ -725,10 +931,12 @@ void tcp_tick(void) {
          * sender learns the window has reopened if the update was lost. */
         if (c->snd_len && c->data_rto_deadline && now >= c->data_rto_deadline) {
             if (++c->data_tries > RTO_MAX_TRIES) {
+                closed_by_data_retries++;
                 c->state = TCP_CLOSED;
                 continue;
             }
             retransmits++;
+            cc_on_timeout(c);
             c->snd_next = c->snd_unacked;
             c->data_rto_ticks *= 2;
             c->data_rto_deadline = 0;
@@ -752,6 +960,7 @@ void tcp_tick(void) {
         if (now < c->rto_deadline) continue;
 
         if (++c->tries > RTO_MAX_TRIES) {
+            closed_by_retries++;
             c->state = TCP_CLOSED;
             continue;
         }
@@ -840,4 +1049,14 @@ uint32_t tcp_send_space(int handle) {
         c->fin_queued || c->pending_flags)
         return 0;
     return TCP_SEND_BUFFER - c->snd_len;
+}
+
+uint32_t tcp_ooo_held(void) { return ooo_held; }
+uint32_t tcp_fast_retransmits(void) { return fast_retransmits; }
+
+/* Why connections ended badly: a reset from the peer, or the SYN/FIN or
+ * the data retransmitted RTO_MAX_TRIES times without an answer. */
+void tcp_bad_closes(uint32_t* reset, uint32_t* control, uint32_t* data) {
+    *reset = closed_by_reset; *control = closed_by_retries;
+    *data = closed_by_data_retries;
 }

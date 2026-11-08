@@ -47,6 +47,7 @@
 #include "sock64.h"
 #include "clock64.h"
 #include "inet64.h"
+#include "tcp.h"
 
 static int failures = 0;
 
@@ -4586,6 +4587,24 @@ fast_inet:
 
         check("TCP and UDP worked, over the loopback and any card",
               syscall64_exit_code() == 0);
+        serial64_puts("NOVARIS64: tcp: ");
+        serial64_putdec(tcp_retransmits());
+        serial64_puts(" retransmits, ");
+        serial64_putdec(tcp_fast_retransmits());
+        serial64_puts(" of them fast; ");
+        serial64_putdec(tcp_ooo_held());
+        serial64_puts(" segments held ahead of a gap\n");
+        {
+            uint32_t rst, ctl, dat;
+            tcp_bad_closes(&rst, &ctl, &dat);
+            serial64_puts("NOVARIS64: tcp: closed by reset ");
+            serial64_putdec(rst);
+            serial64_puts(", by SYN/FIN retries ");
+            serial64_putdec(ctl);
+            serial64_puts(", by data retries ");
+            serial64_putdec(dat);
+            serial64_putc('\n');
+        }
     }
 
 #ifdef NOVARIS64_FAST
