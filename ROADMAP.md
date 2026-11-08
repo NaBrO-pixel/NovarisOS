@@ -10909,6 +10909,35 @@ guest does not hold, so this also relies on
 `--ignore-certificate-errors`. A machine with ordinary networking needs
 no proxy: QEMU's forwarder does DNS and the guest connects directly.
 
+## Milestone 100 - where an exe's time goes, and less of it in the kernel
+
+The `[cycles]` report now separates page-fault and idle cycles from
+syscall cycles. For headless Chromium loading a page, that left about
+80% as the programs' own emulated code. Three scheduler costs came out
+of it:
+
+- **Timeslice.** A task keeps the processor for `SCHED64_SLICE_TICKS`
+  (4) ticks; it used to be 1. With forty Chromium tasks runnable that
+  was a thousand switches a second, each reloading CR3, which under
+  QEMU's emulation discards the software TLB. Blocking still switches
+  at once. 10 ticks measured no better.
+- **CR3.** `vmspace64_switch` skips the reload when the space is
+  already loaded, as for another thread of the same process.
+- **Bounded scans.** The scheduler scans stop at a high-water mark
+  instead of walking all 1024 task slots on every tick and every wake.
+  A pipe read went from 29K to 12K cycles, a write from 35K to 19K. The
+  inet socket table has the same mark.
+
+Headless Chromium, boot to finish: 212 s before these, 185 s with the
+first two, about 170 s with all three. The Chromium layer went from 327G
+to about 255-263G cycles. `make test` with Chromium staged prints 32
+PASS, 0 FAIL.
+
+What is left is mostly not the kernel's. `poll` costs about 150K cycles
+walking the wineserver's few hundred descriptors, which is 3%. Most of
+the rest is Chromium's own work, much of it background services (update
+checks, Safe Browsing, sign-in) that Chromium's flags could turn off.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
