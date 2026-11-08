@@ -10938,6 +10938,75 @@ walking the wineserver's few hundred descriptors, which is 3%. Most of
 the rest is Chromium's own work, much of it background services (update
 checks, Safe Browsing, sign-in) that Chromium's flags could turn off.
 
+## Milestone 101 - four ways to run emulated code faster, measured
+
+Milestone 100 found about 80% of a Chromium run to be the programs' own
+emulated code. Four attempts at that, each measured on headless Chromium
+loading `https://novaris.test/page.html` (`make chrome-net`); one CPU's
+baseline is about 165-170 s boot to finish.
+
+**1. Chromium doing less (`-DCHROME64_LEAN`, opt-in).** Switches that turn
+off its background services: networking, component updates, sync,
+extensions, default apps and more. It halves the Google lookups, and saves
+no time (172 s), so it is not the default. Bisecting it found a real bug:
+**`uspace64_build_stack` kept 16 `argv` entries and 16 environment
+variables, silently, for every `execve`**. Chromium, given a few more
+switches, lost `--dump-dom` and its URL. It now keeps 256 of each, says
+so beyond that, and `run_wine_program` takes 62 arguments.
+`userland/spawn64.c` execs itself with 41 arguments and 40 more variables,
+on Linux and here.
+
+**2. QEMU's own settings (`QEMU_EXTRA`).** A 2GB translation cache took
+181 s and `-cpu max` 188 s; neither beat the default.
+
+**3. KVM (`QEMU_ACCEL`).** `-enable-kvm -cpu host` whenever `/dev/kvm` can
+be opened, for every QEMU the Makefile runs. With KVM the guest's code
+runs on the processor; it is the one change likely to make most of the
+80% disappear. This build machine has no KVM (a VM without `vmx`/`svm`),
+so it is untested here.
+
+**4. More than one CPU (`QEMU_SMP`, default 1).** `kernel/smp64.c` starts
+the application processors with INIT/STARTUP through a real-mode
+trampoline (`boot/ap_trampoline.s`). Each CPU gets its own:
+- GDT and TSS; the TSS sits at its own GDT slot, so `str` names the CPU
+  without an MMIO read;
+- interrupt stacks;
+- SYSCALL entry stub and stack, with the user's rsp kept in the frame;
+- LAPIC timer.
+
+One recursive kernel lock is taken on every system call, interrupt and
+exception, and dropped on the way back to ring 3 and around halts. Each
+CPU's `current` task and pid are swapped with it, so the kernel still sees
+one CPU. Processes are pinned to a CPU (chosen in turn at fork from the
+Wine prefix on), so a page-table change never has to be flushed from
+another CPU's TLB. Idle CPUs drop the lock, load the kernel's page tables
+and halt; a wake-up sends an IPI to halted CPUs. Bugs found getting it
+stable:
+- AP timers ran the scheduler before scheduling started.
+- An idle AP took the bootstrap CPU's tasks.
+- Every CPU's context started at task 0.
+- During quiesce, a tick that interrupted the idle loop re-entered it a
+  level deeper every millisecond, until the stack overflowed.
+
+On 4 CPUs the whole Wine and Chromium sequence works (prefix, winegui,
+chromeprobe, Chromium printing the page), and it is **much slower**:
+
+| CPUs | boot to finish | lock waits | spinning | wake-up IPIs |
+|---|---|---|---|---|
+| 1 | 165 s | - | - | - |
+| 2 | 824 s | 2.5M of 7.8M | ~100G cycles | 1.6M |
+| 4 | 335-822 s | 7.4M of 13.3M | ~1,180G cycles | 4.5M |
+
+Wine is kernel-bound: every wineserver request is several system calls,
+and with one lock around the kernel the CPUs take turns. The
+wineserver's clients sit on other CPUs, so every request also becomes a
+cross-CPU wake-up. Each wake-up IPI and each APIC access is an emulated
+device access, which takes QEMU's own global lock. To gain from more
+CPUs the kernel needs finer locking (pipes, futexes and the scheduler
+first), and Wine's processes placed beside their server. That is the
+next large project; until then `QEMU_SMP=1`, which runs the uniprocessor
+path unchanged.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
