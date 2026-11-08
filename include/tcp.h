@@ -135,6 +135,9 @@ void tcp_init(void);
 
 uint32_t tcp_bytes_received(void);
 uint32_t tcp_retransmits(void);
+uint32_t tcp_ooo_held(void);          /* segments kept ahead of a gap */
+uint32_t tcp_fast_retransmits(void);  /* resent on three duplicate ACKs */
+void tcp_bad_closes(uint32_t* reset, uint32_t* control, uint32_t* data);
 
 /* Diagnostics: how many times the tick ran, how many acknowledgements it
  * managed to send, and how many it could not. */
