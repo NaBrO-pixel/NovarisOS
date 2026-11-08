@@ -117,6 +117,8 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/pipe64.o \
        $(BUILD_DIR)/sock64.o \
        $(BUILD_DIR)/inet64.o \
+       $(BUILD_DIR)/smp64.o \
+       $(BUILD_DIR)/ap_blob.o \
        $(BUILD_DIR)/net.o \
        $(BUILD_DIR)/tcp.o \
        $(BUILD_DIR)/dhcp.o \
@@ -157,6 +159,14 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 $(BUILD_DIR)/boot64.o: boot/boot64.s | $(BUILD_DIR)
+	$(AS) $(ASFLAGS) $< -o $@
+
+# The application processors' real-mode entry (kernel/smp64.c): a flat
+# binary, carried in the kernel by ap_blob.s and copied to 0x8000.
+$(BUILD_DIR)/ap_trampoline.bin: boot/ap_trampoline.s | $(BUILD_DIR)
+	$(AS) -f bin $< -o $@
+
+$(BUILD_DIR)/ap_blob.o: kernel/ap_blob.s $(BUILD_DIR)/ap_trampoline.bin | $(BUILD_DIR)
 	$(AS) $(ASFLAGS) $< -o $@
 
 $(BUILD_DIR)/isr64.o: kernel/isr64.s | $(BUILD_DIR)
@@ -878,9 +888,11 @@ QEMU_RAM ?= $(if $(CHROMIUM64_DIR),12G,2G)
 QEMU_KVM   ?= $(shell [ -r /dev/kvm ] && [ -w /dev/kvm ] && echo 1)
 QEMU_ACCEL ?= $(if $(QEMU_KVM),-enable-kvm -cpu host)
 QEMU_EXTRA ?=
+# How many CPUs the guest has (kernel/smp64.c starts the others).
+QEMU_SMP   ?= 1
 
 run: iso
-	qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) $(QEMU_ACCEL) $(QEMU_EXTRA) -serial stdio
+	qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) $(QEMU_ACCEL) -smp $(QEMU_SMP) $(QEMU_EXTRA) -serial stdio
 
 # The bring-up test. kernel_main halts rather than exiting, so the run has
 # to be stopped from outside and judged by what reached the serial port.
@@ -917,7 +929,7 @@ test: iso
 	    --log $(BUILD_DIR)/net64.http.log & \
 	  hpid=$$!; \
 	  tools/qemu_net64.sh $(BUILD_DIR)/resolv.net64 \
-	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) $(QEMU_ACCEL) $(QEMU_EXTRA) -display none \
+	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) $(QEMU_ACCEL) -smp $(QEMU_SMP) $(QEMU_EXTRA) -display none \
 	    $(NET64_QEMU) \
 	    -serial file:$(BUILD_DIR)/serial.log -no-reboot >/dev/null 2>&1 & \
 	  qpid=$$!; waited=0; \
@@ -1374,7 +1386,7 @@ chrome-net:
 	    --log $(BUILD_DIR)/net64.http.log & \
 	  hpid=$$!; \
 	  tools/qemu_net64.sh $(BUILD_DIR)/resolv.net64 \
-	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) $(QEMU_ACCEL) $(QEMU_EXTRA) -display none \
+	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) $(QEMU_ACCEL) -smp $(QEMU_SMP) $(QEMU_EXTRA) -display none \
 	    $(NET64_QEMU) \
 	    -serial file:$(BUILD_DIR)/serial.log -no-reboot >/dev/null 2>&1 & \
 	  qpid=$$!; waited=0; \
@@ -1417,7 +1429,7 @@ chrome-window:
 	    --log $(BUILD_DIR)/net64.http.log & \
 	  hpid=$$!; \
 	  tools/qemu_net64.sh $(BUILD_DIR)/resolv.net64 \
-	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) $(QEMU_ACCEL) $(QEMU_EXTRA) -display none \
+	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) $(QEMU_ACCEL) -smp $(QEMU_SMP) $(QEMU_EXTRA) -display none \
 	    $(NET64_QEMU) -monitor unix:$(BUILD_DIR)/chrome.mon,server,nowait \
 	    -serial file:$(BUILD_DIR)/serial.log -no-reboot >/dev/null 2>&1 & \
 	  qpid=$$!; \

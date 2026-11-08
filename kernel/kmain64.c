@@ -47,6 +47,7 @@
 #include "sock64.h"
 #include "clock64.h"
 #include "inet64.h"
+#include "smp64.h"
 #include "tcp.h"
 
 static int failures = 0;
@@ -4554,6 +4555,9 @@ fast_inet:
         idt64_irq_set_mask(0, 0);
         __asm__ __volatile__("pushfq; pop %0; sti" : "=r"(flags) :: "memory");
         card = inet64_init();
+        /* And the other processors, while the clock is running with
+         * interrupts on - starting one waits for it to answer. */
+        smp64_init();
         __asm__ __volatile__("push %0; popfq" :: "r"(flags) : "memory", "cc");
         idt64_irq_set_mask(0, 1);
         if (card)
