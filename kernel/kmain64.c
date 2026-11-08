@@ -4901,6 +4901,11 @@ fast_inet:
 #ifdef NOVARIS64_FAST
 fast_wine:
 #endif
+    /* From the prefix on, every CPU there is runs programs (Milestone
+     * 101): Wine and Chromium are dozens of processes, and each new one is
+     * pinned to the next CPU. Everything before ran on this one. */
+    smp64_start_scheduling();
+
     /* --- layer 38: a Wine prefix (Milestone 71) ---------------------- */
     /* Milestone 68 removed every reason a prefix could not exist here -
      * the node ceiling, the name and path ceilings, the missing links,
@@ -5446,6 +5451,7 @@ static const char* const chrome_args[] = {
     }
 
     reclaim_finished("end");
+    smp64_quiesce();
     serial64_puts("NOVARIS64: ---- bring-up complete ----\n");
 
     /* --- the input watch (Milestone 70) ------------------------------

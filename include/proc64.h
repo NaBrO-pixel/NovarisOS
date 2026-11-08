@@ -214,6 +214,11 @@ typedef struct {
      * Always absolute, always without a trailing slash except for the
      * root itself. fork inherits it and execve keeps it. */
     char        cwd[PROC64_PATH_MAX];
+
+    /* The CPU this process's threads run on (Milestone 101). Fixed for
+     * its life: its page tables are then loaded on one CPU only, so a
+     * change to them never has to be flushed from another's TLB. */
+    int         cpu;
 } proc64_t;
 
 void      proc64_init(void);
@@ -287,5 +292,7 @@ int       proc64_has_child(int pid, int want);
 #define PROC64_VFORK_KEY(pid) (0x2000000000000000ULL + (uint64_t)(pid))
 
 uint64_t  proc64_count(void);
+
+int proc64_cpu_of(int pid);     /* its CPU; 0 for none */
 
 #endif

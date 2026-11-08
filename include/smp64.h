@@ -15,4 +15,25 @@ int      smp64_cpus(void);
 uint32_t smp64_lapic_id(void);
 void     smp64_lapic_eoi(void);
 
+/* The vector of the APs' LAPIC timer. */
+#define SMP64_TIMER_VECTOR 0xF0
+
+/* The big kernel lock (see smp64.c). No-ops until smp64_start_scheduling. */
+extern volatile int smp64_active;
+void smp64_enter(void);
+void smp64_exit(void);
+void smp64_leave_to_user(void);
+int  smp64_release_all(void);
+void smp64_reacquire(int depth);
+void smp64_kernel_holds(void);
+int  smp64_this(void);            /* this CPU, while it holds the lock */
+
+int  smp64_pick_cpu(void);        /* the CPU for a new process */
+void smp64_start_scheduling(void);
+void smp64_quiesce(void);
+int  smp64_quiescing(void);
+void smp64_kernel_space(void);
+void smp64_timer_tick(void* frame);
+void smp64_ap_idle(void) __attribute__((noreturn));
+
 #endif

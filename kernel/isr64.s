@@ -138,6 +138,8 @@ IRQ 12, 44
 IRQ 13, 45
 IRQ 14, 46
 IRQ 15, 47
+IRQ 240, 240    ; the APs' LAPIC timer (smp64.c)
+IRQ 255, 255    ; the local APIC's spurious vector: no handler, no EOI
 
 extern isr64_handler
 extern irq64_handler

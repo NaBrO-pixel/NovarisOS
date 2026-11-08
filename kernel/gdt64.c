@@ -17,6 +17,7 @@
 
 #include <stdint.h>
 #include "gdt64.h"
+#include "smp64.h"
 
 #define GDT_ENTRIES 7   /* null, kcode, kdata, udata, ucode, tss (2 slots) */
 
@@ -58,15 +59,22 @@ struct tss64 {
     uint16_t iomap_base;
 } __attribute__((packed));
 
-static struct gdt64_entry gdt[GDT_ENTRIES];
-static struct gdt64_ptr   gdt_ptr;
-static struct tss64       tss;
+/* One of each per CPU (Milestone 101). A TSS is the CPU's own: it names
+ * the stack an interrupt from ring 3 lands on, and two CPUs sharing one
+ * would land on the same stack. The GDT holds the TSS descriptor, whose
+ * busy bit ltr sets, so each CPU needs its own GDT too. */
+static struct gdt64_entry gdt_all[SMP64_MAX_CPUS][GDT_ENTRIES];
+static struct gdt64_ptr   gdt_ptr_all[SMP64_MAX_CPUS];
+static struct tss64       tss_all[SMP64_MAX_CPUS];
 
 /* The stacks the CPU switches to for the vectors that cannot use the one
  * they interrupted. 16KB each, and in .bss rather than allocated, because
  * they have to exist before the heap does. */
-static uint8_t df_stack[16384] __attribute__((aligned(16)));
-static uint8_t nmi_stack[16384] __attribute__((aligned(16)));
+static uint8_t df_stack_all[SMP64_MAX_CPUS][16384] __attribute__((aligned(16)));
+static uint8_t nmi_stack_all[SMP64_MAX_CPUS][16384] __attribute__((aligned(16)));
+
+/* Which CPU set_entry and set_tss_entry are filling in. */
+static struct gdt64_entry* gdt = gdt_all[0];
 
 extern void gdt64_flush(struct gdt64_ptr* ptr);
 extern void tss64_flush(uint16_t selector);
@@ -97,18 +105,30 @@ static void set_tss_entry(int i, uint64_t base, uint32_t limit) {
     e->reserved         = 0;
 }
 
+void gdt64_set_kernel_stack_cpu(int cpu, uint64_t rsp0) {
+    tss_all[cpu].rsp[0] = rsp0;
+}
+
 void gdt64_set_kernel_stack(uint64_t rsp0) {
-    tss.rsp[0] = rsp0;
+    gdt64_set_kernel_stack_cpu(0, rsp0);
 }
 
 uint64_t gdt64_ist_stack(int index) {
-    return (index >= 1 && index <= 7) ? tss.ist[index - 1] : 0;
+    return (index >= 1 && index <= 7) ? tss_all[0].ist[index - 1] : 0;
 }
 
-void gdt64_install(void) {
+void gdt64_install(void) { gdt64_install_cpu(0); }
+
+void gdt64_install_cpu(int cpu) {
     unsigned i;
     uint8_t* p;
+    struct tss64* t = &tss_all[cpu];
+    #define tss (*t)
+    #define df_stack  df_stack_all[cpu]
+    #define nmi_stack nmi_stack_all[cpu]
+    #define gdt_ptr   gdt_ptr_all[cpu]
 
+    gdt = gdt_all[cpu];
     for (p = (uint8_t*)&tss, i = 0; i < sizeof(tss); i++) p[i] = 0;
 
     /* A stack grows down, so the CPU wants the *top*. Rounding to 16 keeps
@@ -135,9 +155,13 @@ void gdt64_install(void) {
 
     set_tss_entry(5, (uint64_t)&tss, sizeof(tss) - 1);
 
-    gdt_ptr.limit = (uint16_t)(sizeof(gdt) - 1);
-    gdt_ptr.base  = (uint64_t)&gdt;
+    gdt_ptr.limit = (uint16_t)(sizeof(gdt_all[cpu]) - 1);
+    gdt_ptr.base  = (uint64_t)gdt_all[cpu];
 
     gdt64_flush(&gdt_ptr);
     tss64_flush(GDT64_TSS_SEL);
+    #undef tss
+    #undef df_stack
+    #undef nmi_stack
+    #undef gdt_ptr
 }

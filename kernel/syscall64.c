@@ -31,6 +31,7 @@
 #include "input64.h"
 #include "fb64.h"
 #include "inet64.h"
+#include "smp64.h"
 
 #define IA32_EFER   0xC0000080u
 #define IA32_STAR   0xC0000081u
@@ -68,6 +69,17 @@ static inline void write_msr(uint32_t msr, uint64_t value) {
                          :: "c"(msr),
                             "a"((uint32_t)value),
                             "d"((uint32_t)(value >> 32)));
+}
+
+/* An application processor's half of syscall64_init: the MSRs are per
+ * CPU, and IA32_LSTAR points at this CPU's own entry stub. */
+extern const uint64_t syscall64_entry_table[];
+void syscall64_init_cpu(int cpu) {
+    write_msr(IA32_EFER, read_msr(IA32_EFER) | EFER_SCE);
+    write_msr(IA32_STAR, ((uint64_t)GDT64_KCODE_SEL << 32) |
+                         ((uint64_t)GDT64_KDATA_SEL << 48));
+    write_msr(IA32_LSTAR, syscall64_entry_table[cpu]);
+    write_msr(IA32_FMASK, (1ULL << 9) | (1ULL << 10) | (1ULL << 8));
 }
 
 void syscall64_init(void) {
@@ -2148,7 +2160,36 @@ void syscall64_oom_kill(uint64_t addr) {
 
 uint64_t syscall64_oom_kills(void) { return oom_kills; }
 
+static uint64_t syscall64_dispatch_locked(syscall64_args_t* args);
+
+/* Every system call comes through here first, from the per-CPU entry
+ * stubs (syscall64.s), and takes the kernel lock (smp64.c) for its whole
+ * length. The user's rsp is in the frame, above the arguments, rather
+ * than in saved_user_rsp: two CPUs can be entering at once. It is copied
+ * to saved_user_rsp - which the code below reads - once this CPU holds
+ * the lock, and back afterwards.
+ *
+ * The calls that do not come back to ring 3 keep the lock: the bootstrap
+ * CPU's goes back to kernel_main, which runs holding it, and on another
+ * CPU there is nothing to go back to, so it parks. */
 uint64_t syscall64_dispatch(syscall64_args_t* args) {
+    uint64_t r, nr = args->nr;
+    uint64_t* user_rsp_slot = (uint64_t*)args + 16;
+
+    smp64_enter();
+    saved_user_rsp = *user_rsp_slot;
+    r = syscall64_dispatch_locked(args);
+    *user_rsp_slot = saved_user_rsp;
+
+    if (nr == SYS64_EXIT || nr == SYS64_EXIT_GROUP || nr == WIN32_64_EXIT) {
+        if (smp64_this() != 0) smp64_ap_idle();
+        return r;
+    }
+    smp64_exit();
+    return r;
+}
+
+static uint64_t syscall64_dispatch_locked(syscall64_args_t* args) {
     uint64_t r;
 
     usd_check("before", args);
@@ -2404,7 +2445,9 @@ static uint64_t syscall64_dispatch_inner(syscall64_args_t* args) {
     }
 #endif
 
-    if (run_deadline && clock64_ticks() > run_deadline) {
+    /* On the bootstrap CPU only: the way out goes back to kernel_main, on
+     * that CPU's stack. Another CPU's next call there finds it. */
+    if (run_deadline && clock64_ticks() > run_deadline && smp64_this() == 0) {
         run_expired = 1;
         run_deadline = 0;
         serial64_puts("\nNOVARIS64: *** the run reached its time limit\n");

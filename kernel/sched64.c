@@ -2,6 +2,8 @@
 
 #include "sched64.h"
 #include "clock64.h"
+#include "smp64.h"
+#include "proc64.h"
 #include "idt64.h"
 #include "gdt64.h"
 #include "serial64.h"
@@ -50,6 +52,7 @@ typedef struct {
     uint64_t      signal_restart;
 
     int           pid;       /* the process this thread belongs to      */
+    int           cpu;       /* the CPU it runs on: its process's (smp64) */
     int           blocked;
     int           used;
 
@@ -128,6 +131,12 @@ static inline uint64_t read_gs_base(void)        { return read_msr_base(IA32_GS_
 static inline void     write_gs_base(uint64_t v) { write_msr_base(IA32_GS_BASE, v); }
 
 static task64_t tasks[SCHED64_MAX_TASKS];
+
+/* A task this CPU may run: its process is pinned here (smp64.c). With one
+ * CPU every task is CPU 0's. */
+static int mine(int i) {
+    return tasks[i].used && tasks[i].cpu == smp64_this();
+}
 static int      task_total;
 static int      current = -1;
 /* One past the highest slot handed out since sched64_init. Every scan of
@@ -316,6 +325,7 @@ int sched64_add(uint64_t rip, uint64_t rsp, uint64_t arg,
      * and every syscall after it would find no process at all - which
      * is a null dereference in the kernel, layers later. */
     tasks[i].pid       = proc64_current_pid();
+    tasks[i].cpu       = proc64_cpu_of(tasks[i].pid);
     tasks[i].used      = 1;
     task_total++;
     return i;
@@ -338,6 +348,7 @@ int sched64_add_frame_for(const registers64_t* regs, const vmspace64_t* space,
     if (i == SCHED64_MAX_TASKS) { tasks_full(); return -1; }
 
     tasks[i].pid       = pid;
+    tasks[i].cpu       = proc64_cpu_of(pid);
     tasks[i].regs      = *regs;
     tasks[i].space     = *space;
     tasks[i].fs_base   = fs_base;
@@ -426,7 +437,7 @@ int sched64_exit_current(registers64_t* out_regs, vmspace64_t* out_space,
      * here until now was single-threaded or ended with exit_group. It is
      * fixed on sight rather than left for the run that finds it. */
     for (next = 0; next < task_hwm; next++)
-        if (tasks[next].used && !tasks[next].blocked) break;
+        if (mine(next) && !tasks[next].blocked) break;
 
     /* Nothing runnable at this instant is not the same as nothing left
      * to run: a sibling asleep on the clock becomes runnable when the
@@ -440,8 +451,8 @@ int sched64_exit_current(registers64_t* out_regs, vmspace64_t* out_space,
      * while the timer can still interrupt and something is genuinely
      * waiting on it. Otherwise there really is nothing to come back
      * for. */
-    if (next == task_hwm && !idt64_irq_is_masked(0) &&
-        any_deadline())
+    if (next == task_hwm && (smp64_this() != 0 ||
+        (!idt64_irq_is_masked(0) && any_deadline())))
         next = idle_until_runnable();
 
     if (next < 0 || next >= task_hwm) { current = -1; return 0; }
@@ -492,10 +503,10 @@ int sched64_exit_process(int pid, registers64_t* out_regs,
      * give up, for the same reason as above too: one process ending
      * while another sleeps on the clock is not the end of the run. */
     for (next = 0; next < task_hwm; next++)
-        if (tasks[next].used && !tasks[next].blocked) break;
+        if (mine(next) && !tasks[next].blocked) break;
 
-    if (next == task_hwm && !idt64_irq_is_masked(0) &&
-        any_deadline())
+    if (next == task_hwm && (smp64_this() != 0 ||
+        (!idt64_irq_is_masked(0) && any_deadline())))
         next = idle_until_runnable();
 
     if (next < 0 || next >= task_hwm) { current = -1; return 0; }
@@ -518,12 +529,14 @@ int sched64_exit_process(int pid, registers64_t* out_regs,
  * interrupt. `current` still names the thread that parked, and its
  * frame is already saved, so the timer must not try to switch away from
  * it: there is no live task frame to save over. */
-static volatile int idling;
+/* Per CPU (Milestone 101): each one idles on its own. */
+static volatile int idling_cpu[SMP64_MAX_CPUS];
+#define idling (idling_cpu[smp64_this()])
 volatile int sched64_external_wakers;
 
 static int first_runnable(void) {
     for (int i = 0; i < task_hwm; i++)
-        if (tasks[i].used && !tasks[i].blocked) return i;
+        if (mine(i) && !tasks[i].blocked) return i;
     return -1;
 }
 
@@ -580,11 +593,23 @@ static int idle_until_runnable(void) {
 
     idling = 1;
     for (;;) {
+        /* With other CPUs, the lock goes for the halt: they may be the
+         * ones to make something here runnable. */
+        int depth = smp64_release_all();
+        smp64_kernel_space();
         __asm__ __volatile__("sti; hlt; cli");
+        smp64_reacquire(depth);
+        if (smp64_this() != 0 && smp64_quiescing()) {
+            idling = 0;
+            smp64_ap_idle();                       /* the run is over */
+        }
         expire_deadlines();
         n = first_runnable();
         if (n >= 0) break;
-        if (!any_deadline() && !sched64_external_wakers) { n = -1; break; }
+        /* Nothing anyone could wake: the end of the run - on the
+         * bootstrap CPU alone. An AP waits for whatever is pinned to it. */
+        if (smp64_this() == 0 && !smp64_active &&
+            !any_deadline() && !sched64_external_wakers) { n = -1; break; }
     }
     idling = 0;
     sched64_idle_cycles += idle_tsc() - t0;
@@ -594,7 +619,7 @@ static int idle_until_runnable(void) {
 static int next_task(int from) {
     for (int n = 1; n <= task_hwm; n++) {
         int i = (from + n) % task_hwm;
-        if (tasks[i].used && !tasks[i].blocked) return i;
+        if (mine(i) && !tasks[i].blocked) return i;
     }
     return from;
 }
@@ -692,7 +717,7 @@ int sched64_block_until_ex(const registers64_t* regs, uint64_t addr,
          * bring-up layers run with IRQ0 off on purpose, and there the
          * deadline would never arrive. */
         if (idt64_irq_is_masked(0) ||
-            (!any_deadline() && !sched64_external_wakers)) {
+            (!any_deadline() && !sched64_external_wakers && !smp64_active)) {
             tasks[current].blocked   = 0;
             tasks[current].wait_addr = 0;
             tasks[current].deadline  = 0;
@@ -894,4 +919,48 @@ void sched64_tick(registers64_t* frame) {
      * it was using still in place. */
     if (stop_after && switch_count >= stop_after && stop_rip)
         frame->rip = stop_rip;
+}
+
+/* For smp64.c, which keeps each CPU's `current` while another holds the
+ * lock: the value alone, nothing else touched. */
+void sched64_set_current_raw(int i) { current = i; }
+
+/* An application processor with nothing running: start a task pinned to
+ * it, if there is one. Does not return if there is. */
+int sched64_run_this_cpu(void) {
+    int n = first_runnable();
+    if (n < 0) return 0;
+    current = n;
+    slice_start = clock64_ticks();
+    fpu_restore(tasks[n].fpu);
+    write_gs_base(tasks[n].gs_base);
+    write_fs_base(tasks[n].fs_base);
+    vmspace64_switch(&tasks[n].space);
+    proc64_set_current(tasks[n].pid);
+    sched64_resume(&tasks[n].regs);            /* releases the lock */
+    return 1;
+}
+
+/* Into a task, for good. The frame is copied to this CPU's own buffer and
+ * the lock given up before the assembly loads it: past that point another
+ * CPU may change the task table. */
+extern void sched64_resume_raw(const registers64_t* regs) __attribute__((noreturn));
+void sched64_resume(const registers64_t* regs) {
+    static registers64_t copy[SMP64_MAX_CPUS];
+    registers64_t* mine_copy = &copy[smp64_this()];
+    *mine_copy = *regs;
+    smp64_leave_to_user();
+    sched64_resume_raw(mine_copy);
+}
+
+/* A task interrupted on an AP at the end of a run: its frame saved as a
+ * switch away would save it, so it resumes correctly if scheduling starts
+ * again, and nothing current on this CPU. */
+void sched64_park_current(const registers64_t* frame) {
+    if (current < 0 || !tasks[current].used) return;
+    tasks[current].regs    = *frame;
+    tasks[current].fs_base = read_fs_base();
+    tasks[current].gs_base = read_gs_base();
+    fpu_save(tasks[current].fpu);
+    current = -1;
 }
