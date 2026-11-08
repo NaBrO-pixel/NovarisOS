@@ -17,6 +17,7 @@ void     smp64_lapic_eoi(void);
 
 /* The vector of the APs' LAPIC timer. */
 #define SMP64_TIMER_VECTOR 0xF0
+#define SMP64_KICK_VECTOR  0xF1   /* "something to run": wakes a halted CPU */
 
 /* The big kernel lock (see smp64.c). No-ops until smp64_start_scheduling. */
 extern volatile int smp64_active;
@@ -33,6 +34,9 @@ void smp64_start_scheduling(void);
 void smp64_quiesce(void);
 int  smp64_quiescing(void);
 void smp64_kernel_space(void);
+void smp64_kick_halted(void);
+void smp64_report(void);
+void smp64_set_halted(int on);
 void smp64_timer_tick(void* frame);
 void smp64_ap_idle(void) __attribute__((noreturn));
 

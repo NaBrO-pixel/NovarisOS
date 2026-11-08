@@ -17,7 +17,8 @@
 #define IST_NMI          2
 
 void gdt64_install(void);
-void gdt64_install_cpu(int cpu);           /* this CPU's own GDT and TSS */
+void gdt64_install_cpu(int cpu);
+int  gdt64_cpu(void);            /* this CPU, from its task register */           /* this CPU's own GDT and TSS */
 void gdt64_set_kernel_stack_cpu(int cpu, uint64_t rsp0);
 
 /* The stack the CPU switches to when an interrupt arrives while in ring 3.

@@ -22,6 +22,7 @@
 #include "clock64.h"
 #include "kstring.h"
 #include "idt64.h"
+#include "gdt64.h"
 
 #define KERNEL_VMA_ 0xFFFFFFFF80000000ULL
 
@@ -123,6 +124,17 @@ static void lapic_enable(void) {
  * running tasks there is nobody to exclude. */
 
 volatile int smp64_active;
+
+/* What the lock costs, per CPU: how often it was taken, how often it had
+ * to be waited for, and the cycles spent waiting (smp64_report). */
+static uint64_t smp64_spin_cycles[SMP64_MAX_CPUS], smp64_contended[SMP64_MAX_CPUS],
+                smp64_acquired[SMP64_MAX_CPUS], smp64_kicks;
+
+static inline uint64_t tsc_now(void) {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
 int smp64_cpu;                          /* the lock holder's CPU */
 
 static volatile int bkl;
@@ -140,9 +152,8 @@ extern int  proc64_current_pid(void);
 extern void proc64_set_current(int pid);
 
 static int this_cpu(void) {
-    if (!lapic) return 0;
-    uint32_t id = lapic_read(LAPIC_ID) >> 24;
-    return id < SMP64_MAX_CPUS ? (int)id : 0;
+    int c = gdt64_cpu();
+    return c >= 0 && c < SMP64_MAX_CPUS ? c : 0;
 }
 
 void smp64_enter(void) {
@@ -150,8 +161,14 @@ void smp64_enter(void) {
     if (!smp64_active) return;
     cpu = this_cpu();
     if (bkl_owner == cpu) { bkl_depth++; return; }
-    while (__atomic_exchange_n(&bkl, 1, __ATOMIC_ACQUIRE))
-        while (bkl) __asm__ __volatile__("pause");
+    if (__atomic_exchange_n(&bkl, 1, __ATOMIC_ACQUIRE)) {
+        uint64_t t0 = tsc_now();
+        while (__atomic_exchange_n(&bkl, 1, __ATOMIC_ACQUIRE))
+            while (bkl) __asm__ __volatile__("pause");
+        smp64_spin_cycles[cpu] += tsc_now() - t0;
+        smp64_contended[cpu]++;
+    }
+    smp64_acquired[cpu]++;
     bkl_owner = cpu;
     bkl_depth = 1;
     smp64_cpu = cpu;
@@ -227,6 +244,29 @@ int smp64_pick_cpu(void) {
 static uint32_t lapic_ticks_per_ms;
 static uint8_t ap_int_stacks[SMP64_MAX_CPUS][16384] __attribute__((aligned(16)));
 static volatile int quiesce;
+static volatile int halted[SMP64_MAX_CPUS];
+
+/* Wakes every other CPU that is halted with nothing to run, so a task
+ * just made runnable there starts now rather than at that CPU's next
+ * tick. A fixed IPI on SMP64_KICK_VECTOR, whose handler only
+ * acknowledges it: the idle loop looks again once hlt returns. */
+void smp64_kick_halted(void) {
+    int me;
+    if (!smp64_active) return;
+    me = smp64_cpu;
+    for (int c = 0; c < ncpus; c++) {
+        if (c == me || !halted[c]) continue;
+        lapic_write(LAPIC_ICR_HI, (uint32_t)c << 24);
+        lapic_write(LAPIC_ICR_LO, 0x4000 | SMP64_KICK_VECTOR);   /* fixed, assert */
+        smp64_kicks++;
+    }
+}
+
+void smp64_set_halted(int on) {
+    if (smp64_active) halted[smp64_cpu] = on;
+}
+
+static void kick_handler(registers64_t* r) { (void)r; smp64_lapic_eoi(); }
 static volatile int parked[SMP64_MAX_CPUS];
 
 extern void gdt64_install_cpu(int cpu);
@@ -240,7 +280,9 @@ extern void sched64_park_current(const registers64_t* frame);
 static void lapic_timer_start(void) {
     lapic_write(LAPIC_TMR_DIV, 0x3);                     /* divide by 16 */
     lapic_write(LAPIC_LVT_TMR, (1u << 17) | SMP64_TIMER_VECTOR);   /* periodic */
-    lapic_write(LAPIC_TMR_INIT, lapic_ticks_per_ms ? lapic_ticks_per_ms : 100000);
+    /* Every 4ms: the scheduler's timeslice (sched64.c), so a tick
+     * between slices would do nothing but cost an APIC access. */
+    lapic_write(LAPIC_TMR_INIT, 4 * (lapic_ticks_per_ms ? lapic_ticks_per_ms : 100000));
 }
 
 static void kernel_space(void) {
@@ -261,9 +303,14 @@ void smp64_ap_idle(void) {
             sched64_run_this_cpu();                      /* returns only if none */
         }
         parked[smp64_cpu] = 1;
-        smp64_leave_to_user();
-        kernel_space();
-        __asm__ __volatile__("sti; hlt; cli");
+        halted[smp64_cpu] = 1;
+        {
+            int me = smp64_cpu;
+            smp64_leave_to_user();
+            kernel_space();
+            __asm__ __volatile__("sti; hlt; cli");
+            halted[me] = 0;
+        }
     }
 }
 
@@ -278,6 +325,11 @@ void smp64_timer_tick(void* frame) {
      * table is about to be reset) and it parks. The interrupt's frame is
      * abandoned on this CPU's own stack. */
     if (quiesce) {
+        /* Only a tick that interrupted a program parks: one that
+         * interrupted the idle loop just returns to it. Parking from there
+         * too called smp64_ap_idle a level deeper every millisecond, until
+         * the stack ran out. */
+        if ((((registers64_t*)frame)->cs & 3) != 3) return;
         sched64_park_current((registers64_t*)frame);
         smp64_ap_idle();
     }
@@ -405,6 +457,7 @@ int smp64_init(void) {
     lapic_write(LAPIC_TMR_INIT, 0);
 
     register_interrupt_handler64(SMP64_TIMER_VECTOR, ap_timer_handler);
+    register_interrupt_handler64(SMP64_KICK_VECTOR, kick_handler);
 
     tramp = (uint8_t*)phys64_to_virt(TRAMPOLINE_PHYS);
     kmemcpy(tramp, ap_trampoline_bin, ap_trampoline_len);
@@ -439,4 +492,22 @@ int smp64_init(void) {
  * trust: the process it last ran may have been reaped by another CPU. */
 void smp64_kernel_space(void) {
     if (smp64_active) kernel_space();
+}
+
+void smp64_report(void) {
+    if (ncpus < 2) return;
+    for (int c = 0; c < ncpus; c++) {
+        serial64_puts("NOVARIS64: [smp] cpu ");
+        serial64_putdec((uint64_t)c);
+        serial64_puts(": lock taken ");
+        serial64_putdec(smp64_acquired[c]);
+        serial64_puts(", waited for ");
+        serial64_putdec(smp64_contended[c]);
+        serial64_puts(" times, ");
+        serial64_putdec(smp64_spin_cycles[c] / 1000000u);
+        serial64_puts("M cycles spinning\n");
+    }
+    serial64_puts("NOVARIS64: [smp] wake-up IPIs sent: ");
+    serial64_putdec(smp64_kicks);
+    serial64_putc('\n');
 }

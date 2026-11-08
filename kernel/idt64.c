@@ -86,6 +86,7 @@ extern void irq12(void); extern void irq13(void); extern void irq14(void);
 extern void irq15(void);
 extern void irq240(void);
 extern void irq255(void);
+extern void irq241(void);
 
 static const char* const exception_names[32] = {
     "divide error", "debug", "non-maskable interrupt", "breakpoint",
@@ -347,6 +348,7 @@ void idt64_install(void) {
     /* The application processors' LAPIC timer (smp64.c). */
     set_gate(SMP64_TIMER_VECTOR, (uint64_t)irq240, 0, 0);
     set_gate(0xFF, (uint64_t)irq255, 0, 0);
+    set_gate(SMP64_KICK_VECTOR, (uint64_t)irq241, 0, 0);
 
     idt_ptr.limit = (uint16_t)(sizeof(idt) - 1);
     idt_ptr.base  = (uint64_t)&idt;

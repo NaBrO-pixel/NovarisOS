@@ -5452,6 +5452,7 @@ static const char* const chrome_args[] = {
 
     reclaim_finished("end");
     smp64_quiesce();
+    smp64_report();
     serial64_puts("NOVARIS64: ---- bring-up complete ----\n");
 
     /* --- the input watch (Milestone 70) ------------------------------

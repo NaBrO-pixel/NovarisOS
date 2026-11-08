@@ -19,7 +19,9 @@
 #include "gdt64.h"
 #include "smp64.h"
 
-#define GDT_ENTRIES 7   /* null, kcode, kdata, udata, ucode, tss (2 slots) */
+/* null, kcode, kdata, udata, ucode, then the TSS (2 slots) - at slot
+ * 5 + 2 * cpu, so its selector says which CPU this is (gdt64_cpu). */
+#define GDT_ENTRIES (7 + 2 * (SMP64_MAX_CPUS - 1))
 
 struct gdt64_entry {
     uint16_t limit_low;
@@ -153,15 +155,25 @@ void gdt64_install_cpu(int cpu) {
     set_entry(3, 0xF2, 0x00);           /* user data: DPL=3                  */
     set_entry(4, 0xFA, 0xA0);           /* user code: DPL=3, L=1             */
 
-    set_tss_entry(5, (uint64_t)&tss, sizeof(tss) - 1);
+    set_tss_entry(5 + 2 * cpu, (uint64_t)&tss, sizeof(tss) - 1);
 
     gdt_ptr.limit = (uint16_t)(sizeof(gdt_all[cpu]) - 1);
     gdt_ptr.base  = (uint64_t)gdt_all[cpu];
 
     gdt64_flush(&gdt_ptr);
-    tss64_flush(GDT64_TSS_SEL);
+    tss64_flush((uint16_t)(GDT64_TSS_SEL + 16 * cpu));
     #undef tss
     #undef df_stack
     #undef nmi_stack
     #undef gdt_ptr
+}
+
+/* Which CPU this is, from the task register: each CPU's TSS is at its own
+ * slot. One instruction and no device access - the local APIC's ID
+ * register is MMIO, and under QEMU every MMIO access takes the emulator's
+ * global lock, which on every system call serialised all the CPUs. */
+int gdt64_cpu(void) {
+    uint16_t tr;
+    __asm__ __volatile__("str %0" : "=r"(tr));
+    return (tr - GDT64_TSS_SEL) / 16;
 }

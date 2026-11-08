@@ -595,10 +595,13 @@ static int idle_until_runnable(void) {
     for (;;) {
         /* With other CPUs, the lock goes for the halt: they may be the
          * ones to make something here runnable. */
-        int depth = smp64_release_all();
+        int depth;
+        smp64_set_halted(1);
+        depth = smp64_release_all();
         smp64_kernel_space();
         __asm__ __volatile__("sti; hlt; cli");
         smp64_reacquire(depth);
+        smp64_set_halted(0);
         if (smp64_this() != 0 && smp64_quiescing()) {
             idling = 0;
             smp64_ap_idle();                       /* the run is over */
@@ -809,6 +812,7 @@ int sched64_wake_pid(int pid) {
         woken_by_signal(i);
         woken++;
     }
+    if (woken) smp64_kick_halted();
     return woken;
 }
 
@@ -822,6 +826,7 @@ int sched64_wake_tid(int tid) {
     if (tid < 0 || tid >= SCHED64_MAX_TASKS) return 0;
     if (!tasks[tid].used || !tasks[tid].blocked) return 0;
     woken_by_signal(tid);
+    smp64_kick_halted();
     return 1;
 }
 
@@ -870,6 +875,11 @@ int sched64_wake_futex(uint64_t addr, int max, uint32_t bits, int pid) {
         tasks[i].deadline  = 0;
         tasks[i].regs.rax  = tasks[i].wake_rax;
     }
+    /* A task woken here may belong to a CPU that is halted with nothing
+     * to do; it would only notice at its next timer tick, a millisecond
+     * on - which, on every round trip between a Wine client and its
+     * server, is what made four CPUs slower than one. */
+    smp64_kick_halted();
     return woken;
 }
 
