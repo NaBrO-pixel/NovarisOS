@@ -10806,6 +10806,62 @@ timeout; no congestion control beyond the peer's window; and real
 internet names and sites were never tried, because this build machine
 has no outside network.
 
+## Milestone 98 - Chromium in a window, and TCP for lossy links
+
+**A browser window on the NovarisOS desktop.** `make chrome-window`
+runs Chromium without `--headless` (`CHROME64_WINDOWED`). It opens its
+window through `winenovaris.drv` and `/dev/wm`, loads
+`https://novaris.test:18783/page.html` and draws it: the tab strip, the
+address bar ("Not secure", because the test certificate is
+self-signed), the `--no-sandbox` warning, and the page with
+`script ran: 42`. The window takes the page's `<title>`.
+`tools/screenshots.py` takes a QEMU screendump every N seconds into
+`build64/shots`. The target checks three things: Chromium's window is
+still open at the end, retitled and drawn into; and the screen changed.
+
+The first attempts showed nothing, and not every time. The window was
+created, then destroyed. `/dev/wm` kept one window per descriptor with
+no count, so a child that the browser forked to start a process exited,
+closed its inherited copy, and destroyed the browser's window. That
+freed the frames the browser still had mapped and was drawing into.
+Windows are now reference-counted: fork, dup and `SCM_RIGHTS` take a
+reference, and the last close frees the window. `/dev/wm` also logs
+each window's opening and closing, and how many pixels it drew; that
+log is what found the bug.
+
+Not done for the window: `/dev/wm` blits every window at the screen's
+origin, so there is no placement, stacking or frame; and Chromium's top
+caption strip is cut by the 23 pixels the driver reserves for a title
+bar nothing draws.
+
+**TCP for links that lose packets.**
+- **Reassembly.** Up to four segments past a gap are kept and drained
+  once it fills.
+- **Duplicate ACKs.** One is sent for each such segment, not one per
+  tick.
+- **Reno-style congestion control.** An initial window of 4 segments,
+  slow start, then congestion avoidance. A timeout drops to one segment;
+  three duplicate ACKs trigger a fast retransmit of just the missing
+  segment, and the window is halved.
+- **`snd_max`.** A go-back used to make every ACK past the reset
+  `snd_next` invalid, so a connection whose receiver had kept data past
+  a gap retried until it died. `-DNET_LOOPBACK_DROP_EVERY=N` found that.
+- **The FIN.** It now counts only once everything before it has
+  arrived. It used to count even when its own data had been refused,
+  and a retransmitted FIN was counted twice.
+
+192KB over the loopback with 20 ms each way and 1 packet in 50 lost
+took 3638 ms with Milestone 97's TCP and 2038 ms with this one. With no
+loss the two are the same. Where each loss costs a lost SYN or a
+retransmission of a retransmission, the 1-second RTO still dominates:
+there is no round-trip estimation. The 32-bit kernel's `test-inet`,
+`test-listen` and `test-winsock` pass on the shared code.
+
+**The real internet is not reachable from here.** This build machine's
+outbound traffic goes through a proxy, and QEMU's user network would
+have to go around it. That was not attempted. Real sites, real DNS and
+real certificates are for a machine with ordinary network access.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
