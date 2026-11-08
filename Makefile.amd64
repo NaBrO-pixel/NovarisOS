@@ -1338,10 +1338,17 @@ test: iso
 CHROME_NET_URL    ?= https://novaris.test:$(NET64_HTTPS)/page.html
 CHROME_NET_BUDGET ?= 300
 CHROME_NET_STALL  ?= 30
+# CHROME_NET_PROXY: an HTTP proxy for Chromium, as the guest sees it. On a
+# build machine whose traffic goes through an HTTPS proxy at
+# 127.0.0.1:PORT, http://10.0.2.2:PORT is that proxy, and with it the
+# real internet: make chrome-net CHROME_NET_URL=https://example.com/
+# CHROME_NET_PROXY=http://10.0.2.2:PORT.
+CHROME_NET_PROXY  ?=
 CHROME_NET_FLAGS   = -DNOVARIS64_FAST -DCHROME64_VERBOSE \
     -DCHROME64_URL=\"$(CHROME_NET_URL)\" \
     -DCHROME64_BUDGET_SECS=$(CHROME_NET_BUDGET)u \
-    -DCHROME64_STALL_SECS=$(CHROME_NET_STALL)
+    -DCHROME64_STALL_SECS=$(CHROME_NET_STALL) \
+    $(if $(CHROME_NET_PROXY),-DCHROME64_PROXY=\"$(CHROME_NET_PROXY)\")
 
 .PHONY: chrome-net
 chrome-net:

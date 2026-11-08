@@ -10862,6 +10862,53 @@ outbound traffic goes through a proxy, and QEMU's user network would
 have to go around it. That was not attempted. Real sites, real DNS and
 real certificates are for a machine with ordinary network access.
 
+## Milestone 99 - faster Windows programs, and the real internet
+
+**Page-aligned PE files.** Wine maps a section from its file only when the
+section's file offset is a page multiple, and reads it into private
+memory otherwise. Chromium's PE files use `FileAlignment` 0x200; for
+example, `chrome.dll`'s 284MB `.text` starts at 0x600. So every Chromium
+process read its own 320MB copy. Wine's own DLLs are built page-aligned
+and were never affected.
+
+`tools/pe_pagealign.py` rewrites a PE with each section at a page-aligned
+file offset:
+- the same bytes at the same RVAs, verified section by section;
+- `FileAlignment` and `SizeOfHeaders` set to 0x1000;
+- the debug directory's file offsets moved with their section;
+- the Authenticode certificate dropped;
+- the checksum recomputed.
+
+The initrd staging runs it on every `.dll` and `.exe` from
+`CHROMIUM64_DIR` (`PE_PAGEALIGN=0` turns it off). With the sections
+mapped, NovarisOS shares one copy of their pages between every process
+(Milestone 92's copy-on-write file mappings).
+
+Headless Chromium loading `https://novaris.test/page.html`
+(`make chrome-net`), original files against rewritten:
+
+| | original | page-aligned |
+|---|---|---|
+| boot to finish | 290 s | 223 s |
+| Chromium layer, cycles | 490G | 342G |
+| page faults | 2.25M | 0.92M |
+| pages first touched | 2.31M (~9GB) | 0.85M (~3.3GB) |
+
+On the build machine's own Wine the same rewrite took headless Chromium
+from 8-14 s to about 4 s.
+
+**The real internet.** This build machine reaches the internet only
+through an HTTPS proxy on its 127.0.0.1. QEMU's user network shows that
+address to the guest as 10.0.2.2. `make chrome-net
+CHROME_NET_URL=https://example.com/
+CHROME_NET_PROXY=http://10.0.2.2:<port>` (`CHROME64_PROXY`) gives
+Chromium the proxy, which makes the connection under its own policy.
+Chromium inside NovarisOS then printed the real `https://example.com/`
+("Example Domain") and exited 0. The proxy re-signs TLS with a CA the
+guest does not hold, so this also relies on
+`--ignore-certificate-errors`. A machine with ordinary networking needs
+no proxy: QEMU's forwarder does DNS and the guest connects directly.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the

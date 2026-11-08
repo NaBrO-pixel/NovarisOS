@@ -5292,6 +5292,15 @@ static const char* const chrome_args[] = {
     /* The helper's certificate is self-signed for novaris.test: a page
      * load that has to succeed cannot also be a lesson in trust. */
     "--ignore-certificate-errors",
+#ifdef CHROME64_PROXY
+    /* The way out to the real internet from a build machine whose traffic
+     * goes through an HTTPS proxy: QEMU's user network shows the machine's
+     * 127.0.0.1 to the guest as 10.0.2.2, so Chromium asks that proxy to
+     * CONNECT instead of connecting itself, and the proxy's policy applies
+     * as to anything else on the machine. The proxy re-signs TLS with a CA
+     * the guest does not hold - --ignore-certificate-errors above. */
+    "--proxy-server=" CHROME64_PROXY,
+#endif
 #ifdef CHROME64_VERBOSE
     /* Chromium's own account of itself, children included: 616 lines
      * for a whole successful run on the Linux host, so the serial port
