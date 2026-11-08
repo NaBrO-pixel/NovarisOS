@@ -868,8 +868,18 @@ iso: $(KERNEL) $(INITRD)
 # renderer was the one that ran out; 12G finishes with 6.7GB free.
 QEMU_RAM ?= $(if $(CHROMIUM64_DIR),12G,2G)
 
+# Hardware virtualisation when this machine has it. With KVM the guest's
+# instructions run on the real processor instead of being translated one
+# block at a time by QEMU's TCG - for Chromium, where about 80% of the
+# time is the programs' own code (Milestone 100), that is most of the
+# run. Used automatically when /dev/kvm can be opened; QEMU_ACCEL= forces
+# emulation. QEMU_EXTRA is anything else to hand QEMU.
+QEMU_KVM   ?= $(shell [ -r /dev/kvm ] && [ -w /dev/kvm ] && echo 1)
+QEMU_ACCEL ?= $(if $(QEMU_KVM),-enable-kvm -cpu host)
+QEMU_EXTRA ?=
+
 run: iso
-	qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -serial stdio
+	qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) $(QEMU_ACCEL) $(QEMU_EXTRA) -serial stdio
 
 # The bring-up test. kernel_main halts rather than exiting, so the run has
 # to be stopped from outside and judged by what reached the serial port.
@@ -906,7 +916,7 @@ test: iso
 	    --log $(BUILD_DIR)/net64.http.log & \
 	  hpid=$$!; \
 	  tools/qemu_net64.sh $(BUILD_DIR)/resolv.net64 \
-	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -display none \
+	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) $(QEMU_ACCEL) $(QEMU_EXTRA) -display none \
 	    $(NET64_QEMU) \
 	    -serial file:$(BUILD_DIR)/serial.log -no-reboot >/dev/null 2>&1 & \
 	  qpid=$$!; waited=0; \
@@ -1363,7 +1373,7 @@ chrome-net:
 	    --log $(BUILD_DIR)/net64.http.log & \
 	  hpid=$$!; \
 	  tools/qemu_net64.sh $(BUILD_DIR)/resolv.net64 \
-	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -display none \
+	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) $(QEMU_ACCEL) $(QEMU_EXTRA) -display none \
 	    $(NET64_QEMU) \
 	    -serial file:$(BUILD_DIR)/serial.log -no-reboot >/dev/null 2>&1 & \
 	  qpid=$$!; waited=0; \
@@ -1406,7 +1416,7 @@ chrome-window:
 	    --log $(BUILD_DIR)/net64.http.log & \
 	  hpid=$$!; \
 	  tools/qemu_net64.sh $(BUILD_DIR)/resolv.net64 \
-	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -display none \
+	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) $(QEMU_ACCEL) $(QEMU_EXTRA) -display none \
 	    $(NET64_QEMU) -monitor unix:$(BUILD_DIR)/chrome.mon,server,nowait \
 	    -serial file:$(BUILD_DIR)/serial.log -no-reboot >/dev/null 2>&1 & \
 	  qpid=$$!; \

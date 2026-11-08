@@ -70,8 +70,56 @@ static int spawn_and_wait(const char *label, int *out_rc)
     return status;
 }
 
-int main(void)
+/* The far side of the long-command-line check below: run as
+ * "spawn64 --count a1 ... a40" with V0..V39 added to the environment, it
+ * says whether all of it arrived. */
+static int count_mode(int argc, char **argv)
 {
+    int env = 0, last_env = 0;
+    for (char **e = environ; *e; e++) {
+        env++;
+        if (!strcmp(*e, "V39=39")) last_env = 1;
+    }
+    return (argc == 42 && !strcmp(argv[41], "a40") && env >= 40 && last_env) ? 0 : 1;
+}
+
+/* A program exec'd with more than sixteen arguments or environment
+ * variables (Milestone 101). The kernel kept sixteen of each, silently;
+ * Chromium lost its last two arguments to it, and every process the end
+ * of an ordinary environment. Run on Linux too, so both must agree. */
+static void long_command_line(const char *self)
+{
+    char *args[43], *envs[200], bufs[40][8], ebufs[40][12];
+    int n = 0, status = -1;
+    pid_t pid;
+
+    args[0] = (char *)self;
+    args[1] = "--count";
+    for (int i = 0; i < 40; i++) {
+        snprintf(bufs[i], sizeof(bufs[i]), "a%d", i + 1);
+        args[2 + i] = bufs[i];
+    }
+    args[42] = NULL;
+    for (char **e = environ; *e && n < 150; e++) envs[n++] = *e;
+    for (int i = 0; i < 40; i++) {
+        snprintf(ebufs[i], sizeof(ebufs[i]), "V%d=%d", i, i);
+        envs[n++] = ebufs[i];
+    }
+    envs[n] = NULL;
+
+    pid = fork();
+    if (pid == 0) {
+        execve(self, args, envs);
+        _exit(2);
+    }
+    waitpid(pid, &status, 0);
+    ok("execve with 41 arguments and 40 more variables delivers all of them",
+       WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc > 1 && !strcmp(argv[1], "--count")) return count_mode(argc, argv);
     int status, rc = 0;
 
     /* Unbuffered: the child of a spawn inherits whatever is sitting in
@@ -125,6 +173,17 @@ int main(void)
         ok("which is what the wineserver checks for",
            (st.st_mode & 077) == 0);
         rmdir(dir);
+    }
+
+    {
+        char self[512];
+        ssize_t l = readlink("/proc/self/exe", self, sizeof(self) - 1);
+        if (l > 0) {
+            self[l] = 0;
+            long_command_line(self);
+        } else {
+            ok("/proc/self/exe names this program", 0);
+        }
     }
 
     printf("spawn64: %d failures\n", failures);

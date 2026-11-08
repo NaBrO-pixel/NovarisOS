@@ -684,9 +684,9 @@ static void run_wine_program(const void* image, uint64_t len,
     const uint64_t STACK_PAGES = 128;
     const uint64_t EXE_BIAS    = 0x0000555555554000ULL;
     const uint64_t INTERP_BASE = 0x00007FFFF7000000ULL;
-    /* uspace64_build_stack copies sixteen argv entries; two are wine and
-     * the program, so fourteen are left for the program's own. */
-    const char* argv[17];
+    /* Wine, the program, and up to sixty-two of the program's own. It was
+     * fourteen, silently - see uspace64_build_stack. */
+    const char* argv[65];
     int nargs = 0;
     elf64_info_t exe, interp;
     uint64_t rsp = 0, i;
@@ -695,9 +695,15 @@ static void run_wine_program(const void* image, uint64_t len,
 
     argv[0] = "/usr/bin/wine";
     argv[1] = program;
-    while (args && args[nargs] && nargs < 14) {
+    while (args && args[nargs] && nargs < 62) {
         argv[2 + nargs] = args[nargs];
         nargs++;
+    }
+    if (args && args[nargs]) {
+        serial64_puts("NOVARIS64: FAIL  more than 62 arguments for ");
+        serial64_puts(program);
+        serial64_puts(" - the rest would have been dropped\n");
+        failures++;
     }
     argv[2 + nargs] = 0;
 
@@ -5275,6 +5281,11 @@ fast_wine:
  * for the page to come out right. make test supplies the network. */
 #define CHROME64_URL "https://novaris.test:18783/page.html"
 #endif
+/* The lean switches, one bit each in CHROME64_LEAN_MASK so a run can
+ * leave any of them out (they were bisected this way). */
+#ifndef CHROME64_LEAN_MASK
+#define CHROME64_LEAN_MASK 0x3FF
+#endif
 static const char* const chrome_args[] = {
 #ifndef CHROME64_WINDOWED
     "--headless",
@@ -5310,6 +5321,53 @@ static const char* const chrome_args[] = {
      * popup with reason kCrash, three times a run. Chromium's own switch,
      * checked on the Linux host to change nothing about the page. */
     "--disable-hang-monitor",
+#ifdef CHROME64_LEAN
+    /* Lean (Milestone 101, opt-in): the background services a page load
+     * does not need - update checks, Safe Browsing, sync, extensions and
+     * the rest that the DNS log showed Chromium reaching for. Measured, it
+     * halves those lookups and saves no time at all (172 s against
+     * 169-171), so the browser runs as it ships unless this is asked
+     * for. Bisecting it is what found the 16-argument limit in
+     * uspace64_build_stack. */
+#ifndef CHROME64_LEAN_NO_SWITCHES
+#if CHROME64_LEAN_MASK & 0x1
+    "--disable-background-networking",
+#endif
+#if CHROME64_LEAN_MASK & 0x2
+    "--disable-component-update",
+#endif
+#if CHROME64_LEAN_MASK & 0x4
+    "--disable-sync",
+#endif
+#if CHROME64_LEAN_MASK & 0x8
+    "--disable-default-apps",
+#endif
+#if CHROME64_LEAN_MASK & 0x10
+    "--disable-extensions",
+#endif
+#if CHROME64_LEAN_MASK & 0x20
+    "--disable-domain-reliability",
+#endif
+#if CHROME64_LEAN_MASK & 0x40
+    "--disable-client-side-phishing-detection",
+#endif
+#if CHROME64_LEAN_MASK & 0x80
+    "--no-first-run",
+#endif
+#if CHROME64_LEAN_MASK & 0x100
+    "--no-default-browser-check",
+#endif
+#if CHROME64_LEAN_MASK & 0x200
+    "--metrics-recording-only",
+#endif
+#endif
+#ifndef CHROME64_LEAN_NO_FEATURES
+    "--disable-features=Translate,OptimizationHints,MediaRouter,"
+        "DialMediaRouteProvider,CalculateNativeWinOcclusion,"
+        "AutofillServerCommunication,CertificateTransparencyComponentUpdater,"
+        "InterestFeedContentSuggestions,OptimizationGuideModelDownloading",
+#endif
+#endif
     /* The helper's certificate is self-signed for novaris.test: a page
      * load that has to succeed cannot also be a lesson in trust. */
     "--ignore-certificate-errors",
