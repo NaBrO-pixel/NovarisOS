@@ -728,7 +728,7 @@ endif
 # the previous list - which costs a build and a boot to notice, and
 # looks exactly like the fix not working.
 $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
-           $(BUILD_DIR)/forkchild64.elf $(NOVAC_CHILD) userland/mkinitrd.py \
+           $(BUILD_DIR)/forkchild64.elf $(BUILD_DIR)/spawn64.elf $(NOVAC_CHILD) userland/mkinitrd.py \
            $(BUILD_DIR)/winegui64.exe $(BUILD_DIR)/chromeprobe64.exe \
            tools/stage_wine.sh tools/wine_prefix_modules.txt \
            tools/wine_chromium_modules.txt tools/pe_pagealign.py $(INITRD_CONFIG)
@@ -738,6 +738,7 @@ $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
 	cp $(BUILD_DIR)/dynhello64.elf $(INITRD_STAGE)/dynhello64
 	mkdir -p $(INITRD_STAGE)/tmp
 	cp $(BUILD_DIR)/forkchild64.elf $(INITRD_STAGE)/tmp/forkchild64
+	cp $(BUILD_DIR)/spawn64.elf $(INITRD_STAGE)/tmp/spawn64
 	cp $(NOVAC_CHILD) $(INITRD_STAGE)/tmp/novac_child
 	@# At the paths ld.so actually searches, which were read off its own
 	@# trace rather than guessed: it tries /lib/x86_64-linux-gnu first.

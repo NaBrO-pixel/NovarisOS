@@ -176,9 +176,14 @@ int main(int argc, char **argv)
     }
 
     {
+        /* NovarisOS runs this test from a copy in the kernel, which has no
+         * file behind it, so the initrd carries one at /tmp/spawn64; on
+         * Linux it is the program itself. */
         char self[512];
-        ssize_t l = readlink("/proc/self/exe", self, sizeof(self) - 1);
-        if (l > 0) {
+        ssize_t l;
+        if (access("/tmp/spawn64", X_OK) == 0) {
+            long_command_line("/tmp/spawn64");
+        } else if ((l = readlink("/proc/self/exe", self, sizeof(self) - 1)) > 0) {
             self[l] = 0;
             long_command_line(self);
         } else {
