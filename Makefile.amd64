@@ -1358,6 +1358,62 @@ chrome-net:
 	  grep -a "chrome = \|\[inet\] pid .* tcp\|\[inet\] sock .* tcp\|\[inet\] [0-9]* sockets\|nothing sent or received\|Page load\|<p id=" \
 	      $(BUILD_DIR)/serial.log | cut -c1-240 | tail -40
 
+# Chromium with a window instead of --headless (CHROME64_WINDOWED): the
+# page drawn on NovarisOS's desktop through winenovaris.drv and /dev/wm,
+# photographed with QEMU's screendump every CHROME_WINDOW_EVERY seconds
+# once Chromium starts, into $(BUILD_DIR)/shots. It does not exit by
+# itself, so CHROME_WINDOW_BUDGET ends it. Not a test.
+CHROME_WINDOW_BUDGET ?= 300
+CHROME_WINDOW_EVERY  ?= 20
+CHROME_WINDOW_FLAGS   = -DNOVARIS64_FAST -DCHROME64_WINDOWED \
+    -DCHROME64_URL=\"$(CHROME_NET_URL)\" \
+    -DCHROME64_BUDGET_SECS=$(CHROME_WINDOW_BUDGET)u
+
+.PHONY: chrome-window
+chrome-window:
+	@[ -n "$(CHROMIUM64_DIR)" ] || (echo "chrome-window needs CHROMIUM64_DIR"; false)
+	@$(MAKE) -f Makefile.amd64 WINE64_INSTALL=1 \
+	    CFLAGS_EXTRA='$(CHROME_WINDOW_FLAGS) $(CFLAGS_EXTRA)' iso
+	@rm -f $(BUILD_DIR)/serial.log $(BUILD_DIR)/net64.status $(BUILD_DIR)/net64.http.log \
+	    $(BUILD_DIR)/chrome.mon
+	@rm -rf $(BUILD_DIR)/shots
+	@echo "nameserver 127.0.0.1" > $(BUILD_DIR)/resolv.net64
+	@python3 tools/net64_helper.py --http $(NET64_HTTP) --https $(NET64_HTTPS) \
+	    --dns $(NET64_DNS) --dns53 \
+	    --connect $(NET64_FWD) --status $(BUILD_DIR)/net64.status \
+	    --log $(BUILD_DIR)/net64.http.log & \
+	  hpid=$$!; \
+	  tools/qemu_net64.sh $(BUILD_DIR)/resolv.net64 \
+	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -display none \
+	    $(NET64_QEMU) -monitor unix:$(BUILD_DIR)/chrome.mon,server,nowait \
+	    -serial file:$(BUILD_DIR)/serial.log -no-reboot >/dev/null 2>&1 & \
+	  qpid=$$!; \
+	  python3 tools/screenshots.py $(BUILD_DIR)/chrome.mon $(BUILD_DIR)/shots \
+	      $(CHROME_WINDOW_EVERY) $(BUILD_DIR)/serial.log "NOVARIS64: --- chrome ---" & \
+	  spid=$$!; waited=0; \
+	  while [ $$waited -lt $(TEST_TIMEOUT) ]; do \
+	      grep -q "bring-up complete" $(BUILD_DIR)/serial.log 2>/dev/null && break; \
+	      kill -0 $$qpid 2>/dev/null || break; \
+	      sleep 1; waited=$$((waited+1)); \
+	  done; \
+	  sleep 3; kill $$qpid 2>/dev/null; wait $$qpid 2>/dev/null || true; \
+	  kill $$spid $$hpid 2>/dev/null; wait $$spid $$hpid 2>/dev/null || true; \
+	  echo "--- after $$waited seconds; requests the host saw:"; \
+	  grep "^http" $(BUILD_DIR)/net64.http.log 2>/dev/null; \
+	  echo "--- screenshots:"; ls $(BUILD_DIR)/shots; \
+	  grep -a "chrome = \|\[wm\].*Chromium" $(BUILD_DIR)/serial.log
+	@# What has to be true for the window to count: Chromium's window
+	@# still open at the end, retitled with the page's own <title>, and
+	@# drawn into; and the last screenshot differs from the first, which
+	@# was taken before Chromium started.
+	@grep -aq '\[wm\] still open: window [0-9]* [0-9]*x[0-9]* "NovarisOS over TCP - Chromium" damages [1-9]' \
+	    $(BUILD_DIR)/serial.log \
+	    || { echo "FAIL: no Chromium window showing the page at the end"; exit 1; }
+	@first=`ls $(BUILD_DIR)/shots/*.png | head -1`; last=`ls $(BUILD_DIR)/shots/*.png | tail -1`; \
+	    ! cmp -s "$$first" "$$last" \
+	    || { echo "FAIL: the screen never changed"; exit 1; }
+	@echo "PASS: Chromium shows the page in a window on the NovarisOS desktop ($(BUILD_DIR)/shots)"
+
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR) $(ISO)
 

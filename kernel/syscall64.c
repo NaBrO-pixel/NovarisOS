@@ -345,6 +345,9 @@ static void fd_take_ref(int fd) {
     if (fd < 0 || fd >= FD_MAX || !fds[fd].used) return;
     if (fds[fd].kind == FD64_FILE) {
         ramfs64_ref_node(fds[fd].node);
+        if (fds[fd].node >= 0 && ramfs64_device(fds[fd].node) == RAMFS64_DEV_WM &&
+            fds[fd].pos)
+            wmdev64_ref((int)fds[fd].pos - 1);
     } else {
         pipe64_ref(fds[fd].rx, 1, 0);
         pipe64_ref(fds[fd].tx, 0, 1);
@@ -4839,8 +4842,13 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                          * returns - and does - so a reference taken only
                          * on arrival would be taken on a pipe that had
                          * already been given back. */
-                        if (fds[sfd].kind == FD64_FILE)
+                        if (fds[sfd].kind == FD64_FILE) {
                             ramfs64_ref_node(fds[sfd].node);
+                            if (fds[sfd].node >= 0 &&
+                                ramfs64_device(fds[sfd].node) == RAMFS64_DEV_WM &&
+                                fds[sfd].pos)
+                                wmdev64_ref((int)fds[sfd].pos - 1);
+                        }
                         else {
                             pipe64_ref(fds[sfd].rx, 1, 0);
                             pipe64_ref(fds[sfd].tx, 0, 1);
