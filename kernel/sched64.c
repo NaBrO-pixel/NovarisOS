@@ -130,7 +130,27 @@ static inline void     write_gs_base(uint64_t v) { write_msr_base(IA32_GS_BASE, 
 static task64_t tasks[SCHED64_MAX_TASKS];
 static int      task_total;
 static int      current = -1;
+/* One past the highest slot handed out since sched64_init. Every scan of
+ * the table stops here rather than at SCHED64_MAX_TASKS: the table has
+ * room for 1024 tasks and a busy run has a few dozen, and the scans run on
+ * every timer tick (deadlines) and every wake - a pipe write, a futex
+ * wake - so a thousand empty slots were walked tens of thousands of times
+ * a second. */
+static int task_hwm;
+
 static uint64_t switch_count;
+
+/* How long a task keeps the processor before the timer takes it away, in
+ * ticks (milliseconds). It was one: every tick switched, so with forty
+ * Chromium tasks runnable the machine changed task a thousand times a
+ * second, and each change between processes reloads CR3 - which under
+ * QEMU's emulation throws the whole software TLB away, to be refilled a
+ * page walk at a time. A task that blocks still gives the processor up
+ * at once; this only bounds how long one that does not may run. */
+#ifndef SCHED64_SLICE_TICKS
+#define SCHED64_SLICE_TICKS 4
+#endif
+static uint64_t slice_start;
 static uint64_t stop_after;
 static uint64_t stop_rip;
 
@@ -144,6 +164,7 @@ void sched64_init(void) {
     *(uint32_t*)(fpu_initial + 24) = 0x1F80;
 
     for (int i = 0; i < SCHED64_MAX_TASKS; i++) tasks[i].used = 0;
+    task_hwm = 0;
     task_total = 0;
     current = -1;
     switch_count = 0;
@@ -164,7 +185,7 @@ static void tasks_full(void) {
     int blocked = 0, running = 0;
     if (said) return;
     said = 1;
-    for (int k = 0; k < SCHED64_MAX_TASKS; k++)
+    for (int k = 0; k < task_hwm; k++)
         if (tasks[k].blocked) blocked++; else running++;
     serial64_puts("NOVARIS64: [sched] all ");
     serial64_putdec((uint64_t)SCHED64_MAX_TASKS);
@@ -192,7 +213,7 @@ void sched64_dump_blocked(void) {
     int live = 0, blocked = 0;
 
     serial64_puts("\nNOVARIS64: [tasks] --- every live task at the deadline ---\n");
-    for (int i = 0; i < SCHED64_MAX_TASKS; i++) {
+    for (int i = 0; i < task_hwm; i++) {
         if (!tasks[i].used) continue;
         live++;
         if (tasks[i].blocked) blocked++;
@@ -246,14 +267,14 @@ int sched64_blocked_pid(int i) {
 
 int sched64_pid_tasks(int pid) {
     int n = 0;
-    for (int i = 0; i < SCHED64_MAX_TASKS; i++)
+    for (int i = 0; i < task_hwm; i++)
         if (tasks[i].used && tasks[i].pid == pid) n++;
     return n;
 }
 
 int sched64_space_in_use(uint64_t pml4_phys) {
     if (!pml4_phys) return 1;                  /* never free nothing */
-    for (int i = 0; i < SCHED64_MAX_TASKS; i++)
+    for (int i = 0; i < task_hwm; i++)
         if (tasks[i].used && tasks[i].space.pml4_phys == pml4_phys)
             return 1;
     return 0;
@@ -264,6 +285,7 @@ int sched64_add(uint64_t rip, uint64_t rsp, uint64_t arg,
     int i;
 
     for (i = 0; i < SCHED64_MAX_TASKS; i++) if (!tasks[i].used) break;
+    if (i < SCHED64_MAX_TASKS && i + 1 > task_hwm) task_hwm = i + 1;
     if (i == SCHED64_MAX_TASKS) { tasks_full(); return -1; }
 
     for (uint64_t* p = (uint64_t*)&tasks[i].regs;
@@ -312,6 +334,7 @@ int sched64_add_frame_for(const registers64_t* regs, const vmspace64_t* space,
     int i;
 
     for (i = 0; i < SCHED64_MAX_TASKS; i++) if (!tasks[i].used) break;
+    if (i < SCHED64_MAX_TASKS && i + 1 > task_hwm) task_hwm = i + 1;
     if (i == SCHED64_MAX_TASKS) { tasks_full(); return -1; }
 
     tasks[i].pid       = pid;
@@ -402,7 +425,7 @@ int sched64_exit_current(registers64_t* out_regs, vmspace64_t* out_space,
      * Nothing had exercised it: exit(2) ends a thread, and every program
      * here until now was single-threaded or ended with exit_group. It is
      * fixed on sight rather than left for the run that finds it. */
-    for (next = 0; next < SCHED64_MAX_TASKS; next++)
+    for (next = 0; next < task_hwm; next++)
         if (tasks[next].used && !tasks[next].blocked) break;
 
     /* Nothing runnable at this instant is not the same as nothing left
@@ -417,14 +440,15 @@ int sched64_exit_current(registers64_t* out_regs, vmspace64_t* out_space,
      * while the timer can still interrupt and something is genuinely
      * waiting on it. Otherwise there really is nothing to come back
      * for. */
-    if (next == SCHED64_MAX_TASKS && !idt64_irq_is_masked(0) &&
+    if (next == task_hwm && !idt64_irq_is_masked(0) &&
         any_deadline())
         next = idle_until_runnable();
 
-    if (next < 0 || next >= SCHED64_MAX_TASKS) { current = -1; return 0; }
+    if (next < 0 || next >= task_hwm) { current = -1; return 0; }
 
     /* Nothing to save: the task that was running has ended. */
     current = next;
+    slice_start = clock64_ticks();
     fpu_restore(tasks[next].fpu);
     write_gs_base(tasks[next].gs_base);
     if (out_regs)     *out_regs     = tasks[next].regs;
@@ -439,7 +463,7 @@ int sched64_exit_current(registers64_t* out_regs, vmspace64_t* out_space,
  * leader of a run, whose ending ends the run. Returns how many went. */
 int sched64_remove_pid(int pid) {
     int n = 0;
-    for (int i = 0; i < SCHED64_MAX_TASKS; i++) {
+    for (int i = 0; i < task_hwm; i++) {
         if (!tasks[i].used || tasks[i].pid != pid) continue;
         tasks[i].used = 0;
         if (task_total > 0) task_total--;
@@ -458,7 +482,7 @@ int sched64_exit_process(int pid, registers64_t* out_regs,
      * running in an address space nobody owns - and, when a test's two
      * tasks belong to the same process, would hand the CPU to the other
      * one instead of finishing the run. */
-    for (int i = 0; i < SCHED64_MAX_TASKS; i++) {
+    for (int i = 0; i < task_hwm; i++) {
         if (!tasks[i].used || tasks[i].pid != pid) continue;
         tasks[i].used = 0;
         if (task_total > 0) task_total--;
@@ -467,17 +491,18 @@ int sched64_exit_process(int pid, registers64_t* out_regs,
     /* Runnable, for the same reason as above - and idle rather than
      * give up, for the same reason as above too: one process ending
      * while another sleeps on the clock is not the end of the run. */
-    for (next = 0; next < SCHED64_MAX_TASKS; next++)
+    for (next = 0; next < task_hwm; next++)
         if (tasks[next].used && !tasks[next].blocked) break;
 
-    if (next == SCHED64_MAX_TASKS && !idt64_irq_is_masked(0) &&
+    if (next == task_hwm && !idt64_irq_is_masked(0) &&
         any_deadline())
         next = idle_until_runnable();
 
-    if (next < 0 || next >= SCHED64_MAX_TASKS) { current = -1; return 0; }
+    if (next < 0 || next >= task_hwm) { current = -1; return 0; }
 
     /* Nothing to save: every thread of that process has ended. */
     current = next;
+    slice_start = clock64_ticks();
     fpu_restore(tasks[next].fpu);
     write_gs_base(tasks[next].gs_base);
     if (out_regs)    *out_regs    = tasks[next].regs;
@@ -497,7 +522,7 @@ static volatile int idling;
 volatile int sched64_external_wakers;
 
 static int first_runnable(void) {
-    for (int i = 0; i < SCHED64_MAX_TASKS; i++)
+    for (int i = 0; i < task_hwm; i++)
         if (tasks[i].used && !tasks[i].blocked) return i;
     return -1;
 }
@@ -509,7 +534,7 @@ static int first_runnable(void) {
  * future; if none has, and nothing is runnable, then nothing will ever
  * happen and halting would be a hang. */
 static int any_deadline(void) {
-    for (int i = 0; i < SCHED64_MAX_TASKS; i++)
+    for (int i = 0; i < task_hwm; i++)
         if (tasks[i].used && tasks[i].blocked && tasks[i].deadline) return 1;
     return 0;
 }
@@ -521,7 +546,7 @@ static int any_deadline(void) {
 static void expire_deadlines(void) {
     uint64_t now = clock64_ticks();
 
-    for (int i = 0; i < SCHED64_MAX_TASKS; i++) {
+    for (int i = 0; i < task_hwm; i++) {
         if (!tasks[i].used || !tasks[i].blocked) continue;
         if (!tasks[i].deadline || now < tasks[i].deadline) continue;
         tasks[i].blocked   = 0;
@@ -540,8 +565,18 @@ static void expire_deadlines(void) {
  * instruction precisely so that the halt cannot be missed. cli again on
  * the way out, because the caller is still inside a syscall and the
  * rest of it expects interrupts off. */
+/* Cycles spent halted with nothing to run, for the [cycles] report. */
+volatile uint64_t sched64_idle_cycles;
+
+static inline uint64_t idle_tsc(void) {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
 static int idle_until_runnable(void) {
     int n;
+    uint64_t t0 = idle_tsc();
 
     idling = 1;
     for (;;) {
@@ -552,12 +587,13 @@ static int idle_until_runnable(void) {
         if (!any_deadline() && !sched64_external_wakers) { n = -1; break; }
     }
     idling = 0;
+    sched64_idle_cycles += idle_tsc() - t0;
     return n;
 }
 
 static int next_task(int from) {
-    for (int n = 1; n <= SCHED64_MAX_TASKS; n++) {
-        int i = (from + n) % SCHED64_MAX_TASKS;
+    for (int n = 1; n <= task_hwm; n++) {
+        int i = (from + n) % task_hwm;
         if (tasks[i].used && !tasks[i].blocked) return i;
     }
     return from;
@@ -675,6 +711,7 @@ int sched64_block_until_ex(const registers64_t* regs, uint64_t addr,
     tasks[current].gs_base = read_gs_base();
     fpu_save(tasks[current].fpu);
     current = next;
+    slice_start = clock64_ticks();
     fpu_restore(tasks[next].fpu);
     write_gs_base(tasks[next].gs_base);
     if (out_regs)    *out_regs    = tasks[next].regs;
@@ -718,6 +755,7 @@ int sched64_yield_current(const registers64_t* regs, registers64_t* out_regs,
     tasks[current].gs_base = read_gs_base();
     fpu_save(tasks[current].fpu);
     current = next;
+    slice_start = clock64_ticks();
     fpu_restore(tasks[next].fpu);
     write_gs_base(tasks[next].gs_base);
     if (out_regs)    *out_regs    = tasks[next].regs;
@@ -740,7 +778,7 @@ int sched64_yield_current(const registers64_t* regs, registers64_t* out_regs,
 int sched64_wake_pid(int pid) {
     int woken = 0;
 
-    for (int i = 0; i < SCHED64_MAX_TASKS; i++) {
+    for (int i = 0; i < task_hwm; i++) {
         if (!tasks[i].used || !tasks[i].blocked) continue;
         if (tasks[i].pid != pid) continue;
         woken_by_signal(i);
@@ -773,7 +811,7 @@ int sched64_wake_bits(uint64_t addr, int max, uint32_t bits) {
 int sched64_wake_futex(uint64_t addr, int max, uint32_t bits, int pid) {
     int woken = 0;
 
-    for (int i = 0; i < SCHED64_MAX_TASKS && woken < max; i++) {
+    for (int i = 0; i < task_hwm && woken < max; i++) {
         if (!tasks[i].used || !tasks[i].blocked) continue;
         if (tasks[i].wait_addr != addr) continue;
         /* A private futex is an address in one process, and the same
@@ -799,7 +837,7 @@ int sched64_wake_futex(uint64_t addr, int max, uint32_t bits, int pid) {
      * on one key and re-checks its whole set when anything anywhere
      * changes. Wider than it needs to be, and still far cheaper than
      * the spin it replaces; a spurious wake costs one re-check. */
-    for (int i = 0; i < SCHED64_MAX_TASKS; i++) {
+    for (int i = 0; i < task_hwm; i++) {
         if (!tasks[i].used || !tasks[i].blocked) continue;
         if (tasks[i].wait_addr != SCHED64_COND_KEY) continue;
         tasks[i].blocked   = 0;
@@ -822,6 +860,7 @@ void sched64_tick(registers64_t* frame) {
     if (idling) return;
 
     if (current < 0 || task_total < 2) return;
+    if (clock64_ticks() - slice_start < SCHED64_SLICE_TICKS) return;
 
     next = next_task(current);
     if (next == current) return;
@@ -835,6 +874,7 @@ void sched64_tick(registers64_t* frame) {
     fpu_save(tasks[current].fpu);
 
     current = next;
+    slice_start = clock64_ticks();
     fpu_restore(tasks[current].fpu);
     write_gs_base(tasks[current].gs_base);
 

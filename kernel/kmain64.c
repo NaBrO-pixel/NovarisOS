@@ -383,7 +383,28 @@ void kmain64_fault_stats(uint64_t* faults, uint64_t* cow, uint64_t* segv) {
     *segv   = segv_delivered;
 }
 
+/* Cycles spent in the page-fault handler, and how many faults, for the
+ * [cycles] report (syscall64.c resets them with the call counters). */
+volatile uint64_t pf_cycles_total, pf_count_total;
+
+static inline uint64_t pf_tsc(void) {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static void page_fault_body(registers64_t* r);
+
 static void page_fault_handler(registers64_t* r) {
+    uint64_t t0 = pf_tsc();
+    page_fault_body(r);
+    /* Not reached for a fault that ends in a signal or a kill - those
+     * leave through the scheduler - which is the rare case. */
+    pf_cycles_total += pf_tsc() - t0;
+    pf_count_total++;
+}
+
+static void page_fault_body(registers64_t* r) {
     /* Only this fault's own refusal may count as running out. */
     (void)pmm64_take_user_oom();
     pf_hits++;

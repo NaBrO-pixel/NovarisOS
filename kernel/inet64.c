@@ -76,6 +76,10 @@ typedef struct {
 } isock_t;
 
 static isock_t socks[INET64_MAX];
+/* One past the highest slot ever handed out: every scan stops here. The
+ * pump walks the table on every tick and every poll, and a browser's few
+ * dozen sockets sat at the start of 512 slots. */
+static int sock_hwm;
 static int      card;           /* a card was found */
 static int      ready;          /* net_init has run */
 static uint16_t next_ephemeral = 32768;
@@ -95,7 +99,7 @@ static void full_once(const char* what, int size) {
     int by_state[6] = { 0 };
     if (said) return;
     said = 1;
-    for (int i = 0; i < INET64_MAX; i++) by_state[socks[i].state]++;
+    for (int i = 0; i < sock_hwm; i++) by_state[socks[i].state]++;
     serial64_puts("NOVARIS64: [inet] all ");
     serial64_putdec((uint64_t)size);
     serial64_puts(" ");
@@ -388,7 +392,7 @@ static int pump_one(isock_t* k) {
 
 static int pump(void) {
     int moved = 0;
-    for (int i = 0; i < INET64_MAX; i++) {
+    for (int i = 0; i < sock_hwm; i++) {
         isock_t* k = &socks[i];
         if (k->state == S_FREE) continue;
         if (k->type == INET64_DGRAM) {
@@ -406,7 +410,7 @@ static int pump(void) {
 }
 
 static int active(void) {
-    for (int i = 0; i < INET64_MAX; i++)
+    for (int i = 0; i < sock_hwm; i++)
         if (socks[i].state != S_FREE) return 1;
     return 0;
 }
@@ -450,7 +454,7 @@ void inet64_timer(void) {
 /* --- sockets ------------------------------------------------------------ */
 
 void inet64_reset(void) {
-    for (int i = 0; i < INET64_MAX; i++) {
+    for (int i = 0; i < sock_hwm; i++) {
         isock_t* k = &socks[i];
         if (k->state == S_FREE) continue;
         if (k->state == S_LISTEN) {
@@ -465,6 +469,7 @@ void inet64_reset(void) {
         k->rx = k->tx = -1;
     }
     sched64_external_wakers = 0;
+    sock_hwm = 0;
 }
 
 int inet64_socket(int type) {
@@ -474,6 +479,7 @@ int inet64_socket(int type) {
     for (int i = 0; i < INET64_MAX; i++) {
         isock_t* k = &socks[i];
         if (k->state != S_FREE) continue;
+        if (i + 1 > sock_hwm) sock_hwm = i + 1;
         kmemset(k, 0, sizeof(*k));
         k->state = S_NEW;
         k->type = type;
@@ -519,7 +525,7 @@ int inet64_rx(int s) { return inet64_valid(s) ? socks[s].rx : -1; }
 int inet64_tx(int s) { return inet64_valid(s) ? socks[s].tx : -1; }
 
 static int port_taken(int type, uint16_t port) {
-    for (int i = 0; i < INET64_MAX; i++) {
+    for (int i = 0; i < sock_hwm; i++) {
         isock_t* k = &socks[i];
         if (k->state == S_FREE || k->type != type) continue;
         if (k->lport == port && (k->state == S_LISTEN || k->udp_bound ||
@@ -784,7 +790,7 @@ int64_t inet64_recvfrom(int s, void* buf, uint64_t n, int peek,
 
 int inet64_sockets_open(void) {
     int n = 0;
-    for (int i = 0; i < INET64_MAX; i++) if (socks[i].state != S_FREE) n++;
+    for (int i = 0; i < sock_hwm; i++) if (socks[i].state != S_FREE) n++;
     return n;
 }
 
@@ -950,7 +956,7 @@ void inet64_report(void) {
     static const char* const names[] = { "free", "new", "listen", "connecting",
                                          "connected", "done" };
     int n = 0;
-    for (int i = 0; i < INET64_MAX; i++) {
+    for (int i = 0; i < sock_hwm; i++) {
         isock_t* k = &socks[i];
         if (k->state == S_FREE) continue;
         n++;
@@ -1030,7 +1036,7 @@ int inet64_stalled(uint64_t ticks) {
     static int said;
     uint64_t now = clock64_ticks();
     if (said) return 0;
-    for (int i = 0; i < INET64_MAX; i++) {
+    for (int i = 0; i < sock_hwm; i++) {
         isock_t* k = &socks[i];
         if (k->state != S_CONNECTED || k->type != INET64_STREAM) continue;
         if (k->bytes_out || k->bytes_in) continue;

@@ -32,7 +32,15 @@ void vmspace64_kernel_space(vmspace64_t* vs) {
     vs->pml4_phys = read_cr3() & ADDR_MASK;
 }
 
+/* A switch to the space that is already loaded - another thread of the
+ * same process - leaves CR3 alone. Loading it again would discard every
+ * TLB entry for nothing, and under emulation that discard is a software
+ * TLB rebuilt one page walk at a time. Nothing here relies on a switch to
+ * flush: an edit to the current space invalidates its own entry
+ * (invlpg), an edit to another space loads that space and then the old
+ * one again, and fork reloads CR3 itself. */
 void vmspace64_switch(const vmspace64_t* vs) {
+    if ((read_cr3() & ADDR_MASK) == vs->pml4_phys) return;
     write_cr3(vs->pml4_phys);
 }
 

@@ -415,15 +415,22 @@ static void fd_release(int fd) {
  * fork, SCM_RIGHTS - copies `pos` and the ends together. */
 static int user_range_ok(uint64_t addr, uint64_t len);
 
-static void inet_fd_sync(int fd) {
+/* The descriptor's half of inet_fd_sync: take the socket's pipes if it
+ * has them now. No polling - poll(2) turns the crank once for all its
+ * descriptors and then attaches each. */
+static void inet_fd_attach(int fd) {
     int s = fds[fd].sock;
-    inet64_poll();
     if (fds[fd].pos || inet64_rx(s) < 0) return;
     fds[fd].rx  = inet64_rx(s);
     fds[fd].tx  = inet64_tx(s);
     fds[fd].pos = 1;
     pipe64_ref(fds[fd].rx, 1, 0);
     pipe64_ref(fds[fd].tx, 0, 1);
+}
+
+static void inet_fd_sync(int fd) {
+    inet64_poll();
+    inet_fd_attach(fd);
 }
 
 static int fd_is_inet(uint64_t fd) {
@@ -2888,6 +2895,9 @@ static const char* const mapk_name[MAPK_N] = {
 static int mmap_kind;
 static uint64_t mapk_cycles[MAPK_N], mapk_calls[MAPK_N], mapk_pages[MAPK_N];
 
+extern volatile uint64_t pf_cycles_total, pf_count_total;
+extern volatile uint64_t sched64_idle_cycles;
+
 static inline uint64_t tsc64(void) {
     uint32_t lo, hi;
     __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
@@ -2947,6 +2957,7 @@ struct pollfd64 { int fd; short events; short revents; };
 static uint64_t do_poll(const syscall64_args_t* args, uint64_t nr,
                         struct pollfd64* pfds, uint64_t n, int64_t timeout) {
     uint64_t ready = 0;
+    int polled_net = 0;
 
     if (n > FD_MAX * 2) return (uint64_t)-22;      /* -EINVAL */
 
@@ -2961,7 +2972,11 @@ static uint64_t do_poll(const syscall64_args_t* args, uint64_t nr,
 
         if (fds[fd].kind == FD64_INET) {
             int s = fds[fd].sock;
-            inet_fd_sync(fd);
+            /* The stack was polled once for this whole call, above:
+             * once per inet descriptor cost the wineserver, which polls
+             * a copy of every socket its clients hold, most of a poll. */
+            if (!polled_net) { inet64_poll(); polled_net = 1; }
+            inet_fd_attach(fd);
             if (inet64_type(s) == INET64_DGRAM) {
                 if (inet64_dgram_ready(s)) got |= POLL64_IN;
                 got |= POLL64_OUT;
@@ -6916,6 +6931,9 @@ void syscall64_reset_calls(void) {
     for (int i = 0; i < 512; i++) { calls_by_nr[i] = 0; cycles_by_nr[i] = 0; }
     for (int i = 0; i < MAPK_N; i++) mapk_cycles[i] = mapk_calls[i] = mapk_pages[i] = 0;
     calls_reset_tsc = tsc64();
+    pf_cycles_total = 0;
+    pf_count_total = 0;
+    sched64_idle_cycles = 0;
     kmain64_fault_stats(&faults_at_reset[0], &faults_at_reset[1],
                         &faults_at_reset[2]);
     kmain64_segv_reset();
@@ -7074,6 +7092,18 @@ void syscall64_report_calls(void) {
         serial64_putdec(in_sys / 1000000u);
         serial64_puts("M in syscalls (");
         serial64_putdec(elapsed ? in_sys * 100 / elapsed : 0);
+        serial64_puts("%), ");
+        serial64_putdec(pf_cycles_total / 1000000u);
+        serial64_puts("M in ");
+        serial64_putdec(pf_count_total);
+        serial64_puts(" page faults (");
+        serial64_putdec(elapsed ? pf_cycles_total * 100 / elapsed : 0);
+        serial64_puts("%, ");
+        serial64_putdec(pf_count_total ? pf_cycles_total / pf_count_total : 0);
+        serial64_puts(" each), ");
+        serial64_putdec(sched64_idle_cycles / 1000000u);
+        serial64_puts("M idle (");
+        serial64_putdec(elapsed ? sched64_idle_cycles * 100 / elapsed : 0);
         serial64_puts("%); costliest:");
         static int took[512];
         for (int i = 0; i < 512; i++) took[i] = 0;
