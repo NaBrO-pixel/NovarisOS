@@ -11076,7 +11076,8 @@ browser - and its threads share a CPU. Spreading a process's threads over
 CPUs is the next step and a larger one: a page-table change would have to
 be flushed from every CPU running that process (TLB shootdown), and its
 page faults and memory calls would need a lock of their own. `QEMU_SMP`
-stays 1 by default; `QEMU_SMP=4` works for the whole sequence.
+stays 1 by default; with `QEMU_SMP=4` the whole `make test` passes
+(32 PASS, 0 FAIL), as it does on one.
 
 Also here: a sampling timer on CPU 0 (its LAPIC, since the PIT's ticks
 are lost), and `-DNOVARIS64_IO_COUNT` to count port I/O by port - which
