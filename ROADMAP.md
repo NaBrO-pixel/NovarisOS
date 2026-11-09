@@ -11084,6 +11084,41 @@ are lost), and `-DNOVARIS64_IO_COUNT` to count port I/O by port - which
 showed the guest makes only 4M port accesses a run, so the 264M times
 QEMU's profile shows its device lock taken are QEMU's own.
 
+## Milestone 103 - where the browser's time goes, and a cheaper poll
+
+Before spreading a process's threads over CPUs - the step Milestone 102
+named - the sampler was extended to threads, to see what it could win. On
+4 CPUs, CPU 0 carried the browser (47 s sampled) and the wineserver (34 s);
+of the browser's 47 s, 21 s were its main thread and the other 26 s were
+spread thinly over a dozen more. So spreading threads could take at most
+about 25 s off CPU 0, and it needs TLB shootdowns, a way to stop a
+process's threads on other CPUs before exit_group or execve tears its
+address space down, and a lock for its page faults and memory calls.
+
+A cheaper version of the same idea was tried first: the wineserver on a
+CPU of its own (`-DSMP64_SERVER_CPU=1`). It was slower - 166 s and 154 s
+against 137 s in the same batch - because the browser's and the server's
+kernel work then compete for the kernel lock instead of taking turns, and
+CPU 0's spinning went from 6% to 19%. Threads of one process on several
+CPUs would compete the same way for as long as most of their syscalls
+take the lock, so that step waits for more of the kernel to come out from
+under it.
+
+What did pay was making the kernel lock's longest holder cheaper. The
+wineserver's `poll` cost 117,000 cycles a call on one CPU and up to
+193,000 on four. Every `fds[...]` in `syscall64.c` is a
+`proc64_current()`, which scanned all 128 process slots, several times
+per descriptor across a few hundred descriptors. The current process's
+slot is remembered per CPU now (and checked on each use), and `do_poll`
+looks its table up once:
+
+| | before | now |
+|---|---|---|
+| `poll`, cycles a call, 1 CPU | 117,000 | 55,000 |
+| `poll`, cycles a call, 4 CPUs | 164,000-193,000 | 73,000 |
+| 1 CPU, boot to the page | 173-199 s | 159 s |
+| 4 CPUs, boot to the page | 137-173 s | 135-148 s |
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the

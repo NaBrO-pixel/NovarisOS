@@ -234,6 +234,9 @@ static volatile int spreading;
  * stay with it (proc64.c), so a process's page tables are only ever
  * loaded on one CPU and nothing has to tell the others to flush their
  * TLBs. Returns -1 while not spreading: the process stays where it is. */
+#ifndef SMP64_SERVER_CPU
+#define SMP64_SERVER_CPU 0
+#endif
 int smp64_pick_cpu_for(int self) {
     int best = -1, best_n = 0;
     if (!spreading || ncpus < 2) return -1;
@@ -244,7 +247,7 @@ int smp64_pick_cpu_for(int self) {
      * Nothing is lost in parallel: the two take turns anyway. */
     {
         const char* comm = proc64_comm_of(self);
-        if (comm && kstrcmp(comm, "wineserver") == 0) return 0;
+        if (comm && kstrcmp(comm, "wineserver") == 0) return SMP64_SERVER_CPU;
     }
     spread_next = (spread_next + 1) % ncpus;
     for (int k = 0; k < ncpus; k++) {
@@ -252,6 +255,7 @@ int smp64_pick_cpu_for(int self) {
         /* The bootstrap CPU has the leader, the wineserver, the clock
          * and the network already: it counts double. */
         int n = proc64_count_on(c, self) * (c == 0 ? 2 : 1);
+        if (SMP64_SERVER_CPU && c == SMP64_SERVER_CPU) n += 1000;   /* the server's own */
         if (best < 0 || n < best_n) { best = c; best_n = n; }
     }
     return best;
@@ -440,6 +444,10 @@ static uint64_t user_ms[SMP64_MAX_CPUS], kernel_ms[SMP64_MAX_CPUS];
 static uint64_t clock_at_start;
 static volatile int accounting;
 static struct { int pid, cpu; uint64_t ms; char comm[16]; } by_proc[64];
+/* And by thread, for knowing whether a busy process's work is spread
+ * over its threads or sits in one of them. */
+static struct { int tid, pid; uint64_t ms; } by_task[128];
+extern int sched64_current(void);
 extern int proc64_current_pid(void);
 void smp64_note_tick(int cpu, const void* frame_, int ms) {
     const registers64_t* frame = (const registers64_t*)frame_;
@@ -448,6 +456,15 @@ void smp64_note_tick(int cpu, const void* frame_, int ms) {
     if ((frame->cs & 3) != 3) { kernel_ms[cpu] += (uint64_t)ms; return; }
     user_ms[cpu] += (uint64_t)ms;
     pid = proc64_current_pid();
+    {
+        int tid = sched64_current(), j, fj = -1;
+        for (j = 0; j < 128; j++) {
+            if (by_task[j].ms && by_task[j].tid == tid && by_task[j].pid == pid) break;
+            if (!by_task[j].ms && fj < 0) fj = j;
+        }
+        if (j == 128 && fj >= 0) { j = fj; by_task[j].tid = tid; by_task[j].pid = pid; }
+        if (j < 128) by_task[j].ms += (uint64_t)ms;
+    }
     for (i = 0; i < 64; i++) {
         if (by_proc[i].ms && by_proc[i].pid == pid && by_proc[i].cpu == cpu) break;
         if (!by_proc[i].ms && free_i < 0) free_i = i;
@@ -471,6 +488,7 @@ void smp64_start_scheduling(void) {
      * the comparison. */
     for (int c = 0; c < SMP64_MAX_CPUS; c++) user_ms[c] = kernel_ms[c] = 0;
     for (int i = 0; i < 64; i++) by_proc[i].ms = 0;
+    for (int i = 0; i < 128; i++) by_task[i].ms = 0;
     accounting = 1;
     if (lapic && this_cpu() == 0) lapic_sampler_start();
     for (int c = 0; c < SMP64_MAX_CPUS; c++) smp64_timer_irqs[c] = 0;
@@ -667,7 +685,26 @@ void smp64_note_wake(int cpu) {
 uint32_t io64_counts[65536];
 #endif
 
+static void report_tasks(void) {
+    serial64_puts("NOVARIS64: [smp] busiest threads (tid/pid:ms):");
+    for (int k = 0; k < 16; k++) {
+        int best = -1;
+        for (int i = 0; i < 128; i++)
+            if (by_task[i].ms && (best < 0 || by_task[i].ms > by_task[best].ms)) best = i;
+        if (best < 0) break;
+        serial64_putc(' ');
+        serial64_putdec((uint64_t)by_task[best].tid);
+        serial64_putc('/');
+        serial64_putdec((uint64_t)by_task[best].pid);
+        serial64_putc(':');
+        serial64_putdec(by_task[best].ms);
+        by_task[best].ms = 0;
+    }
+    serial64_putc('\n');
+}
+
 static void report_procs(void) {
+    report_tasks();
 #ifdef NOVARIS64_IO_COUNT
     serial64_puts("NOVARIS64: [io] busiest ports:");
     for (int k = 0; k < 10; k++) {

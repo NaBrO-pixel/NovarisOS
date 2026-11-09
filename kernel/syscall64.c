@@ -3176,10 +3176,22 @@ static uint64_t dispatch(syscall64_args_t* args) {
  * wait bookkeeping. */
 struct pollfd64 { int fd; short events; short revents; };
 
+/* The descriptor table looked up once for the whole poll, not once per
+ * field per descriptor: a wineserver polls a few hundred at a time, and
+ * each `fds[...]` is a proc64_current(). Same test as fd_is_stream. */
+static proc64_fd_t* current_fd_table(void) { return &fds[0]; }
+#undef fds
+#define fds poll_fds
+#define fd_is_stream(f) \
+    (fds[f].kind == FD64_PIPE || \
+     ((fds[f].kind == FD64_SOCKET || fds[f].kind == FD64_INET) && \
+      (fds[f].rx >= 0 || fds[f].tx >= 0)))
+
 static uint64_t do_poll(const syscall64_args_t* args, uint64_t nr,
                         struct pollfd64* pfds, uint64_t n, int64_t timeout) {
     uint64_t ready = 0;
     int polled_net = 0;
+    proc64_fd_t* poll_fds = current_fd_table();
 
     if (n > FD_MAX * 2) return (uint64_t)-22;      /* -EINVAL */
 
@@ -3258,6 +3270,9 @@ static uint64_t do_poll(const syscall64_args_t* args, uint64_t nr,
                         timeout < 0 ? 0    /* forever */
                                     : clock64_ticks() + (uint64_t)timeout);
 }
+#undef fd_is_stream
+#undef fds
+#define fds    (proc64_current()->fds)
 
 static uint64_t dispatch_body(syscall64_args_t* args) {
     uint64_t nr = args->nr;

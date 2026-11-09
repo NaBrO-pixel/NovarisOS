@@ -22,14 +22,39 @@ void proc64_init(void) {
     next_pid = 1;
 }
 
+static int current_slot_index(void);
+
 static proc64_t* slot_for(int pid) {
+    if (pid >= 0 && pid == current_pid) {
+        int c = current_slot_index();
+        return c >= 0 ? &procs[c] : 0;
+    }
     for (int i = 0; i < PROC64_MAX; i++)
         if (procs[i].used && procs[i].pid == pid) return &procs[i];
     return 0;
 }
 
 proc64_t* proc64_get(int pid)     { return slot_for(pid); }
-proc64_t* proc64_current(void)    { return slot_for(current_pid); }
+
+/* The current process's slot, remembered per CPU. Every `fds[...]` in
+ * syscall64.c is a proc64_current(), and a scan of 128 slots each time
+ * made a wineserver poll over a few hundred descriptors cost 169,000
+ * cycles. Checked on every use, so a slot reused since is not trusted. */
+static int cur_slot_cpu[SMP64_MAX_CPUS] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+
+static int current_slot_index(void) {
+    int c = smp64_active ? gdt64_cpu() & (SMP64_MAX_CPUS - 1) : 0;
+    int pid = current_pid_cpu[c], i = cur_slot_cpu[c];
+    if (i >= 0 && procs[i].used && procs[i].pid == pid) return i;
+    for (i = 0; i < PROC64_MAX; i++)
+        if (procs[i].used && procs[i].pid == pid) { cur_slot_cpu[c] = i; return i; }
+    return -1;
+}
+
+proc64_t* proc64_current(void) {
+    int i = current_slot_index();
+    return i >= 0 ? &procs[i] : 0;
+}
 int       proc64_current_pid(void){ return current_pid; }
 
 /* Which slot a pid occupies, so that per-process state kept outside
@@ -37,12 +62,13 @@ int       proc64_current_pid(void){ return current_pid; }
  * indexed without every such table walking this one itself. -1 for a
  * pid that is not live. */
 int proc64_slot_of(int pid) {
+    if (pid >= 0 && pid == current_pid) return current_slot_index();
     for (int i = 0; i < PROC64_MAX; i++)
         if (procs[i].used && procs[i].pid == pid) return i;
     return -1;
 }
 
-int proc64_current_slot(void) { return proc64_slot_of(current_pid); }
+int proc64_current_slot(void) { return current_slot_index(); }
 void      proc64_set_current(int pid) { current_pid = pid; }
 
 int proc64_create(void) {
