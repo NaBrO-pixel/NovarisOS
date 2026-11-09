@@ -74,6 +74,7 @@ int  vmspace64_clone_cow(uint64_t src_pml4, vmspace64_t* dst);
  * holds it, reclaims it if not. Returns 0 if `va` was not a
  * copy-on-write page, which means the fault was a real one. */
 int  vmspace64_break_cow(uint64_t va);
+int  vmspace64_user_ready(uint64_t va, uint64_t len, int write);
 
 /* Changes whether one already-mapped page of the current space may be
  * written. Returns 0 if nothing is mapped at `va`, which mprotect(2)

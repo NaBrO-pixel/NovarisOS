@@ -7,6 +7,7 @@
 #include "idt64.h"
 #include "gdt64.h"
 #include "serial64.h"
+#include "spin64.h"
 
 #define UCODE_SEL_RPL3 0x23
 #define UDATA_SEL_RPL3 0x1B
@@ -132,13 +133,38 @@ static inline void     write_gs_base(uint64_t v) { write_msr_base(IA32_GS_BASE, 
 
 static task64_t tasks[SCHED64_MAX_TASKS];
 
+/* The wake and block state of the task table, for the callers that do not
+ * hold the kernel lock (Milestone 102: pipe reads and writes). Everything
+ * that makes a task runnable, or marks one asleep, takes it.
+ *
+ * And a count of wake-ups, which is what keeps one from being lost. A
+ * pipe reader that found nothing goes to sleep a moment later; a writer
+ * on another CPU, not waiting for the kernel lock any more, can fill the
+ * pipe and wake its waiters inside that moment, before the reader is one
+ * of them. So a call that is about to sleep and would be run again on
+ * waking says so (sched64_guard_block), and if any wake-up has happened
+ * since the call began (sched64_note_entry) it is run again at once
+ * instead - it will find what the writer left. */
+static spin64_t sched_lock = SPIN64_INIT;
+static volatile uint64_t wake_seq;
+static uint64_t seq_snap[SMP64_MAX_CPUS];
+static int      seq_guard[SMP64_MAX_CPUS];
+static uint64_t block_retries;
+
 /* A task this CPU may run: its process is pinned here (smp64.c). With one
  * CPU every task is CPU 0's. */
 static int mine(int i) {
     return tasks[i].used && tasks[i].cpu == smp64_this();
 }
 static int      task_total;
-static int      current = -1;
+/* Per CPU: what each one is running. Indexed by the CPU's own number
+ * (gdt64_cpu, from its task register), so it is right whether or not the
+ * kernel lock is held - the lock used to swap one global in and out. */
+static int      current_by_cpu[SMP64_MAX_CPUS] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+static inline int cpu_now(void) {
+    return smp64_active ? gdt64_cpu() & (SMP64_MAX_CPUS - 1) : 0;
+}
+#define current (current_by_cpu[cpu_now()])
 /* One past the highest slot handed out since sched64_init. Every scan of
  * the table stops here rather than at SCHED64_MAX_TASKS: the table has
  * room for 1024 tasks and a busy run has a few dozen, and the scans run on
@@ -159,7 +185,17 @@ static uint64_t switch_count;
 #ifndef SCHED64_SLICE_TICKS
 #define SCHED64_SLICE_TICKS 4
 #endif
-static uint64_t slice_start;
+static uint64_t slice_start_cpu[SMP64_MAX_CPUS];
+#define slice_start (slice_start_cpu[cpu_now()])
+
+void sched64_note_entry(void) {
+    int c = cpu_now();
+    seq_snap[c]  = wake_seq;
+    seq_guard[c] = 0;
+}
+
+void sched64_guard_block(void) { seq_guard[cpu_now()] = 1; }
+uint64_t sched64_block_retries(void) { return block_retries; }
 static uint64_t stop_after;
 static uint64_t stop_rip;
 
@@ -175,7 +211,7 @@ void sched64_init(void) {
     for (int i = 0; i < SCHED64_MAX_TASKS; i++) tasks[i].used = 0;
     task_hwm = 0;
     task_total = 0;
-    current = -1;
+    for (int c = 0; c < SMP64_MAX_CPUS; c++) current_by_cpu[c] = -1;
     switch_count = 0;
     stop_after = 0;
     stop_rip = 0;
@@ -478,7 +514,8 @@ int sched64_remove_pid(int pid) {
         if (!tasks[i].used || tasks[i].pid != pid) continue;
         tasks[i].used = 0;
         if (task_total > 0) task_total--;
-        if (i == current) current = -1;
+        for (int c = 0; c < SMP64_MAX_CPUS; c++)
+            if (current_by_cpu[c] == i) current_by_cpu[c] = -1;
         n++;
     }
     return n;
@@ -558,15 +595,17 @@ static int any_deadline(void) {
  * it was waiting for and parks again, so waking one costs a re-check. */
 static void expire_deadlines(void) {
     uint64_t now = clock64_ticks();
+    uint64_t fl = spin64_acquire(&sched_lock);
 
     for (int i = 0; i < task_hwm; i++) {
-        if (!tasks[i].used || !tasks[i].blocked) continue;
+        if (!mine(i) || !tasks[i].blocked) continue;
         if (!tasks[i].deadline || now < tasks[i].deadline) continue;
         tasks[i].blocked   = 0;
         tasks[i].wait_addr = 0;
         tasks[i].deadline  = 0;
         tasks[i].regs.rax  = tasks[i].timeout_rax;
     }
+    spin64_release(&sched_lock, fl);
 }
 
 /* Halt until an interrupt makes something runnable.
@@ -596,10 +635,21 @@ static int idle_until_runnable(void) {
         /* With other CPUs, the lock goes for the halt: they may be the
          * ones to make something here runnable. */
         int depth;
+        int me = smp64_this();
         smp64_set_halted(1);
         depth = smp64_release_all();
         smp64_kernel_space();
-        __asm__ __volatile__("sti; hlt; cli");
+        {
+            extern uint64_t smp64_spin_snapshot(int c), smp64_held_snapshot(int c);
+            extern void smp64_note_idle(int me, uint64_t dt, uint64_t sp0, uint64_t hd0);
+            uint64_t h0 = idle_tsc(), sp0 = smp64_spin_snapshot(me), hd0 = smp64_held_snapshot(me);
+            /* With other CPUs, halted without the lock until something
+             * of this CPU's looks runnable (sched64_maybe_work). */
+            do {
+                __asm__ __volatile__("sti; hlt; cli");
+            } while (smp64_active && !smp64_quiescing() && !sched64_maybe_work(me));
+            smp64_note_idle(me, idle_tsc() - h0, sp0, hd0);
+        }
         smp64_reacquire(depth);
         smp64_set_halted(0);
         if (smp64_this() != 0 && smp64_quiescing()) {
@@ -659,7 +709,15 @@ void sched64_signal_restart(uint64_t nr) { next_signal_restart = nr; }
  * SIGKILL'd child calling _exit() exited with its own status instead of
  * dying. Pointed back at its syscall instead, the re-run is what takes
  * the signal. */
+/* A task made runnable: counted if its CPU is busy running something
+ * else, since it then waits for that CPU's timeslice to end. */
+static void woke(int i) {
+    extern void smp64_note_wake(int cpu);
+    smp64_note_wake(tasks[i].cpu);
+}
+
 static void woken_by_signal(int i) {
+    woke(i);
     tasks[i].blocked   = 0;
     tasks[i].wait_addr = 0;
     if (tasks[i].signal_restart) {
@@ -678,7 +736,25 @@ int sched64_block_until_ex(const registers64_t* regs, uint64_t addr,
                            uint64_t* out_fs_base) {
     int next;
 
+    uint64_t fl;
+    int c = cpu_now();
+
     if (current < 0 || !tasks[current].used) return 0;
+
+    fl = spin64_acquire(&sched_lock);
+    if (seq_guard[c]) {
+        seq_guard[c] = 0;
+        if (wake_seq != seq_snap[c]) {
+            /* Something was woken since this call began: it may be what
+             * this one is about to wait for. Run the call again. */
+            spin64_release(&sched_lock, fl);
+            block_retries++;
+            if (out_regs)    *out_regs    = *regs;
+            if (out_space)   *out_space   = tasks[current].space;
+            if (out_fs_base) *out_fs_base = read_fs_base();
+            return 1;
+        }
+    }
 
     /* The frame the caller built is this thread's entire continuation:
      * when something wakes it, execution resumes from exactly here.
@@ -694,7 +770,6 @@ int sched64_block_until_ex(const registers64_t* regs, uint64_t addr,
      * wrapper, with nothing pointing back at the wait that caused it. */
     tasks[current].fs_base   = read_fs_base();
     tasks[current].regs      = *regs;
-    tasks[current].blocked   = 1;
     tasks[current].wait_addr   = addr;
     tasks[current].wake_rax    = wake_rax;
     tasks[current].timeout_rax = timeout_rax;
@@ -702,6 +777,8 @@ int sched64_block_until_ex(const registers64_t* regs, uint64_t addr,
     tasks[current].deadline    = deadline;
     tasks[current].signal_restart = next_signal_restart;
     next_signal_restart = 0;
+    tasks[current].blocked   = 1;
+    spin64_release(&sched_lock, fl);
 
     next = next_task(current);
     if (next == current || tasks[next].blocked) {
@@ -805,6 +882,8 @@ int sched64_yield_current(const registers64_t* regs, registers64_t* out_regs,
  * end of syscall64_dispatch is where the signal is taken. */
 int sched64_wake_pid(int pid) {
     int woken = 0;
+    uint64_t fl = spin64_acquire(&sched_lock);
+    wake_seq++;
 
     for (int i = 0; i < task_hwm; i++) {
         if (!tasks[i].used || !tasks[i].blocked) continue;
@@ -812,7 +891,7 @@ int sched64_wake_pid(int pid) {
         woken_by_signal(i);
         woken++;
     }
-    if (woken) smp64_kick_halted();
+    spin64_release(&sched_lock, fl);
     return woken;
 }
 
@@ -823,10 +902,16 @@ int sched64_task_pid(int tid) {
 }
 
 int sched64_wake_tid(int tid) {
+    uint64_t fl;
     if (tid < 0 || tid >= SCHED64_MAX_TASKS) return 0;
-    if (!tasks[tid].used || !tasks[tid].blocked) return 0;
+    fl = spin64_acquire(&sched_lock);
+    wake_seq++;
+    if (!tasks[tid].used || !tasks[tid].blocked) {
+        spin64_release(&sched_lock, fl);
+        return 0;
+    }
     woken_by_signal(tid);
-    smp64_kick_halted();
+    spin64_release(&sched_lock, fl);
     return 1;
 }
 
@@ -840,6 +925,8 @@ int sched64_wake_bits(uint64_t addr, int max, uint32_t bits) {
 
 int sched64_wake_futex(uint64_t addr, int max, uint32_t bits, int pid) {
     int woken = 0;
+    uint64_t fl = spin64_acquire(&sched_lock);
+    wake_seq++;
 
     for (int i = 0; i < task_hwm && woken < max; i++) {
         if (!tasks[i].used || !tasks[i].blocked) continue;
@@ -858,6 +945,7 @@ int sched64_wake_futex(uint64_t addr, int max, uint32_t bits, int pid) {
         /* futex(2) returns 0 to a waiter that was woken. The value goes
          * into the saved frame, because that frame IS the thread. */
         tasks[i].regs.rax = tasks[i].wake_rax;
+        woke(i);
         woken++;
     }
 
@@ -870,6 +958,7 @@ int sched64_wake_futex(uint64_t addr, int max, uint32_t bits, int pid) {
     for (int i = 0; i < task_hwm; i++) {
         if (!tasks[i].used || !tasks[i].blocked) continue;
         if (tasks[i].wait_addr != SCHED64_COND_KEY) continue;
+        woke(i);
         tasks[i].blocked   = 0;
         tasks[i].wait_addr = 0;
         tasks[i].deadline  = 0;
@@ -878,28 +967,16 @@ int sched64_wake_futex(uint64_t addr, int max, uint32_t bits, int pid) {
     /* A task woken here may belong to a CPU that is halted with nothing
      * to do; it would only notice at its next timer tick, a millisecond
      * on - which, on every round trip between a Wine client and its
-     * server, is what made four CPUs slower than one. */
-    smp64_kick_halted();
+     * server, is what made four CPUs slower than one. Each woken task's
+     * own CPU is told, by woke(), and no other. */
+    spin64_release(&sched_lock, fl);
     return woken;
 }
 
-void sched64_tick(registers64_t* frame) {
-    int next;
-
-    expire_deadlines();
-
-    /* While idling there is no running task whose frame this is - it is
-     * the idle loop's - so switching would save the halt over a parked
-     * thread's continuation. idle_until_runnable picks the successor
-     * itself once expire_deadlines above has produced one. */
-    if (idling) return;
-
-    if (current < 0 || task_total < 2) return;
-    if (clock64_ticks() - slice_start < SCHED64_SLICE_TICKS) return;
-
-    next = next_task(current);
-    if (next == current) return;
-
+/* The outgoing task saved from the interrupt's frame and `next` written
+ * over it: what iretq then resumes. Shared by the tick and by a wake-up
+ * preemption (sched64_preempt). */
+static void switch_on_frame(registers64_t* frame, int next) {
     /* Everything the outgoing task is, as the CPU and the stub left it -
      * plus the thread pointer, which lives in an MSR rather than in the
      * frame, so nothing else would have saved it. */
@@ -931,6 +1008,102 @@ void sched64_tick(registers64_t* frame) {
         frame->rip = stop_rip;
 }
 
+void sched64_tick(registers64_t* frame) {
+    int next;
+
+    expire_deadlines();
+
+    /* While idling there is no running task whose frame this is - it is
+     * the idle loop's - so switching would save the halt over a parked
+     * thread's continuation. idle_until_runnable picks the successor
+     * itself once expire_deadlines above has produced one. */
+    if (idling) return;
+
+    if (current < 0 || task_total < 2) return;
+    if (clock64_ticks() - slice_start < SCHED64_SLICE_TICKS) return;
+
+    next = next_task(current);
+    if (next == current) return;
+    switch_on_frame(frame, next);
+}
+
+/* Another CPU woke a task that runs here, while this CPU was busy with
+ * something else (smp64_note_wake). Without this the woken task waits
+ * for the running one's timeslice to end - up to 4ms, on every round
+ * trip between a Wine client and a wineserver that shares its CPU with
+ * a busy process. Only a frame from ring 3 is switched: one from the
+ * kernel is the idle loop or kernel_main, which look again themselves. */
+void sched64_preempt(registers64_t* frame) {
+    int next;
+    if (idling || current < 0 || !tasks[current].used) return;
+    if ((frame->cs & 3) != 3) return;
+    next = next_task(current);
+    if (next == current) return;
+    switch_on_frame(frame, next);
+}
+
+/* The calling thread, about to resume at `regs`, moves to `cpu` instead:
+ * its frame is saved runnable there and this CPU goes on with something
+ * of its own, or idles. For a process that has just exec'd - one thread,
+ * a fresh address space - which is where processes are placed. Returns 0
+ * if the thread cannot move (it has siblings), with nothing changed. */
+int sched64_migrate_current(const registers64_t* regs, int cpu,
+                            registers64_t* out_regs, vmspace64_t* out_space,
+                            uint64_t* out_fs_base) {
+    extern void smp64_note_wake(int cpu);
+    int me = current, next, n = 0;
+
+    if (me < 0 || !tasks[me].used || cpu == tasks[me].cpu) return 0;
+    for (int i = 0; i < task_hwm; i++)
+        if (tasks[i].used && tasks[i].pid == tasks[me].pid) n++;
+    if (n != 1) return 0;
+
+    tasks[me].regs    = *regs;
+    tasks[me].fs_base = read_fs_base();
+    tasks[me].gs_base = read_gs_base();
+    fpu_save(tasks[me].fpu);
+    {
+        uint64_t fl = spin64_acquire(&sched_lock);
+        tasks[me].blocked   = 0;
+        tasks[me].wait_addr = 0;
+        tasks[me].deadline  = 0;
+        proc64_set_cpu(tasks[me].pid, cpu);
+        tasks[me].cpu = cpu;            /* from here it is that CPU's */
+        spin64_release(&sched_lock, fl);
+    }
+    current = -1;
+    smp64_note_wake(cpu);
+
+    next = first_runnable();
+    if (next < 0) next = idle_until_runnable();
+    if (next < 0) return -1;            /* the end of the run */
+
+    current = next;
+    slice_start = clock64_ticks();
+    fpu_restore(tasks[next].fpu);
+    write_gs_base(tasks[next].gs_base);
+    if (out_regs)    *out_regs    = tasks[next].regs;
+    if (out_space)   *out_space   = tasks[next].space;
+    if (out_fs_base) *out_fs_base = tasks[next].fs_base;
+    proc64_set_current(tasks[next].pid);
+    return 1;
+}
+
+/* Whether `cpu` has something to run, or a deadline due: read without
+ * the lock, by an idle CPU deciding whether to take it. Racy by design -
+ * a stale answer costs a look under the lock or one more tick. */
+int sched64_maybe_work(int cpu) {
+    uint64_t now = clock64_ticks();
+    int hwm = task_hwm;
+    for (int i = 0; i < hwm; i++) {
+        volatile task64_t* t = &tasks[i];
+        if (!t->used || t->cpu != cpu) continue;
+        if (!t->blocked) return 1;
+        if (t->deadline && now >= t->deadline) return 1;
+    }
+    return 0;
+}
+
 /* For smp64.c, which keeps each CPU's `current` while another holds the
  * lock: the value alone, nothing else touched. */
 void sched64_set_current_raw(int i) { current = i; }
@@ -938,7 +1111,9 @@ void sched64_set_current_raw(int i) { current = i; }
 /* An application processor with nothing running: start a task pinned to
  * it, if there is one. Does not return if there is. */
 int sched64_run_this_cpu(void) {
-    int n = first_runnable();
+    int n;
+    expire_deadlines();
+    n = first_runnable();
     if (n < 0) return 0;
     current = n;
     slice_start = clock64_ticks();

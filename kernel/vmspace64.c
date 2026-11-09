@@ -562,6 +562,29 @@ int vmspace64_write_u32(vmspace64_t* vs, uint64_t va, uint32_t value) {
     return 1;
 }
 
+/* Whether every page of [va, va+len) is mapped for ring 3 in the space
+ * that is loaded - and writable, if `write` - so that a copy to or from it
+ * cannot fault. For the syscalls that run without the kernel lock and
+ * copy while holding a pipe's lock: a fault there that needed the kernel
+ * lock would take it out of order (spin64.h). A page not yet touched, or
+ * shared copy-on-write, answers no, and the call takes the locked way. */
+int vmspace64_user_ready(uint64_t va, uint64_t len, int write) {
+    uint64_t pml4 = read_cr3() & ADDR_MASK;
+    uint64_t end, p;
+    if (!len) return 1;
+    end = va + len;
+    if (end < va || end > 0x0000800000000000ULL) return 0;
+    for (p = va & ~(PAGE64_SIZE - 1); p < end; p += PAGE64_SIZE) {
+        uint64_t* pte = pte_for(pml4, p, 0);
+        uint64_t e;
+        if (!pte) return 0;
+        e = *pte;
+        if (!(e & PAGE64_PRESENT) || !(e & PAGE64_USER)) return 0;
+        if (write && !(e & PAGE64_WRITE)) return 0;
+    }
+    return 1;
+}
+
 int vmspace64_break_cow(uint64_t va) {
     uint64_t pml4 = read_cr3() & ADDR_MASK;
     uint64_t* pte = pte_for(pml4, va & ~(PAGE64_SIZE - 1), 0);

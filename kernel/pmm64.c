@@ -247,13 +247,13 @@ void pmm64_init(const multiboot_info_t* mbi,
     ready = 1;
 }
 
-void pmm64_reserve_region(uint64_t start_addr, uint64_t end_addr) {
+static void reserve_region_nl(uint64_t start_addr, uint64_t end_addr) {
     uint64_t sf = start_addr / PMM64_FRAME_SIZE;
     uint64_t ef = (end_addr + PMM64_FRAME_SIZE - 1) / PMM64_FRAME_SIZE;
     if (ef > sf) mark_range(sf, ef - sf, 1);
 }
 
-uint64_t pmm64_alloc_frame(void) {
+static uint64_t alloc_frame_nl(void) {
     if (!ready) return 0;
 
     /* Two sweeps from a rolling hint rather than one from zero. The 32-bit
@@ -311,7 +311,7 @@ int pmm64_take_user_oom(void) {
     return was;
 }
 
-uint64_t pmm64_alloc_high(void) {
+static uint64_t alloc_high_nl(void) {
     if (!ready) return 0;
     if (high_hint > frame_count) high_hint = frame_count;
 
@@ -336,7 +336,7 @@ uint64_t pmm64_alloc_high(void) {
 
     /* Out of high memory is not out of memory: fall back rather than
      * failing an allocation the low path could still have served. */
-    return pmm64_alloc_frame();
+    return alloc_frame_nl();
 }
 
 /* A frame at or above `min_phys`, so that a test can ask for exactly the
@@ -344,7 +344,7 @@ uint64_t pmm64_alloc_high(void) {
  * kernel proper cares where a frame comes from - which is the point of
  * Milestone 66 - so this exists to make the ceiling's absence provable
  * rather than to be used by the allocator's normal callers. */
-uint64_t pmm64_alloc_above(uint64_t min_phys) {
+static uint64_t alloc_above_nl(uint64_t min_phys) {
     uint64_t first = (min_phys + PMM64_FRAME_SIZE - 1) / PMM64_FRAME_SIZE;
 
     if (!ready) return 0;
@@ -378,7 +378,7 @@ static void watch_report(const char* what, uint64_t f) {
     serial64_putc('\n');
 }
 
-void pmm64_free_frame(uint64_t phys) {
+static void free_frame_nl(uint64_t phys) {
     uint64_t f = phys / PMM64_FRAME_SIZE;
     if (!ready || f >= frame_count) return;
 
@@ -449,7 +449,7 @@ int      pmm64_ready(void)        { return ready; }
 /* Adds an owner. Returns 0 if the frame cannot take another - either it
  * is not a frame this allocator owns, or the count has saturated - and
  * the caller must copy rather than share. */
-int pmm64_ref_frame(uint64_t phys) {
+static int ref_frame_nl(uint64_t phys) {
     uint64_t f = phys / PMM64_FRAME_SIZE;
 
     if (!ready || !refs || f >= frame_count) return 0;
@@ -483,3 +483,64 @@ int pmm64_owns(uint64_t phys) {
 
 uint64_t pmm64_refs_phys(void)  { return refs_phys_addr; }
 uint64_t pmm64_refs_bytes(void) { return refs_size_bytes; }
+
+/* --- the allocator's own lock -------------------------------------------
+ *
+ * The frame bitmap, the owner counts and the hints are shared by every
+ * CPU, and since Milestone 102 not every caller holds the kernel lock: a
+ * page fault takes frames without it (kmain64.c). So the allocator has a
+ * lock of its own, the innermost in the kernel - nothing is called with
+ * it held but the allocator itself and a serial line. Interrupts are off
+ * while it is held, since kernel_main runs with them on and the timer's
+ * network pump allocates. */
+static volatile int pmm_lock;
+
+static inline uint64_t pmm_acquire(void) {
+    uint64_t fl;
+    __asm__ __volatile__("pushfq; pop %0; cli" : "=r"(fl) :: "memory");
+    while (__atomic_exchange_n(&pmm_lock, 1, __ATOMIC_ACQUIRE))
+        while (pmm_lock) __asm__ __volatile__("pause");
+    return fl;
+}
+
+static inline void pmm_release(uint64_t fl) {
+    __atomic_store_n(&pmm_lock, 0, __ATOMIC_RELEASE);
+    if (fl & 0x200) __asm__ __volatile__("sti" ::: "memory");
+}
+
+uint64_t pmm64_alloc_frame(void) {
+    uint64_t fl = pmm_acquire(), f = alloc_frame_nl();
+    pmm_release(fl);
+    return f;
+}
+
+uint64_t pmm64_alloc_high(void) {
+    uint64_t fl = pmm_acquire(), f = alloc_high_nl();
+    pmm_release(fl);
+    return f;
+}
+
+uint64_t pmm64_alloc_above(uint64_t min_phys) {
+    uint64_t fl = pmm_acquire(), f = alloc_above_nl(min_phys);
+    pmm_release(fl);
+    return f;
+}
+
+void pmm64_free_frame(uint64_t phys) {
+    uint64_t fl = pmm_acquire();
+    free_frame_nl(phys);
+    pmm_release(fl);
+}
+
+int pmm64_ref_frame(uint64_t phys) {
+    uint64_t fl = pmm_acquire();
+    int r = ref_frame_nl(phys);
+    pmm_release(fl);
+    return r;
+}
+
+void pmm64_reserve_region(uint64_t start_addr, uint64_t end_addr) {
+    uint64_t fl = pmm_acquire();
+    reserve_region_nl(start_addr, end_addr);
+    pmm_release(fl);
+}

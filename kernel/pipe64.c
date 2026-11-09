@@ -7,6 +7,7 @@
 #include "ramfs64.h"
 #include "proc64.h"
 #include "inet64.h"
+#include "spin64.h"
 
 typedef struct {
     fdpass64_t fds[8];
@@ -56,7 +57,7 @@ int pipe64_valid(int p) {
     return p >= 0 && p < PIPE64_MAX && pipes[p].used;
 }
 
-int pipe64_create(void) {
+static int create_nl(void) {
     int i;
 
     for (i = 0; i < PIPE64_MAX; i++) if (!pipes[i].used) break;
@@ -93,13 +94,13 @@ int pipe64_create(void) {
     return i;
 }
 
-void pipe64_ref(int p, int reader, int writer) {
+static void ref_nl(int p, int reader, int writer) {
     if (!pipe64_valid(p)) return;
     if (reader) pipes[p].readers++;
     if (writer) pipes[p].writers++;
 }
 
-void pipe64_unref(int p, int reader, int writer) {
+static void unref_nl(int p, int reader, int writer) {
     if (!pipe64_valid(p)) return;
     if (reader && pipes[p].readers > 0) pipes[p].readers--;
     if (writer && pipes[p].writers > 0) pipes[p].writers--;
@@ -142,7 +143,7 @@ static void drop_inflight(const fdpass64_t* f) {
     if (f->kind == FD64_INET) inet64_unref(f->sock);
 }
 
-int pipe64_send_fds(int p, const fdpass64_t* in, int n) {
+static int send_fds_nl(int p, const fdpass64_t* in, int n) {
     batch64_t* b;
 
     if (!pipe64_valid(p) || n <= 0) return 0;
@@ -157,7 +158,7 @@ int pipe64_send_fds(int p, const fdpass64_t* in, int n) {
     return 1;
 }
 
-int pipe64_recv_fds(int p, fdpass64_t* out, int max) {
+static int recv_fds_nl(int p, fdpass64_t* out, int max) {
     batch64_t* b;
     int n;
 
@@ -192,7 +193,7 @@ uint64_t pipe64_space(int p) {
 int pipe64_readers(int p) { return pipe64_valid(p) ? pipes[p].readers : 0; }
 int pipe64_writers(int p) { return pipe64_valid(p) ? pipes[p].writers : 0; }
 
-int64_t pipe64_read(int p, void* buf, uint64_t n) {
+static int64_t read_nl(int p, void* buf, uint64_t n) {
     pipe64_t* q;
     uint8_t*  out = (uint8_t*)buf;
     uint64_t  got = 0;
@@ -223,7 +224,7 @@ int64_t pipe64_read(int p, void* buf, uint64_t n) {
 /* pipe64_read without taking anything: MSG_PEEK on a connected socket.
  * Chromium asks whether a connection is still alive by peeking a byte,
  * and a peek that consumed would hand it the first byte of the reply. */
-int64_t pipe64_peek(int p, void* buf, uint64_t n) {
+static int64_t peek_nl(int p, void* buf, uint64_t n) {
     pipe64_t* q;
     uint8_t*  out = (uint8_t*)buf;
     uint64_t  got = 0, at;
@@ -244,7 +245,7 @@ int64_t pipe64_peek(int p, void* buf, uint64_t n) {
     return (int64_t)got;
 }
 
-int64_t pipe64_write(int p, const void* buf, uint64_t n) {
+static int64_t write_nl(int p, const void* buf, uint64_t n) {
     pipe64_t*      q;
     const uint8_t* in = (const uint8_t*)buf;
     uint64_t       put = 0, room;
@@ -278,4 +279,88 @@ uint64_t pipe64_live(void) {
     uint64_t n = 0;
     for (int i = 0; i < PIPE64_MAX; i++) if (pipes[i].used) n++;
     return n;
+}
+
+/* --- the pipes' lock -------------------------------------------------------
+ *
+ * One for every pipe (spin64.h): reads and writes of pipes and sockets
+ * run without the kernel lock now (syscall64.c), and the two ends of a
+ * pipe are usually two processes on two CPUs. The sections are short - a
+ * copy of at most a ring's worth - so one lock for all of them costs less
+ * than the bookkeeping of one each would. */
+static spin64_t pipes_lock = SPIN64_INIT;
+
+int pipe64_create(void) {
+    uint64_t fl = spin64_acquire(&pipes_lock);
+    int r = create_nl();
+    spin64_release(&pipes_lock, fl);
+    return r;
+}
+
+void pipe64_ref(int p, int reader, int writer) {
+    uint64_t fl = spin64_acquire(&pipes_lock);
+    ref_nl(p, reader, writer);
+    spin64_release(&pipes_lock, fl);
+}
+
+void pipe64_unref(int p, int reader, int writer) {
+    uint64_t fl = spin64_acquire(&pipes_lock);
+    unref_nl(p, reader, writer);
+    spin64_release(&pipes_lock, fl);
+}
+
+int pipe64_send_fds(int p, const fdpass64_t* in, int n) {
+    uint64_t fl = spin64_acquire(&pipes_lock);
+    int r = send_fds_nl(p, in, n);
+    spin64_release(&pipes_lock, fl);
+    return r;
+}
+
+int pipe64_recv_fds(int p, fdpass64_t* out, int max) {
+    uint64_t fl = spin64_acquire(&pipes_lock);
+    int r = recv_fds_nl(p, out, max);
+    spin64_release(&pipes_lock, fl);
+    return r;
+}
+
+int64_t pipe64_read(int p, void* buf, uint64_t n) {
+    uint64_t fl = spin64_acquire(&pipes_lock);
+    int64_t r = read_nl(p, buf, n);
+    spin64_release(&pipes_lock, fl);
+    return r;
+}
+
+int64_t pipe64_peek(int p, void* buf, uint64_t n) {
+    uint64_t fl = spin64_acquire(&pipes_lock);
+    int64_t r = peek_nl(p, buf, n);
+    spin64_release(&pipes_lock, fl);
+    return r;
+}
+
+int64_t pipe64_write(int p, const void* buf, uint64_t n) {
+    uint64_t fl = spin64_acquire(&pipes_lock);
+    int64_t r = write_nl(p, buf, n);
+    spin64_release(&pipes_lock, fl);
+    return r;
+}
+
+
+/* All of `n` bytes, or none: for a writer that runs without the kernel
+ * lock and cannot sleep, so must not leave half a request behind. The
+ * pieces are the caller's iovec, already checked to be mapped. -EAGAIN if
+ * the ring has less room than that; -EPIPE with no reader. */
+int64_t pipe64_write_all(int p, const void* const* bufs, const uint64_t* lens,
+                         int cnt, uint64_t n) {
+    uint64_t fl = spin64_acquire(&pipes_lock);
+    int64_t r;
+    if (!pipe64_valid(p)) r = -9;
+    else if (pipes[p].readers == 0) r = -32;
+    else if (PIPE64_BUF - pipes[p].len < n) r = -11;
+    else {
+        for (int i = 0; i < cnt; i++)
+            if (lens[i]) (void)write_nl(p, bufs[i], lens[i]);
+        r = (int64_t)n;
+    }
+    spin64_release(&pipes_lock, fl);
+    return r;
 }

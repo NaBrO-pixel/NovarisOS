@@ -227,6 +227,13 @@ extern void sched64_resume(const registers64_t* regs)
 
 /* Called from the timer handler with the interrupted frame. */
 void sched64_tick(registers64_t* frame);
+int  sched64_maybe_work(int cpu);
+void sched64_note_entry(void);      /* a locked syscall begins */
+void sched64_guard_block(void);     /* the next block re-runs if woken since */
+uint64_t sched64_block_retries(void);
+int  sched64_migrate_current(const registers64_t* regs, int cpu,
+                             registers64_t* out_regs, vmspace64_t* out_space,
+                             uint64_t* out_fs_base);   /* lock-free: anything for this CPU? */
 
 /* Marks a task as the one currently running - the first task is entered
  * directly rather than switched to, so the scheduler has to be told. */

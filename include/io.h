@@ -7,11 +7,22 @@
  * (PIC, PIT, keyboard, ...) talks to its device through port I/O, so this
  * header is shared by all of them. */
 
+/* A count of every access by port, for finding what the emulator spends
+ * its device lock on (smp64_report). Off unless asked for. */
+#ifdef NOVARIS64_IO_COUNT
+extern uint32_t io64_counts[65536];
+#define IO64_COUNT(p) __atomic_fetch_add(&io64_counts[(uint16_t)(p)], 1, __ATOMIC_RELAXED)
+#else
+#define IO64_COUNT(p) ((void)0)
+#endif
+
 static inline void outb(uint16_t port, uint8_t val) {
+    IO64_COUNT(port);
     __asm__ __volatile__("outb %0, %1" : : "a"(val), "Nd"(port));
 }
 
 static inline uint8_t inb(uint16_t port) {
+    IO64_COUNT(port);
     uint8_t ret;
     __asm__ __volatile__("inb %1, %0" : "=a"(ret) : "Nd"(port));
     return ret;
@@ -20,10 +31,12 @@ static inline uint8_t inb(uint16_t port) {
 /* 16-bit port access. Added for the ACPI shutdown ports, which are the
  * one thing in this kernel that has to be poked a word at a time. */
 static inline void outw(uint16_t port, uint16_t val) {
+    IO64_COUNT(port);
     __asm__ __volatile__("outw %0, %1" : : "a"(val), "Nd"(port));
 }
 
 static inline uint16_t inw(uint16_t port) {
+    IO64_COUNT(port);
     uint16_t ret;
     __asm__ __volatile__("inw %1, %0" : "=a"(ret) : "Nd"(port));
     return ret;
@@ -34,10 +47,12 @@ static inline uint16_t inw(uint16_t port) {
  * time is not the same transaction - and every register on the RTL8139
  * that matters is 32 bits wide. */
 static inline void outl(uint16_t port, uint32_t val) {
+    IO64_COUNT(port);
     __asm__ __volatile__("outl %0, %1" : : "a"(val), "Nd"(port));
 }
 
 static inline uint32_t inl(uint16_t port) {
+    IO64_COUNT(port);
     uint32_t ret;
     __asm__ __volatile__("inl %1, %0" : "=a"(ret) : "Nd"(port));
     return ret;

@@ -294,5 +294,8 @@ int       proc64_has_child(int pid, int want);
 uint64_t  proc64_count(void);
 
 int proc64_cpu_of(int pid);     /* its CPU; 0 for none */
+void proc64_set_cpu(int pid, int cpu);
+int proc64_count_on(int cpu, int except);   /* live processes there */
+const char* proc64_comm_of(int pid);
 
 #endif

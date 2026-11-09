@@ -175,5 +175,6 @@ void gdt64_install_cpu(int cpu) {
 int gdt64_cpu(void) {
     uint16_t tr;
     __asm__ __volatile__("str %0" : "=r"(tr));
+    if (tr < GDT64_TSS_SEL) return 0;          /* before the TSS is loaded */
     return (tr - GDT64_TSS_SEL) / 16;
 }

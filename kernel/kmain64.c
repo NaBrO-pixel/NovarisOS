@@ -396,6 +396,36 @@ static inline uint64_t pf_tsc(void) {
 
 static void page_fault_body(registers64_t* r);
 
+/* The two faults that are not errors, without the kernel lock: memory
+ * touched for the first time and a write to a page fork shared. Both
+ * concern only the faulting process's own page tables and reservations -
+ * which only its own CPU touches, since a process's threads all run on
+ * one CPU (smp64.c) - and the frame allocator, which has its own lock.
+ * A million of these in a Chromium run each took the one lock every
+ * other CPU was waiting for. Anything else, and anything that goes wrong,
+ * is left to page_fault_body under the lock: returns 0 and the fault is
+ * taken again there from the start. */
+static volatile uint64_t pf_fast_hits;
+uint64_t kmain64_pf_fast_hits(void) { return pf_fast_hits; }
+
+int kmain64_page_fault_fast(registers64_t* r) {
+    uint64_t cr2 = read_cr2(), t0 = pf_tsc();
+    uint64_t err = r->err_code;
+    int done = 0;
+
+    if (cr2 >= 0x0000800000000000ULL || proc64_current_pid() < 0) return 0;
+    if (!(err & 0x1)) done = uspace64_fault(cr2, (err & 0x2) != 0);
+    else if ((err & 0x3) == 0x3) done = vmspace64_break_cow(cr2);
+    if (!done) {
+        (void)pmm64_take_user_oom();       /* the locked path asks again */
+        return 0;
+    }
+    __atomic_fetch_add(&pf_fast_hits, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&pf_count_total, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&pf_cycles_total, pf_tsc() - t0, __ATOMIC_RELAXED);
+    return 1;
+}
+
 static void page_fault_handler(registers64_t* r) {
     uint64_t t0 = pf_tsc();
     page_fault_body(r);

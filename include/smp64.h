@@ -14,10 +14,14 @@ int      smp64_init(void);
 int      smp64_cpus(void);
 uint32_t smp64_lapic_id(void);
 void     smp64_lapic_eoi(void);
+int      smp64_idle_here(void);   /* halted with nothing to run */
+void     smp64_idle_irq(int vector);
 
 /* The vector of the APs' LAPIC timer. */
 #define SMP64_TIMER_VECTOR 0xF0
 #define SMP64_KICK_VECTOR  0xF1   /* "something to run": wakes a halted CPU */
+#define SMP64_SAMPLE_VECTOR 0xF2  /* the bootstrap CPU's sampling timer */
+void smp64_sample_irq(void* frame);
 
 /* The big kernel lock (see smp64.c). No-ops until smp64_start_scheduling. */
 extern volatile int smp64_active;
@@ -27,9 +31,11 @@ void smp64_leave_to_user(void);
 int  smp64_release_all(void);
 void smp64_reacquire(int depth);
 void smp64_kernel_holds(void);
-int  smp64_this(void);            /* this CPU, while it holds the lock */
+int  smp64_this(void);            /* this CPU */
+int  smp64_held_here(void);       /* this CPU holds the kernel lock */
 
 int  smp64_pick_cpu(void);        /* the CPU for a new process */
+int  smp64_pick_cpu_for(int self);  /* after an exec; -1 to stay put */
 void smp64_start_scheduling(void);
 void smp64_quiesce(void);
 int  smp64_quiescing(void);
@@ -38,6 +44,8 @@ void smp64_kick_halted(void);
 void smp64_report(void);
 void smp64_set_halted(int on);
 void smp64_timer_tick(void* frame);
+struct registers64;
+void smp64_note_tick(int cpu, const void* frame, int ms);
 void smp64_ap_idle(void) __attribute__((noreturn));
 
 #endif

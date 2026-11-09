@@ -696,6 +696,7 @@ static uint64_t wait_restart(const syscall64_args_t* args, uint64_t nr,
      * Falling through to a yield keeps the old behaviour wherever
      * sleeping is not safe: the scheduler refuses when the timer is
      * masked or nothing is waiting on the clock. */
+    sched64_guard_block();
     if (sched64_block_until(&self, SCHED64_COND_KEY, nr, deadline,
                             &next, &next_space, &next_fs)) {
         vmspace64_switch(&next_space);
@@ -723,6 +724,7 @@ static uint64_t inet_block(const syscall64_args_t* args, uint64_t nr) {
     if (signal_interrupts_wait()) return (uint64_t)-4;     /* -EINTR */
     frame_from_args(args, nr, &self);
     self.rip = args->ret_rip - 2;
+    sched64_guard_block();
     if (!sched64_block_until(&self, INET64_WAIT_KEY, nr,
                              clock64_ticks() + 1000,
                              &next, &next_space, &next_fs))
@@ -892,6 +894,7 @@ full:
 
     frame_from_args(args, nr, &self);
     self.rip = args->ret_rip - 2;
+    sched64_guard_block();
     if (!sched64_block_current(&self, PIPE64_WAIT_KEY(fds[fd].tx), nr,
                                &next, &next_space, &next_fs)) {
         /* Nothing else can run, so nothing will ever drain this. */
@@ -951,6 +954,7 @@ static int64_t do_pipe_read_ex(const syscall64_args_t* args, uint64_t nr,
     frame_from_args(args, nr, &self);
     self.rip = args->ret_rip - 2;
 
+    sched64_guard_block();
     if (!sched64_block_current(&self, PIPE64_WAIT_KEY(fds[fd].rx),
                                nr, &next, &next_space, &next_fs)) {
         /* Nothing else can run, so nobody can ever fill this pipe.
@@ -2172,11 +2176,160 @@ static uint64_t syscall64_dispatch_locked(syscall64_args_t* args);
  * The calls that do not come back to ring 3 keep the lock: the bootstrap
  * CPU's goes back to kernel_main, which runs holding it, and on another
  * CPU there is nothing to go back to, so it parks. */
+/* --- calls that do not need the kernel lock ------------------------------
+ *
+ * With more than one CPU, every syscall took the one lock (smp64.c), and
+ * half of all syscalls Chromium makes are clock reads and signal-mask
+ * changes: 503,000 clock_gettime and 503,000 rt_sigprocmask in one run
+ * against 2.5 million calls of every kind. Each reads the clock or the
+ * calling thread's own state and nothing else - a thread's mask is only
+ * ever written by that thread - so they run here, before the lock, on
+ * whichever CPU the caller is on. If that leaves a signal deliverable (an
+ * unblocking sigprocmask), the lock is taken and it is delivered the usual
+ * way, by delivery_tail. */
+static uint64_t delivery_tail(syscall64_args_t* args, uint64_t r);
+
+static int signal_waiting(void) {
+    int me = proc64_current_pid();
+    return me >= 0 && (signal64_has_pending_task(sched64_current()) ||
+                       signal64_has_pending(me));
+}
+
+static uint64_t lockfree_hits;
+uint64_t syscall64_lockfree_hits(void) { return lockfree_hits; }
+
+/* A pipe, or a socket made of pipes, that a call may read or write
+ * without the kernel lock. Not an AF_INET one, whose pipes the network
+ * pump also tends. */
+static int lockfree_stream(uint64_t fd) {
+    return fd < FD_MAX && fds[fd].used &&
+           (fds[fd].kind == FD64_PIPE ||
+            (fds[fd].kind == FD64_SOCKET && (fds[fd].rx >= 0 || fds[fd].tx >= 0)));
+}
+
+/* read(2) on such a stream, when there is something to read or nothing
+ * will ever come. An empty pipe with a writer is the locked path's, which
+ * knows how to wait. */
+static int lockfree_read(uint64_t fd, uint64_t buf, uint64_t n, uint64_t* out) {
+    int rx;
+    int64_t r;
+    if (!lockfree_stream(fd) || (rx = fds[fd].rx) < 0) return 0;
+    if (pipe64_available(rx) == 0 && pipe64_writers(rx) > 0) return 0;
+    if (n > PIPE64_BUF) n = PIPE64_BUF;
+    if (!vmspace64_user_ready(buf, n, 1)) return 0;
+    r = pipe64_read(rx, (void*)buf, n);
+    if (r == -11 || r < 0) return 0;
+    if (r > 0) sched64_wake(PIPE64_WAIT_KEY(rx), SCHED64_MAX_TASKS);
+    *out = (uint64_t)r;
+    return 1;
+}
+
+/* write(2) and writev(2) on such a stream, when all of it fits now. Any
+ * of it not fitting, a reader gone, or a write already part done and
+ * being restarted, is the locked path's (stream_write). */
+static int lockfree_write(uint64_t fd, const iovec64_t* iov, uint64_t cnt,
+                          uint64_t* out) {
+    const void* bufs[8];
+    uint64_t lens[8], total = 0;
+    int tx, t = sched64_current();
+    int64_t r;
+
+    if (!lockfree_stream(fd) || (tx = fds[fd].tx) < 0) return 0;
+    if (cnt > 8 || t < 0 || t >= SCHED64_MAX_TASKS || wprog[t].active) return 0;
+    for (uint64_t i = 0; i < cnt; i++) {
+        bufs[i] = iov[i].iov_base;
+        lens[i] = iov[i].iov_len;
+        total += lens[i];
+        if (!vmspace64_user_ready((uint64_t)bufs[i], lens[i], 0)) return 0;
+    }
+    if (total > pipe64_space(tx)) return 0;
+    r = pipe64_write_all(tx, bufs, lens, (int)cnt, total);
+    if (r < 0) return 0;
+    if (r > 0) sched64_wake(PIPE64_WAIT_KEY(tx), SCHED64_MAX_TASKS);
+    *out = (uint64_t)r;
+    return 1;
+}
+
+static int lockfree_syscall(syscall64_args_t* args, uint64_t* out) {
+    uint64_t nr = args->nr, a1 = args->a1, a2 = args->a2, a3 = args->a3;
+    uint64_t r;
+
+    if (sched64_current() < 0) return 0;
+    switch (nr) {
+    case SYS64_READ:
+        if (!lockfree_read(a1, a2, a3, &r)) return 0;
+        break;
+    case SYS64_WRITE: {
+        iovec64_t one = { (void*)a2, a3 };
+        if (!a3 || !lockfree_write(a1, &one, 1, &r)) return 0;
+        break;
+    }
+    case SYS64_WRITEV:
+        if (!a2 || !a3 || a3 > 8 || !user_range_ok(a2, a3 * sizeof(iovec64_t)) ||
+            !vmspace64_user_ready(a2, a3 * sizeof(iovec64_t), 0))
+            return 0;
+        if (!lockfree_write(a1, (const iovec64_t*)a2, a3, &r)) return 0;
+        break;
+    case SYS64_CLOCK_GETTIME: {
+        struct { uint64_t sec, nsec; }* ts = (void*)a2;
+        if (clock64_kind(a1) == CLOCK64_KIND_NONE) r = (uint64_t)-22;
+        else if (!ts || !user_range_ok(a2, 16)) r = (uint64_t)-14;
+        else { clock64_read(a1, &ts->sec, &ts->nsec); r = 0; }
+        break;
+    }
+    case SYS64_GETTIMEOFDAY: {
+        struct { uint64_t sec, usec; }* tv = (void*)a1;
+        if (tv && !user_range_ok(a1, 16)) return 0;
+        if (tv) {
+            uint64_t sec, ns;
+            clock64_realtime(&sec, &ns);
+            tv->sec  = sec;
+            tv->usec = ns / 1000;
+        }
+        r = 0;
+        break;
+    }
+    case SYS64_GETPID: r = (uint64_t)proc64_current_pid();  break;
+    case SYS64_GETTID: r = (uint64_t)sched64_current() + 1; break;
+    case SYS64_GETUID: case SYS64_GETEUID:
+    case SYS64_GETGID: case SYS64_GETEGID: r = 0; break;
+    case SYS64_RT_SIGPROCMASK: {
+        uint64_t set, old;
+        int rc;
+        if (a2 && !user_range_ok(a2, 8)) { r = (uint64_t)-14; break; }
+        if (a3 && !user_range_ok(a3, 8)) { r = (uint64_t)-14; break; }
+        if (a2) set = *(const uint64_t*)a2;
+        rc = signal64_sigprocmask((int)a1, a2 ? &set : 0, a3 ? &old : 0, args->a4);
+        if (rc) { r = (uint64_t)(int64_t)rc; break; }
+        if (a3) *(uint64_t*)a3 = old;
+        r = 0;
+        break;
+    }
+    default:
+        return 0;
+    }
+    __atomic_fetch_add(&calls_by_nr[nr], 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&lockfree_hits, 1, __ATOMIC_RELAXED);
+    *out = r;
+    return 1;
+}
+
 uint64_t syscall64_dispatch(syscall64_args_t* args) {
     uint64_t r, nr = args->nr;
     uint64_t* user_rsp_slot = (uint64_t*)args + 16;
 
+    if (smp64_active && lockfree_syscall(args, &r)) {
+        if (!signal_waiting()) return r;
+        smp64_enter();
+        saved_user_rsp = *user_rsp_slot;
+        r = delivery_tail(args, r);
+        *user_rsp_slot = saved_user_rsp;
+        smp64_exit();
+        return r;
+    }
+
     smp64_enter();
+    sched64_note_entry();
     saved_user_rsp = *user_rsp_slot;
     r = syscall64_dispatch_locked(args);
     *user_rsp_slot = saved_user_rsp;
@@ -2195,6 +2348,10 @@ static uint64_t syscall64_dispatch_locked(syscall64_args_t* args) {
     usd_check("before", args);
     r = syscall64_dispatch_inner(args);
     usd_check("after", args);
+    return delivery_tail(args, r);
+}
+
+static uint64_t delivery_tail(syscall64_args_t* args, uint64_t r) {
 
     /* Anything kill(2) left for this process, taken on the way out.
      *
@@ -2900,6 +3057,28 @@ static uint64_t do_execve(const char* path, const char* const* argv,
         uint64_t before = pmm64_free_frames();
         vmspace64_destroy(&old_space);
         reclaim_report("exec", before);
+    }
+
+    /* Where the process runs from now on (smp64_pick_cpu_for): with a
+     * fresh address space and one thread there is nothing tying it to
+     * this CPU, and this is the moment Wine's launchers become the
+     * programs they launch. */
+    /* Not the run's leader: its exit returns to kernel_main, whose stack
+     * is the bootstrap CPU's. */
+    if (proc64_current_pid() != leader_pid) {
+        int cpu = smp64_pick_cpu_for(proc64_current_pid());
+        if (cpu >= 0 && cpu != smp64_this()) {
+            registers64_t next;
+            vmspace64_t next_space;
+            uint64_t next_fs;
+            int m = sched64_migrate_current(&entry, cpu, &next, &next_space, &next_fs);
+            if (m > 0) {
+                vmspace64_switch(&next_space);
+                write_msr(0xC0000100u, next_fs);
+                sched64_resume(&next);                 /* never returns */
+            }
+            if (m < 0 && smp64_this() != 0) smp64_ap_idle();
+        }
     }
     sched64_resume(&entry);                            /* never returns */
     return 0;

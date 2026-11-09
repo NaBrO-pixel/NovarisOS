@@ -123,4 +123,7 @@ int pipe64_inflight(int p);
  * connection is not visible any other way. */
 uint64_t pipe64_live(void);
 
+int64_t pipe64_write_all(int p, const void* const* bufs, const uint64_t* lens,
+                         int cnt, uint64_t n);
+
 #endif

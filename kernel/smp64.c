@@ -23,6 +23,7 @@
 #include "kstring.h"
 #include "idt64.h"
 #include "gdt64.h"
+#include "proc64.h"
 
 #define KERNEL_VMA_ 0xFFFFFFFF80000000ULL
 
@@ -60,6 +61,7 @@ static uint64_t tr_pd[512]   __attribute__((aligned(4096)));
 static uint8_t ap_stacks[SMP64_MAX_CPUS][16384] __attribute__((aligned(16)));
 
 static void ap_timer_handler(registers64_t* r);
+static void send_kick(int c);
 
 static uint64_t image_phys(const void* p) { return (uint64_t)p - KERNEL_VMA_; }
 
@@ -115,10 +117,9 @@ static void lapic_enable(void) {
  * It is recursive: an interrupt arriving while this CPU already holds it
  * (kernel_main runs with interrupts on; the idle loop does) only counts.
  *
- * And it carries the kernel's idea of who is running. The scheduler's
- * `current` and proc64's current pid are single globals; each CPU keeps its
- * own pair here, loaded when it takes the lock and stored when it lets go,
- * so the code that reads them never knows there is more than one CPU.
+ * Who is running is not the lock's business: the scheduler's current task
+ * and proc64's current pid are kept per CPU, indexed by gdt64_cpu, so they
+ * read the same with or without the lock.
  *
  * None of it does anything until smp64_start_scheduling: with one CPU
  * running tasks there is nobody to exclude. */
@@ -129,6 +130,11 @@ volatile int smp64_active;
  * to be waited for, and the cycles spent waiting (smp64_report). */
 static uint64_t smp64_spin_cycles[SMP64_MAX_CPUS], smp64_contended[SMP64_MAX_CPUS],
                 smp64_acquired[SMP64_MAX_CPUS], smp64_kicks;
+/* And where the rest of each CPU's time goes: holding the lock, and
+ * halted with nothing to run. What is neither is ring 3. */
+static uint64_t smp64_held_cycles[SMP64_MAX_CPUS], held_since[SMP64_MAX_CPUS];
+uint64_t smp64_idle_cycles[SMP64_MAX_CPUS];
+static uint64_t smp64_t_start, smp64_busy_wakes;
 
 static inline uint64_t tsc_now(void) {
     uint32_t lo, hi;
@@ -141,15 +147,6 @@ static volatile int bkl;
 static volatile int bkl_owner = -1;
 static int bkl_depth;
 
-static struct {
-    int sched_current;
-    int proc_pid;
-} ctx[SMP64_MAX_CPUS];
-
-extern int  sched64_current(void);
-extern void sched64_set_current_raw(int i);
-extern int  proc64_current_pid(void);
-extern void proc64_set_current(int pid);
 
 static int this_cpu(void) {
     int c = gdt64_cpu();
@@ -169,17 +166,15 @@ void smp64_enter(void) {
         smp64_contended[cpu]++;
     }
     smp64_acquired[cpu]++;
+    held_since[cpu] = tsc_now();
     bkl_owner = cpu;
     bkl_depth = 1;
     smp64_cpu = cpu;
-    sched64_set_current_raw(ctx[cpu].sched_current);
-    proc64_set_current(ctx[cpu].proc_pid);
 }
 
 static void release(void) {
     int cpu = smp64_cpu;
-    ctx[cpu].sched_current = sched64_current();
-    ctx[cpu].proc_pid = proc64_current_pid();
+    smp64_held_cycles[cpu] += tsc_now() - held_since[cpu];
     bkl_depth = 0;
     bkl_owner = -1;
     __atomic_store_n(&bkl, 0, __ATOMIC_RELEASE);
@@ -222,21 +217,49 @@ void smp64_kernel_holds(void) {
     bkl_depth = 1;
 }
 
-int smp64_this(void) { return smp64_active ? smp64_cpu : 0; }
+/* This CPU. 0 until scheduling spreads - every caller before then is the
+ * bootstrap CPU - which saves the task-register read in the scheduler's
+ * scans on one CPU. */
+int smp64_this(void) { return smp64_active ? this_cpu() : 0; }
+
+int smp64_held_here(void) { return smp64_active && bkl_owner == this_cpu(); }
 
 /* --- spreading processes ---------------------------------------------- */
 
 static int spread_next;
 static volatile int spreading;
 
-/* The CPU a new process runs on: every CPU in turn while spreading, the
- * bootstrap one otherwise. Threads stay with their process (proc64.c), so
- * a process's page tables are only ever loaded on one CPU and nothing has
- * to tell the others to flush their TLBs. */
-int smp64_pick_cpu(void) {
-    if (!spreading || ncpus < 2) return 0;
+/* The CPU for a process that has just exec'd: the one with fewest live
+ * processes, `self` not counted, ties going round in turn. Its threads
+ * stay with it (proc64.c), so a process's page tables are only ever
+ * loaded on one CPU and nothing has to tell the others to flush their
+ * TLBs. Returns -1 while not spreading: the process stays where it is. */
+int smp64_pick_cpu_for(int self) {
+    int best = -1, best_n = 0;
+    if (!spreading || ncpus < 2) return -1;
+    /* The wineserver stays with the run's leader, on the bootstrap CPU.
+     * Every Wine process talks to it in strict request and reply, the
+     * browser most of all; on one CPU each reply is a switch, on two it
+     * is a wake-up IPI each way, and QEMU is slow at waking a halted CPU.
+     * Nothing is lost in parallel: the two take turns anyway. */
+    {
+        const char* comm = proc64_comm_of(self);
+        if (comm && kstrcmp(comm, "wineserver") == 0) return 0;
+    }
     spread_next = (spread_next + 1) % ncpus;
-    return spread_next;
+    for (int k = 0; k < ncpus; k++) {
+        int c = (spread_next + k) % ncpus;
+        /* The bootstrap CPU has the leader, the wineserver, the clock
+         * and the network already: it counts double. */
+        int n = proc64_count_on(c, self) * (c == 0 ? 2 : 1);
+        if (best < 0 || n < best_n) { best = c; best_n = n; }
+    }
+    return best;
+}
+
+int smp64_pick_cpu(void) {
+    int c = smp64_pick_cpu_for(-1);
+    return c < 0 ? 0 : c;
 }
 
 /* --- the application processors' scheduling ---------------------------- */
@@ -253,20 +276,38 @@ static volatile int halted[SMP64_MAX_CPUS];
 void smp64_kick_halted(void) {
     int me;
     if (!smp64_active) return;
-    me = smp64_cpu;
+    me = this_cpu();
     for (int c = 0; c < ncpus; c++) {
         if (c == me || !halted[c]) continue;
-        lapic_write(LAPIC_ICR_HI, (uint32_t)c << 24);
-        lapic_write(LAPIC_ICR_LO, 0x4000 | SMP64_KICK_VECTOR);   /* fixed, assert */
-        smp64_kicks++;
+        send_kick(c);
     }
 }
 
 void smp64_set_halted(int on) {
-    if (smp64_active) halted[smp64_cpu] = on;
+    if (smp64_active) halted[this_cpu()] = on;
 }
 
-static void kick_handler(registers64_t* r) { (void)r; smp64_lapic_eoi(); }
+/* A task woken for a CPU that is running something else: that CPU is
+ * sent the same IPI, and switches to it at once if it was in ring 3
+ * (sched64_preempt). One IPI outstanding per CPU at most. */
+static volatile int preempt_pending[SMP64_MAX_CPUS];
+uint64_t smp64_timer_irqs[SMP64_MAX_CPUS];   /* every AP timer interrupt */
+extern void sched64_preempt(registers64_t* frame);
+
+static void kick_handler(registers64_t* r) {
+    int me = this_cpu();
+    smp64_lapic_eoi();
+    if (preempt_pending[me]) {
+        preempt_pending[me] = 0;
+        sched64_preempt(r);
+    }
+}
+
+static void send_kick(int c) {
+    lapic_write(LAPIC_ICR_HI, (uint32_t)c << 24);
+    lapic_write(LAPIC_ICR_LO, 0x4000 | SMP64_KICK_VECTOR);   /* fixed, assert */
+    smp64_kicks++;
+}
 static volatile int parked[SMP64_MAX_CPUS];
 
 extern void gdt64_install_cpu(int cpu);
@@ -276,6 +317,19 @@ extern void syscall64_init_cpu(int cpu);
 extern int  sched64_run_this_cpu(void);      /* resumes a task, or returns 0 */
 extern void sched64_tick(registers64_t* frame);
 extern void sched64_park_current(const registers64_t* frame);
+
+/* The bootstrap CPU's own LAPIC timer, for sampling only: its scheduling
+ * tick is the PIT, whose interrupts QEMU raises from its main thread -
+ * which waits for QEMU's device lock, and loses ticks when that is busy.
+ * Each CPU's LAPIC timer is raised by that CPU's own thread, so every
+ * CPU is sampled the same way. */
+static void sample_handler(registers64_t* r);
+
+static void lapic_sampler_start(void) {
+    lapic_write(LAPIC_TMR_DIV, 0x3);
+    lapic_write(LAPIC_LVT_TMR, (1u << 17) | SMP64_SAMPLE_VECTOR);
+    lapic_write(LAPIC_TMR_INIT, 4 * (lapic_ticks_per_ms ? lapic_ticks_per_ms : 100000));
+}
 
 static void lapic_timer_start(void) {
     lapic_write(LAPIC_TMR_DIV, 0x3);                     /* divide by 16 */
@@ -292,6 +346,37 @@ static void kernel_space(void) {
 /* An AP with nothing to do: no lock, the kernel's own page tables (the
  * process it last ran may be gone, and its tables with it), interrupts on
  * for the timer. Picks up any task pinned to it. */
+/* A halt's length, less what the interrupts that ended it spent spinning
+ * for the lock and holding it: those are counted as such already. */
+void smp64_note_idle(int me, uint64_t dt, uint64_t sp0, uint64_t hd0) {
+    uint64_t other = (smp64_spin_cycles[me] - sp0) + (smp64_held_cycles[me] - hd0);
+    smp64_idle_cycles[me] += dt > other ? dt - other : 0;
+}
+
+/* An interrupt that found this CPU halted (idt64.c): acknowledged and
+ * nothing else - the halt loop looks for work itself. A preemption asked
+ * for meanwhile is moot: there is nothing running to preempt. */
+static void sample_handler(registers64_t* r) {
+    smp64_lapic_eoi();
+    smp64_note_tick(0, r, 4);
+}
+
+/* The sampler's interrupt, before any lock (idt64.c). */
+void smp64_sample_irq(void* frame) { sample_handler((registers64_t*)frame); }
+
+void smp64_idle_irq(int vector) {
+    int me = this_cpu();
+    if (vector == SMP64_TIMER_VECTOR) smp64_timer_irqs[me]++;
+    preempt_pending[me] = 0;
+    smp64_lapic_eoi();
+}
+
+int smp64_idle_here(void) {
+    return smp64_active && halted[this_cpu()];
+}
+
+extern int sched64_maybe_work(int cpu);
+
 void smp64_ap_idle(void) __attribute__((noreturn));
 void smp64_ap_idle(void) {
     for (;;) {
@@ -299,16 +384,25 @@ void smp64_ap_idle(void) {
         /* Only once scheduling is on: before that the lock is not live
          * and "this CPU's tasks" would read as the bootstrap CPU's. */
         if (smp64_active && !quiesce) {
-            parked[smp64_cpu] = 0;
+            parked[this_cpu()] = 0;
             sched64_run_this_cpu();                      /* returns only if none */
         }
-        parked[smp64_cpu] = 1;
-        halted[smp64_cpu] = 1;
+        parked[this_cpu()] = 1;
+        halted[this_cpu()] = 1;
         {
-            int me = smp64_cpu;
+            int me = this_cpu();
             smp64_leave_to_user();
+            uint64_t t0, sp0, hd0;
             kernel_space();
-            __asm__ __volatile__("sti; hlt; cli");
+            t0 = tsc_now(); sp0 = smp64_spin_cycles[me]; hd0 = smp64_held_cycles[me];
+            /* Halted until something here looks runnable - read without
+             * the lock, so the busy CPUs are not held up while this one
+             * has nothing to do. A wrong guess either way costs one
+             * look under the lock, or the next tick. */
+            do {
+                __asm__ __volatile__("sti; hlt; cli");
+            } while (smp64_active && !quiesce && !sched64_maybe_work(me));
+            smp64_note_idle(me, tsc_now() - t0, sp0, hd0);
             halted[me] = 0;
         }
     }
@@ -317,6 +411,7 @@ void smp64_ap_idle(void) {
 /* The APs' timer: a scheduler tick for whatever this CPU is running. The
  * clock itself is the bootstrap processor's PIT. */
 void smp64_timer_tick(void* frame) {
+    smp64_timer_irqs[this_cpu()]++;
     smp64_lapic_eoi();
     /* Before scheduling starts an AP has nothing to schedule - and its
      * idea of `current` would be the bootstrap CPU's. */
@@ -333,16 +428,53 @@ void smp64_timer_tick(void* frame) {
         sched64_park_current((registers64_t*)frame);
         smp64_ap_idle();
     }
+    smp64_note_tick(this_cpu(), (registers64_t*)frame, 4);
     sched64_tick((registers64_t*)frame);
 }
 
 int smp64_quiescing(void) { return quiesce; }
+
+/* Ring-3 time, sampled by the timer: each CPU's, and the processes that
+ * had it (the busiest few are reported). `ms` is the tick's length. */
+static uint64_t user_ms[SMP64_MAX_CPUS], kernel_ms[SMP64_MAX_CPUS];
+static uint64_t clock_at_start;
+static volatile int accounting;
+static struct { int pid, cpu; uint64_t ms; char comm[16]; } by_proc[64];
+extern int proc64_current_pid(void);
+void smp64_note_tick(int cpu, const void* frame_, int ms) {
+    const registers64_t* frame = (const registers64_t*)frame_;
+    int pid, i, free_i = -1;
+    if (!accounting) return;
+    if ((frame->cs & 3) != 3) { kernel_ms[cpu] += (uint64_t)ms; return; }
+    user_ms[cpu] += (uint64_t)ms;
+    pid = proc64_current_pid();
+    for (i = 0; i < 64; i++) {
+        if (by_proc[i].ms && by_proc[i].pid == pid && by_proc[i].cpu == cpu) break;
+        if (!by_proc[i].ms && free_i < 0) free_i = i;
+    }
+    if (i == 64) {
+        const char* c = proc64_comm_of(pid);
+        if (free_i < 0) return;
+        i = free_i;
+        by_proc[i].pid = pid; by_proc[i].cpu = cpu;
+        kstrlcpy(by_proc[i].comm, c ? c : "?", sizeof(by_proc[i].comm));
+    }
+    by_proc[i].ms += (uint64_t)ms;
+}
 
 static void ap_timer_handler(registers64_t* r) { smp64_timer_tick(r); }
 
 /* Starts scheduling on the APs: from here on new processes are spread
  * over every CPU (smp64_pick_cpu) and the lock is live. */
 void smp64_start_scheduling(void) {
+    /* The ring-3 sampling (smp64_note_tick) runs on one CPU too, for
+     * the comparison. */
+    for (int c = 0; c < SMP64_MAX_CPUS; c++) user_ms[c] = kernel_ms[c] = 0;
+    for (int i = 0; i < 64; i++) by_proc[i].ms = 0;
+    accounting = 1;
+    if (lapic && this_cpu() == 0) lapic_sampler_start();
+    for (int c = 0; c < SMP64_MAX_CPUS; c++) smp64_timer_irqs[c] = 0;
+    clock_at_start = clock64_ticks();
     if (ncpus < 2) return;
     quiesce = 0;
     /* This CPU is inside the kernel - kernel_main - and so holds the lock
@@ -351,13 +483,17 @@ void smp64_start_scheduling(void) {
     bkl_owner = 0;
     bkl_depth = 1;
     smp64_cpu = 0;
-    /* Every AP starts with nothing running. */
-    for (int c = 1; c < SMP64_MAX_CPUS; c++) {
-        ctx[c].sched_current = -1;
-        ctx[c].proc_pid = -1;
-    }
     smp64_active = 1;
     spreading = 1;
+    smp64_t_start = tsc_now();
+    for (int c = 0; c < SMP64_MAX_CPUS; c++) {
+        smp64_spin_cycles[c] = smp64_contended[c] = smp64_acquired[c] = 0;
+        smp64_held_cycles[c] = smp64_idle_cycles[c] = 0;
+    }
+    smp64_kicks = smp64_busy_wakes = 0;
+    for (int c = 0; c < SMP64_MAX_CPUS; c++) user_ms[c] = 0;
+    for (int i = 0; i < 64; i++) by_proc[i].ms = 0;
+    held_since[0] = smp64_t_start;
     serial64_puts("NOVARIS64: [smp] scheduling on ");
     serial64_putdec((uint64_t)ncpus);
     serial64_puts(" CPUs\n");
@@ -368,6 +504,7 @@ void smp64_start_scheduling(void) {
  * lock; it is let go while the APs park. */
 void smp64_quiesce(void) {
     int depth, all;
+    accounting = 0;
     if (!smp64_active) return;
     spreading = 0;
     quiesce = 1;
@@ -451,13 +588,27 @@ int smp64_init(void) {
     /* The LAPIC timer's rate, against the PIT: count down for 20ms. */
     lapic_write(LAPIC_TMR_DIV, 0x3);
     lapic_write(LAPIC_LVT_TMR, 1u << 16);                /* masked, one-shot */
-    lapic_write(LAPIC_TMR_INIT, 0xFFFFFFFFu);
-    wait_ms(20);
-    lapic_ticks_per_ms = (0xFFFFFFFFu - lapic_read(LAPIC_TMR_CUR)) / 20;
-    lapic_write(LAPIC_TMR_INIT, 0);
+    {
+        /* And the TSC's against the same window, for the clock
+         * (clock64_use_tsc). Waited for from the edge of a tick, so the
+         * window is whole ticks; the machine is idle, so none is lost. */
+        uint64_t t0, t1;
+        wait_ms(1);
+        t0 = tsc_now();
+        lapic_write(LAPIC_TMR_INIT, 0xFFFFFFFFu);
+        wait_ms(50);
+        lapic_ticks_per_ms = (0xFFFFFFFFu - lapic_read(LAPIC_TMR_CUR)) / 50;
+        t1 = tsc_now();
+        lapic_write(LAPIC_TMR_INIT, 0);
+        clock64_use_tsc((t1 - t0) / 50);
+        serial64_puts("NOVARIS64: [clock] the TSC runs at ");
+        serial64_putdec((t1 - t0) / 50);
+        serial64_puts(" a millisecond; the clock follows it from here\n");
+    }
 
     register_interrupt_handler64(SMP64_TIMER_VECTOR, ap_timer_handler);
     register_interrupt_handler64(SMP64_KICK_VECTOR, kick_handler);
+    register_interrupt_handler64(SMP64_SAMPLE_VECTOR, sample_handler);
 
     tramp = (uint8_t*)phys64_to_virt(TRAMPOLINE_PHYS);
     kmemcpy(tramp, ap_trampoline_bin, ap_trampoline_len);
@@ -494,8 +645,106 @@ void smp64_kernel_space(void) {
     if (smp64_active) kernel_space();
 }
 
+#ifndef SMP64_WAKE_PREEMPT
+#define SMP64_WAKE_PREEMPT 1
+#endif
+void smp64_note_wake(int cpu) {
+    if (!smp64_active || cpu < 0 || cpu >= ncpus || cpu == this_cpu()) return;
+    /* Halted with nothing to do: woken, so it starts the task now rather
+     * than at its next tick. Only this CPU - waking every halted one on
+     * every wake-up was 3 million IPIs a run, each a trip through QEMU's
+     * device lock on both sides. */
+    if (halted[cpu]) { send_kick(cpu); return; }
+    smp64_busy_wakes++;
+    if (SMP64_WAKE_PREEMPT && !preempt_pending[cpu]) {
+        preempt_pending[cpu] = 1;
+        send_kick(cpu);
+    }
+}
+
+/* The processes with the most ring-3 time, and where they ran. */
+#ifdef NOVARIS64_IO_COUNT
+uint32_t io64_counts[65536];
+#endif
+
+static void report_procs(void) {
+#ifdef NOVARIS64_IO_COUNT
+    serial64_puts("NOVARIS64: [io] busiest ports:");
+    for (int k = 0; k < 10; k++) {
+        int best = -1;
+        for (int p = 0; p < 65536; p++)
+            if (io64_counts[p] && (best < 0 || io64_counts[p] > io64_counts[best])) best = p;
+        if (best < 0) break;
+        serial64_puts(" ");
+        serial64_puthex((uint64_t)best);
+        serial64_puts("x");
+        serial64_putdec(io64_counts[best]);
+        io64_counts[best] = 0;
+    }
+    serial64_putc('\n');
+#endif
+    for (int k = 0; k < 16; k++) {
+        int best = -1;
+        for (int i = 0; i < 64; i++)
+            if (by_proc[i].ms && (best < 0 || by_proc[i].ms > by_proc[best].ms)) best = i;
+        if (best < 0) break;
+        serial64_puts("NOVARIS64: [smp]   pid ");
+        serial64_putdec((uint64_t)by_proc[best].pid);
+        serial64_puts(" ");
+        serial64_puts(by_proc[best].comm);
+        serial64_puts(" on cpu ");
+        serial64_putdec((uint64_t)by_proc[best].cpu);
+        serial64_puts(": ");
+        serial64_putdec(by_proc[best].ms);
+        serial64_puts("ms\n");
+        by_proc[best].ms = 0;
+    }
+}
+
 void smp64_report(void) {
-    if (ncpus < 2) return;
+    uint64_t el;
+    if (ncpus < 2) { report_procs(); return; }
+    el = tsc_now() - smp64_t_start;
+    for (int c = 0; c < ncpus; c++) {
+        uint64_t k = smp64_held_cycles[c], sp = smp64_spin_cycles[c], id = smp64_idle_cycles[c];
+        uint64_t u = el > k + sp + id ? el - k - sp - id : 0;
+        serial64_puts("NOVARIS64: [smp] cpu ");
+        serial64_putdec((uint64_t)c);
+        serial64_puts(" time: kernel ");
+        serial64_putdec(el ? k * 100 / el : 0);
+        serial64_puts("%, spinning ");
+        serial64_putdec(el ? sp * 100 / el : 0);
+        serial64_puts("%, idle ");
+        serial64_putdec(el ? id * 100 / el : 0);
+        serial64_puts("%, user ");
+        serial64_putdec(el ? u * 100 / el : 0);
+        serial64_puts("% of ");
+        serial64_putdec(el / 1000000u);
+        serial64_puts("M; sampled: ring 3 ");
+        serial64_putdec(user_ms[c]);
+        serial64_puts("ms, kernel with interrupts on ");
+        serial64_putdec(kernel_ms[c]);
+        serial64_puts("ms\n");
+    }
+    report_procs();
+    serial64_puts("NOVARIS64: [smp] AP timer interrupts:");
+    for (int c = 1; c < ncpus; c++) { serial64_putc(' '); serial64_putdec(smp64_timer_irqs[c]); }
+    serial64_puts(" over ");
+    serial64_putdec(clock64_ticks() - clock_at_start);
+    serial64_puts("ms of the clock; lapic ");
+    serial64_putdec(lapic_ticks_per_ms);
+    serial64_puts(" counts/ms\n");
+    {
+        extern uint64_t syscall64_lockfree_hits(void), kmain64_pf_fast_hits(void);
+        serial64_puts("NOVARIS64: [smp] without the lock: ");
+        serial64_putdec(syscall64_lockfree_hits());
+        serial64_puts(" syscalls, ");
+        serial64_putdec(kmain64_pf_fast_hits());
+        serial64_puts(" page faults\n");
+    }
+    serial64_puts("NOVARIS64: [smp] wakes of a task on a busy CPU: ");
+    serial64_putdec(smp64_busy_wakes);
+    serial64_putc('\n');
     for (int c = 0; c < ncpus; c++) {
         serial64_puts("NOVARIS64: [smp] cpu ");
         serial64_putdec((uint64_t)c);
@@ -511,3 +760,6 @@ void smp64_report(void) {
     serial64_putdec(smp64_kicks);
     serial64_putc('\n');
 }
+
+uint64_t smp64_spin_snapshot(int c) { return smp64_spin_cycles[c]; }
+uint64_t smp64_held_snapshot(int c) { return smp64_held_cycles[c]; }

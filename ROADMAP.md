@@ -11007,6 +11007,82 @@ first), and Wine's processes placed beside their server. That is the
 next large project; until then `QEMU_SMP=1`, which runs the uniprocessor
 path unchanged.
 
+## Milestone 102 - more than one CPU, faster than one
+
+Milestone 101 left four CPUs at 335-822 s for the Chromium page against
+one CPU's 165 s, and put it down to the one kernel lock. Measured
+properly first (`smp64_report`: each CPU's time held, spinning, idle and
+in ring 3, and which processes ran where), the lock was not the main
+problem:
+
+- **Processes did not spread.** Wine starts a program through a
+  launcher, so round robin at fork put every launcher on one CPU and every
+  program on the next; with four CPUs the programs only ever landed on
+  two, and CPUs 1 and 3 ran under 0.1 s of ring 3 in a whole run. A
+  process is now placed at `execve`, when it has one thread and a fresh
+  address space, on the CPU with the fewest live processes
+  (`smp64_pick_cpu_for`, `sched64_migrate_current`); a fork stays with its
+  parent until then. The run's leader never moves - its exit returns to
+  `kernel_main` on CPU 0 - and the wineserver stays beside it: the two
+  talk in strict request and reply, and a reply on the same CPU is a
+  switch where one across CPUs is two wake-up IPIs. With it one run took
+  252 s and the next 484 s: runs varied that much until the rest below.
+- **Every wake-up interrupted every halted CPU**: 3 million IPIs a run,
+  each two trips through QEMU's device lock. Now only the woken task's
+  CPU is told, if it is halted; if it is busy it is asked to switch to the
+  task at once (`sched64_preempt`) rather than at the end of the running
+  one's 4 ms slice. About 300,000 a run.
+- **An idle CPU took the lock to find it had nothing to do**, on every
+  timer tick and every IPI. It now halts without the lock until something
+  of its own looks runnable (`sched64_maybe_work`, read without it).
+- **The clock lost half its time.** It counted PIT interrupts, and QEMU
+  merges a tick that arrives while the last is still pending - when CPU 0
+  has interrupts off for a while, or QEMU's main thread, which raises
+  them, waits for QEMU's device lock. A four-CPU run counted 134 s across
+  268 s of real time, so every timeout ran twice as long as asked. The
+  clock follows the TSC now, measured against the PIT at start-up
+  (`clock64_use_tsc`).
+
+Then the lock itself. Who is running is per CPU, read from the task
+register, instead of globals the lock swapped in and out - so code can run
+without the lock and still know whose it is. Without it, now:
+
+| what | per Chromium run | why it is safe |
+|---|---|---|
+| `clock_gettime`, `gettimeofday`, `rt_sigprocmask`, `get*id` | ~1.4M | they read the clock or the caller's own state |
+| page faults: first touch, copy-on-write | ~1.1M | a process's threads share one CPU, so its page tables and reservations are that CPU's; the frame allocator has its own lock |
+| `read`, `write`, `writev` on pipes and Unix sockets | ~1.3M | the pipes have their own lock; the scheduler's wake and block state has its own; user buffers are checked mapped first |
+
+The pipes' lock, the task table's lock and the allocator's lock
+(`include/spin64.h`) sit under the kernel lock in a fixed order, with
+interrupts off while held. A wake-up from a lock-free writer can no longer
+be lost by a reader that has looked and not yet slept: every wake-up
+counts, and a sleep that would be restarted on waking checks the count
+first and, if anything was woken since its call began, runs the call
+again instead (`sched64_guard_block`).
+
+| | before | now |
+|---|---|---|
+| 4 CPUs, boot to the page | 335-822 s | 170-173 s |
+| 1 CPU, same day, unchanged tree | 193 s | 188-199 s |
+| lock waits, 4 CPUs | 7.4M | 0.5M |
+| spinning, CPU 0 | 22-31% | 6-7% |
+| wake-up IPIs | 4.5M | 0.3M |
+
+Four CPUs are faster than one now, not by much: CPU 0 is still 90% busy
+with the browser and the wineserver while the other three are two-thirds
+idle. Almost all of a page load is one multi-threaded process - the
+browser - and its threads share a CPU. Spreading a process's threads over
+CPUs is the next step and a larger one: a page-table change would have to
+be flushed from every CPU running that process (TLB shootdown), and its
+page faults and memory calls would need a lock of their own. `QEMU_SMP`
+stays 1 by default; `QEMU_SMP=4` works for the whole sequence.
+
+Also here: a sampling timer on CPU 0 (its LAPIC, since the PIT's ticks
+are lost), and `-DNOVARIS64_IO_COUNT` to count port I/O by port - which
+showed the guest makes only 4M port accesses a run, so the 264M times
+QEMU's profile shows its device lock taken are QEMU's own.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the

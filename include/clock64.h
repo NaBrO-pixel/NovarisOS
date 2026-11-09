@@ -26,6 +26,10 @@ void     clock64_tick(void);
 
 uint64_t clock64_ticks(void);
 
+/* From here on the time is the TSC's, at `per_ms` cycles a millisecond. */
+void     clock64_use_tsc(uint64_t per_ms);
+uint64_t clock64_tsc_per_ms(void);
+
 /* Seconds and nanoseconds since the timer started. Monotonic: it starts
  * at zero and only goes forwards. */
 void     clock64_now(uint64_t* sec, uint64_t* nsec);

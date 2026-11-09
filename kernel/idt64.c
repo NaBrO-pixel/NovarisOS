@@ -87,6 +87,7 @@ extern void irq15(void);
 extern void irq240(void);
 extern void irq255(void);
 extern void irq241(void);
+extern void irq242(void);
 
 static const char* const exception_names[32] = {
     "divide error", "debug", "non-maskable interrupt", "breakpoint",
@@ -176,7 +177,16 @@ static void panic(registers64_t* r) {
 }
 
 /* Called from isr_common_stub with rdi pointing at the frame. */
+extern int kmain64_page_fault_fast(registers64_t* r);
+
 void isr64_handler(registers64_t* r) {
+    /* The common page faults first, without the kernel lock - unless this
+     * CPU holds it already, a fault in a syscall's own copy to or from
+     * the program, which then stays under it (kmain64.c). */
+    if (r->int_no == 14 && smp64_active && !smp64_held_here() &&
+        kmain64_page_fault_fast(r))
+        return;
+
     /* The kernel lock (smp64.c) for the handler's length; a handler that
      * does not come back - into another task, or to kernel_main - lets it
      * go, or keeps it, on its own way out. */
@@ -197,6 +207,22 @@ void irq64_handler(registers64_t* r) {
     if (r->int_no < 48) {
         if (r->int_no >= 40) outb(PIC2_CMD, PIC_EOI);
         outb(PIC1_CMD, PIC_EOI);
+    }
+
+    /* The sampler: counted and acknowledged, nothing else, no lock. */
+    if (r->int_no == SMP64_SAMPLE_VECTOR) {
+        smp64_sample_irq(r);
+        return;
+    }
+
+    /* An idle CPU's own timer, or a wake-up IPI to it: the halt it
+     * interrupted looks for work itself, without the lock until there
+     * is some (smp64_ap_idle, sched64.c's idle loop). Taking the lock
+     * here was every idle CPU contending with the busy ones 250 times a
+     * second, plus once per wake-up. */
+    if (r->int_no >= 0xF0 && (r->cs & 3) == 0 && smp64_idle_here()) {
+        smp64_idle_irq((int)r->int_no);
+        return;
     }
 
     smp64_enter();
@@ -349,6 +375,7 @@ void idt64_install(void) {
     set_gate(SMP64_TIMER_VECTOR, (uint64_t)irq240, 0, 0);
     set_gate(0xFF, (uint64_t)irq255, 0, 0);
     set_gate(SMP64_KICK_VECTOR, (uint64_t)irq241, 0, 0);
+    set_gate(SMP64_SAMPLE_VECTOR, (uint64_t)irq242, 0, 0);
 
     idt_ptr.limit = (uint16_t)(sizeof(idt) - 1);
     idt_ptr.base  = (uint64_t)&idt;

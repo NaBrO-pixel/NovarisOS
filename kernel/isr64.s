@@ -140,6 +140,7 @@ IRQ 14, 46
 IRQ 15, 47
 IRQ 240, 240    ; the APs' LAPIC timer (smp64.c)
 IRQ 241, 241    ; the kick IPI (smp64.c)
+IRQ 242, 242    ; the bootstrap CPU's sampling timer (smp64.c)
 IRQ 255, 255    ; the local APIC's spurious vector: no handler, no EOI
 
 extern isr64_handler

@@ -2,6 +2,7 @@
 
 #include "proc64.h"
 #include "smp64.h"
+#include "gdt64.h"
 #include "serial64.h"
 #include "pipe64.h"
 #include "inet64.h"
@@ -10,12 +11,14 @@
 #include "kstring.h"
 
 static proc64_t procs[PROC64_MAX];
-static int      current_pid = -1;
+/* Per CPU, like the scheduler's current task (sched64.c). */
+static int      current_pid_cpu[SMP64_MAX_CPUS] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+#define current_pid (current_pid_cpu[smp64_active ? gdt64_cpu() & (SMP64_MAX_CPUS - 1) : 0])
 static int      next_pid = 1;
 
 void proc64_init(void) {
     for (int i = 0; i < PROC64_MAX; i++) procs[i].used = 0;
-    current_pid = -1;
+    for (int c = 0; c < SMP64_MAX_CPUS; c++) current_pid_cpu[c] = -1;
     next_pid = 1;
 }
 
@@ -97,9 +100,13 @@ int proc64_fork_from(int pid) {
     if (child_pid < 0) return -1;
 
     child = slot_for(child_pid);
-    /* A new process, so a CPU of its own choosing: every CPU in turn
-     * while a run is spreading its processes, this one otherwise. */
-    child->cpu = smp64_pick_cpu();
+    /* The parent's CPU. Nearly every fork here is followed by an
+     * execve, which is where a process is placed (smp64_pick_cpu): it
+     * has a fresh address space then and nothing left on this CPU.
+     * Choosing here instead put every launcher's short-lived helper on
+     * one CPU and the program it started on the next, so with round
+     * robin over four CPUs the programs only ever landed on two. */
+    child->cpu = parent->cpu;
 
     /* Everything the child inherits: open files at the same offsets,
      * the same heap layout, the same idea of what it is. The address
@@ -238,4 +245,24 @@ uint64_t proc64_count(void) {
 int proc64_cpu_of(int pid) {
     proc64_t* p = slot_for(pid);
     return p ? p->cpu : 0;
+}
+
+void proc64_set_cpu(int pid, int cpu) {
+    proc64_t* p = slot_for(pid);
+    if (p) p->cpu = cpu;
+}
+
+/* Live processes placed on `cpu`, not counting `except`: the load
+ * smp64_pick_cpu balances. */
+int proc64_count_on(int cpu, int except) {
+    int n = 0;
+    for (int i = 0; i < PROC64_MAX; i++)
+        if (procs[i].used && !procs[i].exited && procs[i].cpu == cpu &&
+            procs[i].pid != except) n++;
+    return n;
+}
+
+const char* proc64_comm_of(int pid) {
+    proc64_t* p = slot_for(pid);
+    return p ? p->comm : 0;
 }
