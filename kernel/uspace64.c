@@ -812,7 +812,14 @@ uint64_t uspace64_build_stack(vmspace64_t* space, uint64_t stack_top,
                               uint64_t interp_base,
                               const char* const* envp) {
     uint64_t saved_cr3, p, random_va, rsp;
-    uint64_t argv_va[16], env_va[16];
+    /* Room for every argument and variable execve accepts (128 each) and
+     * more. It was sixteen of each, silently: a program exec'd with a
+     * seventeenth argument never saw it, and every process lost the end
+     * of an ordinary environment. It showed when Chromium's command line
+     * grew past it and lost its last two arguments - --dump-dom and the
+     * URL - and sat, started, with nothing to load. Static: there is one
+     * processor and this is never re-entered. */
+    static uint64_t argv_va[256], env_va[256];
     uint64_t* v;
     uint64_t n;
     int nenv = 0, nargv = 0;
@@ -832,8 +839,10 @@ uint64_t uspace64_build_stack(vmspace64_t* space, uint64_t stack_top,
         ((uint8_t*)p)[i] = (uint8_t)(0x5A + i * 7);
 
     for (nargv = 0; argv && argv[nargv]; nargv++) { }
-    if (nargv > (int)(sizeof(argv_va) / sizeof(argv_va[0])))
+    if (nargv > (int)(sizeof(argv_va) / sizeof(argv_va[0]))) {
+        serial64_puts("NOVARIS64: [exec] more than 256 arguments - the rest are dropped\n");
         nargv = (int)(sizeof(argv_va) / sizeof(argv_va[0]));
+    }
     for (int a = nargv - 1; a >= 0; a--) {
         uint64_t l = kstrlen(argv[a]) + 1;
         p -= l;
@@ -846,8 +855,10 @@ uint64_t uspace64_build_stack(vmspace64_t* space, uint64_t stack_top,
      * find HOME, and Wine derives its prefix from it, so "no variables
      * at all" turns into a NULL dereference deep inside a library. */
     for (nenv = 0; envp && envp[nenv]; nenv++) { }
-    if (nenv > (int)(sizeof(env_va) / sizeof(env_va[0])))
+    if (nenv > (int)(sizeof(env_va) / sizeof(env_va[0]))) {
+        serial64_puts("NOVARIS64: [exec] more than 256 environment variables - the rest are dropped\n");
         nenv = (int)(sizeof(env_va) / sizeof(env_va[0]));
+    }
     for (int e = nenv - 1; e >= 0; e--) {
         uint64_t l = kstrlen(envp[e]) + 1;
         p -= l;

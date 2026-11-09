@@ -1,6 +1,7 @@
 /* proc64.c - the state a process owns, as opposed to a thread. */
 
 #include "proc64.h"
+#include "smp64.h"
 #include "serial64.h"
 #include "pipe64.h"
 #include "inet64.h"
@@ -96,6 +97,9 @@ int proc64_fork_from(int pid) {
     if (child_pid < 0) return -1;
 
     child = slot_for(child_pid);
+    /* A new process, so a CPU of its own choosing: every CPU in turn
+     * while a run is spreading its processes, this one otherwise. */
+    child->cpu = smp64_pick_cpu();
 
     /* Everything the child inherits: open files at the same offsets,
      * the same heap layout, the same idea of what it is. The address
@@ -229,4 +233,9 @@ uint64_t proc64_count(void) {
     uint64_t n = 0;
     for (int i = 0; i < PROC64_MAX; i++) if (procs[i].used) n++;
     return n;
+}
+
+int proc64_cpu_of(int pid) {
+    proc64_t* p = slot_for(pid);
+    return p ? p->cpu : 0;
 }

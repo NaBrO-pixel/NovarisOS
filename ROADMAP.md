@@ -10862,6 +10862,151 @@ outbound traffic goes through a proxy, and QEMU's user network would
 have to go around it. That was not attempted. Real sites, real DNS and
 real certificates are for a machine with ordinary network access.
 
+## Milestone 99 - faster Windows programs, and the real internet
+
+**Page-aligned PE files.** Wine maps a section from its file only when the
+section's file offset is a page multiple, and reads it into private
+memory otherwise. Chromium's PE files use `FileAlignment` 0x200; for
+example, `chrome.dll`'s 284MB `.text` starts at 0x600. So every Chromium
+process read its own 320MB copy. Wine's own DLLs are built page-aligned
+and were never affected.
+
+`tools/pe_pagealign.py` rewrites a PE with each section at a page-aligned
+file offset:
+- the same bytes at the same RVAs, verified section by section;
+- `FileAlignment` and `SizeOfHeaders` set to 0x1000;
+- the debug directory's file offsets moved with their section;
+- the Authenticode certificate dropped;
+- the checksum recomputed.
+
+The initrd staging runs it on every `.dll` and `.exe` from
+`CHROMIUM64_DIR` (`PE_PAGEALIGN=0` turns it off). With the sections
+mapped, NovarisOS shares one copy of their pages between every process
+(Milestone 92's copy-on-write file mappings).
+
+Headless Chromium loading `https://novaris.test/page.html`
+(`make chrome-net`), original files against rewritten:
+
+| | original | page-aligned |
+|---|---|---|
+| boot to finish | 290 s | 223 s |
+| Chromium layer, cycles | 490G | 342G |
+| page faults | 2.25M | 0.92M |
+| pages first touched | 2.31M (~9GB) | 0.85M (~3.3GB) |
+
+On the build machine's own Wine the same rewrite took headless Chromium
+from 8-14 s to about 4 s.
+
+**The real internet.** This build machine reaches the internet only
+through an HTTPS proxy on its 127.0.0.1. QEMU's user network shows that
+address to the guest as 10.0.2.2. `make chrome-net
+CHROME_NET_URL=https://example.com/
+CHROME_NET_PROXY=http://10.0.2.2:<port>` (`CHROME64_PROXY`) gives
+Chromium the proxy, which makes the connection under its own policy.
+Chromium inside NovarisOS then printed the real `https://example.com/`
+("Example Domain") and exited 0. The proxy re-signs TLS with a CA the
+guest does not hold, so this also relies on
+`--ignore-certificate-errors`. A machine with ordinary networking needs
+no proxy: QEMU's forwarder does DNS and the guest connects directly.
+
+## Milestone 100 - where an exe's time goes, and less of it in the kernel
+
+The `[cycles]` report now separates page-fault and idle cycles from
+syscall cycles. For headless Chromium loading a page, that left about
+80% as the programs' own emulated code. Three scheduler costs came out
+of it:
+
+- **Timeslice.** A task keeps the processor for `SCHED64_SLICE_TICKS`
+  (4) ticks; it used to be 1. With forty Chromium tasks runnable that
+  was a thousand switches a second, each reloading CR3, which under
+  QEMU's emulation discards the software TLB. Blocking still switches
+  at once. 10 ticks measured no better.
+- **CR3.** `vmspace64_switch` skips the reload when the space is
+  already loaded, as for another thread of the same process.
+- **Bounded scans.** The scheduler scans stop at a high-water mark
+  instead of walking all 1024 task slots on every tick and every wake.
+  A pipe read went from 29K to 12K cycles, a write from 35K to 19K. The
+  inet socket table has the same mark.
+
+Headless Chromium, boot to finish: 212 s before these, 185 s with the
+first two, about 170 s with all three. The Chromium layer went from 327G
+to about 255-263G cycles. `make test` with Chromium staged prints 32
+PASS, 0 FAIL.
+
+What is left is mostly not the kernel's. `poll` costs about 150K cycles
+walking the wineserver's few hundred descriptors, which is 3%. Most of
+the rest is Chromium's own work, much of it background services (update
+checks, Safe Browsing, sign-in) that Chromium's flags could turn off.
+
+## Milestone 101 - four ways to run emulated code faster, measured
+
+Milestone 100 found about 80% of a Chromium run to be the programs' own
+emulated code. Four attempts at that, each measured on headless Chromium
+loading `https://novaris.test/page.html` (`make chrome-net`); one CPU's
+baseline is about 165-170 s boot to finish.
+
+**1. Chromium doing less (`-DCHROME64_LEAN`, opt-in).** Switches that turn
+off its background services: networking, component updates, sync,
+extensions, default apps and more. It halves the Google lookups, and saves
+no time (172 s), so it is not the default. Bisecting it found a real bug:
+**`uspace64_build_stack` kept 16 `argv` entries and 16 environment
+variables, silently, for every `execve`**. Chromium, given a few more
+switches, lost `--dump-dom` and its URL. It now keeps 256 of each, says
+so beyond that, and `run_wine_program` takes 62 arguments.
+`userland/spawn64.c` execs itself with 41 arguments and 40 more variables,
+on Linux and here.
+
+**2. QEMU's own settings (`QEMU_EXTRA`).** A 2GB translation cache took
+181 s and `-cpu max` 188 s; neither beat the default.
+
+**3. KVM (`QEMU_ACCEL`).** `-enable-kvm -cpu host` whenever `/dev/kvm` can
+be opened, for every QEMU the Makefile runs. With KVM the guest's code
+runs on the processor; it is the one change likely to make most of the
+80% disappear. This build machine has no KVM (a VM without `vmx`/`svm`),
+so it is untested here.
+
+**4. More than one CPU (`QEMU_SMP`, default 1).** `kernel/smp64.c` starts
+the application processors with INIT/STARTUP through a real-mode
+trampoline (`boot/ap_trampoline.s`). Each CPU gets its own:
+- GDT and TSS; the TSS sits at its own GDT slot, so `str` names the CPU
+  without an MMIO read;
+- interrupt stacks;
+- SYSCALL entry stub and stack, with the user's rsp kept in the frame;
+- LAPIC timer.
+
+One recursive kernel lock is taken on every system call, interrupt and
+exception, and dropped on the way back to ring 3 and around halts. Each
+CPU's `current` task and pid are swapped with it, so the kernel still sees
+one CPU. Processes are pinned to a CPU (chosen in turn at fork from the
+Wine prefix on), so a page-table change never has to be flushed from
+another CPU's TLB. Idle CPUs drop the lock, load the kernel's page tables
+and halt; a wake-up sends an IPI to halted CPUs. Bugs found getting it
+stable:
+- AP timers ran the scheduler before scheduling started.
+- An idle AP took the bootstrap CPU's tasks.
+- Every CPU's context started at task 0.
+- During quiesce, a tick that interrupted the idle loop re-entered it a
+  level deeper every millisecond, until the stack overflowed.
+
+On 4 CPUs the whole Wine and Chromium sequence works (prefix, winegui,
+chromeprobe, Chromium printing the page), and it is **much slower**:
+
+| CPUs | boot to finish | lock waits | spinning | wake-up IPIs |
+|---|---|---|---|---|
+| 1 | 165 s | - | - | - |
+| 2 | 824 s | 2.5M of 7.8M | ~100G cycles | 1.6M |
+| 4 | 335-822 s | 7.4M of 13.3M | ~1,180G cycles | 4.5M |
+
+Wine is kernel-bound: every wineserver request is several system calls,
+and with one lock around the kernel the CPUs take turns. The
+wineserver's clients sit on other CPUs, so every request also becomes a
+cross-CPU wake-up. Each wake-up IPI and each APIC access is an emulated
+device access, which takes QEMU's own global lock. To gain from more
+CPUs the kernel needs finer locking (pipes, futexes and the scheduler
+first), and Wine's processes placed beside their server. That is the
+next large project; until then `QEMU_SMP=1`, which runs the uniprocessor
+path unchanged.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the

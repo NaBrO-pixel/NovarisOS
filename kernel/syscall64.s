@@ -45,6 +45,8 @@ extern syscall64_dispatch
 ; sees a normal function call.
 ; ---------------------------------------------------------------------
 global enter_user_mode64
+extern smp64_leave_to_user
+extern smp64_kernel_holds
 enter_user_mode64:
     push rbx
     push rbp
@@ -53,6 +55,16 @@ enter_user_mode64:
     push r14
     push r15
     mov [rel kernel_return_rsp], rsp
+
+    ; Out of the kernel: the kernel lock (smp64.c) goes. rdi, rsi and rdx
+    ; are the arguments and the C call may destroy them.
+    push rdi
+    push rsi
+    push rdx                        ; 16-byte aligned again for the call
+    call smp64_leave_to_user
+    pop rdx
+    pop rsi
+    pop rdi
 
     ; The frame iretq consumes, top of stack last: SS, RSP, RFLAGS, CS, RIP.
     push qword UDATA_SEL | RPL3
@@ -72,13 +84,36 @@ enter_user_mode64:
 ; arguments follow Linux's convention: rax = number, then rdi, rsi, rdx.
 ; Only the number and one argument are used during bring-up.
 ; ---------------------------------------------------------------------
-global syscall64_entry
-syscall64_entry:
-    ; Still on the user's stack here. Nothing may be pushed until after
-    ; the next two instructions.
-    mov [rel saved_user_rsp], rsp
-    lea rsp, [rel syscall_stack_top]
+; One stub per CPU (Milestone 101). IA32_LSTAR is per CPU, so each points
+; at its own: the only thing that has to differ is where the user's rsp is
+; parked for the two instructions before there is a stack, and which
+; kernel stack to switch to. The user's rsp then goes into the frame, so
+; the shared body below - and the way back out - never touches a global
+; another CPU might be writing.
+%assign SYSCALL_STACK_SIZE 16384
+%macro SYSCALL_STUB 1
+global syscall64_entry_cpu%1
+syscall64_entry_cpu%1:
+    mov [rel saved_user_rsp_cpu + %1 * 8], rsp
+    lea rsp, [rel syscall_stacks + (%1 + 1) * SYSCALL_STACK_SIZE]
+    sub rsp, 8                      ; keeps the call below 16-byte aligned
+    push qword [rel saved_user_rsp_cpu + %1 * 8]   ; at args + 128
+    jmp syscall64_entry_common
+%endmacro
 
+global syscall64_entry
+syscall64_entry:                    ; the bootstrap processor's
+    jmp syscall64_entry_cpu0
+SYSCALL_STUB 0
+SYSCALL_STUB 1
+SYSCALL_STUB 2
+SYSCALL_STUB 3
+SYSCALL_STUB 4
+SYSCALL_STUB 5
+SYSCALL_STUB 6
+SYSCALL_STUB 7
+
+syscall64_entry_common:
     push rcx                        ; user rip, destroyed by SYSCALL
     push r11                        ; user rflags, likewise
 
@@ -150,7 +185,7 @@ syscall64_entry:
 
     pop r11
     pop rcx
-    mov rsp, [rel saved_user_rsp]
+    pop rsp                         ; the user's, from the top of the frame
     o64 sysret
 
     ; SYS64_EXIT: do not go back to ring 3. Restore the stack
@@ -158,6 +193,9 @@ syscall64_entry:
     ; still holding whatever the dispatcher returned.
 .leave_ring3:
     mov rsp, [rel kernel_return_rsp]
+    push rax                        ; the result, across the C call
+    call smp64_kernel_holds         ; kernel_main holds the lock, once
+    pop rax
     pop r15
     pop r14
     pop r13
@@ -183,6 +221,9 @@ syscall64_entry:
 global enter_user_mode64_abort
 enter_user_mode64_abort:
     mov rsp, [rel kernel_return_rsp]
+    push rax
+    call smp64_kernel_holds
+    pop rax
     pop r15
     pop r14
     pop r13
@@ -203,8 +244,8 @@ enter_user_mode64_abort:
 ; breaks silently and catastrophically, which is why idt64.h says the two
 ; have to stay in step.
 ; ---------------------------------------------------------------------
-global sched64_resume
-sched64_resume:
+global sched64_resume_raw
+sched64_resume_raw:                 ; through sched64_resume (sched64.c)
     ; The frame iretq consumes, off the incoming struct: ss, rsp,
     ; rflags, cs, rip. Built on the current stack, which iretq abandons
     ; the moment it loads the thread's own rsp.
@@ -288,6 +329,20 @@ task_count_exit:
     jmp .hang
 task_count_code_end:
 
+section .rodata
+align 8
+; Each CPU's IA32_LSTAR, by CPU number (syscall64_init_cpu).
+global syscall64_entry_table
+syscall64_entry_table:
+    dq syscall64_entry_cpu0
+    dq syscall64_entry_cpu1
+    dq syscall64_entry_cpu2
+    dq syscall64_entry_cpu3
+    dq syscall64_entry_cpu4
+    dq syscall64_entry_cpu5
+    dq syscall64_entry_cpu6
+    dq syscall64_entry_cpu7
+
 section .bss
 align 16
 ; Global because a blocking syscall has to record where its caller's
@@ -296,12 +351,14 @@ align 16
 global saved_user_rsp
 saved_user_rsp:     resq 1
 kernel_return_rsp:  resq 1
+global saved_user_rsp_cpu
+saved_user_rsp_cpu: resq 8
 
 ; The stack the entry stub switches to. Reached with `lea`, so it is the
 ; address itself rather than a pointer to be filled in - one less thing
 ; that can be left uninitialised on the path where the CPU is still on a
 ; ring-3 stack and cannot report anything.
 align 16
-syscall_stack_bottom:
-    resb 16384
-syscall_stack_top:
+global syscall_stacks
+syscall_stacks:
+    resb 16384 * 8

@@ -47,6 +47,7 @@
 #include "sock64.h"
 #include "clock64.h"
 #include "inet64.h"
+#include "smp64.h"
 #include "tcp.h"
 
 static int failures = 0;
@@ -383,7 +384,28 @@ void kmain64_fault_stats(uint64_t* faults, uint64_t* cow, uint64_t* segv) {
     *segv   = segv_delivered;
 }
 
+/* Cycles spent in the page-fault handler, and how many faults, for the
+ * [cycles] report (syscall64.c resets them with the call counters). */
+volatile uint64_t pf_cycles_total, pf_count_total;
+
+static inline uint64_t pf_tsc(void) {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static void page_fault_body(registers64_t* r);
+
 static void page_fault_handler(registers64_t* r) {
+    uint64_t t0 = pf_tsc();
+    page_fault_body(r);
+    /* Not reached for a fault that ends in a signal or a kill - those
+     * leave through the scheduler - which is the rare case. */
+    pf_cycles_total += pf_tsc() - t0;
+    pf_count_total++;
+}
+
+static void page_fault_body(registers64_t* r) {
     /* Only this fault's own refusal may count as running out. */
     (void)pmm64_take_user_oom();
     pf_hits++;
@@ -663,9 +685,9 @@ static void run_wine_program(const void* image, uint64_t len,
     const uint64_t STACK_PAGES = 128;
     const uint64_t EXE_BIAS    = 0x0000555555554000ULL;
     const uint64_t INTERP_BASE = 0x00007FFFF7000000ULL;
-    /* uspace64_build_stack copies sixteen argv entries; two are wine and
-     * the program, so fourteen are left for the program's own. */
-    const char* argv[17];
+    /* Wine, the program, and up to sixty-two of the program's own. It was
+     * fourteen, silently - see uspace64_build_stack. */
+    const char* argv[65];
     int nargs = 0;
     elf64_info_t exe, interp;
     uint64_t rsp = 0, i;
@@ -674,9 +696,15 @@ static void run_wine_program(const void* image, uint64_t len,
 
     argv[0] = "/usr/bin/wine";
     argv[1] = program;
-    while (args && args[nargs] && nargs < 14) {
+    while (args && args[nargs] && nargs < 62) {
         argv[2 + nargs] = args[nargs];
         nargs++;
+    }
+    if (args && args[nargs]) {
+        serial64_puts("NOVARIS64: FAIL  more than 62 arguments for ");
+        serial64_puts(program);
+        serial64_puts(" - the rest would have been dropped\n");
+        failures++;
     }
     argv[2 + nargs] = 0;
 
@@ -4527,6 +4555,9 @@ fast_inet:
         idt64_irq_set_mask(0, 0);
         __asm__ __volatile__("pushfq; pop %0; sti" : "=r"(flags) :: "memory");
         card = inet64_init();
+        /* And the other processors, while the clock is running with
+         * interrupts on - starting one waits for it to answer. */
+        smp64_init();
         __asm__ __volatile__("push %0; popfq" :: "r"(flags) : "memory", "cc");
         idt64_irq_set_mask(0, 1);
         if (card)
@@ -4870,6 +4901,11 @@ fast_inet:
 #ifdef NOVARIS64_FAST
 fast_wine:
 #endif
+    /* From the prefix on, every CPU there is runs programs (Milestone
+     * 101): Wine and Chromium are dozens of processes, and each new one is
+     * pinned to the next CPU. Everything before ran on this one. */
+    smp64_start_scheduling();
+
     /* --- layer 38: a Wine prefix (Milestone 71) ---------------------- */
     /* Milestone 68 removed every reason a prefix could not exist here -
      * the node ceiling, the name and path ceilings, the missing links,
@@ -5254,6 +5290,11 @@ fast_wine:
  * for the page to come out right. make test supplies the network. */
 #define CHROME64_URL "https://novaris.test:18783/page.html"
 #endif
+/* The lean switches, one bit each in CHROME64_LEAN_MASK so a run can
+ * leave any of them out (they were bisected this way). */
+#ifndef CHROME64_LEAN_MASK
+#define CHROME64_LEAN_MASK 0x3FF
+#endif
 static const char* const chrome_args[] = {
 #ifndef CHROME64_WINDOWED
     "--headless",
@@ -5289,9 +5330,65 @@ static const char* const chrome_args[] = {
      * popup with reason kCrash, three times a run. Chromium's own switch,
      * checked on the Linux host to change nothing about the page. */
     "--disable-hang-monitor",
+#ifdef CHROME64_LEAN
+    /* Lean (Milestone 101, opt-in): the background services a page load
+     * does not need - update checks, Safe Browsing, sync, extensions and
+     * the rest that the DNS log showed Chromium reaching for. Measured, it
+     * halves those lookups and saves no time at all (172 s against
+     * 169-171), so the browser runs as it ships unless this is asked
+     * for. Bisecting it is what found the 16-argument limit in
+     * uspace64_build_stack. */
+#ifndef CHROME64_LEAN_NO_SWITCHES
+#if CHROME64_LEAN_MASK & 0x1
+    "--disable-background-networking",
+#endif
+#if CHROME64_LEAN_MASK & 0x2
+    "--disable-component-update",
+#endif
+#if CHROME64_LEAN_MASK & 0x4
+    "--disable-sync",
+#endif
+#if CHROME64_LEAN_MASK & 0x8
+    "--disable-default-apps",
+#endif
+#if CHROME64_LEAN_MASK & 0x10
+    "--disable-extensions",
+#endif
+#if CHROME64_LEAN_MASK & 0x20
+    "--disable-domain-reliability",
+#endif
+#if CHROME64_LEAN_MASK & 0x40
+    "--disable-client-side-phishing-detection",
+#endif
+#if CHROME64_LEAN_MASK & 0x80
+    "--no-first-run",
+#endif
+#if CHROME64_LEAN_MASK & 0x100
+    "--no-default-browser-check",
+#endif
+#if CHROME64_LEAN_MASK & 0x200
+    "--metrics-recording-only",
+#endif
+#endif
+#ifndef CHROME64_LEAN_NO_FEATURES
+    "--disable-features=Translate,OptimizationHints,MediaRouter,"
+        "DialMediaRouteProvider,CalculateNativeWinOcclusion,"
+        "AutofillServerCommunication,CertificateTransparencyComponentUpdater,"
+        "InterestFeedContentSuggestions,OptimizationGuideModelDownloading",
+#endif
+#endif
     /* The helper's certificate is self-signed for novaris.test: a page
      * load that has to succeed cannot also be a lesson in trust. */
     "--ignore-certificate-errors",
+#ifdef CHROME64_PROXY
+    /* The way out to the real internet from a build machine whose traffic
+     * goes through an HTTPS proxy: QEMU's user network shows the machine's
+     * 127.0.0.1 to the guest as 10.0.2.2, so Chromium asks that proxy to
+     * CONNECT instead of connecting itself, and the proxy's policy applies
+     * as to anything else on the machine. The proxy re-signs TLS with a CA
+     * the guest does not hold - --ignore-certificate-errors above. */
+    "--proxy-server=" CHROME64_PROXY,
+#endif
 #ifdef CHROME64_VERBOSE
     /* Chromium's own account of itself, children included: 616 lines
      * for a whole successful run on the Linux host, so the serial port
@@ -5354,6 +5451,8 @@ static const char* const chrome_args[] = {
     }
 
     reclaim_finished("end");
+    smp64_quiesce();
+    smp64_report();
     serial64_puts("NOVARIS64: ---- bring-up complete ----\n");
 
     /* --- the input watch (Milestone 70) ------------------------------

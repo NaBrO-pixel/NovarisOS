@@ -117,6 +117,8 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/pipe64.o \
        $(BUILD_DIR)/sock64.o \
        $(BUILD_DIR)/inet64.o \
+       $(BUILD_DIR)/smp64.o \
+       $(BUILD_DIR)/ap_blob.o \
        $(BUILD_DIR)/net.o \
        $(BUILD_DIR)/tcp.o \
        $(BUILD_DIR)/dhcp.o \
@@ -157,6 +159,14 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 $(BUILD_DIR)/boot64.o: boot/boot64.s | $(BUILD_DIR)
+	$(AS) $(ASFLAGS) $< -o $@
+
+# The application processors' real-mode entry (kernel/smp64.c): a flat
+# binary, carried in the kernel by ap_blob.s and copied to 0x8000.
+$(BUILD_DIR)/ap_trampoline.bin: boot/ap_trampoline.s | $(BUILD_DIR)
+	$(AS) -f bin $< -o $@
+
+$(BUILD_DIR)/ap_blob.o: kernel/ap_blob.s $(BUILD_DIR)/ap_trampoline.bin | $(BUILD_DIR)
 	$(AS) $(ASFLAGS) $< -o $@
 
 $(BUILD_DIR)/isr64.o: kernel/isr64.s | $(BUILD_DIR)
@@ -696,11 +706,19 @@ WINE64_NTDLL  ?= $(firstword $(wildcard \
 # installation in the initrd" ten minutes later. The file is rewritten
 # only when its contents differ, so an unchanged configuration is still
 # an up-to-date initrd.
+# Every PE staged from CHROMIUM64_DIR is rewritten with its sections at
+# page-aligned file offsets (tools/pe_pagealign.py), so Wine maps them
+# instead of reading them and every process shares one copy of chrome.dll
+# rather than reading its own 320MB. PE_PAGEALIGN=0 stages the files as
+# they came, to compare.
+PE_PAGEALIGN ?= 1
+
 INITRD_CONFIG = $(BUILD_DIR)/initrd64.config
 INITRD_CONFIG_TEXT = WINE64_INSTALL=$(WINE64_INSTALL) \
     WINE64_LOADER=$(abspath $(WINE64_LOADER)) \
     WINE64_NTDLL=$(abspath $(WINE64_NTDLL)) \
-    CHROMIUM64_DIR=$(CHROMIUM64_DIR) CHROMIUM64_FILES=$(CHROMIUM64_FILES)
+    CHROMIUM64_DIR=$(CHROMIUM64_DIR) CHROMIUM64_FILES=$(CHROMIUM64_FILES) \
+    PE_PAGEALIGN=$(PE_PAGEALIGN)
 # Only when this make is building the image. It used to be rewritten by
 # every invocation, so compiling one object without the Wine and
 # Chromium variables - `make -f Makefile.amd64 build64/inet64.o` - wrote
@@ -720,16 +738,17 @@ endif
 # the previous list - which costs a build and a boot to notice, and
 # looks exactly like the fix not working.
 $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
-           $(BUILD_DIR)/forkchild64.elf $(NOVAC_CHILD) userland/mkinitrd.py \
+           $(BUILD_DIR)/forkchild64.elf $(BUILD_DIR)/spawn64.elf $(NOVAC_CHILD) userland/mkinitrd.py \
            $(BUILD_DIR)/winegui64.exe $(BUILD_DIR)/chromeprobe64.exe \
            tools/stage_wine.sh tools/wine_prefix_modules.txt \
-           tools/wine_chromium_modules.txt $(INITRD_CONFIG)
+           tools/wine_chromium_modules.txt tools/pe_pagealign.py $(INITRD_CONFIG)
 	rm -rf $(INITRD_STAGE)
 	mkdir -p $(INITRD_STAGE)
 	cp $(BUILD_DIR)/dlllib64.dll $(INITRD_STAGE)/dlllib64.dll
 	cp $(BUILD_DIR)/dynhello64.elf $(INITRD_STAGE)/dynhello64
 	mkdir -p $(INITRD_STAGE)/tmp
 	cp $(BUILD_DIR)/forkchild64.elf $(INITRD_STAGE)/tmp/forkchild64
+	cp $(BUILD_DIR)/spawn64.elf $(INITRD_STAGE)/tmp/spawn64
 	cp $(NOVAC_CHILD) $(INITRD_STAGE)/tmp/novac_child
 	@# At the paths ld.so actually searches, which were read off its own
 	@# trace rather than guessed: it tries /lib/x86_64-linux-gnu first.
@@ -821,7 +840,14 @@ $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
 	    for f in $(CHROMIUM64_FILES); do \
 	        [ -f "$(CHROMIUM64_DIR)/$$f" ] || continue; \
 	        mkdir -p "$(INITRD_STAGE)/opt/chromium/$$(dirname $$f)"; \
-	        cp "$(CHROMIUM64_DIR)/$$f" $(INITRD_STAGE)/opt/chromium/$$f; \
+	        case "$$f" in \
+	        *.dll|*.exe) \
+	            if [ "$(PE_PAGEALIGN)" = 1 ]; then \
+	                python3 tools/pe_pagealign.py "$(CHROMIUM64_DIR)/$$f" \
+	                    $(INITRD_STAGE)/opt/chromium/$$f || exit 1; \
+	            else cp "$(CHROMIUM64_DIR)/$$f" $(INITRD_STAGE)/opt/chromium/$$f; fi ;; \
+	        *) cp "$(CHROMIUM64_DIR)/$$f" $(INITRD_STAGE)/opt/chromium/$$f ;; \
+	        esac; \
 	    done; \
 	    echo "  initrd: chromium, $$(du -sh $(INITRD_STAGE)/opt/chromium | cut -f1)"; \
 	 fi
@@ -853,8 +879,20 @@ iso: $(KERNEL) $(INITRD)
 # renderer was the one that ran out; 12G finishes with 6.7GB free.
 QEMU_RAM ?= $(if $(CHROMIUM64_DIR),12G,2G)
 
+# Hardware virtualisation when this machine has it. With KVM the guest's
+# instructions run on the real processor instead of being translated one
+# block at a time by QEMU's TCG - for Chromium, where about 80% of the
+# time is the programs' own code (Milestone 100), that is most of the
+# run. Used automatically when /dev/kvm can be opened; QEMU_ACCEL= forces
+# emulation. QEMU_EXTRA is anything else to hand QEMU.
+QEMU_KVM   ?= $(shell [ -r /dev/kvm ] && [ -w /dev/kvm ] && echo 1)
+QEMU_ACCEL ?= $(if $(QEMU_KVM),-enable-kvm -cpu host)
+QEMU_EXTRA ?=
+# How many CPUs the guest has (kernel/smp64.c starts the others).
+QEMU_SMP   ?= 1
+
 run: iso
-	qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -serial stdio
+	qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) $(QEMU_ACCEL) -smp $(QEMU_SMP) $(QEMU_EXTRA) -serial stdio
 
 # The bring-up test. kernel_main halts rather than exiting, so the run has
 # to be stopped from outside and judged by what reached the serial port.
@@ -891,7 +929,7 @@ test: iso
 	    --log $(BUILD_DIR)/net64.http.log & \
 	  hpid=$$!; \
 	  tools/qemu_net64.sh $(BUILD_DIR)/resolv.net64 \
-	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -display none \
+	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) $(QEMU_ACCEL) -smp $(QEMU_SMP) $(QEMU_EXTRA) -display none \
 	    $(NET64_QEMU) \
 	    -serial file:$(BUILD_DIR)/serial.log -no-reboot >/dev/null 2>&1 & \
 	  qpid=$$!; waited=0; \
@@ -1323,10 +1361,17 @@ test: iso
 CHROME_NET_URL    ?= https://novaris.test:$(NET64_HTTPS)/page.html
 CHROME_NET_BUDGET ?= 300
 CHROME_NET_STALL  ?= 30
+# CHROME_NET_PROXY: an HTTP proxy for Chromium, as the guest sees it. On a
+# build machine whose traffic goes through an HTTPS proxy at
+# 127.0.0.1:PORT, http://10.0.2.2:PORT is that proxy, and with it the
+# real internet: make chrome-net CHROME_NET_URL=https://example.com/
+# CHROME_NET_PROXY=http://10.0.2.2:PORT.
+CHROME_NET_PROXY  ?=
 CHROME_NET_FLAGS   = -DNOVARIS64_FAST -DCHROME64_VERBOSE \
     -DCHROME64_URL=\"$(CHROME_NET_URL)\" \
     -DCHROME64_BUDGET_SECS=$(CHROME_NET_BUDGET)u \
-    -DCHROME64_STALL_SECS=$(CHROME_NET_STALL)
+    -DCHROME64_STALL_SECS=$(CHROME_NET_STALL) \
+    $(if $(CHROME_NET_PROXY),-DCHROME64_PROXY=\"$(CHROME_NET_PROXY)\")
 
 .PHONY: chrome-net
 chrome-net:
@@ -1341,7 +1386,7 @@ chrome-net:
 	    --log $(BUILD_DIR)/net64.http.log & \
 	  hpid=$$!; \
 	  tools/qemu_net64.sh $(BUILD_DIR)/resolv.net64 \
-	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -display none \
+	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) $(QEMU_ACCEL) -smp $(QEMU_SMP) $(QEMU_EXTRA) -display none \
 	    $(NET64_QEMU) \
 	    -serial file:$(BUILD_DIR)/serial.log -no-reboot >/dev/null 2>&1 & \
 	  qpid=$$!; waited=0; \
@@ -1384,7 +1429,7 @@ chrome-window:
 	    --log $(BUILD_DIR)/net64.http.log & \
 	  hpid=$$!; \
 	  tools/qemu_net64.sh $(BUILD_DIR)/resolv.net64 \
-	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) -display none \
+	  qemu-system-x86_64 -cdrom $(ISO) -m $(QEMU_RAM) $(QEMU_ACCEL) -smp $(QEMU_SMP) $(QEMU_EXTRA) -display none \
 	    $(NET64_QEMU) -monitor unix:$(BUILD_DIR)/chrome.mon,server,nowait \
 	    -serial file:$(BUILD_DIR)/serial.log -no-reboot >/dev/null 2>&1 & \
 	  qpid=$$!; \

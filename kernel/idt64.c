@@ -17,6 +17,7 @@
 
 #include <stdint.h>
 #include "idt64.h"
+#include "smp64.h"
 #include "gdt64.h"
 #include "serial64.h"
 #include "io.h"
@@ -83,6 +84,9 @@ extern void irq6(void);  extern void irq7(void);  extern void irq8(void);
 extern void irq9(void);  extern void irq10(void); extern void irq11(void);
 extern void irq12(void); extern void irq13(void); extern void irq14(void);
 extern void irq15(void);
+extern void irq240(void);
+extern void irq255(void);
+extern void irq241(void);
 
 static const char* const exception_names[32] = {
     "divide error", "debug", "non-maskable interrupt", "breakpoint",
@@ -173,8 +177,13 @@ static void panic(registers64_t* r) {
 
 /* Called from isr_common_stub with rdi pointing at the frame. */
 void isr64_handler(registers64_t* r) {
+    /* The kernel lock (smp64.c) for the handler's length; a handler that
+     * does not come back - into another task, or to kernel_main - lets it
+     * go, or keeps it, on its own way out. */
+    smp64_enter();
     if (r->int_no < IDT_ENTRIES && handlers[r->int_no]) {
         handlers[r->int_no](r);
+        smp64_exit();
         return;
     }
     panic(r);
@@ -183,12 +192,23 @@ void isr64_handler(registers64_t* r) {
 /* Called from irq_common_stub. The PIC end-of-interrupt is sent here
  * rather than in the stub so a handler cannot forget it. */
 void irq64_handler(registers64_t* r) {
-    if (r->int_no >= 40) outb(PIC2_CMD, PIC_EOI);
-    outb(PIC1_CMD, PIC_EOI);
+    /* The local APIC's own vectors (the APs' timer) are acknowledged at
+     * the APIC by their handler; only the 8259's need an EOI here. */
+    if (r->int_no < 48) {
+        if (r->int_no >= 40) outb(PIC2_CMD, PIC_EOI);
+        outb(PIC1_CMD, PIC_EOI);
+    }
 
+    smp64_enter();
     if (r->int_no < IDT_ENTRIES && handlers[r->int_no]) {
         handlers[r->int_no](r);
     }
+    smp64_exit();
+}
+
+/* An application processor's: the same table, loaded on that CPU. */
+void idt64_load(void) {
+    idt64_flush(&idt_ptr);
 }
 
 /* The 8259 pair, moved off the exception vectors and then silenced.
@@ -325,6 +345,10 @@ void idt64_install(void) {
     set_gate(45, (uint64_t)irq13, 0, 0);
     set_gate(46, (uint64_t)irq14, 0, 0);
     set_gate(47, (uint64_t)irq15, 0, 0);
+    /* The application processors' LAPIC timer (smp64.c). */
+    set_gate(SMP64_TIMER_VECTOR, (uint64_t)irq240, 0, 0);
+    set_gate(0xFF, (uint64_t)irq255, 0, 0);
+    set_gate(SMP64_KICK_VECTOR, (uint64_t)irq241, 0, 0);
 
     idt_ptr.limit = (uint16_t)(sizeof(idt) - 1);
     idt_ptr.base  = (uint64_t)&idt;
