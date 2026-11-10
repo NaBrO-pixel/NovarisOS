@@ -200,6 +200,7 @@ void isr64_handler(registers64_t* r) {
         smp64_exit();
         return;
     }
+    if (r->int_no == 14) smp64_mm_hold_current();
     if (r->int_no < IDT_ENTRIES && handlers[r->int_no]) {
         handlers[r->int_no](r);
         smp64_exit();

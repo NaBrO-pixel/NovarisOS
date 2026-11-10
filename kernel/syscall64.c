@@ -371,7 +371,18 @@ static void fd_take_ref(int fd) {
     }
 }
 
+static void fd_release_body(int fd);
+
+/* Under the pipes' lock, whole: a thread on another CPU may be reading or
+ * writing this descriptor without the kernel lock (Milestone 106), and
+ * finds it either as it was or gone, never half released. */
 static void fd_release(int fd) {
+    uint64_t fl = pipe64_lock();
+    fd_release_body(fd);
+    pipe64_unlock(fl);
+}
+
+static void fd_release_body(int fd) {
     if (fd < 0 || fd >= FD_MAX || !fds[fd].used) return;
 
     /* Out of any epoll set watching it, as Linux does when the last
@@ -2286,6 +2297,68 @@ static int lockfree_write(uint64_t fd, const iovec64_t* iov, uint64_t cnt,
     return 1;
 }
 
+/* The same two for a process whose threads are on several CPUs
+ * (Milestone 106). A sibling may close the descriptor meanwhile, so it is
+ * looked up and used under the pipes' lock, which close takes too; and the
+ * user's memory is copied through a buffer of this CPU's own, outside that
+ * lock, so a page fault in the copy - which may need the kernel lock -
+ * never happens while it is held. */
+static uint8_t spread_bounce[SMP64_MAX_CPUS][PIPE64_BUF];
+
+static int lockfree_read_spread(uint64_t fd, uint64_t buf, uint64_t n, uint64_t* out) {
+    uint8_t* b = spread_bounce[smp64_this()];
+    uint64_t fl;
+    int rx;
+    int64_t r;
+    if (n > PIPE64_BUF) n = PIPE64_BUF;
+    if (!user_range_ok(buf, n) || !vmspace64_user_ready(buf, n, 1)) return 0;
+    fl = pipe64_lock();
+    if (!lockfree_stream(fd) || (rx = fds[fd].rx) < 0 ||
+        (pipe64_available(rx) == 0 && pipe64_writers(rx) > 0)) {
+        pipe64_unlock(fl);
+        return 0;
+    }
+    r = pipe64_read(rx, b, n);
+    pipe64_unlock(fl);
+    if (r < 0) return 0;
+    kmemcpy((void*)buf, b, (uint64_t)r);
+    if (r > 0) sched64_wake(PIPE64_WAIT_KEY(rx), SCHED64_MAX_TASKS);
+    *out = (uint64_t)r;
+    return 1;
+}
+
+static int lockfree_write_spread(uint64_t fd, const iovec64_t* iov, uint64_t cnt,
+                                 uint64_t* out) {
+    uint8_t* b = spread_bounce[smp64_this()];
+    const void* one[1];
+    uint64_t len[1], total = 0, fl;
+    int tx, t = sched64_current();
+    int64_t r;
+
+    if (cnt > 8 || t < 0 || t >= SCHED64_MAX_TASKS || wprog[t].active) return 0;
+    for (uint64_t i = 0; i < cnt; i++) {
+        if (iov[i].iov_len > PIPE64_BUF - total) return 0;
+        if (!user_range_ok((uint64_t)iov[i].iov_base, iov[i].iov_len) ||
+            !vmspace64_user_ready((uint64_t)iov[i].iov_base, iov[i].iov_len, 0))
+            return 0;
+        kmemcpy(b + total, iov[i].iov_base, iov[i].iov_len);
+        total += iov[i].iov_len;
+    }
+    one[0] = b;
+    len[0] = total;
+    fl = pipe64_lock();
+    if (!lockfree_stream(fd) || (tx = fds[fd].tx) < 0 || total > pipe64_space(tx)) {
+        pipe64_unlock(fl);
+        return 0;
+    }
+    r = pipe64_write_all(tx, one, len, 1, total);
+    pipe64_unlock(fl);
+    if (r < 0) return 0;
+    if (r > 0) sched64_wake(PIPE64_WAIT_KEY(tx), SCHED64_MAX_TASKS);
+    *out = (uint64_t)r;
+    return 1;
+}
+
 static int lockfree_syscall(syscall64_args_t* args, uint64_t* out) {
     uint64_t nr = args->nr, a1 = args->a1, a2 = args->a2, a3 = args->a3;
     uint64_t r;
@@ -2295,17 +2368,17 @@ static int lockfree_syscall(syscall64_args_t* args, uint64_t* out) {
      * epoll sets and the pipes' copies assume the caller's process is on
      * one, so those take the lock. The clock and the thread's own mask
      * do not care where its siblings are. */
-    if (proc64_current_spread() &&
-        (nr == SYS64_READ || nr == SYS64_WRITE || nr == SYS64_WRITEV ||
-         nr == SYS64_EPOLL_WAIT))
-        return 0;
+    int spread = proc64_current_spread();
+    if (spread && nr == SYS64_EPOLL_WAIT) return 0;
     switch (nr) {
     case SYS64_READ:
-        if (!lockfree_read(a1, a2, a3, &r)) return 0;
+        if (!(spread ? lockfree_read_spread(a1, a2, a3, &r)
+                     : lockfree_read(a1, a2, a3, &r))) return 0;
         break;
     case SYS64_WRITE: {
         iovec64_t one = { (void*)a2, a3 };
-        if (!a3 || !lockfree_write(a1, &one, 1, &r)) return 0;
+        if (!a3 || !(spread ? lockfree_write_spread(a1, &one, 1, &r)
+                            : lockfree_write(a1, &one, 1, &r))) return 0;
         break;
     }
     case SYS64_EPOLL_WAIT:
@@ -2315,7 +2388,8 @@ static int lockfree_syscall(syscall64_args_t* args, uint64_t* out) {
         if (!a2 || !a3 || a3 > 8 || !user_range_ok(a2, a3 * sizeof(iovec64_t)) ||
             !vmspace64_user_ready(a2, a3 * sizeof(iovec64_t), 0))
             return 0;
-        if (!lockfree_write(a1, (const iovec64_t*)a2, a3, &r)) return 0;
+        if (!(spread ? lockfree_write_spread(a1, (const iovec64_t*)a2, a3, &r)
+                     : lockfree_write(a1, (const iovec64_t*)a2, a3, &r))) return 0;
         break;
     case SYS64_CLOCK_GETTIME: {
         struct { uint64_t sec, nsec; }* ts = (void*)a2;
@@ -2379,6 +2453,7 @@ uint64_t syscall64_dispatch(syscall64_args_t* args) {
     /* This thread was ended while it waited for the lock - its process
      * exited on another CPU (Milestone 105). */
     if (smp64_take_dead_pending()) sched64_continue_after_death();
+    smp64_mm_hold_current();          /* a spread process's memory map */
     sched64_note_entry();
     saved_user_rsp = *user_rsp_slot;
     r = syscall64_dispatch_locked(args);
@@ -6167,6 +6242,12 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
             if (liov[k].len && !user_range_ok(liov[k].base, liov[k].len))
                 return (uint64_t)-14;
 
+        /* The other process's memory map, if its threads are on several
+         * CPUs and may be faulting pages in without the kernel lock
+         * (Milestone 106). */
+        {
+        int locked = target != proc64_current() && target->spread &&
+                     smp64_mm_lock(target);
         while (li < lcnt && ri < rcnt) {
             uint64_t lleft = liov[li].len - loff;
             uint64_t rleft = riov[ri].len - roff;
@@ -6196,6 +6277,8 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
             done += n;
             loff += n;
             roff += n;
+        }
+        if (locked) smp64_mm_unlock(target);
         }
         if (!done && li < lcnt && ri < rcnt) return (uint64_t)-14;
         return done;

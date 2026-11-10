@@ -151,6 +151,8 @@ static void flush_service(int cpu);
 static void bsp_abort_now(void) __attribute__((noreturn));
 static void flush_and_free(int cpu);
 static int  ndefer[SMP64_MAX_CPUS], mm_dirty[SMP64_MAX_CPUS];
+static proc64_t* mm_held[SMP64_MAX_CPUS];
+void smp64_mm_unlock(proc64_t* p);
 
 static volatile int bkl;
 static volatile int bkl_owner = -1;
@@ -194,6 +196,13 @@ static void release(void) {
     /* A spread process's memory changed under the lock: the other CPUs
      * running it flush before the lock goes, and only then are the
      * frames it gave up handed back. */
+    /* The memory map's lock first: a CPU waiting for it answers flushes
+     * as it waits, but the flush below should not have to wait on it. */
+    if (mm_held[cpu]) {
+        proc64_t* p = mm_held[cpu];
+        mm_held[cpu] = 0;
+        while (p->mm_owner == cpu) smp64_mm_unlock(p);
+    }
     if (ndefer[cpu] || mm_dirty[cpu]) flush_and_free(cpu);
     smp64_held_cycles[cpu] += tsc_now() - held_since[cpu];
     bkl_depth = 0;
@@ -858,6 +867,7 @@ uint64_t smp64_held_snapshot(int c) { return smp64_held_cycles[c]; }
 #define DEFER_MAX 1024
 
 volatile uint64_t smp64_loaded_cr3[SMP64_MAX_CPUS];
+volatile int spin64_held[SMP64_MAX_CPUS];
 static uint64_t defer[SMP64_MAX_CPUS][DEFER_MAX], defer_pml4[SMP64_MAX_CPUS],
                 dirty_pml4[SMP64_MAX_CPUS];
 static uint64_t shootdowns, shootdown_ipis, frees_deferred, threads_spread;
@@ -929,6 +939,10 @@ int smp64_defer_free(uint64_t phys) {
     if (!SMP64_SPREAD_THREADS || !smp64_active) return 0;
     me = this_cpu();
     if (bkl_owner != me || !proc64_current_spread()) return 0;
+    /* Under one of the small locks: a kernel buffer (a pipe's ring, a
+     * file's pages) going back, never a user mapping of this process -
+     * and a full list here could not be flushed safely. */
+    if (spin64_held[me]) return 0;
     pml4 = smp64_loaded_cr3[me];
     if (ndefer[me] && (defer_pml4[me] != pml4 || ndefer[me] == DEFER_MAX))
         flush_and_free(me);
@@ -1022,3 +1036,45 @@ void smp64_spread_report(void) {
     serial64_putdec(frees_deferred);
     serial64_putc('\n');
 }
+
+/* --- a spread process's memory-map lock (Milestone 106) -------------------
+ *
+ * Recursive per CPU. A CPU spinning for it answers TLB flushes, since the
+ * holder may be ending the process and waiting for every CPU to leave it.
+ * Interrupts are off while it is held or waited for. */
+int smp64_mm_lock(proc64_t* p) {
+    int me = this_cpu();
+    if (p->mm_owner == me) { p->mm_depth++; return 1; }
+    while (__atomic_exchange_n(&p->mm_lock, 1, __ATOMIC_ACQUIRE))
+        while (p->mm_lock) {
+            if (flush_req[me]) flush_service(me);
+            __asm__ __volatile__("pause");
+        }
+    p->mm_owner = me;
+    p->mm_depth = 1;
+    return 1;
+}
+
+void smp64_mm_unlock(proc64_t* p) {
+    if (p->mm_owner != this_cpu()) return;
+    if (--p->mm_depth > 0) return;
+    p->mm_owner = -1;
+    __atomic_store_n(&p->mm_lock, 0, __ATOMIC_RELEASE);
+}
+
+/* The current process's, if it is spread, held until this CPU lets the
+ * kernel lock go: for every locked syscall and page fault of a spread
+ * process, so its lock-free page faults never meet a change half made. */
+void smp64_mm_hold_current(void) {
+    int me;
+    proc64_t* p;
+    if (!SMP64_SPREAD_THREADS || !smp64_active) return;
+    me = this_cpu();
+    if (mm_held[me]) return;
+    p = proc64_current();
+    if (!p || !p->spread) return;
+    smp64_mm_lock(p);
+    mm_held[me] = p;
+}
+
+int smp64_dead_pending_here(void) { return dead_pending[this_cpu()]; }

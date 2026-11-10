@@ -63,5 +63,8 @@ int  smp64_pick_thread_cpu(int pid, int home);
 void smp64_run_ended_elsewhere(void) __attribute__((noreturn));
 void smp64_bsp_abort_check(void);
 void smp64_spread_report(void);
+struct proc64;
+void smp64_mm_hold_current(void);
+int  smp64_dead_pending_here(void);
 
 #endif

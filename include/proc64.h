@@ -224,6 +224,10 @@ typedef struct {
      * memory calls and page faults take the kernel lock and end with a
      * TLB shootdown, and the lock-free paths that assume one CPU are off. */
     int         spread;
+    /* Its memory map's lock, once spread: page tables, reservations, brk
+     * and mmap's cursor. smp64_mm_lock. */
+    volatile int mm_lock;
+    int          mm_owner, mm_depth;
     int         cpu;
 } proc64_t;
 
@@ -304,5 +308,8 @@ void proc64_set_cpu(int pid, int cpu);
 int proc64_count_on(int cpu, int except);   /* live processes there */
 const char* proc64_comm_of(int pid);
 int  proc64_current_spread(void);
+/* smp64.c's (Milestone 106): a spread process's memory-map lock. */
+int  smp64_mm_lock(proc64_t* p);
+void smp64_mm_unlock(proc64_t* p);
 
 #endif

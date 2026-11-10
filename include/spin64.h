@@ -25,6 +25,11 @@ typedef struct {
 
 #define SPIN64_INIT { 0, -1, 0 }
 
+/* How many of these each CPU holds (smp64.c): a CPU holding one must not
+ * start a TLB shootdown, since another may be spinning for it with
+ * interrupts off and never answer. */
+extern volatile int spin64_held[];
+
 static inline uint64_t spin64_acquire(spin64_t* l) {
     uint64_t fl;
     int me;
@@ -35,11 +40,13 @@ static inline uint64_t spin64_acquire(spin64_t* l) {
         while (l->lock) __asm__ __volatile__("pause");
     l->owner = me;
     l->depth = 1;
+    spin64_held[me & 7]++;
     return fl;
 }
 
 static inline void spin64_release(spin64_t* l, uint64_t fl) {
     if (--l->depth == 0) {
+        spin64_held[l->owner & 7]--;
         l->owner = -1;
         __atomic_store_n(&l->lock, 0, __ATOMIC_RELEASE);
     }

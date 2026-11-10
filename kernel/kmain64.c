@@ -416,9 +416,26 @@ int kmain64_page_fault_fast(registers64_t* r) {
     int done = 0;
 
     if (cr2 >= 0x0000800000000000ULL || proc64_current_pid() < 0) return 0;
-    /* Its page tables are shared with other CPUs (Milestone 105): under
-     * the lock, where its memory calls are. */
-    if (proc64_current_spread()) return 0;
+    /* Its page tables are shared with other CPUs (Milestone 105). A page
+     * touched for the first time is still taken here, under the process's
+     * memory-map lock, which its locked syscalls and faults hold too
+     * (Milestone 106). A copy-on-write break changes a frame other CPUs
+     * may have cached, and needs the locked path's TLB shootdown. */
+    if (proc64_current_spread()) {
+        proc64_t* me = proc64_current();
+        if (err & 0x1) return 0;
+        smp64_mm_lock(me);
+        /* Ended while waiting for it: the locked path puts another
+         * thread here. */
+        if (smp64_dead_pending_here()) { smp64_mm_unlock(me); return 0; }
+        done = uspace64_fault(cr2, (err & 0x2) != 0);
+        smp64_mm_unlock(me);
+        if (!done) { (void)pmm64_take_user_oom(); return 0; }
+        __atomic_fetch_add(&pf_fast_hits, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&pf_count_total, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&pf_cycles_total, pf_tsc() - t0, __ATOMIC_RELAXED);
+        return 1;
+    }
     if (!(err & 0x1)) done = uspace64_fault(cr2, (err & 0x2) != 0);
     else if ((err & 0x3) == 0x3) done = vmspace64_break_cow(cr2);
     if (!done) {

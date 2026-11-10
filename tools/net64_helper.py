@@ -193,9 +193,19 @@ def connect_loop(port, status):
     while True:
         try:
             with socket.create_connection(("127.0.0.1", port), 2.0) as c:
-                c.settimeout(5.0)
                 c.sendall(b"hello from the host\n")
-                reply = c.recv(128)
+                # The reply may come late on a slow machine, or in pieces:
+                # read until it has all come or 15 seconds have gone.
+                reply, until = b"", time.time() + 15.0
+                while b"hello from NovarisOS" not in reply and time.time() < until:
+                    c.settimeout(max(0.1, until - time.time()))
+                    try:
+                        more = c.recv(128)
+                    except socket.timeout:
+                        break
+                    if not more:
+                        break
+                    reply += more
                 if b"hello from NovarisOS" in reply:
                     with LOCK, open(status, "a") as f:
                         f.write("connected\n")

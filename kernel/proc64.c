@@ -108,6 +108,7 @@ int proc64_create(void) {
 
     kmemset(&procs[i], 0, sizeof(procs[i]));
     procs[i].used   = 1;
+    procs[i].mm_owner = -1;          /* 0 is a CPU */
     procs[i].pid    = next_pid++;
     procs[i].parent = 0;
     /* A process always has a working directory. The root is the only

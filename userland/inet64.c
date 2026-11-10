@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -507,6 +508,17 @@ static void accept_from_host(void) {
     line[n > 0 ? n : 0] = 0;
     ok(strstr(line, "hello from the host") != 0, "read the host's line (guest only)");
     write_all(s, "hello from NovarisOS\n", 21);
+    /* Finished properly - our side shut, then the host's close waited for
+     * - so the reply has left before this process does. The kernel keeps
+     * a closed socket's last bytes as Linux does, but the next bring-up
+     * layer resets the network, and a reply still in the queue then was
+     * lost whenever the timer had not pumped it out yet. */
+    shutdown(s, SHUT_WR);
+    {
+        struct timeval tv = { 10, 0 };
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        while (read(s, line, sizeof(line)) > 0) { }
+    }
     close(s);
     close(ls);
 }

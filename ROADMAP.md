@@ -11237,6 +11237,53 @@ own locks - one for its descriptor table and one for its address space -
 so those paths can come back out from under the kernel lock. Until then
 the default stays, and `make test` passes with spreading on as well.
 
+## Milestone 106 - a spread process's own locks, and still not faster
+
+Milestone 105 found spreading a process's threads 7-12% slower because
+its page faults and pipe I/O went back under the kernel lock. This gives
+a spread process the two locks that were missing, so they come back out:
+
+- **A memory-map lock** per process (`smp64_mm_lock`). A spread process
+  holds it for every syscall that takes the kernel lock and for its slow
+  page faults - released automatically when the kernel lock is let go,
+  so a call that sleeps or never returns cannot keep it - and its
+  first-touch page faults take it alone, without the kernel lock. Rather
+  than find every place that changes a memory map, the rule is simply
+  that nothing of a spread process runs under the kernel lock without
+  it. A CPU spinning for it answers TLB flushes, because the holder may
+  be ending the process and waiting for every CPU to leave. Copy-on-write
+  breaks stay on the locked path: they need a shootdown.
+  `process_vm_readv/writev` take the other process's lock.
+- **The descriptor table** for lock-free reads and writes: the lookup and
+  the pipe operation happen under the pipes' lock, and `close` releases a
+  descriptor under it too, so a sibling closing it on another CPU is seen
+  either before or after. The user's memory is copied through a per-CPU
+  bounce buffer outside that lock, so a fault in the copy never happens
+  while it is held. Each CPU counts the small locks it holds, and a frame
+  freed under one is never held back for a shootdown (which could not be
+  waited for there).
+
+| 4 CPUs, boot to the page | runs |
+|---|---|
+| threads on their process's CPU (default) | 172, 173 s |
+| spread | 176, 182, 183, 196 s - and once 792 s |
+
+Spreading now costs about 5% where it cost 10%, but it still costs. One
+spread run of seven took 792 s with the page printed; the SMP section of
+that run accounted for 158 s of it, and three more runs to catch it
+again did not. It stays off, and that run is the first thing to chase if
+it is turned on. What is left in the way is the kernel lock itself:
+CPU 0 still spends a quarter of its time in the kernel, and every spread
+thread's other syscalls queue for the same lock.
+
+Also found here: `userland/inet64.c` wrote its reply to the host and
+exited at once, and the next bring-up layer resets the network, so the
+reply was lost whenever the timer had not pumped it out in time - in
+every spread build, by the look of it, and in none of the default ones.
+The guest now shuts its side and waits for the host's close, and the
+helper reads its reply for up to 15 s rather than one `recv`.
+`make test` passes 33 with spreading on and off.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
