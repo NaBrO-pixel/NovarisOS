@@ -11119,6 +11119,68 @@ looks its table up once:
 | 1 CPU, boot to the page | 173-199 s | 159 s |
 | 4 CPUs, boot to the page | 137-173 s | 135-148 s |
 
+## Milestone 104 - the wineserver's kernel work, mostly gone
+
+Milestone 103 left the wineserver holding the kernel lock for about a
+third of CPU 0. Profiled by itself (the `[server]` line: its syscalls
+under the lock, by number), a 4-CPU Chromium run had it at 14.8G cycles,
+and three quarters of that was one call:
+
+| | calls | cycles each | total |
+|---|---|---|---|
+| `poll` | 63,000 | 178,000 | 11.2G |
+| `ptrace` (unimplemented) | 2,600 | 471,000 | 1.2G |
+| `openat` | 3,400 | 168,000 | 0.6G |
+
+**epoll (`kernel/epoll64.c`).** The wineserver waits with epoll when
+`epoll_create` works and with `poll` when it does not, and here it never
+had. `poll` hands over every client descriptor on every pass; epoll looks
+only at the ones something may have happened to. Each pipe keeps the
+epoll entries watching it and marks them dirty on any change to its bytes,
+readers or writers - from the lock-free read and write paths too, under
+the pipes' lock - and a wait re-examines the dirty entries, the ones ready
+last time (it is level-triggered, as Wine expects), and the few kinds it
+cannot follow that way (network sockets, listening sockets), which it
+asks about every time. Entries are indexed by descriptor number. A wait
+looks at about 8 entries where `poll` looked at a few hundred.
+`userland/epoll64.c` checks it line for line against Linux in `make test`:
+level-triggering, MOD and DEL, EEXIST and ENOENT, a closed descriptor
+leaving the set, and a wait woken by another process; `make test` now
+passes 33 on one CPU and on four. One difference is
+kept on purpose: a pipe whose writer has gone is reported readable, as
+this kernel's `poll` always has (the wineserver notices a dead client by
+it), where Linux says only hung up.
+
+**The network pump.** A poll or wait with an AF_INET descriptor in it ran
+the whole network stack first - NIC registers, TCP timers - at 69,000
+cycles a time, and the wineserver holds a descriptor for every socket
+Chromium opens. The timer pumps it every millisecond anyway; a poll now
+does so at most once per tick.
+
+**epoll_wait without the lock.** An instance belongs to one process,
+whose threads share a CPU, so a wait that finds something ready runs
+before the lock. Only a wait that finds nothing - which pumps the network
+and sleeps - takes it.
+
+**Unimplemented calls, quietly.** Every ENOSYS printed a line to the
+serial port under the kernel lock - half a million cycles for the
+wineserver's `ptrace`. The first three of each number are printed, then
+every thousandth.
+
+| wineserver, 4 CPUs | before | now |
+|---|---|---|
+| syscalls under the lock | 14.8G cycles | 1.5G |
+| its waits | 63,000 x 178,000 cycles | 10,000 locked x 27,000; the rest lock-free |
+
+On the same host in the same hour - this build machine ran about half
+as fast as the day before, 254 s for the old commit on one CPU against
+159 s - the page took 244 s against 254 s on one CPU and 194 s against
+196 s on four, and the Chromium layer's kernel time fell 13% on one CPU
+and 32% on four. The wall clock barely moves because the kernel is no
+longer what CPU 0 is waiting on: it is the browser's own code. What is
+left is the next question - spreading the browser's threads, which the
+lock no longer stands in the way of as much as it did in Milestone 103.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the

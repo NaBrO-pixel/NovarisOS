@@ -23,6 +23,7 @@
 #include "kstring.h"
 #include "proc64.h"
 #include "pipe64.h"
+#include "epoll64.h"
 #include "sock64.h"
 #include "clock64.h"
 #include "elf64.h"
@@ -134,6 +135,8 @@ extern uint64_t saved_user_rsp;
  * they mean. */
 #define FD_MAX PROC64_FD_MAX
 #define fds    (proc64_current()->fds)
+
+static int srv_pid = -1;        /* the wineserver, for its profile */
 
 /* Gives this process descriptors 0, 1 and 2.
  *
@@ -364,11 +367,21 @@ static void fd_take_ref(int fd) {
         pipe64_ref(fds[fd].rx, 1, 0);
         pipe64_ref(fds[fd].tx, 0, 1);
         if (fds[fd].kind == FD64_INET) inet64_ref(fds[fd].sock);
+        if (fds[fd].kind == FD64_EPOLL) epoll64_ref(fds[fd].sock);
     }
 }
 
 static void fd_release(int fd) {
     if (fd < 0 || fd >= FD_MAX || !fds[fd].used) return;
+
+    /* Out of any epoll set watching it, as Linux does when the last
+     * descriptor of a file is closed - before its pipes are given back,
+     * which the watch refers to. */
+    epoll64_forget_fd(proc64_current_pid(), fd);
+    if (fds[fd].kind == FD64_EPOLL) {
+        epoll64_unref(fds[fd].sock);
+        fds[fd].sock = -1;
+    }
 
     /* A listening socket goes first, and it matters that it does: its
      * queue may still hold connections nobody accepted, whose pipes were
@@ -1181,6 +1194,7 @@ static int64_t fd_write_bytes(uint64_t fd, const char* buf, uint64_t n) {
             return -107;
         }
         if (fds[fd].kind == FD64_SIGNALFD) return -22; /* -EINVAL, as Linux */
+        if (fds[fd].kind == FD64_EPOLL) return -22;    /* -EINVAL, as Linux */
         if (fds[fd].kind == FD64_NETLINK) return nl_send((int)fd, buf, n);
         /* /dev/null takes everything and keeps none of it; the console
          * is the serial port, which is where this kernel's idea of
@@ -1255,6 +1269,7 @@ static int64_t fd_read_bytes(const syscall64_args_t* args, uint64_t nr,
             return inet_dgram_read(args, nr, (int)fd, buf, n, 0, 0, 0);
         return -107;
     }
+    if (fds[fd].kind == FD64_EPOLL) return -22;        /* -EINVAL, as Linux */
     if (fds[fd].kind == FD64_SIGNALFD)
         return signalfd_read(args, nr, (int)fd, buf, n);
     if (fds[fd].kind == FD64_NETLINK)
@@ -2188,6 +2203,7 @@ static uint64_t syscall64_dispatch_locked(syscall64_args_t* args);
  * unblocking sigprocmask), the lock is taken and it is delivered the usual
  * way, by delivery_tail. */
 static uint64_t delivery_tail(syscall64_args_t* args, uint64_t r);
+static int lockfree_epoll_wait(const syscall64_args_t* args, uint64_t* out_r);
 
 static int signal_waiting(void) {
     int me = proc64_current_pid();
@@ -2264,6 +2280,9 @@ static int lockfree_syscall(syscall64_args_t* args, uint64_t* out) {
         if (!a3 || !lockfree_write(a1, &one, 1, &r)) return 0;
         break;
     }
+    case SYS64_EPOLL_WAIT:
+        if (!lockfree_epoll_wait(args, &r)) return 0;
+        break;
     case SYS64_WRITEV:
         if (!a2 || !a3 || a3 > 8 || !user_range_ok(a2, a3 * sizeof(iovec64_t)) ||
             !vmspace64_user_ready(a2, a3 * sizeof(iovec64_t), 0))
@@ -3017,6 +3036,7 @@ static uint64_t do_execve(const char* path, const char* const* argv,
         for (const char* c = kpath; *c; c++)
             if (*c == '/') base = c + 1;
         kstrlcpy(p->comm, base, sizeof(p->comm));
+        if (kstrcmp(p->comm, "wineserver") == 0) srv_pid = proc64_current_pid();
     }
 
     /* The exe's own info either way - AT_PHDR and friends describe the
@@ -3096,6 +3116,9 @@ static uint64_t dispatch_body(syscall64_args_t* args);
  * through here; what it spent before parking goes uncounted, which is
  * small, and the time it then waits is not the kernel's anyway. */
 static uint64_t cycles_by_nr[512];
+/* The same, for the wineserver alone: the process whose kernel work holds
+ * the kernel lock longest (Milestone 104). */
+static uint64_t srv_calls[512], srv_cycles[512];
 static uint64_t calls_reset_tsc;
 static uint64_t faults_at_reset[3];
 
@@ -3158,7 +3181,16 @@ static uint64_t dispatch(syscall64_args_t* args) {
         }
     }
 #endif
-    if (nr < 512) cycles_by_nr[nr] += tsc64() - t0;
+    if (nr < 512) {
+        uint64_t dt = tsc64() - t0;
+        cycles_by_nr[nr] += dt;
+        proc64_t* sp = proc64_current();
+        if (sp && sp->comm[0] == 'w' && sp->comm[4] == 's' &&
+            kstrcmp(sp->comm, "wineserver") == 0) {
+            srv_calls[nr]++;
+            srv_cycles[nr] += dt;
+        }
+    }
     if ((nr == SYS64_MMAP || nr == SYS64_MUNMAP) && mmap_kind >= 0) {
         int k = nr == SYS64_MUNMAP ? MAPK_UNMAP : mmap_kind;
         mapk_cycles[k] += tsc64() - t0;
@@ -3187,6 +3219,85 @@ static proc64_fd_t* current_fd_table(void) { return &fds[0]; }
      ((fds[f].kind == FD64_SOCKET || fds[f].kind == FD64_INET) && \
       (fds[f].rx >= 0 || fds[f].tx >= 0)))
 
+/* The network pumped for a poll that has an AF_INET descriptor in it, at
+ * most once a clock tick. The timer pumps it every tick anyway; the
+ * wineserver, which holds a descriptor for every socket Chromium opens,
+ * was pumping it again on every wait - NIC registers, TCP timers and all
+ * - and that was most of what its waits cost under the kernel lock. */
+static uint64_t net_pumps, net_pumps_skipped, net_pump_cycles;
+
+static void poll_pump_net(void) {
+    static uint64_t last_tick = ~0ULL;
+    uint64_t now = clock64_ticks(), t0;
+    if (now == last_tick) { net_pumps_skipped++; return; }
+    last_tick = now;
+    t0 = tsc64();
+    inet64_poll();
+    net_pump_cycles += tsc64() - t0;
+    net_pumps++;
+}
+
+/* How ready one descriptor is, as poll(2) bits: poll's question, and
+ * epoll's (epoll64.c). `polled_net` is whether the network has been
+ * pumped yet in this call - once is enough. */
+static short poll_one(proc64_fd_t* poll_fds, int fd, short want, int* polled_net) {
+    short got = 0;
+    if (fd < 0 || fd >= FD_MAX || !fds[fd].used) return POLL64_NVAL;
+
+    if (fds[fd].kind == FD64_INET) {
+        int s = fds[fd].sock;
+        /* The stack was polled once for this whole call, above:
+         * once per inet descriptor cost the wineserver, which polls
+         * a copy of every socket its clients hold, most of a poll. */
+        if (!*polled_net) { poll_pump_net(); *polled_net = 1; }
+        inet_fd_attach(fd);
+        if (inet64_type(s) == INET64_DGRAM) {
+            if (inet64_dgram_ready(s)) got |= POLL64_IN;
+            got |= POLL64_OUT;
+        } else if (inet64_is_listening(s)) {
+            if (inet64_accept_ready(s)) got |= POLL64_IN;
+        } else if (fd_is_stream(fd)) {
+            int rx = fds[fd].rx, tx = fds[fd].tx;
+            if (rx >= 0 && (pipe64_available(rx) > 0 ||
+                            pipe64_writers(rx) == 0)) got |= POLL64_IN;
+            if (tx >= 0 && pipe64_space(tx) > 0)      got |= POLL64_OUT;
+            if (tx >= 0 && pipe64_readers(tx) == 0)   got |= POLL64_HUP;
+        } else if (!inet64_connecting(s)) {
+            /* Never connected, or a connect that failed: Linux says
+             * writable and hung up, and an error if there is one. */
+            got |= POLL64_OUT | POLL64_HUP | 0x008;     /* POLLERR */
+        }
+        inet64_note_poll(s, proc64_current_pid(), (want & POLL64_OUT) != 0,
+                         (want & got & POLL64_OUT) != 0);
+    } else if (fds[fd].kind == FD64_SIGNALFD) {
+        /* Readable while a signal it reports is pending for the
+         * poller; never writable. */
+        if (signal64_pending_in_set(fds[fd].sigmask)) got |= POLL64_IN;
+    } else if (fds[fd].kind == FD64_NETLINK) {
+        /* Readable while a reply is waiting; a request can always
+         * be sent. */
+        if (fds[fd].pos & NL_PENDING) got |= POLL64_IN;
+        got |= POLL64_OUT;
+    } else if (fds[fd].kind == FD64_SOCKET && fds[fd].sock >= 0 &&
+        sock64_state(fds[fd].sock) == SOCK64_LISTENING) {
+        /* A listening socket is readable when somebody is
+         * waiting to be accepted. That is the event the whole
+         * server loop turns on. */
+        if (sock64_pending(fds[fd].sock)) got |= POLL64_IN;
+    } else if (fd_is_stream(fd)) {
+        int rx = fds[fd].rx, tx = fds[fd].tx;
+        if (rx >= 0 && (pipe64_available(rx) > 0 ||
+                        pipe64_writers(rx) == 0)) got |= POLL64_IN;
+        if (tx >= 0 && pipe64_space(tx) > 0)      got |= POLL64_OUT;
+        if (tx >= 0 && pipe64_readers(tx) == 0)   got |= POLL64_HUP;
+    } else {
+        /* A file is always ready, which is what Linux says too. */
+        got |= POLL64_IN | POLL64_OUT;
+    }
+
+    return got;
+}
+
 static uint64_t do_poll(const syscall64_args_t* args, uint64_t nr,
                         struct pollfd64* pfds, uint64_t n, int64_t timeout) {
     uint64_t ready = 0;
@@ -3197,64 +3308,12 @@ static uint64_t do_poll(const syscall64_args_t* args, uint64_t nr,
 
     for (uint64_t i = 0; i < n; i++) {
         int fd = pfds[i].fd;
-        short want = pfds[i].events, got = 0;
+        short want = pfds[i].events, got;
 
         pfds[i].revents = 0;
         if (fd < 0) continue;
-        if (fd >= FD_MAX || !fds[fd].used) { pfds[i].revents = POLL64_NVAL;
-                                             ready++; continue; }
-
-        if (fds[fd].kind == FD64_INET) {
-            int s = fds[fd].sock;
-            /* The stack was polled once for this whole call, above:
-             * once per inet descriptor cost the wineserver, which polls
-             * a copy of every socket its clients hold, most of a poll. */
-            if (!polled_net) { inet64_poll(); polled_net = 1; }
-            inet_fd_attach(fd);
-            if (inet64_type(s) == INET64_DGRAM) {
-                if (inet64_dgram_ready(s)) got |= POLL64_IN;
-                got |= POLL64_OUT;
-            } else if (inet64_is_listening(s)) {
-                if (inet64_accept_ready(s)) got |= POLL64_IN;
-            } else if (fd_is_stream(fd)) {
-                int rx = fds[fd].rx, tx = fds[fd].tx;
-                if (rx >= 0 && (pipe64_available(rx) > 0 ||
-                                pipe64_writers(rx) == 0)) got |= POLL64_IN;
-                if (tx >= 0 && pipe64_space(tx) > 0)      got |= POLL64_OUT;
-                if (tx >= 0 && pipe64_readers(tx) == 0)   got |= POLL64_HUP;
-            } else if (!inet64_connecting(s)) {
-                /* Never connected, or a connect that failed: Linux says
-                 * writable and hung up, and an error if there is one. */
-                got |= POLL64_OUT | POLL64_HUP | 0x008;     /* POLLERR */
-            }
-            inet64_note_poll(s, proc64_current_pid(), (want & POLL64_OUT) != 0,
-                             (want & got & POLL64_OUT) != 0);
-        } else if (fds[fd].kind == FD64_SIGNALFD) {
-            /* Readable while a signal it reports is pending for the
-             * poller; never writable. */
-            if (signal64_pending_in_set(fds[fd].sigmask)) got |= POLL64_IN;
-        } else if (fds[fd].kind == FD64_NETLINK) {
-            /* Readable while a reply is waiting; a request can always
-             * be sent. */
-            if (fds[fd].pos & NL_PENDING) got |= POLL64_IN;
-            got |= POLL64_OUT;
-        } else if (fds[fd].kind == FD64_SOCKET && fds[fd].sock >= 0 &&
-            sock64_state(fds[fd].sock) == SOCK64_LISTENING) {
-            /* A listening socket is readable when somebody is
-             * waiting to be accepted. That is the event the whole
-             * server loop turns on. */
-            if (sock64_pending(fds[fd].sock)) got |= POLL64_IN;
-        } else if (fd_is_stream(fd)) {
-            int rx = fds[fd].rx, tx = fds[fd].tx;
-            if (rx >= 0 && (pipe64_available(rx) > 0 ||
-                            pipe64_writers(rx) == 0)) got |= POLL64_IN;
-            if (tx >= 0 && pipe64_space(tx) > 0)      got |= POLL64_OUT;
-            if (tx >= 0 && pipe64_readers(tx) == 0)   got |= POLL64_HUP;
-        } else {
-            /* A file is always ready, which is what Linux says too. */
-            got |= POLL64_IN | POLL64_OUT;
-        }
-
+        got = poll_one(poll_fds, fd, want, &polled_net);
+        if (got == POLL64_NVAL) { pfds[i].revents = POLL64_NVAL; ready++; continue; }
         got &= (short)(want | POLL64_HUP | POLL64_NVAL | 0x008);
         if (got) { pfds[i].revents = got; ready++; }
     }
@@ -3273,6 +3332,83 @@ static uint64_t do_poll(const syscall64_args_t* args, uint64_t nr,
 #undef fd_is_stream
 #undef fds
 #define fds    (proc64_current()->fds)
+
+/* epoll_wait(epfd, events, maxevents, timeout): the ready entries, or a
+ * wait for some exactly as poll waits - parked on the shared condition
+ * key, re-run when anything is woken, with the same deadline bookkeeping
+ * and the same guard against a wake-up landing just before it parks. */
+struct epoll_ctx { proc64_fd_t* table; int polled_net; int lockfree; };
+
+static short epoll_ready(int fd, short want, void* ctx) {
+    struct epoll_ctx* c = (struct epoll_ctx*)ctx;
+    /* Without the kernel lock: no network pump (the timer's is at most a
+     * tick old) and no first attach of a socket's pipes, which changes
+     * the descriptor - such a socket reads as not ready, and the locked
+     * wait that follows an empty one sees to it. */
+    if (c->lockfree && fd >= 0 && fd < FD_MAX && c->table[fd].used &&
+        c->table[fd].kind == FD64_INET) {
+        int pumped = 1;
+        if (!c->table[fd].pos) return 0;
+        return poll_one(c->table, fd, want, &pumped);
+    }
+    return poll_one(c->table, fd, want, &c->polled_net);
+}
+
+/* epoll_wait without the kernel lock, when something is ready. The
+ * instance is its owner's, and the owner's threads share one CPU, so
+ * nothing else walks it meanwhile; what other CPUs do to the pipes it
+ * watches arrives through the dirty queue, under the pipes' lock. */
+static int lockfree_epoll_wait(const syscall64_args_t* args, uint64_t* out_r) {
+    struct epoll_ctx ctx;
+    uint64_t epfd = args->a1, max = (uint64_t)(int64_t)(int32_t)args->a3;
+    epoll64_event_t* out = (epoll64_event_t*)args->a2;
+    int n;
+
+    if (epfd >= FD_MAX || !fds[epfd].used || fds[epfd].kind != FD64_EPOLL) return 0;
+    if ((int64_t)max <= 0 || !out) return 0;
+    if (max > 1024) max = 1024;
+    if (!user_range_ok((uint64_t)out, max * sizeof(*out)) ||
+        !vmspace64_user_ready((uint64_t)out, max * sizeof(*out), 1)) return 0;
+    if (epoll64_owner(fds[epfd].sock) != proc64_current_pid()) return 0;
+
+    ctx.table = &fds[0];
+    ctx.polled_net = 1;
+    ctx.lockfree = 1;
+    n = epoll64_collect(fds[epfd].sock, epoll_ready, &ctx, out, (int)max);
+    if (n <= 0) return 0;
+    wait_done();
+    *out_r = (uint64_t)n;
+    return 1;
+}
+
+static uint64_t do_epoll_wait(const syscall64_args_t* args, uint64_t nr,
+                              uint64_t epfd, epoll64_event_t* out,
+                              int64_t max, int64_t timeout) {
+    struct epoll_ctx ctx;
+    int n;
+
+    if (epfd >= FD_MAX || !fds[epfd].used || fds[epfd].kind != FD64_EPOLL)
+        return (uint64_t)-9;                           /* -EBADF */
+    if (max <= 0) return (uint64_t)-22;
+    if (max > 1024) max = 1024;
+    if (!out || !user_range_ok((uint64_t)out, (uint64_t)max * sizeof(*out)))
+        return (uint64_t)-14;
+    if (epoll64_owner(fds[epfd].sock) != proc64_current_pid())
+        return (uint64_t)-22;          /* another process's descriptors */
+
+    ctx.table = &fds[0];
+    ctx.polled_net = 0;
+    ctx.lockfree = 0;
+    n = epoll64_collect(fds[epfd].sock, epoll_ready, &ctx, out, (int)max);
+    if (n > 0) { wait_done(); return (uint64_t)n; }
+    if (timeout == 0) return 0;
+    if (wait_started()) {
+        if (wait_expired()) { wait_done(); return 0; }
+        return wait_restart(args, nr, wait_deadline[wait_slot()]);
+    }
+    return wait_restart(args, nr,
+                        timeout < 0 ? 0 : clock64_ticks() + (uint64_t)timeout);
+}
 
 static uint64_t dispatch_body(syscall64_args_t* args) {
     uint64_t nr = args->nr;
@@ -5077,7 +5213,8 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                         carried[ncarried].pos  = fds[sfd].pos;
                         carried[ncarried].rx   = fds[sfd].rx;
                         carried[ncarried].tx   = fds[sfd].tx;
-                        carried[ncarried].sock = fds[sfd].kind == FD64_INET
+                        carried[ncarried].sock = (fds[sfd].kind == FD64_INET ||
+                                                  fds[sfd].kind == FD64_EPOLL)
                                                ? fds[sfd].sock : -1;
                         /* O_NONBLOCK belongs to the open file on Linux,
                          * so a passed descriptor arrives with it. Wine's
@@ -5089,6 +5226,8 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                         carried[ncarried].nonblock = fds[sfd].nonblock;
                         if (fds[sfd].kind == FD64_INET)
                             inet64_ref(fds[sfd].sock);
+                        if (fds[sfd].kind == FD64_EPOLL)
+                            epoll64_ref(fds[sfd].sock);
                         /* Referenced for the receiver now. The sender is
                          * free to close its own copy the moment this
                          * returns - and does - so a reference taken only
@@ -5755,6 +5894,71 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
     case SYS64_POLL:
         return do_poll(args, nr, (struct pollfd64*)a1, a2,
                        (int64_t)(int32_t)a3);
+
+    /* epoll(7) (epoll64.c, Milestone 104): what the wineserver waits for
+     * its clients with when it can. epoll_create's size is a hint and
+     * must be positive; epoll_create1 takes EPOLL_CLOEXEC, which is
+     * O_CLOEXEC. */
+    case SYS64_EPOLL_CREATE:
+    case SYS64_EPOLL_CREATE1: {
+        int fd, ep;
+        if (nr == SYS64_EPOLL_CREATE && (int64_t)(int32_t)a1 <= 0) return (uint64_t)-22;
+        if (nr == SYS64_EPOLL_CREATE1 && (a1 & ~0x80000ULL)) return (uint64_t)-22;
+        fd = fd_alloc(3);
+        if (fd < 0) return (uint64_t)-24;               /* -EMFILE */
+        ep = epoll64_create(proc64_current_pid());
+        if (ep < 0) return (uint64_t)-12;               /* -ENOMEM */
+        fds[fd].kind     = FD64_EPOLL;
+        fds[fd].node     = -1;
+        fds[fd].pos      = 0;
+        fds[fd].rx       = -1;
+        fds[fd].tx       = -1;
+        fds[fd].sock     = ep;
+        fds[fd].nonblock = 0;
+        fds[fd].cloexec  = nr == SYS64_EPOLL_CREATE1 && (a1 & 0x80000ULL);
+        fds[fd].used     = 1;
+        return (uint64_t)fd;
+    }
+
+    /* epoll_ctl(epfd, op, fd, event). Which pipes `fd` is made of is
+     * taken now, and whether every change to its readiness is a change
+     * to them: true for a pipe or a connected Unix socket, which is every
+     * wineserver client. */
+    case SYS64_EPOLL_CTL: {
+        const epoll64_event_t* ev = (const epoll64_event_t*)args->a4;
+        uint32_t events = 0;
+        uint64_t data = 0;
+        int watchable;
+        if (a1 >= FD_MAX || !fds[a1].used || fds[a1].kind != FD64_EPOLL) return (uint64_t)-9;
+        if (a3 >= FD_MAX || !fds[a3].used) return (uint64_t)-9;
+        if (a3 == a1) return (uint64_t)-22;
+        if (fds[a3].kind == FD64_FILE) return (uint64_t)-1;   /* -EPERM, as Linux */
+        if (a2 != EPOLL64_CTL_DEL) {
+            if (!ev || !user_range_ok(args->a4, sizeof(*ev))) return (uint64_t)-14;
+            events = ev->events;
+            data   = ev->data;
+        }
+        watchable = fds[a3].kind == FD64_PIPE ||
+                    (fds[a3].kind == FD64_SOCKET && fd_is_stream((int)a3));
+        return (uint64_t)(int64_t)epoll64_ctl(fds[a1].sock, (int)a2, (int)a3,
+                                              events, data, fds[a3].rx,
+                                              fds[a3].tx, watchable);
+    }
+
+    case SYS64_EPOLL_WAIT:
+        return do_epoll_wait(args, nr, a1, (epoll64_event_t*)a2,
+                             (int64_t)(int32_t)a3, (int64_t)(int32_t)args->a4);
+
+    /* epoll_pwait with no mask is epoll_wait; one with a mask would need
+     * ppoll's swap, which nothing here has asked for yet. */
+    case SYS64_EPOLL_PWAIT:
+        if (args->a5) return (uint64_t)-38;             /* -ENOSYS */
+        return do_epoll_wait(args, nr, a1, (epoll64_event_t*)a2,
+                             (int64_t)(int32_t)a3, (int64_t)(int32_t)args->a4);
+
+    /* Wine tries this first and falls back to epoll_wait on -ENOSYS. */
+    case SYS64_EPOLL_PWAIT2:
+        return (uint64_t)-38;
 
     /* ppoll(fds, nfds, timeout, sigmask, sigsetsize): poll with a
      * timespec, and with the thread's signal mask replaced by `sigmask`
@@ -7095,6 +7299,15 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
          * way to find out what a real program wants is to let it ask. */
         unimpl_count++;
         last_unimpl = nr;
+        /* The first few of each number, and then every thousandth: a
+         * program that asks again and again (the wineserver's ptrace, a
+         * thousand times a run) was paying for a serial line each time,
+         * under the kernel lock - half a million cycles a call. */
+        {
+            static uint32_t seen[512];
+            uint32_t k = nr < 512 ? ++seen[nr] : 1;
+            if (k > 3 && k % 1000 != 0) return (uint64_t)-38;
+        }
         serial64_puts("NOVARIS64: [enosys pid ");
         serial64_putdec((uint64_t)proc64_current_pid());
         serial64_puts("] syscall ");
@@ -7165,7 +7378,8 @@ uint64_t syscall64_count(void)     { return call_count; }
 
 void syscall64_reset_calls(void) {
     for (int i = 0; i < PROC64_MAX; i++) { calls_by_slot[i] = 0; pid_of_slot[i] = 0; }
-    for (int i = 0; i < 512; i++) { calls_by_nr[i] = 0; cycles_by_nr[i] = 0; }
+    for (int i = 0; i < 512; i++) { calls_by_nr[i] = 0; cycles_by_nr[i] = 0;
+                                    srv_calls[i] = 0; srv_cycles[i] = 0; }
     for (int i = 0; i < MAPK_N; i++) mapk_cycles[i] = mapk_calls[i] = mapk_pages[i] = 0;
     calls_reset_tsc = tsc64();
     pf_cycles_total = 0;
@@ -7323,6 +7537,54 @@ void syscall64_report_calls(void) {
     {
         uint64_t elapsed = tsc64() - calls_reset_tsc, in_sys = 0;
         for (int i = 0; i < 512; i++) in_sys += cycles_by_nr[i];
+        {
+            static int tk[512];
+            uint64_t tot = 0;
+            for (int i = 0; i < 512; i++) { tk[i] = 0; tot += srv_cycles[i]; }
+            {
+                uint64_t w, d, a, r, o;
+                epoll64_stats(&w, &d, &a, &r, &o);
+                serial64_puts("NOVARIS64: [poll] network pumps for polls ");
+                serial64_putdec(net_pumps);
+                serial64_puts(" (");
+                serial64_putdec(net_pumps ? net_pump_cycles / net_pumps : 0);
+                serial64_puts(" cycles each), skipped as fresh ");
+                serial64_putdec(net_pumps_skipped);
+                serial64_putc('\n');
+                net_pumps = net_pumps_skipped = net_pump_cycles = 0;
+                serial64_puts("NOVARIS64: [epoll] waits ");
+                serial64_putdec(w);
+                serial64_puts(", entries looked at: dirty ");
+                serial64_putdec(d);
+                serial64_puts(", always ");
+                serial64_putdec(a);
+                serial64_puts(", ready ");
+                serial64_putdec(r);
+                serial64_puts("; reported ");
+                serial64_putdec(o);
+                serial64_putc('\n');
+            }
+            serial64_puts("NOVARIS64: [server] wineserver syscalls under the lock: ");
+            serial64_putdec(tot / 1000000u);
+            serial64_puts("M cycles; nr:calls:cycles-each(M total):");
+            for (int k = 0; k < 14; k++) {
+                int b = -1;
+                for (int i = 0; i < 512; i++)
+                    if (!tk[i] && srv_cycles[i] && (b < 0 || srv_cycles[i] > srv_cycles[b])) b = i;
+                if (b < 0) break;
+                tk[b] = 1;
+                serial64_puts(" ");
+                serial64_putdec((uint64_t)b);
+                serial64_puts(":");
+                serial64_putdec(srv_calls[b]);
+                serial64_puts(":");
+                serial64_putdec(srv_cycles[b] / srv_calls[b]);
+                serial64_puts("(");
+                serial64_putdec(srv_cycles[b] / 1000000u);
+                serial64_puts("M)");
+            }
+            serial64_putc('\n');
+        }
         serial64_puts("NOVARIS64: [cycles] ");
         serial64_putdec(elapsed / 1000000u);
         serial64_puts("M elapsed, ");

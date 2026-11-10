@@ -126,4 +126,11 @@ uint64_t pipe64_live(void);
 int64_t pipe64_write_all(int p, const void* const* bufs, const uint64_t* lens,
                          int cnt, uint64_t n);
 
+/* epoll64.c's: entry `fd` of instance `ep` is told of every change to
+ * pipe `p`. 0 if the pipe has no room for another watcher. */
+int      pipe64_watch(int p, int ep, int fd);
+void     pipe64_unwatch(int p, int ep, int fd);
+uint64_t pipe64_lock(void);
+void     pipe64_unlock(uint64_t fl);
+
 #endif

@@ -115,6 +115,12 @@
 #define SYS64_DUP2       33
 #define SYS64_DUP3       292
 #define SYS64_POLL       7
+#define SYS64_EPOLL_CREATE  213
+#define SYS64_EPOLL_WAIT    232
+#define SYS64_EPOLL_CTL     233
+#define SYS64_EPOLL_PWAIT   281
+#define SYS64_EPOLL_CREATE1 291
+#define SYS64_EPOLL_PWAIT2  441
 
 /* The listening socket (Milestone 75). */
 #define SYS64_SOCKET      41

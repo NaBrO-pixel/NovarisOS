@@ -115,6 +115,7 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/mmapfile64_blob.o \
        $(BUILD_DIR)/ramfs64.o \
        $(BUILD_DIR)/pipe64.o \
+       $(BUILD_DIR)/epoll64.o \
        $(BUILD_DIR)/sock64.o \
        $(BUILD_DIR)/inet64.o \
        $(BUILD_DIR)/smp64.o \
@@ -138,6 +139,7 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/prctl64_blob.o \
        $(BUILD_DIR)/tgkill64_blob.o \
        $(BUILD_DIR)/spawn64_blob.o \
+       $(BUILD_DIR)/epolltest64_blob.o \
        $(BUILD_DIR)/pipetest64_blob.o \
        $(BUILD_DIR)/socktest64_blob.o \
        $(BUILD_DIR)/scm64_blob.o \
@@ -383,6 +385,19 @@ $(BUILD_DIR)/spawn64_blob.c: $(BUILD_DIR)/spawn64.elf userland/embed64.py
 	python3 userland/embed64.py $< $@ spawn64_elf
 
 $(BUILD_DIR)/spawn64_blob.o: $(BUILD_DIR)/spawn64_blob.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# epoll(7), as the wineserver uses it (Milestone 104). epolltest64, since
+# kernel/epoll64.c is the implementation.
+$(BUILD_DIR)/epolltest64.elf: userland/epoll64.c | $(BUILD_DIR)
+	gcc -static -O2 -o $@ $<
+	@file $@ | grep -q "statically linked" \
+	    || (echo "ERROR: $@ is not static"; false)
+
+$(BUILD_DIR)/epolltest64_blob.c: $(BUILD_DIR)/epolltest64.elf userland/embed64.py
+	python3 userland/embed64.py $< $@ epolltest64_elf
+
+$(BUILD_DIR)/epolltest64_blob.o: $(BUILD_DIR)/epolltest64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # The descriptor layer (Milestone 74): pipe2, socketpair, fcntl, dup.
@@ -1229,6 +1244,18 @@ test: iso
 	    || (echo "FAIL: the host run of the spawn binary did not exit 103"; \
 	        exit 1)
 	@echo "PASS: posix_spawn behaves the same, and exits 103, on both"
+	@# epoll.
+	@timeout 60 ./$(BUILD_DIR)/epolltest64.elf > $(BUILD_DIR)/epolltest64.host.txt \
+	    2>/dev/null; echo $$? > $(BUILD_DIR)/epolltest64.host.status
+	@while read -r line; do \
+	    grep -qF "$$line" $(BUILD_DIR)/serial.log \
+	        || (echo "FAIL: the guest never printed: $$line"; exit 1) \
+	        || exit 1; \
+	done < $(BUILD_DIR)/epolltest64.host.txt
+	@[ "`cat $(BUILD_DIR)/epolltest64.host.status`" = "104" ] \
+	    || (echo "FAIL: the host run of the epoll binary did not exit 104"; \
+	        exit 1)
+	@echo "PASS: epoll behaves the same, and exits 104, on both"
 	@# The descriptor layer.
 	@timeout 60 ./$(BUILD_DIR)/pipetest64.elf > $(BUILD_DIR)/pipetest64.host.txt \
 	    2>/dev/null; echo $$? > $(BUILD_DIR)/pipetest64.host.status

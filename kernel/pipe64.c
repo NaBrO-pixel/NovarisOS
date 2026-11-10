@@ -8,6 +8,7 @@
 #include "proc64.h"
 #include "inet64.h"
 #include "spin64.h"
+#include "epoll64.h"
 
 typedef struct {
     fdpass64_t fds[8];
@@ -27,9 +28,22 @@ typedef struct {
     int       in_head, in_count;
 
     int      used;
+
+    /* The epoll entries watching this pipe (epoll64.c), told of every
+     * change to it. A few at most: one per epoll descriptor watching a
+     * descriptor of this pipe. */
+    struct { int ep, fd; } watch[4];
+    int      nwatch;
 } pipe64_t;
 
 static pipe64_t pipes[PIPE64_MAX];
+
+/* Called with the pipes' lock held, by everything that changes what a
+ * poll of this pipe would answer. */
+static void notify(int p) {
+    for (int k = 0; k < pipes[p].nwatch; k++)
+        epoll64_mark(pipes[p].watch[k].ep, pipes[p].watch[k].fd);
+}
 
 static void drop_inflight(const fdpass64_t* f);
 
@@ -49,8 +63,10 @@ void pipe64_init(void) {
         pipes[i].writers = 0;
         pipes[i].in_head = 0;
         pipes[i].in_count = 0;
+        pipes[i].nwatch  = 0;
         pipes[i].used    = 0;
     }
+    epoll64_reset();
 }
 
 int pipe64_valid(int p) {
@@ -90,6 +106,7 @@ static int create_nl(void) {
     pipes[i].writers = 0;
     pipes[i].in_head = 0;
     pipes[i].in_count = 0;
+    pipes[i].nwatch  = 0;
     pipes[i].used    = 1;
     return i;
 }
@@ -98,12 +115,14 @@ static void ref_nl(int p, int reader, int writer) {
     if (!pipe64_valid(p)) return;
     if (reader) pipes[p].readers++;
     if (writer) pipes[p].writers++;
+    notify(p);
 }
 
 static void unref_nl(int p, int reader, int writer) {
     if (!pipe64_valid(p)) return;
     if (reader && pipes[p].readers > 0) pipes[p].readers--;
     if (writer && pipes[p].writers > 0) pipes[p].writers--;
+    notify(p);
 
     /* Nobody left on either side. The buffer goes back to the heap and
      * the slot is reusable - a server that accepts connections forever
@@ -218,6 +237,7 @@ static int64_t read_nl(int p, void* buf, uint64_t n) {
         got += run;
     }
     q->len -= got;
+    notify(p);
     return (int64_t)got;
 }
 
@@ -272,6 +292,7 @@ static int64_t write_nl(int p, const void* buf, uint64_t n) {
         put += run;
     }
     q->len += put;
+    notify(p);
     return (int64_t)put;
 }
 
@@ -364,3 +385,33 @@ int64_t pipe64_write_all(int p, const void* const* bufs, const uint64_t* lens,
     spin64_release(&pipes_lock, fl);
     return r;
 }
+
+/* --- epoll's watchers, and its use of the lock --------------------------- */
+
+int pipe64_watch(int p, int ep, int fd) {
+    uint64_t fl = spin64_acquire(&pipes_lock);
+    int ok = 0;
+    if (pipe64_valid(p) && pipes[p].nwatch < 4) {
+        pipes[p].watch[pipes[p].nwatch].ep = ep;
+        pipes[p].watch[pipes[p].nwatch].fd = fd;
+        pipes[p].nwatch++;
+        ok = 1;
+    }
+    spin64_release(&pipes_lock, fl);
+    return ok;
+}
+
+void pipe64_unwatch(int p, int ep, int fd) {
+    uint64_t fl = spin64_acquire(&pipes_lock);
+    if (p >= 0 && p < PIPE64_MAX) {
+        for (int k = 0; k < pipes[p].nwatch; k++) {
+            if (pipes[p].watch[k].ep != ep || pipes[p].watch[k].fd != fd) continue;
+            pipes[p].watch[k] = pipes[p].watch[--pipes[p].nwatch];
+            break;
+        }
+    }
+    spin64_release(&pipes_lock, fl);
+}
+
+uint64_t pipe64_lock(void)          { return spin64_acquire(&pipes_lock); }
+void     pipe64_unlock(uint64_t fl) { spin64_release(&pipes_lock, fl); }

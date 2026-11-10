@@ -114,6 +114,8 @@ extern const unsigned char vmem64_elf[];
 extern const unsigned long vmem64_elf_len;
 extern const unsigned char spawn64_elf[];
 extern const unsigned long spawn64_elf_len;
+extern const unsigned char epolltest64_elf[];
+extern const unsigned long epolltest64_elf_len;
 extern const unsigned char pipetest64_elf[];
 extern const unsigned long pipetest64_elf_len;
 extern const unsigned char socktest64_elf[];
@@ -3869,6 +3871,77 @@ void kernel_main(uint32_t magic, void* mbi) {
         serial64_putc('\n');
         check("each spawn suspended its parent",
               syscall64_vforks() - vforks_before == 2);
+    }
+
+    /* --- epoll (Milestone 104) ----------------------------------------- *
+     *
+     * What the wineserver waits for its clients with, now that there is
+     * one. userland/epoll64.c, the same binary run on the host by make
+     * test, which compares the two line by line. */
+    layer("epoll");
+    {
+        const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
+        const uint64_t STACK_PAGES = 64;
+        vmspace64_t kspace;
+        elf64_info_t info;
+        uint64_t i, rsp;
+        int rc, stack_ok = 1, pid;
+        proc64_t* p;
+        static const char* const ep_argv[] = { "/epoll64", 0 };
+
+        ramfs64_init();
+        ramfs64_seed_from_initrd();
+        syscall64_reset_files();
+        signal64_reset();
+        sched64_init();
+        proc64_init();
+        pipe64_init();
+        sock64_init();
+        vmspace64_kernel_space(&kspace);
+
+        pid = proc64_create();
+        proc64_set_current(pid);
+        p = proc64_current();
+
+        check("a space for it", vmspace64_create(&p->space) != 0);
+        rc = elf64_load(epolltest64_elf, epolltest64_elf_len, &p->space, &info);
+        check("the epoll program loaded", rc == ELF64_OK);
+
+        for (i = 0; i < STACK_PAGES; i++) {
+            uint64_t f = pmm64_alloc_frame();
+            if (!f || vmspace64_map(&p->space,
+                                    STACK_TOP - (i + 1) * PAGE64_SIZE, f,
+                                    PAGE64_PRESENT | PAGE64_WRITE |
+                                    PAGE64_USER) != PAGING64_OK)
+                stack_ok = 0;
+        }
+        check("a stack for it", stack_ok);
+        uspace64_reset(&p->space, info.brk_start);
+        rsp = uspace64_build_stack(&p->space, STACK_TOP, STACK_PAGES,
+                                   ep_argv, &info, 0, 0);
+
+        {
+            registers64_t first;
+            for (i = 0; i < sizeof(first) / 8; i++)
+                ((uint64_t*)&first)[i] = 0;
+            sched64_add_frame_for(&first, &p->space, 0, pid);
+            sched64_set_current(0);
+        }
+
+        serial64_puts("NOVARIS64: --- its output follows ---\n");
+        pf_diagnose = 1;
+        /* The timer, as the clocks layer has it: the program sleeps and
+         * waits with timeouts, and with IRQ0 masked neither ends. */
+        register_interrupt_handler64(32, sched_timer_handler);
+        idt64_irq_set_mask(0, 0);
+        vmspace64_switch(&p->space);
+        enter_user_mode64(info.entry, rsp, 0);
+        vmspace64_switch(&kspace);
+        idt64_irq_set_mask(0, 1);
+        pf_diagnose = 0;
+        serial64_puts("NOVARIS64: --- end of its output ---\n");
+
+        check("epoll behaved as Linux's does", syscall64_exit_code() == 104);
     }
 
     /* --- layer 34: the descriptor layer (Milestone 74) --------------- */
