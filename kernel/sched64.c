@@ -56,6 +56,7 @@ typedef struct {
     int           cpu;       /* the CPU it runs on: its process's (smp64) */
     int           blocked;
     int           used;
+    uint32_t      gen;       /* bumped each time the slot is handed out */
 
     /* The x87/SSE register file, which nothing else saves.
      *
@@ -362,6 +363,7 @@ int sched64_add(uint64_t rip, uint64_t rsp, uint64_t arg,
      * is a null dereference in the kernel, layers later. */
     tasks[i].pid       = proc64_current_pid();
     tasks[i].cpu       = proc64_cpu_of(tasks[i].pid);
+    tasks[i].gen++;
     tasks[i].used      = 1;
     task_total++;
     return i;
@@ -372,7 +374,27 @@ int sched64_add_frame(const registers64_t* regs, const vmspace64_t* space,
     /* A thread of the process that is running. clone(2) takes this
      * path; fork(2) takes the one below, because its new thread belongs
      * to a different process. */
-    return sched64_add_frame_for(regs, space, fs_base, proc64_current_pid());
+    int pid = proc64_current_pid();
+    int i = sched64_add_frame_for(regs, space, fs_base, pid);
+    /* And, with SMP64_SPREAD_THREADS, perhaps on another CPU than its
+     * process's (Milestone 105). */
+    if (i >= 0) {
+        int home = tasks[i].cpu, c = smp64_pick_thread_cpu(pid, home);
+        if (c != home) {
+            proc64_t* p = proc64_get(pid);
+            if (p) p->spread = 1;
+            tasks[i].cpu = c;
+            smp64_note_wake(c);
+        }
+    }
+    return i;
+}
+
+int sched64_tasks_on(int cpu) {
+    int n = 0;
+    for (int i = 0; i < task_hwm; i++)
+        if (tasks[i].used && tasks[i].cpu == cpu) n++;
+    return n;
 }
 
 int sched64_add_frame_for(const registers64_t* regs, const vmspace64_t* space,
@@ -390,6 +412,7 @@ int sched64_add_frame_for(const registers64_t* regs, const vmspace64_t* space,
     tasks[i].fs_base   = fs_base;
     tasks[i].blocked   = 0;
     tasks[i].wait_addr = 0;
+    tasks[i].gen++;
     tasks[i].used      = 1;
     /* This is the path clone and fork take, so it is the one that
      * matters most: a thread resumed with a register file nobody wrote
@@ -508,16 +531,33 @@ int sched64_exit_current(registers64_t* out_regs, vmspace64_t* out_space,
 /* Every task of `pid` out of the table, without choosing a successor:
  * for a process ending when there is nothing to hand the CPU to - the
  * leader of a run, whose ending ends the run. Returns how many went. */
+/* A process whose threads were on several CPUs has just been ended: its
+ * threads running elsewhere are got off its address space before the
+ * caller destroys it (smp64_shootdown finds them dead and they leave). */
+static void evict(int pid, uint64_t pml4) {
+    proc64_t* p = proc64_get(pid);
+    if (pml4 && p && p->spread) smp64_shootdown(pml4);
+}
+
+static uint64_t space_of(int pid) {
+    for (int i = 0; i < task_hwm; i++)
+        if (tasks[i].used && tasks[i].pid == pid) return tasks[i].space.pml4_phys;
+    return 0;
+}
+
 int sched64_remove_pid(int pid) {
     int n = 0;
+    uint64_t pml4 = space_of(pid);
     for (int i = 0; i < task_hwm; i++) {
         if (!tasks[i].used || tasks[i].pid != pid) continue;
         tasks[i].used = 0;
         if (task_total > 0) task_total--;
-        for (int c = 0; c < SMP64_MAX_CPUS; c++)
-            if (current_by_cpu[c] == i) current_by_cpu[c] = -1;
+        /* This CPU's own; another CPU running one finds it dead when it
+         * is evicted below. */
+        if (current == i) current = -1;
         n++;
     }
+    evict(pid, pml4);
     return n;
 }
 
@@ -530,11 +570,13 @@ int sched64_exit_process(int pid, registers64_t* out_regs,
      * running in an address space nobody owns - and, when a test's two
      * tasks belong to the same process, would hand the CPU to the other
      * one instead of finishing the run. */
+    uint64_t pml4 = space_of(pid);
     for (int i = 0; i < task_hwm; i++) {
         if (!tasks[i].used || tasks[i].pid != pid) continue;
         tasks[i].used = 0;
         if (task_total > 0) task_total--;
     }
+    evict(pid, pml4);
 
     /* Runnable, for the same reason as above - and idle rather than
      * give up, for the same reason as above too: one process ending
@@ -647,6 +689,7 @@ static int idle_until_runnable(void) {
              * of this CPU's looks runnable (sched64_maybe_work). */
             do {
                 __asm__ __volatile__("sti; hlt; cli");
+                smp64_bsp_abort_check();
             } while (smp64_active && !smp64_quiescing() && !sched64_maybe_work(me));
             smp64_note_idle(me, idle_tsc() - h0, sp0, hd0);
         }
@@ -804,7 +847,18 @@ int sched64_block_until_ex(const registers64_t* regs, uint64_t addr,
             return 0;
         }
 
-        next = idle_until_runnable();
+        {
+            /* While this CPU idles another may end this thread's process
+             * and hand its slot to a new thread (Milestone 105): then
+             * nothing below is this thread's to save. */
+            int self = current;
+            uint32_t gen = tasks[self].gen;
+            next = idle_until_runnable();
+            if (!tasks[self].used || tasks[self].gen != gen) {
+                if (next < 0) { current = -1; return 0; }
+                goto switch_to_next;
+            }
+        }
         if (next < 0) {
             tasks[current].blocked   = 0;
             tasks[current].wait_addr = 0;
@@ -815,6 +869,7 @@ int sched64_block_until_ex(const registers64_t* regs, uint64_t addr,
 
     tasks[current].gs_base = read_gs_base();
     fpu_save(tasks[current].fpu);
+switch_to_next:
     current = next;
     slice_start = clock64_ticks();
     fpu_restore(tasks[next].fpu);
@@ -1087,6 +1142,60 @@ int sched64_migrate_current(const registers64_t* regs, int cpu,
     if (out_fs_base) *out_fs_base = tasks[next].fs_base;
     proc64_set_current(tasks[next].pid);
     return 1;
+}
+
+/* A TLB flush asked of this CPU (smp64.c, Milestone 105). If the thread it
+ * is running has been ended, it is left - nothing current, the kernel's
+ * page tables loaded - and 1 is returned, so the caller puts another
+ * thread in its place. A CPU idling inside a thread's wait is not running
+ * it, and only flushes. */
+int sched64_flush_service(int cpu) {
+    int cur = current_by_cpu[cpu];
+    uint64_t v;
+    if (!idling_cpu[cpu] && cur >= 0 && !tasks[cur].used) {
+        current_by_cpu[cpu] = -1;
+        proc64_set_current(-1);
+        smp64_kernel_space_now();
+        return 1;
+    }
+    __asm__ __volatile__("mov %%cr3, %0; mov %0, %%cr3" : "=r"(v) :: "memory");
+    return 0;
+}
+
+/* Another of this CPU's tasks, or the idle loop until there is one: the
+ * thread that was here has been ended. */
+static int next_after_death(void) {
+    int n = first_runnable();
+    if (n < 0) n = idle_until_runnable();
+    return n;
+}
+
+static void load_task(int n) {
+    current = n;
+    slice_start = clock64_ticks();
+    fpu_restore(tasks[n].fpu);
+    write_gs_base(tasks[n].gs_base);
+    write_fs_base(tasks[n].fs_base);
+    vmspace64_switch(&tasks[n].space);
+    proc64_set_current(tasks[n].pid);
+}
+
+/* From an interrupt that found its thread ended: the frame becomes the
+ * next task's, and iretq goes there. */
+void sched64_replace_dead(registers64_t* frame) {
+    int n = next_after_death();
+    if (n < 0) { for (;;) __asm__ __volatile__("sti; hlt; cli"); }
+    load_task(n);
+    *frame = tasks[n].regs;
+}
+
+/* From a syscall that found its thread ended while it waited for the
+ * kernel lock: never returns. */
+void sched64_continue_after_death(void) {
+    int n = next_after_death();
+    if (n < 0) { for (;;) __asm__ __volatile__("sti; hlt; cli"); }
+    load_task(n);
+    sched64_resume(&tasks[n].regs);
 }
 
 /* Whether `cpu` has something to run, or a deadline due: read without

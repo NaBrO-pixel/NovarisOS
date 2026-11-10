@@ -18,6 +18,7 @@
  * happens to be at the far end of the window. */
 
 #include "pmm64.h"
+#include "smp64.h"
 #include "serial64.h"
 
 static void watch_report(const char* what, uint64_t f);
@@ -526,10 +527,17 @@ uint64_t pmm64_alloc_above(uint64_t min_phys) {
     return f;
 }
 
-void pmm64_free_frame(uint64_t phys) {
+void pmm64_free_frame_now(uint64_t phys) {
     uint64_t fl = pmm_acquire();
     free_frame_nl(phys);
     pmm_release(fl);
+}
+
+/* Unless a spread process gave it up and its other CPUs have yet to
+ * flush their TLBs (smp64.c, Milestone 105). */
+void pmm64_free_frame(uint64_t phys) {
+    if (smp64_defer_free(phys)) return;
+    pmm64_free_frame_now(phys);
 }
 
 int pmm64_ref_frame(uint64_t phys) {

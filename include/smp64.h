@@ -21,6 +21,7 @@ void     smp64_idle_irq(int vector);
 #define SMP64_TIMER_VECTOR 0xF0
 #define SMP64_KICK_VECTOR  0xF1   /* "something to run": wakes a halted CPU */
 #define SMP64_SAMPLE_VECTOR 0xF2  /* the bootstrap CPU's sampling timer */
+#define SMP64_FLUSH_VECTOR  0xF3  /* TLB shootdown (Milestone 105) */
 void smp64_sample_irq(void* frame);
 
 /* The big kernel lock (see smp64.c). No-ops until smp64_start_scheduling. */
@@ -47,5 +48,20 @@ void smp64_timer_tick(void* frame);
 struct registers64;
 void smp64_note_tick(int cpu, const void* frame, int ms);
 void smp64_ap_idle(void) __attribute__((noreturn));
+
+/* Threads of one process on several CPUs (Milestone 105). */
+int  smp64_spread_threads(void);
+void smp64_note_cr3(uint64_t pml4);
+void smp64_note_wake(int cpu);
+void smp64_shootdown(uint64_t pml4);
+int  smp64_flush_irq(void);
+int  smp64_take_dead_pending(void);
+void smp64_kernel_space_now(void);
+int  smp64_defer_free(uint64_t phys);
+void smp64_mm_dirty(void);
+int  smp64_pick_thread_cpu(int pid, int home);
+void smp64_run_ended_elsewhere(void) __attribute__((noreturn));
+void smp64_bsp_abort_check(void);
+void smp64_spread_report(void);
 
 #endif

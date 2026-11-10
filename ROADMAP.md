@@ -11181,6 +11181,62 @@ longer what CPU 0 is waiting on: it is the browser's own code. What is
 left is the next question - spreading the browser's threads, which the
 lock no longer stands in the way of as much as it did in Milestone 103.
 
+## Milestone 105 - a process's threads on several CPUs, built and measured slower
+
+The step Milestones 102-104 kept pointing at: let a process's threads run
+on more than one CPU, so the browser's dozen busy threads stop sharing
+CPU 0. It is built, behind `-DSMP64_SPREAD_THREADS=1`, and it is off,
+because it is slower.
+
+**What it takes.** A new thread may start on the CPU with fewest tasks
+(`smp64_pick_thread_cpu`); its process is then *spread*. Three things a
+process on one CPU never needed:
+
+- **TLB shootdowns.** Each CPU records the page tables it has loaded
+  (`smp64_note_cr3`). A spread process's memory calls and copy-on-write
+  breaks mark its mappings dirty, the frames it gives up are held back
+  (`smp64_defer_free`, from `pmm64_free_frame`), and before the kernel
+  lock is let go every other CPU with those tables loaded is sent an IPI
+  on `SMP64_FLUSH_VECTOR` and waited for; only then are the frames freed,
+  so no CPU can be writing through a stale mapping into a frame someone
+  else now owns. A CPU waiting for the kernel lock answers the flush in
+  its wait loop, so the two can never wait on each other. `fork` marks
+  the parent dirty where it makes its pages copy-on-write, since a vfork
+  parent leaves by sleeping rather than through the end of its call.
+- **Ending a process on other CPUs.** `exit_group`, a fatal signal and the
+  leader's end mark the threads dead and send the same flush; a CPU
+  running one finds it dead, loads the kernel's tables and runs something
+  else (`sched64_flush_service`, `sched64_replace_dead`), and one that was
+  waiting for the lock on that thread's behalf drops the call
+  (`sched64_continue_after_death`). Task slots carry a generation, so a
+  CPU idling inside a thread's wait never saves into a slot handed to a
+  new thread meanwhile.
+- **The run's leader ending elsewhere.** `kernel_main` is on CPU 0's
+  stack; a leader thread ending on another CPU asks CPU 0 to go back to it
+  (`smp64_run_ended_elsewhere`, checked in the lock's wait loop, the idle
+  loop and the kick IPI).
+
+A spread process's page faults, pipe and socket I/O and epoll waits take
+the kernel lock again: all three assume one CPU per process. Its clock
+reads and signal-mask calls stay lock-free. A fault on a page another
+thread has just mapped is recognised as spurious and retried.
+
+**Measured** - 4 CPUs, same host, alternating, boot to the page:
+
+| | run 1 | run 2 |
+|---|---|---|
+| threads on their process's CPU (default) | 200 s | 175 s |
+| spread | 214 s | 195 s |
+| spread, the browser only | 212 s | 201 s |
+
+About 200 threads moved, 80,000-90,000 shootdowns a run (30,000-48,000
+IPIs). CPU 0's kernel share went from 20% to 26-33% and lock spinning
+doubled: the browser's I/O and page faults, back under the lock, cost more
+than its threads gain from spreading. To pay, a spread process needs its
+own locks - one for its descriptor table and one for its address space -
+so those paths can come back out from under the kernel lock. Until then
+the default stays, and `make test` passes with spreading on as well.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the

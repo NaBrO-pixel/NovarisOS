@@ -1564,10 +1564,24 @@ static void mods_forget(int pid);
  * syscall64_set_run_ticks. */
 static uint64_t run_deadline;
 static int      run_expired;
-static int      leader_exited;
+
 
 /* syscall64.s */
 extern void enter_user_mode64_abort(void) __attribute__((noreturn));
+static int leader_exited;
+int syscall64_leader_pid(void);
+
+/* Where a run's end goes back to kernel_main: on the bootstrap CPU, whose
+ * stack it is, directly. On another CPU - the leader's threads may be
+ * anywhere now (Milestone 105) - the bootstrap CPU is asked to, if it was
+ * the leader that ended; otherwise there was only nothing left to run
+ * here, and this CPU idles. */
+static void run_ends_here(void) __attribute__((noreturn));
+static void run_ends_here(void) {
+    if (smp64_this() == 0) enter_user_mode64_abort();
+    if (leader_exited) smp64_run_ended_elsewhere();
+    smp64_ap_idle();
+}
 static uint64_t last_fork_frames;
 
 static void frame_from_args(const syscall64_args_t* args, uint64_t rax,
@@ -1645,6 +1659,10 @@ static uint64_t do_fork_common(const syscall64_args_t* args,
         proc64_reap_child_pid(proc64_current_pid(), child_pid, 0);
         return (uint64_t)-12;
     }
+    /* The parent's pages are read-only now, and its other CPUs may still
+     * hold them writable (Milestone 105): flushed before the lock goes,
+     * which a vfork parent's sleep also lets go. */
+    smp64_mm_dirty();
 
     /* The child resumes exactly where the parent is about to, with a 0
      * in rax - which is the whole of how the two tell each other
@@ -1901,6 +1919,8 @@ void syscall64_set_trace(int on) { trace = on; }
  * Naming the leader makes "the thing I started has finished" the end of
  * the run, and leaves whatever it started behind - which is also what a
  * shell does. -1 restores the old behaviour. */
+int syscall64_leader_pid(void) { return leader_pid; }
+
 void syscall64_set_leader(int pid) {
     leader_pid = pid;
     if (pid >= 0) report_pid = pid;
@@ -2080,7 +2100,7 @@ static void die_by_signal(int sig) {
         if (leader_pid >= 0 && proc64_current_pid() == leader_pid) {
             leader_exited = 1;
             leader_leaves_scheduler();
-            enter_user_mode64_abort();                 /* never returns */
+            run_ends_here();                 /* never returns */
         }
         /* The parent may be parked in wait4 for exactly this; exit_group
          * wakes it and a death by signal is no less an ending. */
@@ -2138,7 +2158,7 @@ int syscall64_fault_kill(int sig, uint64_t rip, uint64_t addr) {
 
     die_by_signal(sig);
     /* Nothing else to run. Ending the run is all that is left. */
-    enter_user_mode64_abort();                         /* never returns */
+    run_ends_here();                         /* never returns */
     return 1;
 }
 
@@ -2174,7 +2194,7 @@ void syscall64_oom_kill(uint64_t addr) {
     serial64_putc('\n');
     oom_kills++;
     die_by_signal(SIG64_KILLSIG);
-    enter_user_mode64_abort();                         /* never returns */
+    run_ends_here();                         /* never returns */
 }
 
 uint64_t syscall64_oom_kills(void) { return oom_kills; }
@@ -2271,6 +2291,14 @@ static int lockfree_syscall(syscall64_args_t* args, uint64_t* out) {
     uint64_t r;
 
     if (sched64_current() < 0) return 0;
+    /* Threads on several CPUs (Milestone 105): the descriptor table, the
+     * epoll sets and the pipes' copies assume the caller's process is on
+     * one, so those take the lock. The clock and the thread's own mask
+     * do not care where its siblings are. */
+    if (proc64_current_spread() &&
+        (nr == SYS64_READ || nr == SYS64_WRITE || nr == SYS64_WRITEV ||
+         nr == SYS64_EPOLL_WAIT))
+        return 0;
     switch (nr) {
     case SYS64_READ:
         if (!lockfree_read(a1, a2, a3, &r)) return 0;
@@ -2348,10 +2376,27 @@ uint64_t syscall64_dispatch(syscall64_args_t* args) {
     }
 
     smp64_enter();
+    /* This thread was ended while it waited for the lock - its process
+     * exited on another CPU (Milestone 105). */
+    if (smp64_take_dead_pending()) sched64_continue_after_death();
     sched64_note_entry();
     saved_user_rsp = *user_rsp_slot;
     r = syscall64_dispatch_locked(args);
     *user_rsp_slot = saved_user_rsp;
+    /* A spread process's mappings changed: its other CPUs flush before
+     * the lock goes (smp64.c). */
+    switch (nr) {
+    case SYS64_MMAP: case SYS64_MPROTECT: case SYS64_MUNMAP: case SYS64_BRK:
+    case 25: case 28: case 30: case 67:          /* mremap madvise shmat shmdt */
+    case SYS64_CLONE: case SYS64_FORK: case 58:
+        smp64_mm_dirty();
+        break;
+    case SYS64_PROCESS_VM_WRITEV: {
+        proc64_t* t = proc64_get((int)args->a1);
+        if (t && t->spread) smp64_shootdown(t->space.pml4_phys);
+        break;
+    }
+    }
 
     if (nr == SYS64_EXIT || nr == SYS64_EXIT_GROUP || nr == WIN32_64_EXIT) {
         if (smp64_this() != 0) smp64_ap_idle();
@@ -2630,7 +2675,7 @@ static uint64_t syscall64_dispatch_inner(syscall64_args_t* args) {
         /* The one instant the whole system is known to be stuck, which
          * is the only time this graph means anything. */
         sched64_dump_blocked();
-        enter_user_mode64_abort();                     /* never returns */
+        run_ends_here();                     /* never returns */
     }
 
     if (!trace && !trace_this_process()) {
@@ -7196,7 +7241,7 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
             if (leader_pid >= 0 && proc64_current_pid() == leader_pid) {
                 leader_exited = 1;
                 leader_leaves_scheduler();
-                enter_user_mode64_abort();             /* never returns */
+                run_ends_here();             /* never returns */
             }
             if (parent) sched64_wake(PROC64_WAIT_KEY(parent),
                                      SCHED64_MAX_TASKS);
@@ -7248,7 +7293,7 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                 exit_code     = a1;
                 leader_exited = 1;
                 leader_leaves_scheduler();
-                enter_user_mode64_abort();             /* never returns */
+                run_ends_here();             /* never returns */
             }
             /* A parent blocked in wait4 is waiting on exactly this. */
             if (parent) sched64_wake(PROC64_WAIT_KEY(parent),

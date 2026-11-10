@@ -1,6 +1,7 @@
 /* vmspace64.c - one PML4 per process, sharing the kernel's half. */
 
 #include "vmspace64.h"
+#include "smp64.h"
 #include "uspace64.h"
 #include "paging64.h"
 #include "pmm64.h"
@@ -41,6 +42,9 @@ void vmspace64_kernel_space(vmspace64_t* vs) {
  * one again, and fork reloads CR3 itself. */
 void vmspace64_switch(const vmspace64_t* vs) {
     if ((read_cr3() & ADDR_MASK) == vs->pml4_phys) return;
+    /* Said before it is loaded, so a shootdown that misses it is one
+     * that came before the load - which the load flushes anyway. */
+    smp64_note_cr3(vs->pml4_phys);
     write_cr3(vs->pml4_phys);
 }
 

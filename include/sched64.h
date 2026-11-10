@@ -231,6 +231,8 @@ int  sched64_maybe_work(int cpu);
 void sched64_note_entry(void);      /* a locked syscall begins */
 void sched64_guard_block(void);     /* the next block re-runs if woken since */
 uint64_t sched64_block_retries(void);
+void sched64_replace_dead(registers64_t* frame);
+void sched64_continue_after_death(void) __attribute__((noreturn));
 int  sched64_migrate_current(const registers64_t* regs, int cpu,
                              registers64_t* out_regs, vmspace64_t* out_space,
                              uint64_t* out_fs_base);   /* lock-free: anything for this CPU? */

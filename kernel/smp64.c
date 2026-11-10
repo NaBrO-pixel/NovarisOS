@@ -143,6 +143,15 @@ static inline uint64_t tsc_now(void) {
 }
 int smp64_cpu;                          /* the lock holder's CPU */
 
+/* Milestone 105: threads of one process on several CPUs. */
+static volatile int flush_req[SMP64_MAX_CPUS];
+static volatile int dead_pending[SMP64_MAX_CPUS];
+static volatile int bsp_abort;
+static void flush_service(int cpu);
+static void bsp_abort_now(void) __attribute__((noreturn));
+static void flush_and_free(int cpu);
+static int  ndefer[SMP64_MAX_CPUS], mm_dirty[SMP64_MAX_CPUS];
+
 static volatile int bkl;
 static volatile int bkl_owner = -1;
 static int bkl_depth;
@@ -161,7 +170,15 @@ void smp64_enter(void) {
     if (__atomic_exchange_n(&bkl, 1, __ATOMIC_ACQUIRE)) {
         uint64_t t0 = tsc_now();
         while (__atomic_exchange_n(&bkl, 1, __ATOMIC_ACQUIRE))
-            while (bkl) __asm__ __volatile__("pause");
+            while (bkl) {
+                /* Waiting for the lock is where a CPU is when the holder
+                 * needs it to flush its TLB, or to leave a process that
+                 * is being torn down (smp64_shootdown) - so it answers
+                 * here, or the two wait for each other. */
+                if (flush_req[cpu]) flush_service(cpu);
+                if (cpu == 0 && bsp_abort) bsp_abort_now();
+                __asm__ __volatile__("pause");
+            }
         smp64_spin_cycles[cpu] += tsc_now() - t0;
         smp64_contended[cpu]++;
     }
@@ -174,6 +191,10 @@ void smp64_enter(void) {
 
 static void release(void) {
     int cpu = smp64_cpu;
+    /* A spread process's memory changed under the lock: the other CPUs
+     * running it flush before the lock goes, and only then are the
+     * frames it gave up handed back. */
+    if (ndefer[cpu] || mm_dirty[cpu]) flush_and_free(cpu);
     smp64_held_cycles[cpu] += tsc_now() - held_since[cpu];
     bkl_depth = 0;
     bkl_owner = -1;
@@ -213,6 +234,7 @@ void smp64_reacquire(int depth) {
  * holds the lock once now. */
 void smp64_kernel_holds(void) {
     if (!smp64_active) return;
+    dead_pending[this_cpu()] = 0;
     if (bkl_owner != this_cpu()) smp64_enter();
     bkl_depth = 1;
 }
@@ -344,6 +366,7 @@ static void lapic_timer_start(void) {
 }
 
 static void kernel_space(void) {
+    smp64_note_cr3(kernel_cr3);
     __asm__ __volatile__("mov %0, %%cr3" :: "r"(kernel_cr3) : "memory");
 }
 
@@ -385,6 +408,8 @@ void smp64_ap_idle(void) __attribute__((noreturn));
 void smp64_ap_idle(void) {
     for (;;) {
         smp64_enter();
+        /* Nothing is running here to have been ended. */
+        dead_pending[this_cpu()] = 0;
         /* Only once scheduling is on: before that the lock is not live
          * and "this CPU's tasks" would read as the bootstrap CPU's. */
         if (smp64_active && !quiesce) {
@@ -553,6 +578,7 @@ void smp64_ap_entry(uint64_t cpu) {
 
     /* Off the trampoline's tables and onto the kernel's. */
     __asm__ __volatile__("mov %0, %%cr3" :: "r"(kernel_cr3) : "memory");
+    smp64_note_cr3(kernel_cr3);
 
     /* This CPU's own descriptor tables and interrupt stack, the shared
      * IDT, and its SYSCALL entry. */
@@ -800,3 +826,199 @@ void smp64_report(void) {
 
 uint64_t smp64_spin_snapshot(int c) { return smp64_spin_cycles[c]; }
 uint64_t smp64_held_snapshot(int c) { return smp64_held_cycles[c]; }
+
+/* --- threads of one process on several CPUs (Milestone 105) ---------------
+ *
+ * With -DSMP64_SPREAD_THREADS a new thread may start on another CPU than
+ * its process's. Its process is then "spread" (proc64.c), and three
+ * things that one CPU per process made unnecessary have to be done:
+ *
+ * - Each CPU says which page tables it has loaded (smp64_note_cr3), so a
+ *   change to a spread process's memory can be flushed from the TLB of
+ *   every other CPU running it before the kernel lock is let go - and the
+ *   frames it gave up are kept back until then (smp64_defer_free), so no
+ *   other CPU can be writing through a stale mapping into a frame that
+ *   has already been handed to someone else.
+ * - Ending a process (exit_group, a fatal signal) must get its threads off
+ *   the other CPUs before the address space goes: they are marked dead,
+ *   then each CPU running one is sent the same flush, finds its thread
+ *   dead, loads the kernel's page tables and goes on to something else
+ *   (sched64_flush_service, sched64_replace_dead).
+ * - The run's leader may now end on a CPU other than the bootstrap one,
+ *   whose stack kernel_main is on; that CPU asks the bootstrap CPU to
+ *   finish the run (smp64_run_ended_elsewhere).
+ *
+ * The flush is an IPI on SMP64_FLUSH_VECTOR, answered without the kernel
+ * lock; a CPU waiting for the lock answers in its wait loop instead. Only
+ * the lock's holder sends one, so two can never wait on each other. */
+
+#ifndef SMP64_SPREAD_THREADS
+#define SMP64_SPREAD_THREADS 0
+#endif
+#define DEFER_MAX 1024
+
+volatile uint64_t smp64_loaded_cr3[SMP64_MAX_CPUS];
+static uint64_t defer[SMP64_MAX_CPUS][DEFER_MAX], defer_pml4[SMP64_MAX_CPUS],
+                dirty_pml4[SMP64_MAX_CPUS];
+static uint64_t shootdowns, shootdown_ipis, frees_deferred, threads_spread;
+
+extern int  sched64_flush_service(int cpu);
+extern int  sched64_tasks_on(int cpu);
+extern void pmm64_free_frame_now(uint64_t phys);
+extern void enter_user_mode64_abort(void) __attribute__((noreturn));
+
+int smp64_spread_threads(void) { return SMP64_SPREAD_THREADS && smp64_active && spreading; }
+
+void smp64_note_cr3(uint64_t pml4) {
+    smp64_loaded_cr3[this_cpu()] = pml4 & 0x000FFFFFFFFFF000ULL;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
+/* Every other CPU with `pml4` loaded flushes its TLB - or, if what it was
+ * running there has been ended, leaves it - and this waits until each
+ * has. The caller holds the kernel lock and no other. */
+void smp64_shootdown(uint64_t pml4) {
+    int me = this_cpu(), sent = 0;
+    pml4 &= 0x000FFFFFFFFFF000ULL;
+    if (!smp64_active || !pml4 || pml4 == kernel_cr3) return;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    for (int c = 0; c < ncpus; c++) {
+        if (c == me || smp64_loaded_cr3[c] != pml4) continue;
+        flush_req[c] = 1;
+        lapic_write(LAPIC_ICR_HI, (uint32_t)c << 24);
+        lapic_write(LAPIC_ICR_LO, 0x4000 | SMP64_FLUSH_VECTOR);
+        sent++;
+    }
+    for (int c = 0; c < ncpus; c++)
+        while (flush_req[c]) __asm__ __volatile__("pause");
+    shootdowns++;
+    shootdown_ipis += (uint64_t)sent;
+}
+
+/* A flush asked of this CPU: answered after the TLB is clean, or after
+ * the thread it was running is left if that thread has been ended. */
+static void flush_service(int cpu) {
+    if (sched64_flush_service(cpu)) dead_pending[cpu] = 1;
+    flush_req[cpu] = 0;
+}
+
+/* The IPI. Returns 1 if the interrupted thread had been ended, so the
+ * caller must put another in its place before returning to ring 3. */
+int smp64_flush_irq(void) {
+    int me = this_cpu();
+    smp64_lapic_eoi();
+    if (flush_req[me]) flush_service(me);
+    if (dead_pending[me]) { dead_pending[me] = 0; return 1; }
+    return 0;
+}
+
+int smp64_take_dead_pending(void) {
+    int me = this_cpu();
+    if (!dead_pending[me]) return 0;
+    dead_pending[me] = 0;
+    return 1;
+}
+
+void smp64_kernel_space_now(void) { kernel_space(); }
+
+/* A frame a spread process gave up under the lock, kept until its other
+ * CPUs have flushed. Returns 0 when it may be freed at once. */
+int smp64_defer_free(uint64_t phys) {
+    int me;
+    uint64_t pml4;
+    if (!SMP64_SPREAD_THREADS || !smp64_active) return 0;
+    me = this_cpu();
+    if (bkl_owner != me || !proc64_current_spread()) return 0;
+    pml4 = smp64_loaded_cr3[me];
+    if (ndefer[me] && (defer_pml4[me] != pml4 || ndefer[me] == DEFER_MAX))
+        flush_and_free(me);
+    defer_pml4[me] = pml4;
+    defer[me][ndefer[me]++] = phys;
+    frees_deferred++;
+    return 1;
+}
+
+/* The loaded process's mappings have been changed in a way another CPU's
+ * TLB may disagree with - a page made read-only, shared or replaced. */
+void smp64_mm_dirty(void) {
+    int me;
+    if (!SMP64_SPREAD_THREADS || !smp64_active) return;
+    me = this_cpu();
+    if (!proc64_current_spread()) return;
+    if (mm_dirty[me] && dirty_pml4[me] != smp64_loaded_cr3[me]) flush_and_free(me);
+    mm_dirty[me] = 1;
+    dirty_pml4[me] = smp64_loaded_cr3[me];
+}
+
+static void flush_and_free(int cpu) {
+    uint64_t a = ndefer[cpu] ? defer_pml4[cpu] : 0;
+    uint64_t b = mm_dirty[cpu] ? dirty_pml4[cpu] : 0;
+    int n = ndefer[cpu];
+    if (a) smp64_shootdown(a);
+    if (b && b != a) smp64_shootdown(b);
+    if ((a && smp64_loaded_cr3[cpu] == a) || (b && smp64_loaded_cr3[cpu] == b)) {
+        uint64_t v;
+        __asm__ __volatile__("mov %%cr3, %0; mov %0, %%cr3" : "=r"(v) :: "memory");
+    }
+    ndefer[cpu] = 0;
+    mm_dirty[cpu] = 0;
+    for (int i = 0; i < n; i++) pmm64_free_frame_now(defer[cpu][i]);
+}
+
+/* The CPU for a new thread of process `pid`, whose CPU is `home`: the one
+ * with fewest tasks, the home one on a tie. */
+int smp64_pick_thread_cpu(int pid, int home) {
+    int best = home, best_n;
+    if (!smp64_spread_threads() || ncpus < 2) return home;
+#ifdef SMP64_SPREAD_LEADER_ONLY
+    /* Only the run's leader - the browser - whose threads are the work
+     * worth spreading; the rest keep the lock-free paths of a process on
+     * one CPU. */
+    {
+        extern int syscall64_leader_pid(void);
+        if (pid != syscall64_leader_pid()) return home;
+    }
+#else
+    (void)pid;
+#endif
+    best_n = sched64_tasks_on(home);
+    for (int c = 0; c < ncpus; c++) {
+        int n = sched64_tasks_on(c);
+        if (n < best_n) { best = c; best_n = n; }
+    }
+    if (best != home) threads_spread++;
+    return best;
+}
+
+/* The run's leader ended on this CPU, which is not the one kernel_main is
+ * waiting on: the bootstrap CPU is told, and this one goes idle. */
+void smp64_run_ended_elsewhere(void) __attribute__((noreturn));
+void smp64_run_ended_elsewhere(void) {
+    bsp_abort = 1;
+    send_kick(0);
+    smp64_ap_idle();
+}
+
+static void bsp_abort_now(void) {
+    bsp_abort = 0;
+    enter_user_mode64_abort();
+}
+
+/* The bootstrap CPU, wherever it notices that the run's leader ended on
+ * another: back to kernel_main, abandoning whatever it was in. */
+void smp64_bsp_abort_check(void) {
+    if (bsp_abort && this_cpu() == 0) bsp_abort_now();
+}
+
+void smp64_spread_report(void) {
+    if (!SMP64_SPREAD_THREADS || ncpus < 2) return;
+    serial64_puts("NOVARIS64: [smp] threads placed off their process's CPU ");
+    serial64_putdec(threads_spread);
+    serial64_puts(", TLB shootdowns ");
+    serial64_putdec(shootdowns);
+    serial64_puts(" (");
+    serial64_putdec(shootdown_ipis);
+    serial64_puts(" IPIs), frees held for them ");
+    serial64_putdec(frees_deferred);
+    serial64_putc('\n');
+}

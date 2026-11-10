@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include "idt64.h"
 #include "smp64.h"
+#include "sched64.h"
 #include "gdt64.h"
 #include "serial64.h"
 #include "io.h"
@@ -88,6 +89,7 @@ extern void irq240(void);
 extern void irq255(void);
 extern void irq241(void);
 extern void irq242(void);
+extern void irq243(void);
 
 static const char* const exception_names[32] = {
     "divide error", "debug", "non-maskable interrupt", "breakpoint",
@@ -191,6 +193,13 @@ void isr64_handler(registers64_t* r) {
      * does not come back - into another task, or to kernel_main - lets it
      * go, or keeps it, on its own way out. */
     smp64_enter();
+    /* The faulting thread was ended while this waited for the lock: its
+     * fault is moot (Milestone 105). */
+    if (smp64_take_dead_pending() && (r->cs & 3) == 3) {
+        sched64_replace_dead(r);
+        smp64_exit();
+        return;
+    }
     if (r->int_no < IDT_ENTRIES && handlers[r->int_no]) {
         handlers[r->int_no](r);
         smp64_exit();
@@ -207,6 +216,24 @@ void irq64_handler(registers64_t* r) {
     if (r->int_no < 48) {
         if (r->int_no >= 40) outb(PIC2_CMD, PIC_EOI);
         outb(PIC1_CMD, PIC_EOI);
+    }
+
+    /* A TLB shootdown (Milestone 105), answered without the lock - the
+     * CPU asking holds it and is waiting. If the thread this interrupted
+     * was ended, another is put in its place, which does take the lock. */
+    if (r->int_no == SMP64_FLUSH_VECTOR) {
+        if (smp64_flush_irq() && (r->cs & 3) == 3) {
+            smp64_enter();
+            sched64_replace_dead(r);
+            smp64_exit();
+        }
+        smp64_bsp_abort_check();
+        return;
+    }
+    /* The run's leader ended on another CPU: back to kernel_main. */
+    if (r->int_no == SMP64_KICK_VECTOR && gdt64_cpu() == 0) {
+        smp64_lapic_eoi();
+        smp64_bsp_abort_check();
     }
 
     /* The sampler: counted and acknowledged, nothing else, no lock. */
@@ -229,6 +256,9 @@ void irq64_handler(registers64_t* r) {
     if (r->int_no < IDT_ENTRIES && handlers[r->int_no]) {
         handlers[r->int_no](r);
     }
+    /* The thread this interrupted was ended while this waited for the
+     * lock (Milestone 105). */
+    if (smp64_take_dead_pending() && (r->cs & 3) == 3) sched64_replace_dead(r);
     smp64_exit();
 }
 
@@ -376,6 +406,7 @@ void idt64_install(void) {
     set_gate(0xFF, (uint64_t)irq255, 0, 0);
     set_gate(SMP64_KICK_VECTOR, (uint64_t)irq241, 0, 0);
     set_gate(SMP64_SAMPLE_VECTOR, (uint64_t)irq242, 0, 0);
+    set_gate(SMP64_FLUSH_VECTOR, (uint64_t)irq243, 0, 0);
 
     idt_ptr.limit = (uint16_t)(sizeof(idt) - 1);
     idt_ptr.base  = (uint64_t)&idt;

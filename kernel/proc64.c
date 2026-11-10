@@ -294,3 +294,8 @@ const char* proc64_comm_of(int pid) {
     proc64_t* p = slot_for(pid);
     return p ? p->comm : 0;
 }
+
+int proc64_current_spread(void) {
+    proc64_t* p = proc64_current();
+    return p ? p->spread : 0;
+}

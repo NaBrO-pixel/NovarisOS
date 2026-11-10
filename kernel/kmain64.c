@@ -416,6 +416,9 @@ int kmain64_page_fault_fast(registers64_t* r) {
     int done = 0;
 
     if (cr2 >= 0x0000800000000000ULL || proc64_current_pid() < 0) return 0;
+    /* Its page tables are shared with other CPUs (Milestone 105): under
+     * the lock, where its memory calls are. */
+    if (proc64_current_spread()) return 0;
     if (!(err & 0x1)) done = uspace64_fault(cr2, (err & 0x2) != 0);
     else if ((err & 0x3) == 0x3) done = vmspace64_break_cow(cr2);
     if (!done) {
@@ -443,6 +446,17 @@ static void page_fault_body(registers64_t* r) {
     pf_hits++;
     pf_cr2 = read_cr2();
     pf_err = r->err_code;
+
+    /* Already as asked for: another thread of the same process, on
+     * another CPU, faulted the page in first (Milestone 105). The access
+     * runs again and succeeds. */
+    if (pf_cr2 < 0x0000800000000000ULL && proc64_current_spread() &&
+        !(r->err_code & 0x10)) {                        /* not a fetch */
+        int write = (r->err_code & 0x2) != 0;
+        if ((!(r->err_code & 0x1) || write) &&
+            vmspace64_user_ready(pf_cr2 & ~0xFFFULL, 1, write))
+            return;
+    }
 
     /* Anonymous memory touched for the first time: a page that is not
      * there (bit 0 clear), in a range the process holds, gets a frame of
@@ -490,6 +504,7 @@ static void page_fault_body(registers64_t* r) {
      * write to genuinely read-only memory still falls through to
      * everything below. */
     if ((r->err_code & 0x3) == 0x3 && vmspace64_break_cow(pf_cr2)) {
+        smp64_mm_dirty();          /* the page's frame changed under others */
         cow_breaks++;
         return;
     }
@@ -5556,6 +5571,7 @@ static const char* const chrome_args[] = {
     reclaim_finished("end");
     smp64_quiesce();
     smp64_report();
+    smp64_spread_report();
     serial64_puts("NOVARIS64: ---- bring-up complete ----\n");
 
     /* --- the input watch (Milestone 70) ------------------------------

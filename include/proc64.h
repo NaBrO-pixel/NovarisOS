@@ -219,6 +219,11 @@ typedef struct {
     /* The CPU this process's threads run on (Milestone 101). Fixed for
      * its life: its page tables are then loaded on one CPU only, so a
      * change to them never has to be flushed from another's TLB. */
+    /* Threads on more than one CPU (Milestone 105, SMP64_SPREAD_THREADS):
+     * its page tables may be loaded on several CPUs at once, so its
+     * memory calls and page faults take the kernel lock and end with a
+     * TLB shootdown, and the lock-free paths that assume one CPU are off. */
+    int         spread;
     int         cpu;
 } proc64_t;
 
@@ -298,5 +303,6 @@ int proc64_cpu_of(int pid);     /* its CPU; 0 for none */
 void proc64_set_cpu(int pid, int cpu);
 int proc64_count_on(int cpu, int except);   /* live processes there */
 const char* proc64_comm_of(int pid);
+int  proc64_current_spread(void);
 
 #endif
