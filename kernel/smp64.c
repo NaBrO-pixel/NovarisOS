@@ -24,6 +24,7 @@
 #include "idt64.h"
 #include "gdt64.h"
 #include "proc64.h"
+#include "uspace64.h"
 
 #define KERNEL_VMA_ 0xFFFFFFFF80000000ULL
 
@@ -413,6 +414,13 @@ int smp64_idle_here(void) {
 
 extern int sched64_maybe_work(int cpu);
 
+/* Whether an idle CPU should stop zeroing frames and look for work. */
+int smp64_idle_has_work(void) {
+    int me = this_cpu();
+    return sched64_maybe_work(me) || flush_req[me] || quiesce || (me == 0 && bsp_abort);
+}
+static int idle_has_work(void) { return smp64_idle_has_work(); }
+
 void smp64_ap_idle(void) __attribute__((noreturn));
 void smp64_ap_idle(void) {
     for (;;) {
@@ -438,6 +446,9 @@ void smp64_ap_idle(void) {
              * has nothing to do. A wrong guess either way costs one
              * look under the lock, or the next tick. */
             do {
+                /* Idle: zero frames for page faults to come (uspace64.c,
+                 * Milestone 108), a few at a time, then halt. */
+                if (smp64_active && !quiesce) uspace64_zero_ahead(16, idle_has_work);
                 __asm__ __volatile__("sti; hlt; cli");
             } while (smp64_active && !quiesce && !sched64_maybe_work(me));
             smp64_note_idle(me, tsc_now() - t0, sp0, hd0);

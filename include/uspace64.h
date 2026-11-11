@@ -109,4 +109,8 @@ uint64_t uspace64_build_stack(vmspace64_t* space, uint64_t stack_top,
 
 uint64_t uspace64_pages_allocated(void);
 
+uint64_t uspace64_faulted_around(void);
+void uspace64_zero_ahead(int budget, int (*more_work)(void));
+void uspace64_zpool_stats(uint64_t* hits, uint64_t* zeroed, int* held);
+
 #endif

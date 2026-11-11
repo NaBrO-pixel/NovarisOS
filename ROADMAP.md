@@ -11335,6 +11335,37 @@ waits on each connection until QEMU closes it or ten minutes pass.
 `make test` passes 33 on one CPU (twice), on four, and with threads
 spread.
 
+## Milestone 108 - page faults: what one costs, and two ways not to pay it
+
+A Chromium page backs about a million pages on first touch, at 14-22
+thousand cycles each - 5-11% of the Chromium layer. Two ideas, both built,
+both measured, both off:
+
+**Fault-around** (`USPACE64_FAULT_AROUND`, default 1 page). On a first
+touch, the untouched neighbours in the same reservation, within an
+aligned window, are backed too - never past the reservation, so a
+PROT_NONE guard is never touched. At 8 pages the faults fell from 1.05M
+to 0.26-0.32M, and the cycles spent in them did not move (19-31G against
+21-23G), nor did the run (204-213 s against 215-216 s on 4 CPUs, 255-273 s
+against 254-280 s on one). The trap is not the cost.
+
+**What is.** Timing `back_page` itself: allocating a frame 770 cycles,
+mapping it 1,900, **zeroing it 18,900** - 87%. `kmemset` is already
+`rep stosq`; under QEMU's emulation 4KB of stores is simply that much.
+
+**Zeroing ahead** (`-DUSPACE64_ZERO_AHEAD`). The CPUs that are idle
+two-thirds of a 4-CPU run zero free frames into a pool of 8,192 while they
+wait, a few at a time between looks for work, and a fault takes a clear
+one. It does what it says - 329,000 of a run's 1.1M pages came from the
+pool, and zeroing fell to 10,300 cycles a page on average - and the run
+did not get faster: 201-209 s against 181-217 s. About 3G cycles moved off
+the faulting CPU, a second and a half; and the idle CPUs zeroing instead
+of halting share the host's four cores with the one doing the work.
+
+Both stay in, off, with the per-page breakdown in the `[faults]` line.
+Like the kernel lock before them, page faults are no longer where a page
+load's time goes; the emulated programs are.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the

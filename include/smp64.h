@@ -66,5 +66,6 @@ void smp64_spread_report(void);
 struct proc64;
 void smp64_mm_hold_current(void);
 int  smp64_dead_pending_here(void);
+int  smp64_idle_has_work(void);
 
 #endif

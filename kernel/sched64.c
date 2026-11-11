@@ -4,6 +4,7 @@
 #include "clock64.h"
 #include "smp64.h"
 #include "proc64.h"
+#include "uspace64.h"
 #include "idt64.h"
 #include "gdt64.h"
 #include "serial64.h"
@@ -688,6 +689,8 @@ static int idle_until_runnable(void) {
             /* With other CPUs, halted without the lock until something
              * of this CPU's looks runnable (sched64_maybe_work). */
             do {
+                if (smp64_active && !smp64_quiescing())
+                    uspace64_zero_ahead(16, smp64_idle_has_work);
                 __asm__ __volatile__("sti; hlt; cli");
                 smp64_bsp_abort_check();
             } while (smp64_active && !smp64_quiescing() && !sched64_maybe_work(me));

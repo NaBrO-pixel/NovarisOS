@@ -1,6 +1,7 @@
 /* uspace64.c - a Linux process's heap, its mappings, and its first stack. */
 
 #include "uspace64.h"
+#include "spin64.h"
 #include "paging64.h"
 #include "pmm64.h"
 #include "serial64.h"
@@ -189,12 +190,82 @@ static int spill_to_zero_page(uint64_t start, uint64_t end) {
 }
 
 static uint64_t lazy_faults;       /* pages backed on first touch          */
+#ifndef USPACE64_FAULT_AROUND
+#define USPACE64_FAULT_AROUND 1   /* measured: fewer traps, same cost */
+#endif
+static uint64_t faulted_around;    /* backed beside one, before their touch */
 uint64_t uspace64_lazy_faults(void) { return lazy_faults; }
 
 /* One fresh zeroed page at `va`, mapped with `flags`. 0 if memory ran
  * out, which is said once per page, with the numbers. */
+static inline uint64_t bp_tsc(void) {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+uint64_t bp_cycles[3], bp_pages;          /* alloc, zero, map */
+
+/* --- frames zeroed ahead of need (Milestone 108) --------------------------
+ *
+ * Zeroing is 87% of what backing a page costs - 18,900 of 21,600 cycles
+ * under emulation, the rest being the allocator and the page tables - and
+ * a Chromium page backs a million of them. With more than one CPU, the
+ * others are idle two thirds of the time; they zero free frames into this
+ * pool while they wait (uspace64_zero_ahead, from the idle loops), and a
+ * page fault takes one already clear. Frames in the pool are allocated, so
+ * the allocator's own reserve is untouched; the idle CPUs stop well above
+ * it. */
+#define ZPOOL_MAX 8192
+static uint64_t zpool[ZPOOL_MAX];
+static int zcount;
+static spin64_t zpool_lock = SPIN64_INIT;
+static uint64_t zpool_hits, zpool_zeroed;
+
+static uint64_t zpool_take(void) {
+    uint64_t f = 0, fl;
+    if (!zcount) return 0;
+    fl = spin64_acquire(&zpool_lock);
+    if (zcount) f = zpool[--zcount];
+    spin64_release(&zpool_lock, fl);
+    if (f) zpool_hits++;
+    return f;
+}
+
+/* Up to `budget` frames zeroed into the pool, stopping early when
+ * `more_work` says this CPU has something to run. */
+void uspace64_zero_ahead(int budget, int (*more_work)(void)) {
+#ifndef USPACE64_ZERO_AHEAD
+    /* Off: measured no faster (Milestone 108) - the idle CPUs zeroing
+     * compete with the busy one for the host's cores. */
+    (void)budget; (void)more_work;
+    return;
+#endif
+    while (budget-- > 0 && zcount < ZPOOL_MAX) {
+        uint64_t f, fl;
+        if (pmm64_free_frames() < 16 * PMM64_USER_RESERVE) return;
+        if (more_work && more_work()) return;
+        f = pmm64_alloc_user();
+        if (!f) return;
+        kmemset(phys64_to_virt(f), 0, PAGE64_SIZE);
+        fl = spin64_acquire(&zpool_lock);
+        if (zcount < ZPOOL_MAX) { zpool[zcount++] = f; f = 0; }
+        spin64_release(&zpool_lock, fl);
+        if (f) { pmm64_free_frame(f); return; }
+        zpool_zeroed++;
+    }
+}
+
+void uspace64_zpool_stats(uint64_t* hits, uint64_t* zeroed, int* held) {
+    *hits = zpool_hits; *zeroed = zpool_zeroed; *held = zcount;
+    zpool_hits = zpool_zeroed = 0;
+}
+
 static int back_page(uint64_t va, uint64_t flags) {
-    uint64_t frame = pmm64_alloc_user();
+    uint64_t t0 = bp_tsc(), t1, t2;
+    uint64_t frame = zpool_take();
+    int clear = frame != 0;
+    if (!frame) frame = pmm64_alloc_user();
+    t1 = bp_tsc();
     if (!frame) {
         serial64_puts("NOVARIS64: [oom] backing ");
         serial64_puthex(va);
@@ -205,11 +276,14 @@ static int back_page(uint64_t va, uint64_t flags) {
         serial64_putc('\n');
         return 0;
     }
-    kmemset(phys64_to_virt(frame), 0, PAGE64_SIZE);
+    if (!clear) kmemset(phys64_to_virt(frame), 0, PAGE64_SIZE);
+    t2 = bp_tsc();
     if (paging64_map(va, frame, flags) != PAGING64_OK) {
         pmm64_free_frame(frame);
         return 0;
     }
+    bp_cycles[0] += t1 - t0; bp_cycles[1] += t2 - t1; bp_cycles[2] += bp_tsc() - t2;
+    bp_pages++;
     pages_allocated++;
     return 1;
 }
@@ -328,8 +402,30 @@ int uspace64_fault(uint64_t va, int write) {
     if (paging64_translate(va, &had) == PAGING64_OK) return 0;
     if (!back_page(va, flags)) return 0;
     lazy_faults++;
+
+    /* Fault-around (Milestone 108): the untouched neighbours in the same
+     * reservation, within an aligned window of USPACE64_FAULT_AROUND
+     * pages, are backed now too. Programs touch memory in runs, and every
+     * fault is a trip out of the program's emulated code and back - about
+     * a million of them for a Chromium page. Only pages of this
+     * reservation, with its permissions, so a PROT_NONE guard beside it is
+     * never touched; and never into the allocator's reserve. */
+    {
+        uint64_t w = (uint64_t)USPACE64_FAULT_AROUND * PAGE64_SIZE;
+        uint64_t lo = va & ~(w - 1), hi = lo + w;
+        if (lo < p->resv[i].start) lo = p->resv[i].start;
+        if (hi > p->resv[i].end) hi = p->resv[i].end;
+        for (uint64_t a = lo; a < hi; a += PAGE64_SIZE) {
+            if (a == va || paging64_translate(a, &had) == PAGING64_OK) continue;
+            if (pmm64_free_frames() < 4 * PMM64_USER_RESERVE) break;
+            if (!back_page(a, flags)) break;
+            faulted_around++;
+        }
+    }
     return 1;
 }
+
+uint64_t uspace64_faulted_around(void) { return faulted_around; }
 
 /* Frees every page really mapped in [start, end), skipping the stretches
  * with no tables at all. Every reservation that spilled is standing on

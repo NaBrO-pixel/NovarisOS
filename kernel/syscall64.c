@@ -7827,7 +7827,36 @@ void syscall64_report_calls(void) {
             serial64_putdec(c - faults_at_reset[1]);
             serial64_puts(" copy-on-write, ");
             serial64_putdec(g - faults_at_reset[2]);
-            serial64_puts(" SIGSEGV; calls >= 5000:");
+            serial64_puts(" SIGSEGV, ");
+            {
+                static uint64_t around_at_reset;
+                uint64_t now = uspace64_faulted_around();
+                serial64_putdec(now - around_at_reset);
+                around_at_reset = now;
+            }
+            {
+                extern uint64_t bp_cycles[3], bp_pages;
+                serial64_puts(" pages faulted around (per page: alloc ");
+                serial64_putdec(bp_pages ? bp_cycles[0] / bp_pages : 0);
+                serial64_puts(", zero ");
+                serial64_putdec(bp_pages ? bp_cycles[1] / bp_pages : 0);
+                serial64_puts(", map ");
+                serial64_putdec(bp_pages ? bp_cycles[2] / bp_pages : 0);
+                serial64_puts(" cycles)");
+                bp_cycles[0] = bp_cycles[1] = bp_cycles[2] = bp_pages = 0;
+                {
+                    uint64_t h, z; int held;
+                    uspace64_zpool_stats(&h, &z, &held);
+                    serial64_puts(", pre-zeroed ");
+                    serial64_putdec(h);
+                    serial64_puts(" taken of ");
+                    serial64_putdec(z);
+                    serial64_puts(" made, ");
+                    serial64_putdec((uint64_t)held);
+                    serial64_puts(" waiting");
+                }
+            }
+            serial64_puts("; calls >= 5000:");
             for (int i = 0; i < 512; i++) {
                 if (calls_by_nr[i] < 5000) continue;
                 serial64_puts(" ");
