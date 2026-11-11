@@ -11284,6 +11284,57 @@ The guest now shuts its side and waits for the host's close, and the
 helper reads its reply for up to 15 s rather than one `recv`.
 `make test` passes 33 with spreading on and off.
 
+## Milestone 107 - the last big locked calls, and where SMP stands
+
+What a 4-CPU Chromium layer still did under the kernel lock, by cost:
+`write` (6.8G cycles), `mmap` (4.5G), `mprotect` (3.9G), `openat` (1.6G),
+`futex` (1.3G). Counting the locked reads and writes by descriptor kind
+(the `[rw]` report line) showed the writes were not the pipes at all - they
+had left the lock in Milestone 102 - but 1,600 lines of console output at
+3.2 million cycles each: Wine's and Chromium's diagnostics, one character
+at a time to the serial port, two port accesses per character.
+
+- **The serial port** looks at its status once per 16 bytes instead of
+  once per byte: the transmit FIFO is on, and "holding register empty"
+  then means all 16 are free. About half the port accesses of every line,
+  on one CPU or four.
+- **Anonymous `mmap`, `munmap`, `mprotect`, `brk` and `madvise`** run
+  without the kernel lock for a process on one CPU, under its memory-map
+  lock (Milestone 106). They touch only its page tables and reservations
+  and the frame allocator, which has its own lock; the one thing that
+  reaches into another process's memory map meanwhile -
+  `process_vm_readv/writev`, the wineserver reading and writing its
+  clients - now takes that process's memory-map lock always. A spread
+  process's still take the kernel lock, since a change there needs a
+  shootdown only the lock's holder may start.
+
+| 4 CPUs, same host, alternating | run 1 | run 2 |
+|---|---|---|
+| Milestone 106 | 177 s | 187 s |
+| now | 176 s | 178 s |
+| now, threads spread | 204 s | 184 s |
+
+A few percent, inside the noise. **That is where SMP stands.** Since
+Milestone 101 the kernel lock has gone from the thing that made four CPUs
+slower than one to a few percent of CPU 0; what CPU 0 does now is run the
+browser's main thread and the wineserver, in their own code, in turn,
+under emulation. Spreading threads does not help because those two are
+the critical path and neither is parallel. What would move the page load
+from here is the emulation itself - KVM, which the Makefile uses when
+`/dev/kvm` exists and this build machine lacks - not more of the kernel
+coming out from under its lock.
+
+The "host could not connect to a socket in the guest" failure of
+Milestone 106 came back once on one CPU, so it was not only the reply
+being lost. QEMU accepts the helper's connection on the forwarded port at
+once and keeps retrying the guest with TCP's back-off until it listens;
+the helper gave up on a connection after a timeout and opened another,
+and when the guest's listen came late it accepted the abandoned one -
+read the line, answered nobody, and stopped listening. The helper now
+waits on each connection until QEMU closes it or ten minutes pass.
+`make test` passes 33 on one CPU (twice), on four, and with threads
+spread.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the

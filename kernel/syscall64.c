@@ -2384,6 +2384,34 @@ static int lockfree_syscall(syscall64_args_t* args, uint64_t* out) {
     case SYS64_EPOLL_WAIT:
         if (!lockfree_epoll_wait(args, &r)) return 0;
         break;
+    /* The anonymous memory calls (Milestone 107), for a process on one
+     * CPU: they change only its own page tables and reservations, which
+     * nothing else touches meanwhile but another process's
+     * process_vm_readv/writev - and that takes this one's memory-map lock,
+     * as these do. A spread process's need TLB shootdowns, which only the
+     * kernel lock's holder may start. */
+    case SYS64_MMAP: case SYS64_MUNMAP: case SYS64_MPROTECT:
+    case SYS64_BRK: case SYS64_MADVISE: {
+        proc64_t* me = proc64_current();
+        if (spread || !me) return 0;
+        if (nr == SYS64_MMAP && !(args->a4 & MAP_ANONYMOUS)) return 0;
+        smp64_mm_lock(me);
+        switch (nr) {
+        case SYS64_MMAP:   r = uspace64_mmap(a1, a2, a3, args->a4); break;
+        case SYS64_MUNMAP: r = uspace64_munmap(a1, a2); break;
+        case SYS64_BRK:    r = uspace64_brk(a1); break;
+        case SYS64_MPROTECT:
+            if (a1 & (PAGE64_SIZE - 1)) r = (uint64_t)-22;
+            else { uspace64_protect(a1, a2, a3); r = 0; }
+            break;
+        default:                                    /* madvise */
+            if (a1 & (PAGE64_SIZE - 1)) r = (uint64_t)-22;
+            else { if (a3 == 4 || a3 == 8) uspace64_discard(a1, a2); r = 0; }
+            break;
+        }
+        smp64_mm_unlock(me);
+        break;
+    }
     case SYS64_WRITEV:
         if (!a2 || !a3 || a3 > 8 || !user_range_ok(a2, a3 * sizeof(iovec64_t)) ||
             !vmspace64_user_ready(a2, a3 * sizeof(iovec64_t), 0))
@@ -3239,6 +3267,7 @@ static uint64_t cycles_by_nr[512];
 /* The same, for the wineserver alone: the process whose kernel work holds
  * the kernel lock longest (Milestone 104). */
 static uint64_t srv_calls[512], srv_cycles[512];
+static uint64_t rw_locked[2][10], rw_cycles[2][10];
 static uint64_t calls_reset_tsc;
 static uint64_t faults_at_reset[3];
 
@@ -3301,6 +3330,20 @@ static uint64_t dispatch(syscall64_args_t* args) {
         }
     }
 #endif
+    if (nr == SYS64_WRITE || nr == SYS64_READ) {
+        /* Which kinds of descriptor still read and write under the lock
+         * (Milestone 107): [rw] in the report. */
+        int k = 7;
+        uint64_t fd = args->a1;
+        if (fd < FD_MAX && fds[fd].used) {
+            k = fds[fd].kind;
+            if (k == FD64_FILE && ramfs64_device(fds[fd].node) == RAMFS64_DEV_CON) k = 8;
+            if ((k == FD64_PIPE || k == FD64_SOCKET) && fds[fd].rx < 0 && fds[fd].tx < 0) k = 9;
+        }
+        if (k > 9) k = 9;
+        rw_locked[nr == SYS64_WRITE][k]++;
+        rw_cycles[nr == SYS64_WRITE][k] += tsc64() - t0;
+    }
     if (nr < 512) {
         uint64_t dt = tsc64() - t0;
         cycles_by_nr[nr] += dt;
@@ -6242,12 +6285,11 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
             if (liov[k].len && !user_range_ok(liov[k].base, liov[k].len))
                 return (uint64_t)-14;
 
-        /* The other process's memory map, if its threads are on several
-         * CPUs and may be faulting pages in without the kernel lock
-         * (Milestone 106). */
+        /* The other process's memory map: it may be changing it without
+         * the kernel lock - mmap and friends (Milestone 107), or page
+         * faults if its threads are on several CPUs (Milestone 106). */
         {
-        int locked = target != proc64_current() && target->spread &&
-                     smp64_mm_lock(target);
+        int locked = target != proc64_current() && smp64_mm_lock(target);
         while (li < lcnt && ri < rcnt) {
             uint64_t lleft = liov[li].len - loff;
             uint64_t rleft = riov[ri].len - roff;
@@ -7691,6 +7733,25 @@ void syscall64_report_calls(void) {
                 serial64_puts("; reported ");
                 serial64_putdec(o);
                 serial64_putc('\n');
+            }
+            {
+                static const char* const kn[10] = { "file", "pipe", "socket",
+                    "signalfd", "netlink", "inet", "epoll", "badfd", "console", "unconnected" };
+                for (int w = 0; w < 2; w++) {
+                    serial64_puts(w ? "NOVARIS64: [rw] locked writes by kind:" :
+                                      "NOVARIS64: [rw] locked reads by kind:");
+                    for (int k = 0; k < 10; k++) {
+                        if (!rw_locked[w][k]) continue;
+                        serial64_puts(" ");
+                        serial64_puts(kn[k]);
+                        serial64_puts(":");
+                        serial64_putdec(rw_locked[w][k]);
+                        serial64_puts(":");
+                        serial64_putdec(rw_cycles[w][k] / rw_locked[w][k]);
+                        rw_locked[w][k] = rw_cycles[w][k] = 0;
+                    }
+                    serial64_putc('\n');
+                }
             }
             serial64_puts("NOVARIS64: [server] wineserver syscalls under the lock: ");
             serial64_putdec(tot / 1000000u);

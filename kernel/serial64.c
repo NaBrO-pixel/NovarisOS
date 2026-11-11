@@ -25,13 +25,27 @@ void serial64_init(void) {
     outb(COM1 + UART_MODEM_CTRL, 0x0F); /* DTR/RTS/OUT2 */
 }
 
-void serial64_putc(char c) {
-    if (c == '\n') {
+/* The transmit FIFO is on (serial64_init, 0xC7), 16 bytes deep, and
+ * "transmitter holding register empty" with it on means the whole FIFO
+ * is: so one look at the status buys 16 bytes, not one. Under emulation
+ * every port access is a trip out of the guest's code, and a status read
+ * per character was half of what a console line cost (Milestone 107).
+ * One count for the one FIFO; two CPUs printing at once already mix their
+ * characters, and this is no worse. */
+static volatile int fifo_room;
+
+static void put_byte(uint8_t b) {
+    if (fifo_room <= 0) {
         while (!(inb(COM1 + UART_LINE_STATUS) & LSR_THR_EMPTY)) { }
-        outb(COM1 + UART_DATA, '\r');
+        fifo_room = 16;
     }
-    while (!(inb(COM1 + UART_LINE_STATUS) & LSR_THR_EMPTY)) { }
-    outb(COM1 + UART_DATA, (uint8_t)c);
+    outb(COM1 + UART_DATA, b);
+    fifo_room--;
+}
+
+void serial64_putc(char c) {
+    if (c == '\n') put_byte('\r');
+    put_byte((uint8_t)c);
 }
 
 void serial64_puts(const char* s) {

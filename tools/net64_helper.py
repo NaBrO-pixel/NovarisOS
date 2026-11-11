@@ -194,9 +194,14 @@ def connect_loop(port, status):
         try:
             with socket.create_connection(("127.0.0.1", port), 2.0) as c:
                 c.sendall(b"hello from the host\n")
-                # The reply may come late on a slow machine, or in pieces:
-                # read until it has all come or 15 seconds have gone.
-                reply, until = b"", time.time() + 15.0
+                # QEMU accepts this at once and then keeps trying the guest,
+                # with TCP's growing back-off, until the guest listens. A
+                # connection given up on here can still be the one the
+                # guest accepts - it reads this line, answers nobody, and
+                # stops listening, so no later attempt is ever let in.
+                # So it is waited on for as long as bring-up could take;
+                # QEMU closing it (the guest refused) is what moves on.
+                reply, until = b"", time.time() + 600.0
                 while b"hello from NovarisOS" not in reply and time.time() < until:
                     c.settimeout(max(0.1, until - time.time()))
                     try:
