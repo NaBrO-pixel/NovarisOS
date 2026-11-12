@@ -11571,15 +11571,58 @@ the driver still builds in the 32-bit tree, where there is no EGL.
 
 ### Not done
 
-- **Vulkan in a window.** win32u gives a driver without Vulkan a headless
-  surface, and Mesa's headless swapchain shows nothing. Getting frames out
-  of a swapchain needs a presentation path Mesa supports for software
-  rendering - its Wayland one, through a small compositor in the driver,
-  is the likeliest - and that is the next milestone. It is the one games
-  need: DXVK turns Direct3D 9-11 into Vulkan.
+- **Vulkan in a window** - Milestone 111.
 - **A GL window that is resized** keeps its first pbuffer; the driver
   says so with a FIXME. Pbuffers cannot grow, so a resize has to make a
   new one and rebind it.
+
+## Milestone 111 - Vulkan in a window, through a compositor inside the driver
+
+Milestone 110 left Vulkan rendering and nowhere to show it. For a driver
+without Vulkan, win32u makes every window surface a headless one, and
+Mesa's headless swapchain presents to nothing. Of the presentation paths
+lavapipe has, the one a display driver can stand at the other end of is
+Wayland: with a software device, Mesa's Wayland swapchain draws into
+`wl_shm` buffers - shared memory - and commits them to a surface.
+
+**So the driver runs a Wayland compositor.** `novawl_server.c` and
+`novawl_client.c` (wine/winenovaris.drv), about 400 lines: a server on
+a socket pair, on its own thread, offering exactly `wl_compositor`,
+surfaces, regions and `wl_shm` - which libwayland implements itself -
+and a client end the driver binds and hands to Vulkan. Each window's
+`VkSurfaceKHR` is a `wl_surface` on it; each committed buffer comes back
+by the surface's protocol id - the same number on both ends of the
+connection - and is copied over the window's client area exactly as an
+OpenGL frame is. The buffer is released at once and every frame callback
+answered, so a FIFO swapchain paces itself on the copy.
+`VK_KHR_win32_surface` becomes `VK_KHR_wayland_surface` on the host, as
+it does for Wine's own Wayland driver.
+
+libwayland is MIT-licensed and loaded at run time: the protocol header's
+inline helpers call the library's own names, so the driver defines
+hidden wrappers under those names that forward to `dlsym`'d pointers,
+using the non-variadic `_array` entry points. A build without libwayland
+links, and its Vulkan windows show nothing, as before.
+
+**Proved natively first**, as before: `userland/vkwl64.c` links the same
+two files, presents two swapchain frames of two colours, and checks what
+the compositor received. On the host: both frames, exact. On NovarisOS
+it stopped at the first line - libwayland's event loop makes an
+**`eventfd`**, which this kernel did not have. `eventfd` and `eventfd2`
+are now a counter shared by every descriptor naming it (dup, fork,
+SCM_RIGHTS), readable while non-zero, with `EFD_SEMAPHORE` and
+`EFD_NONBLOCK`, waking pollers when written. Then it passed.
+
+**Under Wine**, `winevk64.exe` makes a window, a Win32 Vulkan surface, a
+swapchain the size of its client area, and presents a frame of
+`(0.25, 0.5, 0.75)` and then one of red: the composited screen shows
+`#4080bf` and then `#ff0000` at the window's centre. It passed on the
+first run, which is what proving the pieces natively was for.
+
+`make -f Makefile.amd64 WINE64_INSTALL=1 MESA64_INSTALL=1 test`: 38 PASS,
+the two new ones being these. `make test` 32, `make chrome-window`, and
+the driver in the 32-bit tree all still pass. `vulkan-1.dll` joined the
+staged modules, and libwayland's two libraries the Mesa set.
 
 ## Where chrome.exe actually is from here
 

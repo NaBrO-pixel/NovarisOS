@@ -148,6 +148,7 @@ wineboot.exe
 wined3d.dll
 winedevice.exe
 winedmo.dll
+vulkan-1.dll
 winevulkan.dll
 winhttp.dll
 wininet.dll

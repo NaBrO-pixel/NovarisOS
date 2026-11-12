@@ -245,7 +245,9 @@ static BOOL novaris_drawable_swap(struct opengl_drawable *base)
     p_glBindBuffer(GL_PIXEL_PACK_BUFFER, pack_buffer);
     p_glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo);
 
-    novaris_present_client(base->client->hwnd, client->pixels, gl->width, gl->height);
+    novaris_present_client(base->client->hwnd,
+                           (char *)client->pixels + (size_t)(gl->height - 1) * gl->width * 4,
+                           gl->width, gl->height, -gl->width * 4);
     return TRUE;
 }
 

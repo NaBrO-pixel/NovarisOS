@@ -9,7 +9,9 @@
 # /usr/share/glvnd/egl_vendor.d that tells it Mesa is the implementation;
 # Mesa's libEGL_mesa, which it then dlopens; and libgallium, where
 # llvmpipe lives, with LLVM behind it. For Vulkan: the loader, lavapipe
-# (libvulkan_lvp), and its manifest under /usr/share/vulkan/icd.d. Every library is closed under ldd
+# (libvulkan_lvp), and its manifest under /usr/share/vulkan/icd.d. And
+# libwayland's server and client, for the compositor winenovaris.drv
+# presents Vulkan windows through (Milestone 111). Every library is closed under ldd
 # and staged under the soname the loader asks for, as stage_wine.sh does
 # for Wine's own dlopens - a dlopen that fails on a dependency says
 # nothing more useful than one that fails on the library.
@@ -25,7 +27,7 @@ if [ -z "$DEST" ]; then
     exit 1
 fi
 
-seeds="libEGL.so.1 libEGL_mesa.so.0 libGLdispatch.so.0 libvulkan.so.1 libvulkan_lvp.so"
+seeds="libEGL.so.1 libEGL_mesa.so.0 libGLdispatch.so.0 libvulkan.so.1 libvulkan_lvp.so libwayland-server.so.0 libwayland-client.so.0"
 mkdir -p "$LIB" "$DEST/usr/share/glvnd/egl_vendor.d" "$DEST/usr/share/vulkan/icd.d"
 
 staged=0

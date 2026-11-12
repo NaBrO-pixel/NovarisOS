@@ -269,6 +269,8 @@ typedef struct {
 #define SYS64_PSELECT6        270
 #define SYS64_SIGNALFD        282
 #define SYS64_SIGNALFD4       289
+#define SYS64_EVENTFD         284
+#define SYS64_EVENTFD2        290
 #define SYS64_PPOLL           271
 #define SYS64_IOCTL           16
 #define SYS64_WRITEV          20
@@ -499,5 +501,8 @@ int syscall64_fault_kill(int sig, uint64_t rip, uint64_t addr);
  * back a page it was entitled to - see syscall64.c. Does not return. */
 void syscall64_oom_kill(uint64_t addr);
 uint64_t syscall64_oom_kills(void);
+
+/* One more descriptor names eventfd counter `id` (fork, in proc64.c). */
+void syscall64_eventfd_ref(int id);
 
 #endif

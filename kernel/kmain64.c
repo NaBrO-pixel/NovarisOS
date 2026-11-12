@@ -5746,6 +5746,10 @@ static const char* const chrome_args[] = {
                     run_program(egl_image, egl_len, ld_image, ld_len, boot_env, &kspace,
                                 "vk", "Vulkan cleared an image through lavapipe",
                                 "/usr/bin/vk64", 0, 0, 120u * CLOCK64_HZ, 1, 111);
+                if (initrd64_open("usr/bin/vkwl64", &egl_image, &egl_len) == INITRD64_OK)
+                    run_program(egl_image, egl_len, ld_image, ld_len, boot_env, &kspace,
+                                "vkwl", "a swapchain reached the compositor",
+                                "/usr/bin/vkwl64", 0, 0, 120u * CLOCK64_HZ, 1, 112);
             }
 
             /* And the same through Wine: WGL in a window, rendered by
@@ -5755,6 +5759,14 @@ static const char* const chrome_args[] = {
                 run_wine_program(image, len, ld_image, ld_len, boot_env, &kspace,
                                  "winegl", "OpenGL drew into a window, through Mesa",
                                  "/usr/bin/x86_64-windows/winegl64.exe",
+                                 0, 180u * CLOCK64_HZ, 1);
+
+            /* And Vulkan, presented into a window through the driver's
+             * Wayland compositor (Milestone 111). */
+            if (ramfs64_lookup("/usr/share/vulkan/icd.d/lvp_icd.json") >= 0)
+                run_wine_program(image, len, ld_image, ld_len, boot_env, &kspace,
+                                 "winevk", "Vulkan presented into a window, through Mesa",
+                                 "/usr/bin/x86_64-windows/winevk64.exe",
                                  0, 180u * CLOCK64_HZ, 1);
 
             /* Before chrome, the questions chrome_elf asks. Cheap, and

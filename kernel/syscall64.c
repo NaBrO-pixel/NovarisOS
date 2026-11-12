@@ -356,6 +356,23 @@ static int fd_is_stream(int fd) {
  * it - which is the whole list, because getting it wrong in one place
  * looks like a file that vanished or a pipe that never reports end of
  * file. */
+/* eventfd(2) counters (Milestone 111). A counter belongs to every
+ * descriptor that names it - dup, fork and SCM_RIGHTS share it - so it
+ * is here, counted, rather than in the descriptor. libwayland's event
+ * loop makes one before anything else, which is how the driver's Wayland
+ * compositor first found it missing. */
+#define EVENTFD_MAX 256
+#define EVENTFD_TOP 0xFFFFFFFFFFFFFFFEULL
+static struct { int refs; int semaphore; uint64_t count; } efds[EVENTFD_MAX];
+
+static int eventfd_valid(int id) { return id >= 0 && id < EVENTFD_MAX && efds[id].refs > 0; }
+
+void syscall64_eventfd_ref(int id) { if (eventfd_valid(id)) efds[id].refs++; }
+
+static void eventfd_unref(int id) { if (eventfd_valid(id)) efds[id].refs--; }
+
+static int64_t eventfd_write(int fd, const void* buf, uint64_t n);
+
 static void fd_take_ref(int fd) {
     if (fd < 0 || fd >= FD_MAX || !fds[fd].used) return;
     if (fds[fd].kind == FD64_FILE) {
@@ -368,6 +385,7 @@ static void fd_take_ref(int fd) {
         pipe64_ref(fds[fd].tx, 0, 1);
         if (fds[fd].kind == FD64_INET) inet64_ref(fds[fd].sock);
         if (fds[fd].kind == FD64_EPOLL) epoll64_ref(fds[fd].sock);
+        if (fds[fd].kind == FD64_EVENTFD) syscall64_eventfd_ref(fds[fd].sock);
     }
 }
 
@@ -391,6 +409,10 @@ static void fd_release_body(int fd) {
     epoll64_forget_fd(proc64_current_pid(), fd);
     if (fds[fd].kind == FD64_EPOLL) {
         epoll64_unref(fds[fd].sock);
+        fds[fd].sock = -1;
+    }
+    if (fds[fd].kind == FD64_EVENTFD) {
+        eventfd_unref(fds[fd].sock);
         fds[fd].sock = -1;
     }
 
@@ -1205,6 +1227,7 @@ static int64_t fd_write_bytes(uint64_t fd, const char* buf, uint64_t n) {
             return -107;
         }
         if (fds[fd].kind == FD64_SIGNALFD) return -22; /* -EINVAL, as Linux */
+        if (fds[fd].kind == FD64_EVENTFD) return eventfd_write((int)fd, buf, n);
         if (fds[fd].kind == FD64_EPOLL) return -22;    /* -EINVAL, as Linux */
         if (fds[fd].kind == FD64_NETLINK) return nl_send((int)fd, buf, n);
         /* /dev/null takes everything and keeps none of it; the console
@@ -1264,6 +1287,44 @@ static int64_t signalfd_read(const syscall64_args_t* args, uint64_t nr,
     return (int64_t)wait_restart(args, nr, 0);
 }
 
+/* An eventfd read: the count, and zero left - or, as a semaphore, one
+ * and one fewer left. Nothing to read blocks, or is -EAGAIN. */
+static int64_t eventfd_read(const syscall64_args_t* args, uint64_t nr,
+                            int fd, void* buf, uint64_t n) {
+    int id = fds[fd].sock;
+    uint64_t v;
+
+    if (n < 8) return -22;                             /* -EINVAL */
+    if (!user_range_ok((uint64_t)buf, 8)) return -14;  /* -EFAULT */
+    if (!eventfd_valid(id)) return -9;
+    if (!efds[id].count) {
+        if (fds[fd].nonblock) return -11;              /* -EAGAIN */
+        return (int64_t)wait_restart(args, nr, 0);
+    }
+    v = efds[id].semaphore ? 1 : efds[id].count;
+    efds[id].count -= v;
+    *(uint64_t*)buf = v;
+    wait_done();
+    sched64_wake(SCHED64_COND_KEY, SCHED64_MAX_TASKS);  /* a writer that was full */
+    return 8;
+}
+
+static int64_t eventfd_write(int fd, const void* buf, uint64_t n) {
+    int id = fds[fd].sock;
+    uint64_t v;
+
+    if (n < 8) return -22;
+    if (!user_range_ok((uint64_t)buf, 8)) return -14;
+    if (!eventfd_valid(id)) return -9;
+    v = *(const uint64_t*)buf;
+    if (v == ~0ULL) return -22;
+    if (v > EVENTFD_TOP - efds[id].count) return -11;  /* would overflow: -EAGAIN */
+    efds[id].count += v;
+    /* Anything parked in poll, epoll_wait or a read looks again. */
+    sched64_wake(SCHED64_COND_KEY, SCHED64_MAX_TASKS);
+    return 8;
+}
+
 static int64_t fd_read_bytes(const syscall64_args_t* args, uint64_t nr,
                              uint64_t fd, void* buf, uint64_t n) {
     int64_t r;
@@ -1283,6 +1344,8 @@ static int64_t fd_read_bytes(const syscall64_args_t* args, uint64_t nr,
     if (fds[fd].kind == FD64_EPOLL) return -22;        /* -EINVAL, as Linux */
     if (fds[fd].kind == FD64_SIGNALFD)
         return signalfd_read(args, nr, (int)fd, buf, n);
+    if (fds[fd].kind == FD64_EVENTFD)
+        return eventfd_read(args, nr, (int)fd, buf, n);
     if (fds[fd].kind == FD64_NETLINK)
         return nl_recv(args, nr, (int)fd, buf, n, 0, 0, 0, 0);
 
@@ -3432,6 +3495,12 @@ static short poll_one(proc64_fd_t* poll_fds, int fd, short want, int* polled_net
         }
         inet64_note_poll(s, proc64_current_pid(), (want & POLL64_OUT) != 0,
                          (want & got & POLL64_OUT) != 0);
+    } else if (fds[fd].kind == FD64_EVENTFD) {
+        int id = fds[fd].sock;
+        if (id >= 0 && id < EVENTFD_MAX && efds[id].refs > 0) {
+            if (efds[id].count) got |= POLL64_IN;
+            if (efds[id].count < EVENTFD_TOP) got |= POLL64_OUT;
+        }
     } else if (fds[fd].kind == FD64_SIGNALFD) {
         /* Readable while a signal it reports is pending for the
          * poller; never writable. */
@@ -5415,6 +5484,8 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                             inet64_ref(fds[sfd].sock);
                         if (fds[sfd].kind == FD64_EPOLL)
                             epoll64_ref(fds[sfd].sock);
+                        if (fds[sfd].kind == FD64_EVENTFD)
+                            syscall64_eventfd_ref(fds[sfd].sock);
                         /* Referenced for the receiver now. The sender is
                          * free to close its own copy the moment this
                          * returns - and does - so a reference taken only
@@ -6409,6 +6480,33 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
      * A signalfd is how a program that waits on descriptors waits on
      * signals in the same loop: systemd and every event library built
      * on epoll or poll use it. */
+    /* eventfd(initval) and eventfd2(initval, flags). */
+    case SYS64_EVENTFD:
+    case SYS64_EVENTFD2: {
+        uint64_t flags = nr == SYS64_EVENTFD2 ? a2 : 0;
+        int fd, id;
+
+        if (flags & ~(uint64_t)(O_NONBLOCK | O_CLOEXEC | 1)) return (uint64_t)-22;
+        for (id = 0; id < EVENTFD_MAX; id++) if (!efds[id].refs) break;
+        if (id == EVENTFD_MAX) return (uint64_t)-23;           /* -ENFILE */
+        fd = fd_alloc(3);
+        if (fd < 0) return (uint64_t)-24;                      /* -EMFILE */
+        efds[id].refs = 1;
+        efds[id].count = (uint32_t)a1;
+        efds[id].semaphore = (flags & 1) != 0;                 /* EFD_SEMAPHORE */
+        fds[fd].kind     = FD64_EVENTFD;
+        fds[fd].node     = -1;
+        fds[fd].pos      = 0;
+        fds[fd].rx       = -1;
+        fds[fd].tx       = -1;
+        fds[fd].sock     = id;
+        fds[fd].sigmask  = 0;
+        fds[fd].nonblock = (flags & O_NONBLOCK) != 0;
+        fds[fd].cloexec  = (flags & O_CLOEXEC) != 0;
+        fds[fd].used     = 1;
+        return (uint64_t)fd;
+    }
+
     case SYS64_SIGNALFD:
     case SYS64_SIGNALFD4: {
         int fd = (int)(int64_t)a1;

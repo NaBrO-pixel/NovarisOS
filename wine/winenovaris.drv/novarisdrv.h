@@ -167,7 +167,7 @@ void novaris_win_data_release(struct novaris_win_data *data);
 void novaris_win_data_destroy(HWND hwnd);
 struct novaris_win_data *novaris_win_data_slot(int i);
 BOOL novaris_window_create(struct novaris_win_data *data, int width, int height);
-void novaris_present_client(HWND hwnd, const void *bottom_up, int width, int height);
+void novaris_present_client(HWND hwnd, const void *top_row, int width, int height, int stride);
 void novaris_detach_client(HWND hwnd);
 void novaris_win_data_close(struct novaris_win_data *data);
 
@@ -203,6 +203,9 @@ struct opengl_funcs;
 struct opengl_driver_funcs;
 UINT     NOVARIS_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs,
                             const struct opengl_driver_funcs **driver_funcs);
+struct vulkan_driver_funcs;
+UINT     NOVARIS_VulkanInit(UINT version, void *vulkan_handle,
+                            const struct vulkan_driver_funcs **driver_funcs);
 BOOL     NOVARIS_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style,
                                      UINT *style_mask, UINT *ex_style_mask);
 

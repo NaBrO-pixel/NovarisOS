@@ -1,6 +1,7 @@
 /* proc64.c - the state a process owns, as opposed to a thread. */
 
 #include "proc64.h"
+#include "syscall64.h"
 #include "smp64.h"
 #include "gdt64.h"
 #include "serial64.h"
@@ -162,6 +163,7 @@ int proc64_fork_from(int pid) {
         }
         if (parent->fds[f].kind == FD64_INET) inet64_ref(parent->fds[f].sock);
         if (parent->fds[f].kind == FD64_EPOLL) epoll64_ref(parent->fds[f].sock);
+        if (parent->fds[f].kind == FD64_EVENTFD) syscall64_eventfd_ref(parent->fds[f].sock);
     }
     child->brk_base    = parent->brk_base;
     child->brk_current = parent->brk_current;

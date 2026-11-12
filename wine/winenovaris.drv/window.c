@@ -422,9 +422,11 @@ void NOVARIS_DestroyWindow(HWND hwnd)
  * area, the way a compositor puts a client's buffer over its window: the
  * window surface below is GDI's, and its flushes leave that rectangle
  * alone, so a repainted caption cannot put an old client area back over
- * the newest frame. `bottom_up` is GL's row order.
+ * the newest frame. `top_row` is the frame's top row and `stride` the
+ * bytes from one row to the next below it - negative for GL, whose rows
+ * run bottom to top; positive for a Wayland buffer.
  */
-void novaris_present_client(HWND hwnd, const void *bottom_up, int width, int height)
+void novaris_present_client(HWND hwnd, const void *top_row, int width, int height, int stride)
 {
     struct novaris_win_data *data;
     struct wm_rect damage;
@@ -446,7 +448,7 @@ void novaris_present_client(HWND hwnd, const void *bottom_up, int width, int hei
         data->gl_active = TRUE;
         for (y = 0; y < h; y++)
             memcpy((char *)data->pixels + ((size_t)(cy + y) * data->stride + cx) * 4,
-                   (const char *)bottom_up + (size_t)(height - 1 - y) * width * 4, (size_t)w * 4);
+                   (const char *)top_row + (ptrdiff_t)y * stride, (size_t)w * 4);
         damage.x = cx;
         damage.y = cy;
         damage.w = w;

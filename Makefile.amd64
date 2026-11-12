@@ -396,6 +396,11 @@ $(BUILD_DIR)/egl64.elf: userland/egl64.c | $(BUILD_DIR)
 	gcc -O2 -o $@ $< -lEGL
 $(BUILD_DIR)/vk64.elf: userland/vk64.c | $(BUILD_DIR)
 	gcc -O2 -o $@ $< -lvulkan
+# A swapchain presented to the driver's own Wayland compositor (Milestone
+# 111): the same novawl sources the driver is built from.
+NOVAWL_SRC = wine/winenovaris.drv/novawl_server.c wine/winenovaris.drv/novawl_client.c
+$(BUILD_DIR)/vkwl64.elf: userland/vkwl64.c $(NOVAWL_SRC) wine/winenovaris.drv/novawl.h | $(BUILD_DIR)
+	gcc -O2 -Iwine/winenovaris.drv -o $@ $< $(NOVAWL_SRC) -lvulkan -ldl -lpthread
 
 # epoll(7), as the wineserver uses it (Milestone 104). epolltest64, since
 # kernel/epoll64.c is the implementation.
@@ -567,6 +572,20 @@ $(BUILD_DIR)/winegui64.exe: userland/pe_test/winegui64.c | $(BUILD_DIR)
 	        && echo "  built $@"; \
 	 else \
 	    echo "  no mingw, skipping $@"; \
+	 fi
+
+# Vulkan in a window (Milestone 111). Against the host's Vulkan headers,
+# alone: mingw has none, and the rest of /usr/include is Linux's.
+$(BUILD_DIR)/vkinc/vulkan: | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/vkinc
+	ln -sfn /usr/include/vulkan $(BUILD_DIR)/vkinc/vulkan
+	ln -sfn /usr/include/vk_video $(BUILD_DIR)/vkinc/vk_video
+$(BUILD_DIR)/winevk64.exe: userland/pe_test/winevk64.c | $(BUILD_DIR) $(BUILD_DIR)/vkinc/vulkan
+	@if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1 && [ -d /usr/include/vulkan ]; then \
+	    x86_64-w64-mingw32-gcc -O2 -isystem $(BUILD_DIR)/vkinc -o $@ $< -lgdi32 -luser32 \
+	        && echo "  built $@"; \
+	 else \
+	    echo "  no mingw or no Vulkan headers, skipping $@"; \
 	 fi
 
 # OpenGL in a window (Milestone 110).
@@ -795,7 +814,9 @@ endif
 $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf $(WINE64_DRIVER) \
            $(BUILD_DIR)/forkchild64.elf $(BUILD_DIR)/spawn64.elf $(NOVAC_CHILD) userland/mkinitrd.py \
            $(BUILD_DIR)/winegui64.exe $(BUILD_DIR)/winedesk64.exe $(BUILD_DIR)/winegl64.exe \
-           $(if $(MESA64_INSTALL),$(BUILD_DIR)/egl64.elf $(BUILD_DIR)/vk64.elf tools/stage_mesa.sh) \
+           $(BUILD_DIR)/winevk64.exe \
+           $(if $(MESA64_INSTALL),$(BUILD_DIR)/egl64.elf $(BUILD_DIR)/vk64.elf \
+                $(BUILD_DIR)/vkwl64.elf tools/stage_mesa.sh) \
            $(BUILD_DIR)/chromeprobe64.exe tools/stage_wine.sh tools/wine_prefix_modules.txt \
            tools/wine_chromium_modules.txt tools/pe_pagealign.py $(INITRD_CONFIG)
 	rm -rf $(INITRD_STAGE)
@@ -881,7 +902,13 @@ $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf $(WINE64_DRIVER
 	    mkdir -p $(INITRD_STAGE)/usr/bin; \
 	    cp $(BUILD_DIR)/egl64.elf $(INITRD_STAGE)/usr/bin/egl64; \
 	    cp $(BUILD_DIR)/vk64.elf $(INITRD_STAGE)/usr/bin/vk64; \
-	    echo "  initrd: egl64 and vk64 staged"; \
+	    cp $(BUILD_DIR)/vkwl64.elf $(INITRD_STAGE)/usr/bin/vkwl64; \
+	    echo "  initrd: egl64, vk64 and vkwl64 staged"; \
+	 fi
+	@if [ -n "$(WINE64_INSTALL)" ] && [ -f "$(BUILD_DIR)/winevk64.exe" ]; then \
+	    cp $(BUILD_DIR)/winevk64.exe \
+	       $(INITRD_STAGE)/usr/bin/x86_64-windows/winevk64.exe; \
+	    echo "  initrd: winevk64.exe staged"; \
 	 fi
 	@if [ -n "$(WINE64_INSTALL)" ] && [ -f "$(BUILD_DIR)/winegl64.exe" ]; then \
 	    cp $(BUILD_DIR)/winegl64.exe \
@@ -1447,6 +1474,12 @@ test: iso
 	        || { echo "FAIL: winegl64.exe: OpenGL did not reach the window"; exit 1; }; \
 	    echo "PASS: a Windows OpenGL program draws into its window, through Mesa"; \
 	fi
+	@if grep -q "NOVARIS64: --- winevk ---" $(BUILD_DIR)/serial.log && \
+	    ! grep -q "NOVARIS64: winevk = not staged" $(BUILD_DIR)/serial.log; then \
+	    grep -q "winevk = exit= 0 " $(BUILD_DIR)/serial.log \
+	        || { echo "FAIL: winevk64.exe: Vulkan did not reach the window"; exit 1; }; \
+	    echo "PASS: a Windows Vulkan program presents into its window, through Mesa"; \
+	fi
 	@if grep -q "NOVARIS64: --- egl ---" $(BUILD_DIR)/serial.log; then \
 	    timeout 120 ./$(BUILD_DIR)/egl64.elf > $(BUILD_DIR)/egl64.host.txt 2>/dev/null; \
 	    [ $$? = 110 ] || { echo "FAIL: the host run of egl64 did not exit 110"; exit 1; }; \
@@ -1468,6 +1501,17 @@ test: iso
 	    grep -q "vk = exit= 111 " $(BUILD_DIR)/serial.log \
 	        || { echo "FAIL: vk64 did not exit 111 in the guest"; exit 1; }; \
 	    echo "PASS: Vulkan through Mesa's lavapipe clears and copies the same, and exits 111, on both"; \
+	fi
+	@if grep -q "NOVARIS64: --- vkwl ---" $(BUILD_DIR)/serial.log; then \
+	    timeout 120 ./$(BUILD_DIR)/vkwl64.elf > $(BUILD_DIR)/vkwl64.host.txt 2>/dev/null; \
+	    [ $$? = 112 ] || { echo "FAIL: the host run of vkwl64 did not exit 112"; exit 1; }; \
+	    while read -r line; do \
+	        grep -qF "$$line" $(BUILD_DIR)/serial.log \
+	            || { echo "FAIL: the guest never printed: $$line"; exit 1; }; \
+	    done < $(BUILD_DIR)/vkwl64.host.txt; \
+	    grep -q "vkwl = exit= 112 " $(BUILD_DIR)/serial.log \
+	        || { echo "FAIL: vkwl64 did not exit 112 in the guest"; exit 1; }; \
+	    echo "PASS: a Vulkan swapchain presents to the driver's compositor the same, and exits 112, on both"; \
 	fi
 
 # One headless Chromium page load over the network, as fast as this
