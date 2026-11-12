@@ -387,6 +387,16 @@ $(BUILD_DIR)/spawn64_blob.c: $(BUILD_DIR)/spawn64.elf userland/embed64.py
 $(BUILD_DIR)/spawn64_blob.o: $(BUILD_DIR)/spawn64_blob.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# OpenGL with no window system (Milestone 110): Mesa's surfaceless EGL and
+# llvmpipe. Dynamically linked - it is libEGL that finds Mesa - so it runs
+# from the initrd with Mesa staged beside it (MESA64_INSTALL=1), not as a
+# blob in the kernel.
+MESA64_INSTALL ?=
+$(BUILD_DIR)/egl64.elf: userland/egl64.c | $(BUILD_DIR)
+	gcc -O2 -o $@ $< -lEGL
+$(BUILD_DIR)/vk64.elf: userland/vk64.c | $(BUILD_DIR)
+	gcc -O2 -o $@ $< -lvulkan
+
 # epoll(7), as the wineserver uses it (Milestone 104). epolltest64, since
 # kernel/epoll64.c is the implementation.
 $(BUILD_DIR)/epolltest64.elf: userland/epoll64.c | $(BUILD_DIR)
@@ -554,6 +564,15 @@ $(BUILD_DIR)/fbdraw64_blob.o: $(BUILD_DIR)/fbdraw64_blob.c
 $(BUILD_DIR)/winegui64.exe: userland/pe_test/winegui64.c | $(BUILD_DIR)
 	@if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then \
 	    x86_64-w64-mingw32-gcc -O2 -o $@ $< -lgdi32 -luser32 \
+	        && echo "  built $@"; \
+	 else \
+	    echo "  no mingw, skipping $@"; \
+	 fi
+
+# OpenGL in a window (Milestone 110).
+$(BUILD_DIR)/winegl64.exe: userland/pe_test/winegl64.c | $(BUILD_DIR)
+	@if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then \
+	    x86_64-w64-mingw32-gcc -O2 -o $@ $< -lopengl32 -lgdi32 -luser32 \
 	        && echo "  built $@"; \
 	 else \
 	    echo "  no mingw, skipping $@"; \
@@ -742,7 +761,7 @@ INITRD_CONFIG_TEXT = WINE64_INSTALL=$(WINE64_INSTALL) \
     WINE64_LOADER=$(abspath $(WINE64_LOADER)) \
     WINE64_NTDLL=$(abspath $(WINE64_NTDLL)) \
     CHROMIUM64_DIR=$(CHROMIUM64_DIR) CHROMIUM64_FILES=$(CHROMIUM64_FILES) \
-    PE_PAGEALIGN=$(PE_PAGEALIGN)
+    PE_PAGEALIGN=$(PE_PAGEALIGN) MESA64_INSTALL=$(MESA64_INSTALL)
 # Only when this make is building the image. It used to be rewritten by
 # every invocation, so compiling one object without the Wine and
 # Chromium variables - `make -f Makefile.amd64 build64/inet64.o` - wrote
@@ -775,7 +794,8 @@ endif
 
 $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf $(WINE64_DRIVER) \
            $(BUILD_DIR)/forkchild64.elf $(BUILD_DIR)/spawn64.elf $(NOVAC_CHILD) userland/mkinitrd.py \
-           $(BUILD_DIR)/winegui64.exe $(BUILD_DIR)/winedesk64.exe \
+           $(BUILD_DIR)/winegui64.exe $(BUILD_DIR)/winedesk64.exe $(BUILD_DIR)/winegl64.exe \
+           $(if $(MESA64_INSTALL),$(BUILD_DIR)/egl64.elf $(BUILD_DIR)/vk64.elf tools/stage_mesa.sh) \
            $(BUILD_DIR)/chromeprobe64.exe tools/stage_wine.sh tools/wine_prefix_modules.txt \
            tools/wine_chromium_modules.txt tools/pe_pagealign.py $(INITRD_CONFIG)
 	rm -rf $(INITRD_STAGE)
@@ -856,6 +876,18 @@ $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf $(WINE64_DRIVER
 	       $(INITRD_STAGE)/usr/bin/x86_64-windows/winegui64.exe; \
 	    echo "  initrd: winegui64.exe staged"; \
 	 fi
+	@if [ -n "$(MESA64_INSTALL)" ]; then \
+	    sh tools/stage_mesa.sh $(INITRD_STAGE) || exit 1; \
+	    mkdir -p $(INITRD_STAGE)/usr/bin; \
+	    cp $(BUILD_DIR)/egl64.elf $(INITRD_STAGE)/usr/bin/egl64; \
+	    cp $(BUILD_DIR)/vk64.elf $(INITRD_STAGE)/usr/bin/vk64; \
+	    echo "  initrd: egl64 and vk64 staged"; \
+	 fi
+	@if [ -n "$(WINE64_INSTALL)" ] && [ -f "$(BUILD_DIR)/winegl64.exe" ]; then \
+	    cp $(BUILD_DIR)/winegl64.exe \
+	       $(INITRD_STAGE)/usr/bin/x86_64-windows/winegl64.exe; \
+	    echo "  initrd: winegl64.exe staged"; \
+	 fi
 	@if [ -n "$(WINE64_INSTALL)" ] && [ -f "$(BUILD_DIR)/winedesk64.exe" ]; then \
 	    cp $(BUILD_DIR)/winedesk64.exe \
 	       $(INITRD_STAGE)/usr/bin/x86_64-windows/winedesk64.exe; \
@@ -918,7 +950,7 @@ iso: $(KERNEL) $(INITRD)
 # map, and the page tables of a 1.5TB address-space reservation - and a
 # run has four or five of them beside a 450MB browser. In 6G the page's
 # renderer was the one that ran out; 12G finishes with 6.7GB free.
-QEMU_RAM ?= $(if $(CHROMIUM64_DIR),12G,2G)
+QEMU_RAM ?= $(if $(CHROMIUM64_DIR),12G,$(if $(MESA64_INSTALL),3G,2G))
 
 # Hardware virtualisation when this machine has it. With KVM the guest's
 # instructions run on the real processor instead of being translated one
@@ -1390,7 +1422,8 @@ test: iso
 	@grep -a "2MB in" $(BUILD_DIR)/serial.log | head -1
 	@# Headless Chromium, when it is staged: the page is fetched by name
 	@# over HTTPS, and its script's paragraph is in the DOM it prints.
-	@if grep -q "NOVARIS64: --- chrome ---" $(BUILD_DIR)/serial.log; then \
+	@if grep -q "NOVARIS64: --- chrome ---" $(BUILD_DIR)/serial.log && \
+	    ! grep -q "NOVARIS64: chrome = not staged" $(BUILD_DIR)/serial.log; then \
 	    grep -q '<p id="js">script ran: 42</p>' $(BUILD_DIR)/serial.log \
 	        || { echo "FAIL: Chromium did not print the page it was sent"; exit 1; }; \
 	    grep -q 'https .*"GET /page.html' $(BUILD_DIR)/net64.http.log \
@@ -1398,6 +1431,43 @@ test: iso
 	    grep -q "dns novaris.test type 1" $(BUILD_DIR)/net64.http.log \
 	        || { echo "FAIL: Chromium never looked novaris.test up"; exit 1; }; \
 	    echo "PASS: headless Chromium loads https://novaris.test/page.html and runs its script"; \
+	fi
+	@# The Windows programs and OpenGL, when they are staged: each says
+	@# what its exit code means on the serial port, and that code is
+	@# what is checked.
+	@if grep -q "NOVARIS64: --- winedesk ---" $(BUILD_DIR)/serial.log && \
+	    ! grep -q "NOVARIS64: winedesk = not staged" $(BUILD_DIR)/serial.log; then \
+	    grep -q "winedesk = exit= 0 " $(BUILD_DIR)/serial.log \
+	        || { echo "FAIL: winedesk64.exe: windows, clicks or keys did not hold"; exit 1; }; \
+	    echo "PASS: windows stack and move, and clicks and keys reach them, under Wine"; \
+	fi
+	@if grep -q "NOVARIS64: --- winegl ---" $(BUILD_DIR)/serial.log && \
+	    ! grep -q "NOVARIS64: winegl = not staged" $(BUILD_DIR)/serial.log; then \
+	    grep -q "winegl = exit= 0 " $(BUILD_DIR)/serial.log \
+	        || { echo "FAIL: winegl64.exe: OpenGL did not reach the window"; exit 1; }; \
+	    echo "PASS: a Windows OpenGL program draws into its window, through Mesa"; \
+	fi
+	@if grep -q "NOVARIS64: --- egl ---" $(BUILD_DIR)/serial.log; then \
+	    timeout 120 ./$(BUILD_DIR)/egl64.elf > $(BUILD_DIR)/egl64.host.txt 2>/dev/null; \
+	    [ $$? = 110 ] || { echo "FAIL: the host run of egl64 did not exit 110"; exit 1; }; \
+	    while read -r line; do \
+	        grep -qF "$$line" $(BUILD_DIR)/serial.log \
+	            || { echo "FAIL: the guest never printed: $$line"; exit 1; }; \
+	    done < $(BUILD_DIR)/egl64.host.txt; \
+	    grep -q "egl = exit= 110 " $(BUILD_DIR)/serial.log \
+	        || { echo "FAIL: egl64 did not exit 110 in the guest"; exit 1; }; \
+	    echo "PASS: OpenGL through Mesa's llvmpipe draws the same, and exits 110, on both"; \
+	fi
+	@if grep -q "NOVARIS64: --- vk ---" $(BUILD_DIR)/serial.log; then \
+	    timeout 120 ./$(BUILD_DIR)/vk64.elf > $(BUILD_DIR)/vk64.host.txt 2>/dev/null; \
+	    [ $$? = 111 ] || { echo "FAIL: the host run of vk64 did not exit 111"; exit 1; }; \
+	    while read -r line; do \
+	        grep -qF "$$line" $(BUILD_DIR)/serial.log \
+	            || { echo "FAIL: the guest never printed: $$line"; exit 1; }; \
+	    done < $(BUILD_DIR)/vk64.host.txt; \
+	    grep -q "vk = exit= 111 " $(BUILD_DIR)/serial.log \
+	        || { echo "FAIL: vk64 did not exit 111 in the guest"; exit 1; }; \
+	    echo "PASS: Vulkan through Mesa's lavapipe clears and copies the same, and exits 111, on both"; \
 	fi
 
 # One headless Chromium page load over the network, as fast as this

@@ -11497,6 +11497,90 @@ In order, each a milestone:
    Milestone 98 already runs. It needs the real internet, which this
    build machine does not have; that part is for a machine that does.
 
+## Milestone 110 - OpenGL and Vulkan, through Mesa, and OpenGL in a window
+
+The second step towards Steam: graphics an application draws with an API
+rather than with GDI. There is no GPU here, so the renderer is Mesa's
+software one - llvmpipe for OpenGL, lavapipe for Vulkan - which compiles
+every shader to x86 with LLVM and rasterizes on threads. That makes it a
+heavy, honest workload for the kernel: JIT into executable memory, a
+thread pool, and memory shared between mappings.
+
+**Natively first** (`userland/egl64.c`, `userland/vk64.c`), so a kernel
+problem cannot hide behind Wine. Both run on the Linux host and on
+NovarisOS and the guest must print what the host printed:
+
+- `egl64`: Mesa's surfaceless EGL platform - no window system at all -
+  a desktop OpenGL 4.5 context on llvmpipe, a pbuffer, a triangle, and
+  the pixels read back. **It passed on the first boot**, pixel for pixel.
+- `vk64`: an instance, the llvmpipe physical device, a queue, an image
+  cleared on the device and copied into host-visible memory. It crashed:
+  the first host-visible allocation came back unmapped and the program
+  jumped through it. llvmpipe allocates device memory with
+  **`memfd_create`**, which this kernel did not have, and has no fallback.
+  `memfd_create` is now an ordinary file made and unlinked at once - the
+  filesystem already keeps an unlinked file alive while a descriptor
+  holds it, and its `MAP_SHARED` is genuinely shared (Milestone 78) - and
+  `fallocate` (mode 0) and the sealing `fcntl`s are answered with it.
+  With that, `vk64` passes too.
+
+**Then under Wine.** Wine was reconfigured with EGL and Vulkan (it had
+been built `--without-opengl --without-vulkan`). Wine 11's win32u does
+OpenGL through EGL for any driver, but for a driver with no OpenGL of its
+own it renders a window into framebuffer objects and makes SwapBuffers a
+no-op: a context works, and nothing reaches the screen. So
+`winenovaris.drv` gains `opengl.c`: Mesa's surfaceless platform, a
+pbuffer the size of each GL window's client area, and a SwapBuffers that
+reads the frame back and puts it straight into the window's `/dev/wm`
+buffer over the client area - the window surface's own flushes leave that
+rectangle alone, so a repainted caption never paints an old frame back.
+
+Two things on the way:
+
+- The first SwapBuffers was a jump to address 0, twice, survived because
+  Wine catches faults in its Unix calls. win32u's function table holds
+  the OpenGL 1.1 entry points from the start and the rest only once a
+  program asks; `glBindBuffer` is 1.5. The driver now looks up what it
+  needs past 1.1 through `eglGetProcAddress`.
+- A first version wrote the frame into the window through GDI, so that
+  every later flush would carry it. GDI accepted it and the screen never
+  changed; writing the buffer directly is simpler, one copy cheaper, and
+  what a compositor does with a client's buffer anyway.
+
+`winegl64.exe` makes a window, a pixel format, a WGL context, draws the
+triangle and swaps twice; `glReadPixels` and the composited screen
+(`WMIO_PEEK`) both have to show it. They do: `#ff0000` inside the
+triangle, `#4080bf` outside.
+
+**Staging.** `tools/stage_mesa.sh` stages glvnd's libEGL, Mesa's EGL
+vendor file and libEGL_mesa, libgallium, the Vulkan loader, lavapipe and
+its manifest, closed under ldd - 34 libraries, 235MB, most of it libLLVM
+and ICU - so it is opt-in: `MESA64_INSTALL=1`, which also gives the guest
+3GB. `make test` with it checks the four programs: `winedesk`, `winegl`,
+and `egl64` and `vk64` line for line against the host.
+
+```bash
+make -f Makefile.amd64 WINE64_INSTALL=1 MESA64_INSTALL=1 test
+```
+
+That passes, 36 PASS: the 32 of the plain `make test` and these four.
+Those checks also skip a program that was not staged; the Chromium one
+did not, so a Wine `make test` without Chromium had failed on it since
+Milestone 97. `make chrome-window` still passes on the rebuilt Wine, and
+the driver still builds in the 32-bit tree, where there is no EGL.
+
+### Not done
+
+- **Vulkan in a window.** win32u gives a driver without Vulkan a headless
+  surface, and Mesa's headless swapchain shows nothing. Getting frames out
+  of a swapchain needs a presentation path Mesa supports for software
+  rendering - its Wayland one, through a small compositor in the driver,
+  is the likeliest - and that is the next milestone. It is the one games
+  need: DXVK turns Direct3D 9-11 into Vulkan.
+- **A GL window that is resized** keeps its first pbuffer; the driver
+  says so with a FIXME. Pbuffers cannot grow, so a resize has to make a
+  new one and rebind it.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the

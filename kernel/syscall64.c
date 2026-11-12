@@ -5855,6 +5855,49 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         if (fds[a1].kind != FD64_FILE) return (uint64_t)-22;   /* -EINVAL */
         return (uint64_t)(int64_t)ramfs64_resize(fds[a1].node, a2);
 
+    /* fallocate(fd, mode, offset, len). Mode 0 only - make sure the
+     * file is at least offset+len long - which is what posix_fallocate
+     * asks for, and all a file that is already its frames can mean.
+     * The hole-punching and range modes are -EOPNOTSUPP, as on a
+     * filesystem without them. */
+    case SYS64_FALLOCATE: {
+        uint64_t end = args->a3 + args->a4;
+        if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        if (fds[a1].kind != FD64_FILE) return (uint64_t)-19;   /* -ENODEV */
+        if (a2) return (uint64_t)-95;                         /* -EOPNOTSUPP */
+        if ((int64_t)args->a3 < 0 || (int64_t)args->a4 <= 0 || end < args->a3)
+            return (uint64_t)-22;
+        if (end <= ramfs64_size(fds[a1].node)) return 0;
+        return (uint64_t)(int64_t)ramfs64_resize(fds[a1].node, end);
+    }
+
+    /* memfd_create(name, flags): a file with no name, for memory that
+     * two mappings - or two processes, through SCM_RIGHTS - see alike
+     * (Milestone 110). Mesa's llvmpipe and lavapipe allocate device
+     * memory this way and have no fallback; without it lavapipe's first
+     * host-visible allocation came back unmapped and the program
+     * jumped through it.
+     *
+     * It is an ordinary file made and unlinked at once, which this
+     * filesystem already keeps alive for as long as a descriptor holds
+     * it, so ftruncate, mmap MAP_SHARED, read and write are the file
+     * calls they always were. */
+    case SYS64_MEMFD_CREATE: {
+        static uint64_t memfd_seq;
+        char path[40] = "/.memfd-";
+        char digits[24];
+        uint64_t n = ++memfd_seq, r;
+        int len = 0, at = 8;
+
+        if (a2 & ~0x7ULL) return (uint64_t)-22;   /* CLOEXEC, ALLOW_SEALING, HUGETLB */
+        do { digits[len++] = (char)('0' + n % 10); n /= 10; } while (n);
+        while (len) path[at++] = digits[--len];
+        path[at] = 0;
+        r = do_open(path, 2 | 0x40 | 0x80 | ((a2 & 1) ? 0x80000 : 0), 0600);
+        if ((int64_t)r >= 0) ramfs64_unlink(path);
+        return r;
+    }
+
     case SYS64_TRUNCATE: {
         char path[PROC64_PATH_MAX];
         int64_t e = abs_path((const char*)a1, path);
@@ -6661,6 +6704,10 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
             fd_take_ref(nfd);
             return (uint64_t)nfd;
         }
+        case 1033:                 /* F_ADD_SEALS: kept by nobody, refused to nobody */
+            return 0;
+        case 1034:                 /* F_GET_SEALS: none */
+            return 0;
         case F_GETLK:
         case F_SETLK:
         case F_SETLKW:

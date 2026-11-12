@@ -7,4 +7,5 @@ SOURCES = \
 	dllmain.c \
 	legacy.c \
 	novarisdrv_main.c \
+	opengl.c \
 	window.c

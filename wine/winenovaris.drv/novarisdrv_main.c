@@ -31,7 +31,9 @@
  * decorations, so the caption, its buttons and the borders are drawn and
  * hit-tested by Wine exactly as they are on Windows.
  *
- * That is the whole driver. There is no OpenGL, no Vulkan, no clipboard,
+ * OpenGL is win32u's EGL with this driver's window surfaces (opengl.c).
+ *
+ * That is the whole driver. There is no Vulkan, no clipboard,
  * no IME, no display-mode changing: those are all optional entry points
  * and win32u has sensible behaviour for a driver that does not fill them
  * in. What is *not* optional is the set below, and the reason each is
@@ -111,6 +113,7 @@ static const struct user_driver_funcs novarisdrv_funcs =
     .pCreateWindowSurface = NOVARIS_CreateWindowSurface,
     .pDestroyWindow = NOVARIS_DestroyWindow,
     .pGetWindowStyleMasks = NOVARIS_GetWindowStyleMasks,
+    .pOpenGLInit = NOVARIS_OpenGLInit,
     .pProcessEvents = NOVARIS_ProcessEvents,
     .pSetWindowText = NOVARIS_SetWindowText,
     .pThreadDetach = NOVARIS_ThreadDetach,

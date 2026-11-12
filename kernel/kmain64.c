@@ -873,13 +873,18 @@ static void reclaim_leader(int pid) {
  * silent - Wine's own err:/fixme: lines and Chromium's LOG output go to
  * stderr, which is a different path - so a program too big to trace is
  * still a program that says what went wrong. */
-static void run_wine_program(const void* image, uint64_t len,
-                             const void* ld_image, uint64_t ld_len,
-                             const char* const* env, vmspace64_t* kspace,
-                             const char* label, const char* success,
-                             const char* program,
-                             const char* const* args, uint64_t budget,
-                             int trace)
+/* Runs one program from the installed tree to completion: `image` is the
+ * ELF at `exe_path`, started through the dynamic loader. Under Wine that
+ * is Wine's loader, and `program` the Windows program it is to run; for a
+ * native program `program` is 0. `expect` is the exit code that means it
+ * held. */
+static void run_program(const void* image, uint64_t len,
+                        const void* ld_image, uint64_t ld_len,
+                        const char* const* env, vmspace64_t* kspace,
+                        const char* label, const char* success,
+                        const char* exe_path, const char* program,
+                        const char* const* args, uint64_t budget,
+                        int trace, uint64_t expect)
 {
     const uint64_t STACK_TOP   = 0x00007FFFFFFF0000ULL;
     const uint64_t STACK_PAGES = 128;
@@ -894,25 +899,27 @@ static void run_wine_program(const void* image, uint64_t len,
     int rc, stack_ok = 1, pid, slot;
     proc64_t* p;
 
-    argv[0] = "/usr/bin/wine";
+    int first = program ? 2 : 1;
+
+    argv[0] = exe_path;
     argv[1] = program;
     while (args && args[nargs] && nargs < 62) {
-        argv[2 + nargs] = args[nargs];
+        argv[first + nargs] = args[nargs];
         nargs++;
     }
     if (args && args[nargs]) {
         serial64_puts("NOVARIS64: FAIL  more than 62 arguments for ");
-        serial64_puts(program);
+        serial64_puts(program ? program : exe_path);
         serial64_puts(" - the rest would have been dropped\n");
         failures++;
     }
-    argv[2 + nargs] = 0;
+    argv[first + nargs] = 0;
 
     serial64_puts("NOVARIS64: --- ");
     serial64_puts(label);
     serial64_puts(" ---\n");
 
-    if (ramfs64_lookup(program) < 0) {
+    if (ramfs64_lookup(program ? program : exe_path) < 0) {
         serial64_puts("NOVARIS64: ");
         serial64_puts(label);
         serial64_puts(" = not staged, skipped\n");
@@ -945,7 +952,7 @@ static void run_wine_program(const void* image, uint64_t len,
 
     rc = vmspace64_create(&p->space) != 0 ? ELF64_OK : -1;
     if (rc == ELF64_OK) {
-        syscall64_set_exe_path("/usr/bin/wine");
+        syscall64_set_exe_path(exe_path);
         rc = elf64_load_at(image, len, &p->space, EXE_BIAS, &exe);
     }
     if (rc == ELF64_OK)
@@ -1030,10 +1037,24 @@ static void run_wine_program(const void* image, uint64_t len,
     } else {
         serial64_puts("exit= ");
         serial64_putdec(syscall64_exit_code());
-        serial64_puts(" (0 = ");
+        serial64_puts(" (");
+        serial64_putdec(expect);
+        serial64_puts(" = ");
         serial64_puts(success);
         serial64_puts(")\n");
     }
+}
+
+static void run_wine_program(const void* image, uint64_t len,
+                             const void* ld_image, uint64_t ld_len,
+                             const char* const* env, vmspace64_t* kspace,
+                             const char* label, const char* success,
+                             const char* program,
+                             const char* const* args, uint64_t budget,
+                             int trace)
+{
+    run_program(image, len, ld_image, ld_len, env, kspace, label, success,
+                "/usr/bin/wine", program, args, budget, trace, 0);
 }
 
 void kernel_main(uint32_t magic, void* mbi) {
@@ -5710,6 +5731,31 @@ static const char* const chrome_args[] = {
                              "winedesk", "windows stack, move, and take clicks and keys",
                              "/usr/bin/x86_64-windows/winedesk64.exe",
                              0, 90u * CLOCK64_HZ, 1);
+
+            /* OpenGL with no window system: Mesa's surfaceless EGL
+             * and llvmpipe, as a plain Linux program - the floor Wine's
+             * OpenGL stands on here, without Wine (Milestone 110). */
+            {
+                const void* egl_image;
+                uint64_t egl_len;
+                if (initrd64_open("usr/bin/egl64", &egl_image, &egl_len) == INITRD64_OK)
+                    run_program(egl_image, egl_len, ld_image, ld_len, boot_env, &kspace,
+                                "egl", "OpenGL drew through llvmpipe",
+                                "/usr/bin/egl64", 0, 0, 120u * CLOCK64_HZ, 1, 110);
+                if (initrd64_open("usr/bin/vk64", &egl_image, &egl_len) == INITRD64_OK)
+                    run_program(egl_image, egl_len, ld_image, ld_len, boot_env, &kspace,
+                                "vk", "Vulkan cleared an image through lavapipe",
+                                "/usr/bin/vk64", 0, 0, 120u * CLOCK64_HZ, 1, 111);
+            }
+
+            /* And the same through Wine: WGL in a window, rendered by
+             * win32u through the same EGL, onto the screen. Only with
+             * Mesa staged; without it there is no OpenGL to ask for. */
+            if (ramfs64_lookup("/usr/share/glvnd/egl_vendor.d/50_mesa.json") >= 0)
+                run_wine_program(image, len, ld_image, ld_len, boot_env, &kspace,
+                                 "winegl", "OpenGL drew into a window, through Mesa",
+                                 "/usr/bin/x86_64-windows/winegl64.exe",
+                                 0, 180u * CLOCK64_HZ, 1);
 
             /* Before chrome, the questions chrome_elf asks. Cheap, and
              * it means a failing chrome run is read against measured

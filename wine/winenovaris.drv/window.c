@@ -416,6 +416,77 @@ void NOVARIS_DestroyWindow(HWND hwnd)
     novaris_win_data_destroy(hwnd);
 }
 
+/* --- OpenGL's frames ------------------------------------------------------
+ *
+ * A swapped frame goes straight into the window's buffer, over the client
+ * area, the way a compositor puts a client's buffer over its window: the
+ * window surface below is GDI's, and its flushes leave that rectangle
+ * alone, so a repainted caption cannot put an old client area back over
+ * the newest frame. `bottom_up` is GL's row order.
+ */
+void novaris_present_client(HWND hwnd, const void *bottom_up, int width, int height)
+{
+    struct novaris_win_data *data;
+    struct wm_rect damage;
+    int cx, cy, w, h, y;
+
+    if (!(data = novaris_win_data_get(hwnd))) return;
+    if (!data->mapped || !data->pixels)
+    {
+        novaris_win_data_release(data);
+        return;
+    }
+    cx = data->rects.client.left - data->rects.visible.left;
+    cy = data->rects.client.top - data->rects.visible.top;
+    w = min(width, data->width - cx);
+    h = min(height, data->height - cy);
+    if (cx >= 0 && cy >= 0 && w > 0 && h > 0)
+    {
+        SetRect(&data->gl_rect, cx, cy, cx + w, cy + h);
+        data->gl_active = TRUE;
+        for (y = 0; y < h; y++)
+            memcpy((char *)data->pixels + ((size_t)(cy + y) * data->stride + cx) * 4,
+                   (const char *)bottom_up + (size_t)(height - 1 - y) * width * 4, (size_t)w * 4);
+        damage.x = cx;
+        damage.y = cy;
+        damage.w = w;
+        damage.h = h;
+        ioctl(data->fd, WMIO_DAMAGE, &damage);
+    }
+    novaris_win_data_release(data);
+}
+
+void novaris_detach_client(HWND hwnd)
+{
+    struct novaris_win_data *data;
+
+    if (!(data = novaris_win_data_get(hwnd))) return;
+    data->gl_active = FALSE;
+    novaris_win_data_release(data);
+}
+
+/* One row of a surface flush, leaving out the part OpenGL owns. */
+static void copy_row(struct novaris_win_data *data, char *dst, const char *src, int wx, int wy, int w)
+{
+    int l, r;
+
+    if (!data->gl_active || wy < data->gl_rect.top || wy >= data->gl_rect.bottom)
+    {
+        memcpy(dst, src, (size_t)w * 4);
+        return;
+    }
+    l = max(wx, data->gl_rect.left);
+    r = min(wx + w, data->gl_rect.right);
+    if (l >= r)
+    {
+        memcpy(dst, src, (size_t)w * 4);
+        return;
+    }
+    if (l > wx) memcpy(dst, src, (size_t)(l - wx) * 4);
+    if (wx + w > r) memcpy(dst + (size_t)(r - wx) * 4, src + (size_t)(r - wx) * 4,
+                           (size_t)(wx + w - r) * 4);
+}
+
 /* --- the window surface ---------------------------------------------------- */
 
 struct novaris_window_surface
@@ -474,7 +545,7 @@ static BOOL novaris_surface_flush(struct window_surface *base, const RECT *rect,
 
     for (y = 0; y < h; y++)
     {
-        memcpy(dst, src, (size_t)w * 4);
+        copy_row(data, dst, src, wx, wy + y, w);
         src += src_stride;
         dst += (size_t)data->stride * 4;
     }

@@ -178,6 +178,8 @@ typedef struct {
 #define SYS64_RENAME      82
 #define SYS64_RENAMEAT    264
 #define SYS64_FTRUNCATE   77
+#define SYS64_FALLOCATE   285
+#define SYS64_MEMFD_CREATE 319
 #define SYS64_TRUNCATE    76
 
 /* Time. The epoch is when the timer started, not 1970 - see clock64.h. */

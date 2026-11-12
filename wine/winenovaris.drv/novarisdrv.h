@@ -155,6 +155,8 @@ struct novaris_win_data
     BOOL    mapped;             /* the kernel has a window for this */
     BOOL    shown;
     BOOL    closing;            /* 32-bit kernel: the user clicked its X */
+    BOOL    gl_active;          /* OpenGL draws the client area (opengl.c) */
+    RECT    gl_rect;            /* where, in the window's buffer */
 };
 
 extern pthread_mutex_t novaris_mutex;
@@ -165,6 +167,8 @@ void novaris_win_data_release(struct novaris_win_data *data);
 void novaris_win_data_destroy(HWND hwnd);
 struct novaris_win_data *novaris_win_data_slot(int i);
 BOOL novaris_window_create(struct novaris_win_data *data, int width, int height);
+void novaris_present_client(HWND hwnd, const void *bottom_up, int width, int height);
+void novaris_detach_client(HWND hwnd);
 void novaris_win_data_close(struct novaris_win_data *data);
 
 /* Whether /dev/wm is the 64-bit kernel's compositor, which places windows
@@ -195,6 +199,10 @@ void     NOVARIS_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint,
 void     NOVARIS_SetWindowText(HWND hwnd, LPCWSTR text);
 void     NOVARIS_ThreadDetach(void);
 void     NOVARIS_ActivateWindow(HWND hwnd, HWND previous);
+struct opengl_funcs;
+struct opengl_driver_funcs;
+UINT     NOVARIS_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs,
+                            const struct opengl_driver_funcs **driver_funcs);
 BOOL     NOVARIS_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style,
                                      UINT *style_mask, UINT *ex_style_mask);
 
