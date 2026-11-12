@@ -93,6 +93,8 @@ OBJS = $(BUILD_DIR)/boot64.o \
        $(BUILD_DIR)/serial64.o \
        $(BUILD_DIR)/fb64.o \
        $(BUILD_DIR)/wmdev64.o \
+       $(BUILD_DIR)/gpu64.o \
+       $(BUILD_DIR)/ativga64.o \
        $(BUILD_DIR)/input64.o \
        $(BUILD_DIR)/fbdraw64_blob.o \
        $(BUILD_DIR)/pmm64.o \
@@ -1580,6 +1582,14 @@ CHROME_WINDOW_EVERY  ?= 20
 CHROME_WINDOW_FLAGS   = -DNOVARIS64_FAST -DCHROME64_WINDOWED \
     -DCHROME64_URL=\"$(CHROME_NET_URL)\" \
     -DCHROME64_BUDGET_SECS=$(CHROME_WINDOW_BUDGET)u
+
+# The GPU driver on the one ATI/AMD part QEMU can emulate (Milestone 112):
+# booted on -device ati-vga, a mode set, two flips and the mode put back,
+# each checked with a screendump by tools/gputest.py.
+.PHONY: test-gpu
+test-gpu: iso
+	@python3 tools/gputest.py $(ISO) $(BUILD_DIR) rage128p
+	@python3 tools/gputest.py $(ISO) $(BUILD_DIR) rv100
 
 .PHONY: chrome-window
 chrome-window:

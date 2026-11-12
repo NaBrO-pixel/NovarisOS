@@ -25,6 +25,8 @@
 #include "fb64.h"
 #include "input64.h"
 #include "wmdev64.h"
+#include "gpu64.h"
+#include "ativga64.h"
 #include "gdt64.h"
 #include "idt64.h"
 #include "multiboot.h"
@@ -283,6 +285,151 @@ static void breakpoint_handler(registers64_t* r) {
 
     /* #BP is a trap: rip already points past the int3, so returning
      * unchanged resumes at the next instruction. */
+}
+
+/* --- GPUs (Milestone 112) --------------------------------------------------
+ *
+ * Inside layer 6c too, before its picture: on an ATI card this changes the
+ * mode and puts it back. Three kinds of evidence, for three kinds of
+ * hardware:
+ *
+ *   - every display controller on the bus, identified - Intel's platform
+ *     and generation and AMD's ASIC from Linux's ID lists - with its BARs
+ *     sized and the boot framebuffer found in one of them;
+ *   - Intel's display state decoded from register files made up here,
+ *     because no Intel GPU can be emulated: gen 7, 9 and 12 layouts;
+ *   - QEMU's ATI Radeon really driven: the firmware's mode read back, a
+ *     new mode set, the screen flipped between buffers and back. The host
+ *     (tools/gputest.py) takes a screendump at each step and answers on
+ *     the serial line, which is what this waits for before going on. */
+static int host_ack(const char* what) {
+    serial64_puts("NOVARIS64: [gpu-test] ");
+    serial64_puts(what);
+    serial64_putc('\n');
+    for (uint64_t i = 0; i < 20000000ULL; i++)
+        if (inb(0x3FD) & 1) { (void)inb(0x3F8); return 1; }
+    return 0;
+}
+
+struct fake_regs { uint32_t off[8], val[8]; };
+
+static uint32_t fake_read(void* ctx, uint32_t off) {
+    const struct fake_regs* f = (const struct fake_regs*)ctx;
+    for (int i = 0; i < 8; i++) if (f->off[i] == off) return f->val[i];
+    return 0;
+}
+
+static void fill_rect(volatile uint32_t* vram, uint32_t pitch_px, uint32_t x, uint32_t y,
+                      uint32_t w, uint32_t h, uint32_t colour) {
+    for (uint32_t r = y; r < y + h; r++)
+        for (uint32_t c = x; c < x + w; c++) vram[(uint64_t)r * pitch_px + c] = colour;
+}
+
+static void gpu_layer(void) {
+    int n, boot = 0, gen = 0, apu = 0, old = 0;
+    const char* f;
+    gpu64_intel_plane_t p;
+
+    serial64_puts("NOVARIS64: -- GPUs --\n");
+    n = gpu64_scan();
+    gpu64_report();
+    check("the display controllers on the bus are found", n >= 1);
+    for (int i = 0; i < n; i++) boot |= gpu64_at(i)->boot;
+    check("and the boot framebuffer is in one of their BARs", boot);
+
+    f = gpu64_intel_family(0x9A49, &gen);
+    check("Intel 9A49 is Tiger Lake, gen 12", f && !kstrncmp(f, "TGL", 4) && gen == 12);
+    f = gpu64_intel_family(0x5917, &gen);
+    check("Intel 5917 is Kaby Lake, gen 9", f && !kstrncmp(f, "KBL", 4) && gen == 9);
+    f = gpu64_amd_family(0x73BF, &apu, &old);
+    check("AMD 73BF is Navi 21 (SIENNA_CICHLID), a discrete GPU",
+          f && !kstrncmp(f, "SIENNA_CICHLID", 15) && !apu && !old);
+    f = gpu64_amd_family(0x1636, &apu, &old);
+    check("AMD 1636 is Renoir, the GPU of a Ryzen processor", f && !kstrncmp(f, "RENOIR", 7) && apu);
+    check("an AMD ID the table lacks is left to IP discovery", !gpu64_amd_family(0x744C, &apu, &old));
+
+    {
+        struct fake_regs g9 = { { 0x70180, 0x6001C, 0x70188, 0x7019C },
+                                { 0x80000000u | (4u << 24), (1919u << 16) | 1079u, 7680 / 64, 0x00100000 } };
+        gpu64_intel_decode(9, 0, fake_read, &g9, &p);
+        check("gen 9: pipe A, 1920x1080, linear XRGB8888, stride 7680",
+              p.found && p.pipe == 0 && p.width == 1920 && p.height == 1080 && p.linear &&
+              p.xrgb8888 && p.stride_bytes == 7680 && p.surface == 0x00100000);
+    }
+    {
+        struct fake_regs g12 = { { 0x71180, 0x6101C, 0x71188, 0x7119C },
+                                 { 0x80000000u | (4u << 24) | (1u << 10), (2559u << 16) | 1439u, 160, 0x00200000 } };
+        gpu64_intel_decode(12, 0, fake_read, &g12, &p);
+        check("gen 12: an unlit pipe A is passed over for pipe B, 2560x1440, tiled",
+              p.found && p.pipe == 1 && p.width == 2560 && p.height == 1440 && !p.linear && p.xrgb8888);
+    }
+    {
+        struct fake_regs g7 = { { 0x70180, 0x6001C, 0x70188 },
+                                { 0x80000000u | (6u << 26), (1023u << 16) | 767u, 4096 } };
+        gpu64_intel_decode(7, 0, fake_read, &g7, &p);
+        check("gen 7: the stride is in bytes, BGRX888 is format 6",
+              p.found && p.width == 1024 && p.height == 768 && p.stride_bytes == 4096 && p.xrgb8888);
+        gpu64_intel_decode(7, 1, fake_read, &g7, &p);
+        check("Valleyview's display block is 0x180000 further in", !p.found);
+    }
+
+    if (ativga64_probe()) {
+        ativga64_mode_t m;
+        const gpu64_t* g = gpu64_find_kind(GPU64_ATI_OLD);
+        volatile uint32_t* vram = gpu64_map(g, 0, 0, 8u << 20);
+        const uint32_t BLUE = 0x0000FF, ORANGE = 0xFF8000, GREEN = 0x00FF00, RED = 0xFF0000;
+        const uint32_t second = 3200u * 1400u;     /* a whole number of 800-pixel rows */
+
+        serial64_puts("NOVARIS64: [gpu] driving the ATI card: ");
+        serial64_putdec(ativga64_vram_size() >> 20);
+        serial64_puts("MB of video memory\n");
+        check("the ATI card has video memory, mapped", ativga64_vram_size() >= (8u << 20) && vram);
+        check("its mode reads back", ativga64_get_mode(&m) == 0);
+        serial64_puts("NOVARIS64: [gpu] the firmware left it at ");
+        serial64_putdec(m.width); serial64_putc('x'); serial64_putdec(m.height);
+        serial64_putc('x'); serial64_putdec(m.bpp);
+        serial64_puts(m.enabled ? ", on" : ", off");
+        serial64_puts(", pitch "); serial64_putdec(m.pitch);
+        serial64_putc('\n');
+        check("as the mode the bootloader reported",
+              m.enabled && m.width == fb64_width() && m.height == fb64_height() &&
+              m.bpp == 32 && m.pitch == fb64_pitch() && m.offset == 0);
+
+        if (vram) {
+            fill_rect(vram, 800, 0, 0, 800, 600, ORANGE);
+            fill_rect(vram, 800, 0, 0, 100, 100, BLUE);
+            check("800x600 is set", ativga64_set_mode(800, 600, 800, 0) == 0);
+            ativga64_get_mode(&m);
+            check("and reads back as 800x600x32, pitch 3200",
+                  m.enabled && m.width == 800 && m.height == 600 && m.bpp == 32 && m.pitch == 3200);
+            check("the screen shows it (host screendump)",
+                  host_ack("SHOT mode 800 600 10,10=0000ff 400,300=ff8000"));
+
+            fill_rect(vram + second / 4, 800, 0, 0, 800, 600, GREEN);
+            fill_rect(vram + second / 4, 800, 700, 500, 100, 100, RED);
+            check("a flip to a second buffer", ativga64_flip(second) == 0);
+            ativga64_get_mode(&m);
+            check("moves the scanout there", m.offset == second);
+            check("and the screen shows the second buffer (host screendump)",
+                  host_ack("SHOT flip 800 600 400,300=00ff00 750,550=ff0000"));
+            check("a flip back", ativga64_flip(0) == 0);
+            check("shows the first again (host screendump)",
+                  host_ack("SHOT back 800 600 400,300=ff8000"));
+            check("a flip that is not a whole number of rows is refused", ativga64_flip(4) != 0);
+
+            check("the bootloader's mode is put back",
+                  ativga64_set_mode(fb64_width(), fb64_height(), fb64_pitch() / 4, 0) == 0);
+            ativga64_get_mode(&m);
+            check("and reads back as it was",
+                  m.width == fb64_width() && m.height == fb64_height() && m.pitch == fb64_pitch());
+            check("and is on the screen again (host screendump)",
+                  host_ack(fb64_width() == 1024 && fb64_height() == 768 ? "SHOT restored 1024 768"
+                                                                        : "SHOT restored 0 0"));
+        }
+        host_ack("done");
+    } else {
+        serial64_puts("NOVARIS64: SKIP  no ATI card to drive (make test-gpu boots on one)\n");
+    }
 }
 
 /* --- the compositor (Milestone 109) -------------------------------------
@@ -1563,6 +1710,7 @@ void kernel_main(uint32_t magic, void* mbi) {
              * geometry the bootloader hands over, and only the pattern
              * needs a screen at least as big as the one boot64.s asks
              * for. A smaller mode says so instead of failing. */
+            gpu_layer();
             compositor_layer();
 
             if (fb64_width() >= 1024 && fb64_height() >= 768) {
