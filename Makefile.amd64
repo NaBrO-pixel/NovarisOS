@@ -559,6 +559,15 @@ $(BUILD_DIR)/winegui64.exe: userland/pe_test/winegui64.c | $(BUILD_DIR)
 	    echo "  no mingw, skipping $@"; \
 	 fi
 
+# Several windows, a pointer and a keyboard (Milestone 109).
+$(BUILD_DIR)/winedesk64.exe: userland/pe_test/winedesk64.c | $(BUILD_DIR)
+	@if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then \
+	    x86_64-w64-mingw32-gcc -O2 -o $@ $< -lgdi32 -luser32 \
+	        && echo "  built $@"; \
+	 else \
+	    echo "  no mingw, skipping $@"; \
+	 fi
+
 # The probe that asks chrome_elf's own questions (Milestone 90). It is a
 # console program like the rest, and it links version.dll because
 # reading chrome.exe's VS_VERSION_INFO is one of the things it checks.
@@ -752,10 +761,22 @@ endif
 # of staged modules leaves the initrd untouched and the next run tests
 # the previous list - which costs a build and a boot to notice, and
 # looks exactly like the fix not working.
-$(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
+# The display driver is ours (wine/winenovaris.drv) and built inside the
+# Wine tree; with Wine in the image, a change to its sources rebuilds it
+# and restages the initrd. Without this the image kept whichever driver
+# was built last by hand, and a fixed driver was tested as the broken one.
+WINE64_TREE   = $(abspath $(dir $(WINE64_LOADER))..)
+WINE64_DRIVER = $(if $(and $(strip $(WINE64_INSTALL)),$(wildcard $(WINE64_TREE)/configure.ac)),\
+                    $(WINE64_TREE)/dlls/winenovaris.drv/winenovaris.so)
+ifneq ($(strip $(WINE64_DRIVER)),)
+$(WINE64_DRIVER): $(wildcard wine/winenovaris.drv/*) tools/build_wine_driver.sh
+	sh tools/build_wine_driver.sh $(WINE64_TREE)
+endif
+
+$(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf $(WINE64_DRIVER) \
            $(BUILD_DIR)/forkchild64.elf $(BUILD_DIR)/spawn64.elf $(NOVAC_CHILD) userland/mkinitrd.py \
-           $(BUILD_DIR)/winegui64.exe $(BUILD_DIR)/chromeprobe64.exe \
-           tools/stage_wine.sh tools/wine_prefix_modules.txt \
+           $(BUILD_DIR)/winegui64.exe $(BUILD_DIR)/winedesk64.exe \
+           $(BUILD_DIR)/chromeprobe64.exe tools/stage_wine.sh tools/wine_prefix_modules.txt \
            tools/wine_chromium_modules.txt tools/pe_pagealign.py $(INITRD_CONFIG)
 	rm -rf $(INITRD_STAGE)
 	mkdir -p $(INITRD_STAGE)
@@ -834,6 +855,11 @@ $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf \
 	    cp $(BUILD_DIR)/winegui64.exe \
 	       $(INITRD_STAGE)/usr/bin/x86_64-windows/winegui64.exe; \
 	    echo "  initrd: winegui64.exe staged"; \
+	 fi
+	@if [ -n "$(WINE64_INSTALL)" ] && [ -f "$(BUILD_DIR)/winedesk64.exe" ]; then \
+	    cp $(BUILD_DIR)/winedesk64.exe \
+	       $(INITRD_STAGE)/usr/bin/x86_64-windows/winedesk64.exe; \
+	    echo "  initrd: winedesk64.exe staged"; \
 	 fi
 	@if [ -n "$(WINE64_INSTALL)" ] && [ -f "$(BUILD_DIR)/chromeprobe64.exe" ]; then \
 	    cp $(BUILD_DIR)/chromeprobe64.exe \

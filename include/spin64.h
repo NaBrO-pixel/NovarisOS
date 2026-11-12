@@ -9,7 +9,8 @@
  * The kernel lock (smp64.c) still covers most of the kernel. These cover
  * what is now also reached without it: the pipes (pipe64.c), the task
  * table's wake and block state (sched64.c) and the frame allocator
- * (pmm64.c). The order is fixed - the kernel lock, then a pipe, then the
+ * (pmm64.c), and the compositor (wmdev64.c, Milestone 109). The order is
+ * fixed - the kernel lock, then a pipe, then the compositor, then the
  * task table, then the allocator - and nothing is called with one of
  * these held that could take one earlier in that list.
  *

@@ -285,6 +285,139 @@ static void breakpoint_handler(registers64_t* r) {
      * unchanged resumes at the next instruction. */
 }
 
+/* --- the compositor (Milestone 109) -------------------------------------
+ *
+ * Run inside layer 6c, before it draws the picture tools/fbtest.py checks,
+ * because this repaints the whole screen. The kernel's own calls, so every
+ * answer is exact: which colour is in front where two windows overlap,
+ * what a hidden or moved window leaves behind, where the pointer is drawn,
+ * and what a mouse packet and a key become by the time a process reads
+ * them. Nothing here needs the filesystem: /dev/wm is the node, and the
+ * node is not what is under test. */
+static void compositor_layer(void) {
+    serial64_puts("NOVARIS64: -- the compositor --\n");
+    {
+        const uint32_t RED = 0x00C00000u, BLUE = 0x000000C0u, DESK = 0x00305878u;
+        struct wm64_create cr;
+        struct wm64_rect r;
+        struct wm64_stack st;
+        struct wm64_inject inj;
+        struct wm64_event ev;
+        int a, b, l, n;
+
+        input64_reset();
+
+        #define PEEK(px, py) (r.x = (px), r.y = (py), wmdev64_peek(&r), (uint32_t)r.w)
+        #define FILL(win, colour) do { uint64_t nf_, by_; \
+            const uint64_t* f_ = wmdev64_frames(win, &nf_, &by_); \
+            for (uint64_t i_ = 0; f_ && i_ < nf_; i_++) { \
+                uint32_t* p_ = (uint32_t*)phys64_to_virt(f_[i_]); \
+                for (int j_ = 0; j_ < 1024; j_++) p_[j_] = (colour); } } while (0)
+
+        kmemset(&cr, 0, sizeof(cr));
+        cr.w = 100; cr.h = 80;
+        kstrlcpy(cr.title, "red", sizeof(cr.title));
+        a = wmdev64_create(&cr);
+        kstrlcpy(cr.title, "blue", sizeof(cr.title));
+        b = wmdev64_create(&cr);
+        check("two windows open", a >= 0 && b >= 0 && a != b);
+        FILL(a, RED);
+        FILL(b, BLUE);
+        r.x = 50; r.y = 40; r.w = 100; r.h = 80;  wmdev64_move(a, &r);
+        r.x = 100; r.y = 60; r.w = 100; r.h = 80; wmdev64_move(b, &r);
+        r.x = 0; r.y = 0; r.w = 100; r.h = 80;
+        wmdev64_damage(a, &r);
+        wmdev64_damage(b, &r);
+        wmdev64_setid(b, 0xB0B);
+
+        check("a window is drawn where it was put", PEEK(60, 50) == RED);
+        check("the desktop shows where no window is", PEEK(30, 200) == DESK);
+        check("where two overlap, the later one is in front", PEEK(120, 70) == BLUE);
+        check("and the earlier one still shows where it is not covered",
+              PEEK(149, 119) == BLUE && PEEK(99, 119) == RED);
+        st.mode = WM64_STACK_TOP; st.other = 0;
+        wmdev64_stack(a, &st);
+        check("raised, the earlier one is in front", PEEK(120, 70) == RED);
+        st.mode = WM64_STACK_BELOW; st.other = 0xB0B;
+        wmdev64_stack(a, &st);
+        check("stacked below another by its id, it goes behind it",
+              PEEK(120, 70) == BLUE);
+        wmdev64_show(b, 0);
+        check("a hidden window shows what is behind it", PEEK(120, 70) == RED);
+        check("and the desktop where nothing is", PEEK(180, 130) == DESK);
+        wmdev64_show(b, 1);
+        r.x = 300; r.y = 300; r.w = 100; r.h = 80;
+        wmdev64_move(b, &r);
+        check("a moved window is drawn where it went", PEEK(310, 310) == BLUE);
+        check("and leaves what was behind it where it was",
+              PEEK(120, 70) == RED && PEEK(180, 130) == DESK);
+        r.x = 300; r.y = 300; r.w = 40; r.h = 30;
+        wmdev64_move(b, &r);
+        check("shrunk, it shows only that much of itself",
+              PEEK(330, 320) == BLUE && PEEK(350, 320) == DESK);
+        r.x = 300; r.y = 300; r.w = 500; r.h = 500;
+        wmdev64_move(b, &r);
+        check("and cannot grow past its buffer", PEEK(399, 379) == BLUE &&
+              PEEK(401, 381) == DESK);
+
+        l = wmdev64_listen();
+        check("a listener", l >= WM64_LISTENER_BASE);
+        check("with nothing to read yet", !wmdev64_readable(l));
+
+        inj.type = WM64_INJECT_POINTER; inj.a = 320; inj.b = 320; inj.c = 0;
+        wmdev64_inject(&inj);
+        check("a pointer move makes the listener readable", wmdev64_readable(l));
+        n = wmdev64_poll(l, &ev);
+        check("and is an absolute position on the screen",
+              n == 1 && ev.type == WM64_EV_POINTER && ev.a == 320 && ev.b == 320 && ev.c == 0);
+        inj.a = 600; inj.b = 500;          /* more than one packet away */
+        wmdev64_inject(&inj);
+        inj.a = 340; inj.b = 340;
+        wmdev64_inject(&inj);
+        n = wmdev64_poll(l, &ev);
+        check("moves not yet read become one, at the latest place",
+              n == 1 && ev.a == 340 && ev.b == 340);
+        check("and nothing else is left", wmdev64_poll(l, &ev) == 0);
+        check("the pointer is drawn: its tip is black", PEEK(340, 340) == 0);
+        check("and its inside white", PEEK(341, 345) == 0x00FFFFFFu);
+        inj.c = WM64_BUTTON_LEFT;
+        wmdev64_inject(&inj);
+        n = wmdev64_poll(l, &ev);
+        check("a press is the button held, where the pointer is",
+              n == 1 && ev.c == WM64_BUTTON_LEFT && ev.a == 340);
+        inj.a = 5; inj.b = 5;              /* off the window, still held */
+        wmdev64_inject(&inj);
+        n = wmdev64_poll(l, &ev);
+        check("a drag off the window still reaches its process",
+              n == 1 && ev.c == WM64_BUTTON_LEFT && ev.a == 5 && ev.b == 5);
+        inj.c = 0;
+        wmdev64_inject(&inj);
+        n = wmdev64_poll(l, &ev);
+        check("and so does the release", n == 1 && ev.c == 0);
+        check("where the pointer was, the window shows again", PEEK(342, 350) == BLUE);
+
+        inj.type = WM64_INJECT_KEY; inj.a = 30; inj.b = 1;   /* KEY_A */
+        wmdev64_inject(&inj);
+        n = wmdev64_poll(l, &ev);
+        check("a key is its Linux keycode", n == 1 && ev.type == WM64_EV_KEYCODE &&
+              ev.a == 30 && ev.b == 1);
+        inj.a = 103;                                         /* KEY_UP */
+        wmdev64_inject(&inj);
+        n = wmdev64_poll(l, &ev);
+        check("an arrow is KEY_UP, not keypad 8", n == 1 && ev.a == 103);
+
+        wmdev64_close(a);
+        wmdev64_close(b);
+        check("closed, the desktop is all that is left",
+              PEEK(60, 50) == DESK && PEEK(310, 310) == DESK);
+        wmdev64_close(l);
+        check("and a listener can be read no longer", wmdev64_poll(l, &ev) < 0);
+        #undef PEEK
+        #undef FILL
+        input64_reset();
+    }
+}
+
 static volatile uint64_t timer_ticks;
 
 static void timer_handler(registers64_t* r) {
@@ -302,6 +435,9 @@ static void sched_timer_handler(registers64_t* r) {
      * millisecond, before the scheduler picks who runs next - so a task
      * the pump just woke is a candidate already. */
     inet64_timer();
+    /* And the pointer: it moves when the mouse does, whether or not any
+     * program is asking. */
+    wmdev64_timer();
     sched64_tick(r);
 }
 
@@ -1406,6 +1542,8 @@ void kernel_main(uint32_t magic, void* mbi) {
              * geometry the bootloader hands over, and only the pattern
              * needs a screen at least as big as the one boot64.s asks
              * for. A smaller mode says so instead of failing. */
+            compositor_layer();
+
             if (fb64_width() >= 1024 && fb64_height() >= 768) {
                 fb64_clear(BG);
                 fb64_fill_rect(100, 100, 200, 200, RED);
@@ -3649,6 +3787,14 @@ void kernel_main(uint32_t magic, void* mbi) {
         check("and the queue is empty again",
               input64_queued(INPUT64_KBD) == 0);
 
+        /* An extended key: E0 48 is the Up arrow, not keypad 8. */
+        input64_feed_scancode(0xE0);
+        input64_feed_scancode(0x48);
+        got = input64_read(INPUT64_KBD, evs, sizeof(evs));
+        check("an E0-prefixed key has Linux's own keycode (KEY_UP)",
+              got == 2 * sizeof(input64_event_t) && evs[0].code == 103 &&
+              evs[0].value == 1);
+
         /* Shift is a key in its own right *and* a modifier. Reporting
          * only the modifier would lose the keystroke; tracking only the
          * keystroke would lose the state. */
@@ -5033,6 +5179,7 @@ fast_inet:
      * stops paying for a Wine prefix it never looks at. */
     serial64_puts("NOVARIS64: ---- display settled ----\n");
 
+
 #ifdef NOVARIS64_FAST
 fast_wine:
 #endif
@@ -5556,6 +5703,13 @@ static const char* const chrome_args[] = {
                              "winegui", "a window was created and drawn",
                              "/usr/bin/x86_64-windows/winegui64.exe",
                              0, 60u * CLOCK64_HZ, 1);
+
+            /* Several windows, a pointer and a keyboard: where they
+             * are on the screen, and what a click and a key reach. */
+            run_wine_program(image, len, ld_image, ld_len, boot_env, &kspace,
+                             "winedesk", "windows stack, move, and take clicks and keys",
+                             "/usr/bin/x86_64-windows/winedesk64.exe",
+                             0, 90u * CLOCK64_HZ, 1);
 
             /* Before chrome, the questions chrome_elf asks. Cheap, and
              * it means a failing chrome run is read against measured

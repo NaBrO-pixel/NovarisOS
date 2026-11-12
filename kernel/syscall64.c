@@ -3453,6 +3453,12 @@ static short poll_one(proc64_fd_t* poll_fds, int fd, short want, int* polled_net
                         pipe64_writers(rx) == 0)) got |= POLL64_IN;
         if (tx >= 0 && pipe64_space(tx) > 0)      got |= POLL64_OUT;
         if (tx >= 0 && pipe64_readers(tx) == 0)   got |= POLL64_HUP;
+    } else if (fds[fd].node >= 0 && ramfs64_device(fds[fd].node) == RAMFS64_DEV_WM) {
+        /* /dev/wm is readable while its process has input waiting: the
+         * wineserver polls it as a thread's queue descriptor, and "always
+         * ready" would wake that thread forever. */
+        got |= POLL64_OUT;
+        if (fds[fd].pos && wmdev64_readable((int)fds[fd].pos - 1)) got |= POLL64_IN;
     } else {
         /* A file is always ready, which is what Linux says too. */
         got |= POLL64_IN | POLL64_OUT;
@@ -4389,9 +4395,27 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
             int r;
 
             if (!a3) return (uint64_t)-14;                /* -EFAULT */
-            if (!user_range_ok(a3, 4)) return (uint64_t)-14;
+            if (!user_range_ok(a3, sizeof(struct wm64_stack))) return (uint64_t)-14;
 
             switch ((uint32_t)a2) {
+            case WMIO64_LISTEN:
+                if (win >= 0) return (uint64_t)-22;
+                r = wmdev64_listen();
+                if (r < 0) return (uint64_t)(int64_t)r;
+                fds[a1].pos = (uint64_t)(r + 1);
+                return 0;
+            case WMIO64_MOVE:
+                return (uint64_t)(int64_t)wmdev64_move(win, (const struct wm64_rect*)a3);
+            case WMIO64_SHOW:
+                return (uint64_t)(int64_t)wmdev64_show(win, *(const int*)a3);
+            case WMIO64_STACK:
+                return (uint64_t)(int64_t)wmdev64_stack(win, (const struct wm64_stack*)a3);
+            case WMIO64_SETID:
+                return (uint64_t)(int64_t)wmdev64_setid(win, *(const uint64_t*)a3);
+            case WMIO64_INJECT:
+                return (uint64_t)(int64_t)wmdev64_inject((const struct wm64_inject*)a3);
+            case WMIO64_PEEK:
+                return (uint64_t)(int64_t)wmdev64_peek((struct wm64_rect*)a3);
             case WMIO64_SCREEN:
                 return (uint64_t)(int64_t)wmdev64_screen(
                            (struct wm64_rect*)a3);
@@ -6095,7 +6119,13 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         if (a1 >= FD_MAX || !fds[a1].used || fds[a1].kind != FD64_EPOLL) return (uint64_t)-9;
         if (a3 >= FD_MAX || !fds[a3].used) return (uint64_t)-9;
         if (a3 == a1) return (uint64_t)-22;
-        if (fds[a3].kind == FD64_FILE) return (uint64_t)-1;   /* -EPERM, as Linux */
+        /* Linux refuses a regular file, which is always ready, and
+         * takes a device that can say when it is: /dev/wm is one - the
+         * wineserver watches a GUI thread's listener with epoll, and
+         * refusing it meant no click ever woke anybody. */
+        if (fds[a3].kind == FD64_FILE &&
+            !(fds[a3].node >= 0 && ramfs64_device(fds[a3].node) == RAMFS64_DEV_WM))
+            return (uint64_t)-1;                               /* -EPERM, as Linux */
         if (a2 != EPOLL64_CTL_DEL) {
             if (!ev || !user_range_ok(args->a4, sizeof(*ev))) return (uint64_t)-14;
             events = ev->events;

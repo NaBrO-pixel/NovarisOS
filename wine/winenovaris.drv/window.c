@@ -22,24 +22,24 @@
  * display driver is:
  *
  *   - **A surface to draw into.** pCreateWindowSurface hands win32u a
- *     plain top-down 32-bit DIB; GDI renders the whole window into it and
- *     calls flush() with the dirty rectangle. flush copies those rows
- *     into the window's /dev/wm mapping and damages it.
+ *     plain top-down 32-bit DIB; GDI renders the whole window into it,
+ *     frame and caption included, and calls flush() with the dirty
+ *     rectangle. flush copies those rows into the window's /dev/wm
+ *     mapping and damages it.
  *
- *   - **Somewhere to put it.** pWindowPosChanged is where win32u says
- *     where a window is and how big. The first time a window is visible
- *     and has a size, that becomes an ioctl(WMIO_CREATE) and the window
- *     appears on the Novaris desktop.
+ *   - **Somewhere to put it.** pWindowPosChanged says where a window is,
+ *     how big, and where it is in the stacking order. Every shown
+ *     top-level window becomes a /dev/wm window at exactly that place -
+ *     Novaris's compositor (Milestone 109) puts windows where Wine says,
+ *     the way a virtual desktop does, and stacks them in Wine's order.
  *
- *   - **Input coming back.** pProcessEvents drains ioctl(WMIO_POLL) and
- *     turns each event into an INPUT for NtUserSendHardwareInput. That
- *     call is the same one X11 and Wayland make; from user32 upwards
- *     there is no difference between a click on a Novaris window and a
- *     click on an X11 one.
- *
- * The bookkeeping in between is a fixed table of sixteen windows, because
- * sixteen is what kernel/wmdev.c has. A driver that quietly failed on the
- * seventeenth would be worse than one that says so.
+ *   - **Input coming back.** Each thread that pumps messages holds a
+ *     /dev/wm listener and has given it to the wineserver as its queue
+ *     descriptor, so a click wakes it. pProcessEvents drains the
+ *     listener and turns each event into an INPUT for
+ *     NtUserSendHardwareInput - the same call X11 and Wayland make. The
+ *     events carry screen coordinates and the wineserver finds the
+ *     window, so from user32 upwards a click on Novaris is a click.
  */
 
 #if 0
@@ -56,20 +56,17 @@
 #include <unistd.h>
 
 #include "novarisdrv.h"
+#include "wine/server.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(novarisdrv);
 
-#define NOVARIS_MAX_WINDOWS 16
+#define NOVARIS_MAX_WINDOWS 64
+
+static int thread_listener(void);
 
 static struct novaris_win_data win_data[NOVARIS_MAX_WINDOWS];
 
-/* --- the window table ---------------------------------------------------
- *
- * Guarded by one mutex rather than one per window: everything here is a
- * handful of integers and an ioctl, and a driver whose locking is more
- * complicated than the thing it protects is a driver with a deadlock in
- * it somewhere.
- */
+/* --- the window table --------------------------------------------------- */
 
 struct novaris_win_data *novaris_win_data_get(HWND hwnd)
 {
@@ -110,15 +107,18 @@ void novaris_win_data_release(struct novaris_win_data *data)
     if (data) pthread_mutex_unlock(&novaris_mutex);
 }
 
-/* Gives the kernel's slot back. Closing the descriptor is the whole of
- * it: /dev/wm frees the window when the last reference to the descriptor
- * goes, so there is nothing to tear down in the right order. */
-static void win_data_close(struct novaris_win_data *data)
+/* For legacy.c, which walks the table the way the driver used to. */
+struct novaris_win_data *novaris_win_data_slot(int i)
+{
+    return &win_data[i];
+}
+
+/* Closing the descriptor is the whole of it: /dev/wm frees the window
+ * when the last descriptor naming it goes. */
+void novaris_win_data_close(struct novaris_win_data *data)
 {
     if (data->pixels)
     {
-        /* The mapping's own length, not the window's: since the window
-         * resizes, `width`*`height` is no longer what was mapped. */
         munmap(data->pixels, data->bytes);
         data->pixels = NULL;
     }
@@ -128,8 +128,9 @@ static void win_data_close(struct novaris_win_data *data)
         data->fd = -1;
     }
     data->mapped = FALSE;
+    data->shown = FALSE;
     data->width = data->height = 0;
-    data->stride = 0;
+    data->stride = data->cap_h = 0;
     data->bytes = 0;
 }
 
@@ -138,58 +139,37 @@ void novaris_win_data_destroy(HWND hwnd)
     struct novaris_win_data *data;
 
     if (!(data = novaris_win_data_get(hwnd))) return;
-    win_data_close(data);
+    novaris_win_data_close(data);
     data->hwnd = 0;
     novaris_win_data_release(data);
 }
 
-/* --- which windows get one ----------------------------------------------
+/* --- which windows get one ------------------------------------------------
  *
- * Not every HWND is a window somebody should see. Wine creates a desktop
- * window, a message-only window per thread, child controls, and tool
- * windows that are never meant to be managed - and the first version of
- * this driver gave every one of them a /dev/wm slot, which is why a
- * screenshot of Notepad had four empty black windows behind it.
- *
- * The test is Wine's own, from nodrv_CreateWindow and X11's
- * is_window_managed: a window is ours if the desktop is its parent and it
- * looks like something a user would drag - a caption, a resizable frame,
- * or the explicit "this is an application window" flag. Everything else
- * is drawn by whoever owns it, into a surface nobody shows.
+ * Every top-level window. Until Milestone 109 only windows with a caption
+ * or a frame got one, because the kernel drew a frame around each and a
+ * frame around a menu is wrong - which meant menus, tooltips, combo-box
+ * drop-downs and every borderless main window (a browser's, a game
+ * launcher's) were drawn by win32u into a surface nobody showed. Now the
+ * kernel draws no frames and Wine draws its own, so the test is only
+ * whether the window is a top-level one: a child is drawn into its
+ * parent's surface already, and a message-only window is never seen.
  */
 static BOOL should_manage(HWND hwnd)
 {
-    UINT style, ex_style;
     HWND parent;
 
     if (!hwnd || hwnd == NtUserGetDesktopWindow()) return FALSE;
-
     parent = NtUserGetAncestor(hwnd, GA_PARENT);
     if (!parent) return FALSE;                              /* a desktop */
     if (parent == UlongToHandle(NtUserGetThreadInfo()->msg_window))
         return FALSE;                                       /* HWND_MESSAGE */
     if (parent != NtUserGetDesktopWindow()) return FALSE;   /* a child */
-
-    style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
-    if ((style & (WS_CHILD | WS_POPUP)) == WS_CHILD) return FALSE;
-    if ((style & WS_CAPTION) == WS_CAPTION) return TRUE;
-    if (style & WS_THICKFRAME) return TRUE;
-
-    ex_style = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
-    if (ex_style & WS_EX_APPWINDOW) return TRUE;
-    /* A popup with a system menu is a dialog in everything but name. */
-    if ((style & WS_POPUP) && (style & WS_SYSMENU)) return TRUE;
-
-    return FALSE;
+    return TRUE;
 }
 
-/* --- getting a window onto the desktop ---------------------------------- */
+/* --- getting a window onto the desktop ----------------------------------- */
 
-/* The title, as a /dev/wm expects it: 7-bit, NUL-terminated, short.
- * Novaris draws its window titles in an 8x16 bitmap font that has no
- * glyphs above 126, so anything else would be drawn as nothing at all -
- * better to see "Notepad" with a character missing than a blank title
- * bar. */
 static void window_title(HWND hwnd, char *out, unsigned int size)
 {
     WCHAR buffer[WM_DEV_TITLE_MAX];
@@ -202,13 +182,11 @@ static void window_title(HWND hwnd, char *out, unsigned int size)
     if (!out[0]) strcpy(out, "Wine");
 }
 
-/* Opens the window, at the size win32u says the *visible* rectangle is.
- * Called from pWindowPosChanged, which is the first moment both facts are
- * known: that the window is visible, and how big. */
-static BOOL window_create(struct novaris_win_data *data, int width, int height)
+BOOL novaris_window_create(struct novaris_win_data *data, int width, int height)
 {
     struct wm_create create;
     struct wm_info info;
+    UINT64 id = (UINT64)(ULONG_PTR)data->hwnd;
 
     if (width <= 0 || height <= 0) return FALSE;
 
@@ -223,21 +201,10 @@ static BOOL window_create(struct novaris_win_data *data, int width, int height)
     create.h = height;
     window_title(data->hwnd, create.title, sizeof(create.title));
 
-    if (ioctl(data->fd, WMIO_CREATE, &create) != 0)
+    if (ioctl(data->fd, WMIO_CREATE, &create) != 0 ||
+        ioctl(data->fd, WMIO_GETINFO, &info) != 0 || !info.stride || !info.bytes)
     {
         ERR("%s refused a %dx%d window\n", WMDEV_PATH, width, height);
-        close(data->fd);
-        data->fd = -1;
-        return FALSE;
-    }
-
-    /* How big the buffer actually is, which is not how big the window is:
-     * the kernel sizes it for the largest this window could be shown at so
-     * that a resize never moves it. Map all of it, once - every later
-     * resize is then a change of `width`/`height` and nothing else. */
-    if (ioctl(data->fd, WMIO_GETINFO, &info) != 0 || !info.stride || !info.bytes)
-    {
-        ERR("%s did not answer WMIO_GETINFO\n", WMDEV_PATH);
         close(data->fd);
         data->fd = -1;
         return FALSE;
@@ -253,33 +220,51 @@ static BOOL window_create(struct novaris_win_data *data, int width, int height)
         return FALSE;
     }
 
+    /* The HWND is the window's name in the kernel too: it is the same
+     * number in every Wine process, so a window in one process can be
+     * stacked directly below another process's. */
+    ioctl(data->fd, WMIO_SETID, &id);
+
     data->width = width;
     data->height = height;
     data->stride = info.stride;
+    data->cap_h = info.cap_h;
     data->bytes = info.bytes;
     data->mapped = TRUE;
+    data->shown = TRUE;
 
-    TRACE("hwnd %p -> %dx%d window \"%s\" (buffer %ux%u)\n", data->hwnd, width, height,
-          create.title, info.stride, info.cap_h);
+    TRACE("hwnd %p -> %dx%d window \"%s\"\n", data->hwnd, width, height, create.title);
     return TRUE;
+}
+
+/* Where a window goes in the stack, found the way the X11 driver finds
+ * it: the nearest window above it in Wine's own order that is on the
+ * Novaris desktop too. With none, it is on top. Asked before the table
+ * is locked, because it calls back into win32u. */
+static void stacking_for(HWND hwnd, struct wm_stack *stack)
+{
+    HWND prev = NtUserGetWindowRelative(hwnd, GW_HWNDPREV);
+
+    while (prev && (!(NtUserGetWindowLongW(prev, GWL_STYLE) & WS_VISIBLE) ||
+                    !should_manage(prev)))
+        prev = NtUserGetWindowRelative(prev, GW_HWNDPREV);
+
+    memset(stack, 0, sizeof(*stack));
+    if (prev)
+    {
+        stack->mode = WM_STACK_BELOW;
+        stack->other = (UINT64)(ULONG_PTR)prev;
+    }
+    else stack->mode = WM_STACK_TOP;
 }
 
 /**********************************************************************
  *      WindowPosChanged
  *
- * Everything about where a window is arrives here: shown, hidden, moved,
- * resized, minimized. Novaris's window manager places and moves windows
- * itself - a program does not get to say where on the desktop it lands,
- * the same way it does not under a tiling window manager - so a move is
- * ignored and three things are acted on: a window becoming visible for
- * the first time, which opens it; a window becoming hidden, which closes
- * it; and a size change, which since Milestone 42 the window follows.
- *
- * A size change used to be deliberately ignored, because /dev/wm could
- * not resize a mapping under a process drawing into it. It no longer has
- * to: the kernel allocates the buffer for the largest the window can be
- * shown at and the client size is a sub-rectangle of it, so following a
- * resize is two stores here and nothing at all underneath.
+ * Shown, hidden, moved, resized or restacked: all of it arrives here,
+ * and all of it is passed on. The kernel's window is the window's
+ * visible rectangle, at its screen position; it grows by being made
+ * again at the new size, since its buffer cannot.
  */
 void NOVARIS_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                               const struct window_rects *new_rects,
@@ -288,105 +273,121 @@ void NOVARIS_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     struct novaris_win_data *data;
     UINT style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
     BOOL visible = (style & WS_VISIBLE) && !(style & WS_MINIMIZE);
+    BOOL restack = !(swp_flags & SWP_NOZORDER) || (swp_flags & SWP_SHOWWINDOW);
+    struct wm_stack stack;
+    struct wm_rect place;
     int width, height;
 
-    /* A window that is not ours never gets a slot in the first place, but
-     * one that *was* ours and has stopped being (a window can lose its
-     * caption) has to give its slot back. */
+    if (!novaris_compositor)
+    {
+        legacy_window_pos_changed(hwnd, insert_after, owner_hint, swp_flags, new_rects, surface);
+        return;
+    }
     if (!should_manage(hwnd))
     {
         novaris_win_data_destroy(hwnd);   /* a no-op if it never had one */
         return;
     }
 
-    if (!(data = novaris_win_data_get_or_create(hwnd))) return;
-
-    data->rects = *new_rects;
     width = new_rects->visible.right - new_rects->visible.left;
     height = new_rects->visible.bottom - new_rects->visible.top;
+    if (width > 2048) width = 2048;
+    if (height > 2048) height = 2048;
 
-    TRACE("hwnd %p %s style %08x visible %u %dx%d\n", hwnd,
-          debugstr_window_rects(new_rects), style, visible, width, height);
-
-    /* Clamped to the desktop, because a window may legitimately be bigger
-     * than the screen and /dev/wm allocates what it is asked for. Wine
-     * also resolves CW_USEDEFAULT against the screen it knows about, so a
-     * request far outside it is a sign the display devices are not
-     * reported yet rather than something to honour. */
-    if (width > novaris_screen.w) width = novaris_screen.w;
-    if (height > novaris_screen.h) height = novaris_screen.h;
-
-    /* And big enough to be worth a frame. Explorer keeps a couple of
-     * captioned windows whose client area is a pixel or two tall - real
-     * windows, but not ones anybody is meant to look at, and a Novaris
-     * frame around one is 32 pixels of title bar over nothing. Sixteen
-     * square is well under any window a program shows on purpose. */
-    if (visible && !data->mapped && !data->closing && width >= 16 && height >= 16)
-        window_create(data, width, height);
-    else if (!visible && data->mapped) win_data_close(data);
-    else if (data->mapped && (width != data->width || height != data->height) &&
-             width > 0 && height > 0)
+    if (visible)
     {
-        /* A program resized its own window. Since Milestone 42 that costs
-         * nothing on this side: the buffer was allocated for the largest
-         * this window can be, so the mapping and its stride are unchanged
-         * and only the part of it that is shown moves. Clamped to the
-         * buffer, because the kernel will show at most that much.
-         *
-         * win32u recreates the window surface on a size change and will
-         * flush the whole of it, so there is no repaint to ask for here. */
-        if (width > data->stride) width = data->stride;
-        data->width = width;
-        data->height = height;
-        TRACE("hwnd %p resized to %dx%d\n", hwnd, width, height);
+        stacking_for(hwnd, &stack);
+        /* The thread that shows a window is the one input will be for,
+         * and it must be watching before any arrives: win32u only calls
+         * ProcessEvents once the wineserver has seen the listener
+         * readable, so a listener made inside ProcessEvents is never
+         * made at all. */
+        if (novaris_compositor) thread_listener();
+    }
+
+    if (!(data = novaris_win_data_get_or_create(hwnd))) return;
+    data->rects = *new_rects;
+
+    TRACE("hwnd %p %s style %08x visible %u swp %04x\n", hwnd,
+          debugstr_window_rects(new_rects), style, visible, swp_flags);
+
+    if (!visible || width <= 0 || height <= 0)
+    {
+        if (data->mapped && data->shown)
+        {
+            int off = 0;
+            ioctl(data->fd, WMIO_SHOW, &off);
+            data->shown = FALSE;
+        }
+        novaris_win_data_release(data);
+        return;
+    }
+
+    if (data->mapped && (width > data->stride || height > data->cap_h))
+    {
+        TRACE("hwnd %p grew to %dx%d past its %dx%d buffer\n", hwnd, width, height,
+              data->stride, data->cap_h);
+        novaris_win_data_close(data);
+        restack = TRUE;
+    }
+    if (!data->mapped)
+    {
+        if (!novaris_window_create(data, width, height))
+        {
+            novaris_win_data_release(data);
+            return;
+        }
+        restack = TRUE;
+    }
+
+    place.x = new_rects->visible.left;
+    place.y = new_rects->visible.top;
+    place.w = width;
+    place.h = height;
+    ioctl(data->fd, WMIO_MOVE, &place);
+    data->width = width;
+    data->height = height;
+
+    if (restack) ioctl(data->fd, WMIO_STACK, &stack);
+    if (!data->shown)
+    {
+        int on = 1;
+        ioctl(data->fd, WMIO_SHOW, &on);
+        data->shown = TRUE;
     }
 
     novaris_win_data_release(data);
 }
 
 /**********************************************************************
+ *      ActivateWindow
+ *
+ * Wine does not raise a window it activates: on X11 and Wayland the
+ * window manager does, and Wine reads the new order back. Here the
+ * window manager is this driver, so a window that becomes the
+ * foreground is put on top of Wine's own order - which comes back
+ * through WindowPosChanged to the compositor like any other restack,
+ * and takes the window's owned popups with it, as on Windows.
+ */
+void NOVARIS_ActivateWindow(HWND hwnd, HWND previous)
+{
+    if (!novaris_compositor || !should_manage(hwnd)) return;
+    NtUserSetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+/**********************************************************************
  *      GetWindowStyleMasks
  *
- * "Which of these styles do you draw yourself?" Novaris's window manager
- * draws a title bar with the usual three buttons and a resizable frame
- * around every window it owns, so win32u must not draw them too - and
- * without this it did, leaving Notepad with its own blue caption sitting
- * inside the one Novaris had already drawn for it.
- *
- * Two things about the implementation, both learnt the hard way.
- *
- * It answers from the styles it is passed and calls nothing. This runs
- * inside win32u's window-position calculation - get_visible_rect(), with
- * the window locked - so a driver that calls back into win32u here
- * answers at the wrong time. X11's version calls nothing either, and that
- * is not an accident.
- *
- * And it depends on there being a font. win32u turns the mask into a
- * rectangle with NtUserAdjustWindowRect, whose caption height is
- * SM_CYCAPTION, which normalize_nonclientmetrics() computes as
- * `max(iCaptionHeight, 2 + tm.tmHeight)` for the caption font. With no
- * font engine that TEXTMETRICW is uninitialised, tm.tmHeight came out at
- * about six and three quarter million, and implementing this produced a
- * Notepad window 952 pixels wide and one pixel tall - invisible, with a
- * transcript that passed every assertion. That is why tools/install_wine.sh
- * ships Wine's fonts and FreeType: not for the text, though the text is
- * the visible half, but because the window frame is measured in glyphs.
+ * "Which of these styles do you draw yourself?" None, on the compositor:
+ * win32u draws every frame and caption, and hit-tests them, as it does
+ * on Windows. The 32-bit kernel draws its own (legacy.c).
  */
 BOOL NOVARIS_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style,
                                  UINT *style_mask, UINT *ex_style_mask)
 {
-    (void)hwnd;
-    *style_mask = *ex_style_mask = 0;
-
-    if ((style & (WS_CHILD | WS_POPUP)) == WS_CHILD) return TRUE;
-
-    if ((style & WS_CAPTION) == WS_CAPTION || (style & WS_THICKFRAME) ||
-        (ex_style & WS_EX_APPWINDOW))
-    {
-        *style_mask = WS_CAPTION | WS_DLGFRAME | WS_THICKFRAME;
-        *ex_style_mask = WS_EX_DLGMODALFRAME;
-    }
-    return TRUE;
+    if (!novaris_compositor)
+        return legacy_get_window_style_masks(hwnd, style, ex_style, style_mask, ex_style_mask);
+    return FALSE;
 }
 
 /**********************************************************************
@@ -415,7 +416,7 @@ void NOVARIS_DestroyWindow(HWND hwnd)
     novaris_win_data_destroy(hwnd);
 }
 
-/* --- the window surface -------------------------------------------------- */
+/* --- the window surface ---------------------------------------------------- */
 
 struct novaris_window_surface
 {
@@ -430,20 +431,12 @@ static struct novaris_window_surface *surface_cast(struct window_surface *base)
 
 static void novaris_surface_set_clip(struct window_surface *base, const RECT *rects, UINT count)
 {
-    /* Novaris composites the window itself and clips to the frame, so
-     * there is nothing here that the compositor is not already doing. */
 }
 
-/* GDI has finished drawing; `color_bits` is the surface's own DIB and
- * `dirty` is what changed, in surface coordinates. One row-by-row copy
- * into the window's mapping and one damage call.
- *
- * The copy is the price of not owning the surface's memory. It could be
- * avoided by passing the /dev/wm mapping to window_surface_create() as
- * the bitmap's bits, and that is worth doing - but only once resizing
- * works, because today the mapping's size is fixed at creation and a
- * surface is recreated on every size change.
- */
+/* GDI has finished drawing. `rect` is where the surface is in the
+ * window's visible rectangle - not always its top-left: win32u crops a
+ * surface to the screen - and `dirty` is what changed, in the surface's
+ * own coordinates. */
 static BOOL novaris_surface_flush(struct window_surface *base, const RECT *rect, const RECT *dirty,
                                   const BITMAPINFO *color_info, const void *color_bits,
                                   BOOL shape_changed, const BITMAPINFO *shape_info,
@@ -454,7 +447,7 @@ static BOOL novaris_surface_flush(struct window_surface *base, const RECT *rect,
     struct wm_rect damage;
     const char *src;
     char *dst;
-    int src_stride, y, x0, y0, w, h;
+    int src_stride, y, x0, y0, w, h, wx, wy;
 
     if (!(data = novaris_win_data_get(surface->hwnd))) return FALSE;
     if (!data->mapped || !data->pixels)
@@ -463,26 +456,21 @@ static BOOL novaris_surface_flush(struct window_surface *base, const RECT *rect,
         return FALSE;
     }
 
-    /* Surface coordinates are relative to `rect`, which is the visible
-     * rectangle in screen coordinates; the window's pixels start at its
-     * own top-left, so the dirty rectangle is already what we want. */
     x0 = max(dirty->left, 0);
     y0 = max(dirty->top, 0);
-    w = min(dirty->right, data->width) - x0;
-    h = min(dirty->bottom, data->height) - y0;
-    if (w <= 0 || h <= 0)
+    wx = rect->left + x0;
+    wy = rect->top + y0;
+    w = min(dirty->right - x0, data->width - wx);
+    h = min(dirty->bottom - y0, data->height - wy);
+    if (wx < 0 || wy < 0 || w <= 0 || h <= 0)
     {
         novaris_win_data_release(data);
         return TRUE;
     }
 
-    /* The destination steps by the *buffer's* stride, which is wider than
-     * the window whenever the window is not at its largest. Stepping by
-     * `data->width` here would shear the picture the first time anything
-     * was resized. */
     src_stride = color_info->bmiHeader.biWidth * 4;
     src = (const char *)color_bits + (size_t)y0 * src_stride + (size_t)x0 * 4;
-    dst = (char *)data->pixels + ((size_t)y0 * data->stride + x0) * 4;
+    dst = (char *)data->pixels + ((size_t)wy * data->stride + wx) * 4;
 
     for (y = 0; y < h; y++)
     {
@@ -491,8 +479,8 @@ static BOOL novaris_surface_flush(struct window_surface *base, const RECT *rect,
         dst += (size_t)data->stride * 4;
     }
 
-    damage.x = x0;
-    damage.y = y0;
+    damage.x = wx;
+    damage.y = wy;
     damage.w = w;
     damage.h = h;
     ioctl(data->fd, WMIO_DAMAGE, &damage);
@@ -549,211 +537,165 @@ BOOL NOVARIS_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_re
     return TRUE;
 }
 
-/* --- input --------------------------------------------------------------
- *
- * Every event becomes an INPUT and goes through NtUserSendHardwareInput,
- * which is the same call X11 and Wayland make. Above this line there is
- * no difference between a click on a Novaris window and a click on an X
- * one - that is the point of doing it this way rather than posting
- * messages directly.
- */
+/* --- input ------------------------------------------------------------------ */
 
-/* `origin` is the window's visible top-left in screen coordinates, taken
- * under the lock and passed in rather than read here: NtUserSendHardwareInput
- * can run a message loop, a message loop can call back into
- * pProcessEvents, and this driver's mutex is not recursive. Nothing below
- * this line touches shared state. */
-static void send_mouse_input(HWND hwnd, POINT origin, const struct wm_event *ev)
+/* Each thread that waits for messages has a listener: a /dev/wm
+ * descriptor that is readable while this process has input. Handed to
+ * the wineserver as the thread's queue descriptor - exactly what X11
+ * does with its display connection - so a thread asleep in GetMessage
+ * is woken by a click rather than by its next timer. Kept in the
+ * thread's driver_data, biased by one. */
+static int thread_listener(void)
 {
-    INPUT input = {.type = INPUT_MOUSE};
+    struct ntuser_thread_info *info = NtUserGetThreadInfo();
+    HANDLE handle;
+    int fd, dummy = 0;
+    NTSTATUS status;
 
-    input.mi.dx = origin.x + ev->a;
-    input.mi.dy = origin.y + ev->b;
+    if (info->driver_data) return (int)info->driver_data - 1;
 
-    switch (ev->c)
+    if ((fd = open(WMDEV_PATH, O_RDWR)) < 0) return -1;
+    if (ioctl(fd, WMIO_LISTEN, &dummy) != 0)
     {
-    case WM_MOUSE_MOVE:
-    case WM_MOUSE_DRAG:
-        input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
-        break;
-    case WM_MOUSE_DOWN:
-    case WM_MOUSE_DOUBLE:
-        input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-        break;
-    case WM_MOUSE_UP:
-        input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
-        break;
-    case WM_MOUSE_RIGHT_DOWN:
-        input.mi.dwFlags = MOUSEEVENTF_RIGHTDOWN;
-        break;
-    case WM_MOUSE_WHEEL:
+        close(fd);
+        return -1;
+    }
+    info->driver_data = (UINT_PTR)fd + 1;
+
+    if (!(status = wine_server_fd_to_handle(fd, GENERIC_READ | SYNCHRONIZE, 0, &handle)))
+    {
+        SERVER_START_REQ( set_queue_fd )
+        {
+            req->handle = wine_server_obj_handle( handle );
+            status = wine_server_call( req );
+        }
+        SERVER_END_REQ;
+        if (status) ERR("the wineserver would not take the input descriptor: %08x\n", status);
+        NtClose(handle);
+    }
+    else ERR("no handle for the input descriptor: %08x\n", status);
+    return fd;
+}
+
+void NOVARIS_ThreadDetach(void)
+{
+    struct ntuser_thread_info *info = NtUserGetThreadInfo();
+
+    if (info->driver_data) close((int)info->driver_data - 1);
+    info->driver_data = 0;
+}
+
+/* The buttons the last pointer event this process sent held, so a new
+ * one can say which went down and which came up. Read and written only
+ * by the thread holding input_mutex. */
+static pthread_mutex_t input_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int last_buttons;
+
+static void send_pointer(const struct wm_event *ev)
+{
+    static const struct { int bit; DWORD down, up; } buttons[] =
+    {
+        { WM_BUTTON_LEFT,   MOUSEEVENTF_LEFTDOWN,   MOUSEEVENTF_LEFTUP },
+        { WM_BUTTON_RIGHT,  MOUSEEVENTF_RIGHTDOWN,  MOUSEEVENTF_RIGHTUP },
+        { WM_BUTTON_MIDDLE, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP },
+    };
+    INPUT input = {.type = INPUT_MOUSE};
+    unsigned int i;
+
+    /* Pixels, not the 0-65535 of SendInput: a driver's hardware input is
+     * in screen coordinates, as X11's is. */
+    input.mi.dx = ev->a;
+    input.mi.dy = ev->b;
+    input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+    NtUserSendHardwareInput(0, 0, &input, 0);
+
+    for (i = 0; i < ARRAY_SIZE(buttons); i++)
+    {
+        if (!((ev->c ^ last_buttons) & buttons[i].bit)) continue;
+        input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE |
+                           ((ev->c & buttons[i].bit) ? buttons[i].down : buttons[i].up);
+        NtUserSendHardwareInput(0, 0, &input, 0);
+    }
+    last_buttons = ev->c;
+
+    if (ev->d)
+    {
         input.mi.dwFlags = MOUSEEVENTF_WHEEL;
         input.mi.mouseData = ev->d * WHEEL_DELTA;
-        break;
-    default:
-        return;
+        NtUserSendHardwareInput(0, 0, &input, 0);
     }
-
-    NtUserSendHardwareInput(hwnd, 0, &input, 0);
 }
 
-/* Novaris reports a key as a character plus a code; Windows wants a
- * virtual key and a scan code. The mapping below covers what a keyboard
- * produces that a program acts on - letters, digits, and the keys with
- * names. It is not a keyboard layout: a real one would be a KBDTABLES
- * through pKbdLayerDescriptor, which is the next thing this driver needs
- * and does not have.
- *
- * The Novaris key codes above 255 are kernel/keyboard.h's KEY_*, in the
- * order they are declared there. */
-enum
+/* A Linux keycode is a set-1 scancode for the main block; the extended
+ * keys are the same codes behind an 0xE0. The scancode is what Wine
+ * wants: win32u turns it into a virtual key through the keyboard layout,
+ * which is what makes shift, caps lock and WM_CHAR come out right. */
+static int scancode_for(int key)
 {
-    NOVARIS_KEY_ESCAPE = 256, NOVARIS_KEY_BACKSPACE, NOVARIS_KEY_TAB,
-    NOVARIS_KEY_ENTER, NOVARIS_KEY_LEFT, NOVARIS_KEY_RIGHT,
-    NOVARIS_KEY_UP, NOVARIS_KEY_DOWN, NOVARIS_KEY_HOME, NOVARIS_KEY_END,
-    NOVARIS_KEY_PAGE_UP, NOVARIS_KEY_PAGE_DOWN, NOVARIS_KEY_DELETE,
-    NOVARIS_KEY_INSERT,
-};
-
-static WORD vkey_for(const struct wm_event *ev)
-{
-    int ch = ev->a;
-
-    switch (ev->b)
+    static const struct { unsigned short key, scan; } extended[] =
     {
-    case NOVARIS_KEY_ESCAPE:    return VK_ESCAPE;
-    case NOVARIS_KEY_BACKSPACE: return VK_BACK;
-    case NOVARIS_KEY_TAB:       return VK_TAB;
-    case NOVARIS_KEY_ENTER:     return VK_RETURN;
-    case NOVARIS_KEY_LEFT:      return VK_LEFT;
-    case NOVARIS_KEY_RIGHT:     return VK_RIGHT;
-    case NOVARIS_KEY_UP:        return VK_UP;
-    case NOVARIS_KEY_DOWN:      return VK_DOWN;
-    case NOVARIS_KEY_HOME:      return VK_HOME;
-    case NOVARIS_KEY_END:       return VK_END;
-    case NOVARIS_KEY_PAGE_UP:   return VK_PRIOR;
-    case NOVARIS_KEY_PAGE_DOWN: return VK_NEXT;
-    case NOVARIS_KEY_DELETE:    return VK_DELETE;
-    case NOVARIS_KEY_INSERT:    return VK_INSERT;
-    default: break;
-    }
+        {  96, 0x1c }, {  97, 0x1d }, {  98, 0x35 }, { 100, 0x38 }, { 102, 0x47 },
+        { 103, 0x48 }, { 104, 0x49 }, { 105, 0x4b }, { 106, 0x4d }, { 107, 0x4f },
+        { 108, 0x50 }, { 109, 0x51 }, { 110, 0x52 }, { 111, 0x53 }, { 125, 0x5b },
+        { 126, 0x5c }, { 127, 0x5d },
+    };
+    unsigned int i;
 
-    if (ch >= 'a' && ch <= 'z') return 'A' + (ch - 'a');
-    if (ch >= 'A' && ch <= 'Z') return ch;
-    if (ch >= '0' && ch <= '9') return ch;
-    if (ch == ' ') return VK_SPACE;
-    if (ch == '\n' || ch == '\r') return VK_RETURN;
-    if (ch == '\b') return VK_BACK;
-    if (ch == '\t') return VK_TAB;
-    return 0;
+    if (key > 0 && key < 0x59) return key;
+    for (i = 0; i < ARRAY_SIZE(extended); i++)
+        if (extended[i].key == key) return 0x100 | extended[i].scan;
+    return -1;
 }
 
-static void send_key_input(HWND hwnd, const struct wm_event *ev)
+static void send_key(const struct wm_event *ev)
 {
     INPUT input = {.type = INPUT_KEYBOARD};
-    WORD vkey = vkey_for(ev);
+    int scan = scancode_for(ev->a);
 
-    if (!vkey) return;
-
-    input.ki.wVk = vkey;
-    input.ki.wScan = 0;
-    input.ki.dwFlags = ev->d ? 0 : KEYEVENTF_KEYUP;
-
-    NtUserSendHardwareInput(hwnd, 0, &input, 0);
+    if (scan < 0) return;
+    input.ki.wScan = (scan & 0x100) ? 0xe000 | (scan & 0xff) : scan;
+    input.ki.dwFlags = KEYEVENTF_SCANCODE;
+    if (scan & 0x100) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    if (!ev->b) input.ki.dwFlags |= KEYEVENTF_KEYUP;
+    NtUserSendHardwareInput(0, 0, &input, 0);
 }
 
 /**********************************************************************
  *      ProcessEvents
  *
- * Called from win32u's message loop whenever a thread waits for a
- * message. Everything the driver has to say arrives here, and it must
- * not block: /dev/wm has no blocking read and the desktop is composited
- * by whichever process is asking, so a driver that waited would be
- * waiting for a frame it was itself supposed to draw.
- *
- * Returns whether an event was seen, which is what tells the caller to
- * check its message queue again before sleeping.
+ * Called by win32u only after the wineserver has seen this thread's
+ * listener readable and flagged its queue (QS_DRIVER); the server stops
+ * watching the listener until this says it drained. So it always says
+ * so: the input is the process's, not the thread's, and another thread
+ * may already have taken it - a FALSE here would leave the flag set and
+ * every wait on this thread returning at once. It must not block, and
+ * it may be re-entered - NtUserSendHardwareInput can run a message loop
+ * - so one thread drains at a time and a second leaves it to the first.
  */
 BOOL NOVARIS_ProcessEvents(DWORD mask)
 {
-    BOOL got_event = FALSE;
-    int i;
+    struct wm_event ev;
+    int fd;
 
-    for (i = 0; i < NOVARIS_MAX_WINDOWS; i++)
+    if (!novaris_compositor) return legacy_process_events(mask);
+    if ((fd = thread_listener()) < 0) return FALSE;
+    if (pthread_mutex_trylock(&input_mutex)) return TRUE;
+
+    while (ioctl(fd, WMIO_POLL, &ev) == 1)
     {
-        struct novaris_win_data *data;
-        struct wm_event ev;
-        HWND hwnd;
-        int fd;
-
-        pthread_mutex_lock(&novaris_mutex);
-        data = &win_data[i];
-        hwnd = data->hwnd;
-        fd = data->mapped ? data->fd : -1;
-        pthread_mutex_unlock(&novaris_mutex);
-
-        if (!hwnd || fd < 0) continue;
-
-        /* The lock is dropped across the ioctl and taken again to read
-         * `data`, rather than held across it: an ioctl on /dev/wm
-         * composites a frame, which can run arbitrary kernel drawing
-         * code, and holding a driver-wide lock through that would
-         * serialise every window in the process behind one. */
-        while (ioctl(fd, WMIO_POLL, &ev) == 1)
+        switch (ev.type)
         {
-            POINT origin;
-
-            got_event = TRUE;
-
-            if (!(data = novaris_win_data_get(hwnd))) break;
-            origin.x = data->rects.visible.left;
-            origin.y = data->rects.visible.top;
-            if (ev.type == WM_EV_CLOSE) data->closing = TRUE;
-            novaris_win_data_release(data);
-
-            /* Everything below runs with no lock held, because all of it
-             * can re-enter this driver through win32u. */
-            switch (ev.type)
-            {
-            case WM_EV_MOUSE:
-                send_mouse_input(hwnd, origin, &ev);
-                break;
-            case WM_EV_KEY:
-                send_key_input(hwnd, &ev);
-                break;
-            case WM_EV_CLOSE:
-                TRACE("hwnd %p closed by the user\n", hwnd);
-                NtUserPostMessage(hwnd, WM_SYSCOMMAND, SC_CLOSE, 0);
-                break;
-            case WM_EV_RESIZE:
-                /* The user dragged an edge on the Novaris desktop. Hand
-                 * the new size up to win32u, which recreates the window
-                 * surface at it, sends the program WM_SIZE, and comes
-                 * back down through WindowPosChanged - where the only
-                 * thing left to do is note the new width and height,
-                 * because since Milestone 42 the buffer and the mapping
-                 * are already the right ones.
-                 *
-                 * `ev.a`/`ev.b` are the kernel's client area, which is
-                 * the rectangle this driver asked for at WMIO_CREATE and
-                 * so is Wine's *visible* rectangle - the same quantity
-                 * window_create() was given. The frame Novaris draws
-                 * around it is the window manager's own and Wine does not
-                 * count it (see GetWindowStyleMasks).
-                 *
-                 * The re-entry terminates: SetWindowPos reaches
-                 * WindowPosChanged, which changes bookkeeping and sends
-                 * nothing back to /dev/wm. */
-                TRACE("hwnd %p resized to %dx%d by the user\n", hwnd, ev.a, ev.b);
-                if (ev.a > 0 && ev.b > 0)
-                    NtUserSetWindowPos(hwnd, 0, 0, 0, ev.a, ev.b,
-                                       SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-                break;
-            default:
-                break;
-            }
+        case WM_EV_POINTER:
+            send_pointer(&ev);
+            break;
+        case WM_EV_KEYCODE:
+            send_key(&ev);
+            break;
+        default:
+            break;
         }
     }
 
-    return got_event;
+    pthread_mutex_unlock(&input_mutex);
+    return TRUE;
 }

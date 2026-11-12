@@ -87,22 +87,58 @@ static void sync_report(int dev) {
 
 static int kbd_extended;        /* an 0xE0 prefix is pending */
 
+/* The extended set repeats base codes behind an 0xE0 prefix - the right
+ * Ctrl is E0 1D, the same 1D as the left one, and the arrow keys are the
+ * keypad's 8, 4, 6 and 2. Linux gives each its own keycode above the
+ * base block, and so does this, since Milestone 109: a window manager
+ * that turned the Up arrow into keypad 8 types an 8. */
+static const struct { uint8_t sc; uint16_t key; } extended[] = {
+    { 0x1C,  96 },  /* KEY_KPENTER   */
+    { 0x1D,  97 },  /* KEY_RIGHTCTRL */
+    { 0x35,  98 },  /* KEY_KPSLASH   */
+    { 0x38, 100 },  /* KEY_RIGHTALT  */
+    { 0x47, 102 },  /* KEY_HOME      */
+    { 0x48, 103 },  /* KEY_UP        */
+    { 0x49, 104 },  /* KEY_PAGEUP    */
+    { 0x4B, 105 },  /* KEY_LEFT      */
+    { 0x4D, 106 },  /* KEY_RIGHT     */
+    { 0x4F, 107 },  /* KEY_END       */
+    { 0x50, 108 },  /* KEY_DOWN      */
+    { 0x51, 109 },  /* KEY_PAGEDOWN  */
+    { 0x52, 110 },  /* KEY_INSERT    */
+    { 0x53, 111 },  /* KEY_DELETE    */
+    { 0x5B, 125 },  /* KEY_LEFTMETA  */
+    { 0x5C, 126 },  /* KEY_RIGHTMETA */
+    { 0x5D, 127 },  /* KEY_COMPOSE   */
+};
+
+int input64_scancode_for(int keycode) {
+    if (keycode > 0 && keycode < 0x59) return keycode;
+    for (unsigned i = 0; i < sizeof(extended) / sizeof(extended[0]); i++)
+        if (extended[i].key == keycode) return 0x100 | extended[i].sc;
+    return -1;
+}
+
 void input64_feed_scancode(uint8_t byte) {
     uint8_t code;
-    int released;
+    uint16_t key;
+    int released, was_extended;
 
     if (byte == 0xE0) { kbd_extended = 1; return; }
 
     released = (byte & 0x80) != 0;
     code     = byte & 0x7F;
-
-    /* The extended set repeats the base codes with a prefix - the right
-     * Ctrl is E0 1D, the same 1D as the left one. Linux gives those
-     * their own keycodes well above the base block; this driver reports
-     * the base keycode and does not pretend to tell the two apart,
-     * which is a limitation and not a lie as long as it is written
-     * down. */
+    key      = code;
+    was_extended = kbd_extended;
     kbd_extended = 0;
+
+    if (was_extended) {
+        /* E0 2A and E0 AA are the fake shifts a keyboard wraps around
+         * some extended keys; they are not keys. */
+        if (code == SC_LSHIFT || code == SC_RSHIFT) return;
+        for (unsigned i = 0; i < sizeof(extended) / sizeof(extended[0]); i++)
+            if (extended[i].sc == code) { key = extended[i].key; break; }
+    }
 
     switch (code) {
     case SC_LSHIFT:
@@ -127,7 +163,7 @@ void input64_feed_scancode(uint8_t byte) {
      * driver passes on as presses - a reader counting keystrokes would
      * over-count a held key, exactly as it would on a kernel that had
      * not been told to synthesise repeats either. */
-    push(INPUT64_KBD, EV64_KEY, code, released ? 0 : 1);
+    push(INPUT64_KBD, EV64_KEY, key, released ? 0 : 1);
     sync_report(INPUT64_KBD);
 }
 

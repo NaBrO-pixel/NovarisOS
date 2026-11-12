@@ -11366,6 +11366,137 @@ Both stay in, off, with the per-page breakdown in the `[faults]` line.
 Like the kernel lock before them, page faults are no longer where a page
 load's time goes; the emulated programs are.
 
+## Milestone 109 - a desktop: windows where Wine puts them, and a hand on the mouse
+
+The first step towards Steam. Steam's client is a borderless main window
+drawn by a Chromium (CEF) process, with menus, tooltips, a login dialog
+and a tray of popups around it, all clicked and typed into. None of that
+could work, and it was not obvious why, because one window - Chromium's,
+Milestone 98 - did.
+
+**What `/dev/wm` was.** A surface per descriptor, copied to the screen at
+the top-left corner one pixel at a time: no position, no stacking, no
+pointer, and `WMIO_POLL` always said nothing had happened. The driver hid
+every window without a caption, because the 32-bit kernel's window
+manager drew a frame around whatever it was given - so a menu, a tooltip,
+a combo box's list and any borderless main window were drawn by win32u
+into a surface nobody showed.
+
+**What it is now** (`kernel/wmdev64.c`, `include/wmdev64.h`):
+
+- **Windows where Wine puts them, stacked as Wine stacks them.**
+  `WMIO_MOVE` takes a window's screen position and shown size;
+  `WMIO_STACK` puts it on top, at the bottom, or directly below another
+  window named by `WMIO_SETID` - the HWND, which is the same number in
+  every Wine process, so one process can stack under another's.
+- **Composited.** A changed rectangle is redrawn from the stack a row at
+  a time: each pixel comes from the topmost window over it, or the
+  desktop, found span by span, and the row goes to the framebuffer in
+  one blit with the pointer already in it. Each pixel is written once.
+- **Frames are Wine's.** The driver no longer masks the caption and
+  border styles, so win32u draws and hit-tests them exactly as Windows
+  does; the kernel draws nothing around a window.
+- **Input, routed.** The PS/2 mouse moves a pointer the kernel owns. Each
+  packet goes to the process whose window is under it - or the one that
+  has it grabbed while a button is held, so a drag that leaves the window
+  still ends in it - and keys to the process whose window is in front.
+  Both arrive in screen coordinates and become `NtUserSendHardwareInput`;
+  the wineserver decides which window they are for, as it does for X11.
+  Extended keys now have Linux's own keycodes (Up is `KEY_UP`, not keypad
+  8), and the driver hands win32u scancodes, so the keyboard layout makes
+  shift, caps lock and `WM_CHAR` come out right.
+- **Something to wait on.** `WMIO_LISTEN` makes a descriptor that
+  `poll(2)` reports readable while its process has input. The driver
+  gives one per GUI thread to the wineserver with `set_queue_fd` - the X11
+  driver's arrangement for its display connection - so a thread asleep in
+  `GetMessage` wakes for a click.
+
+**Three things were between the injected click and the window**, each of
+which looked like the others from the outside - the click never arrived:
+
+1. win32u in Wine 11 calls a driver's `ProcessEvents` only after the
+   wineserver has seen the thread's queue descriptor readable. The first
+   driver made its listener inside `ProcessEvents`, so it never made one.
+   It is made now when a thread first shows a window.
+2. The image had the old driver. The initrd did not depend on the driver
+   built in the Wine tree, so a fixed driver was tested as the broken one
+   twice. `Makefile.amd64` now builds `wine/winenovaris.drv` into the Wine
+   tree and restages the initrd when its sources change.
+3. `epoll_ctl` refused every file descriptor with `EPERM`. Linux refuses
+   regular files, which are always ready, not devices that can say when
+   they are; the wineserver's watch on the listener failed and it never
+   looked again. A `/dev/wm` descriptor is accepted now.
+
+And one that was Wine's design rather than a bug: Wine does not raise a
+window it activates - the X11 or Wayland window manager does, and Wine
+reads the order back. Here the driver is the window manager, so its
+`ActivateWindow` puts the foreground window on top of Wine's own order,
+which comes back down as a restack.
+
+`ProcessEvents` always reports that it drained, because the input is the
+process's and another thread may already have taken it; reporting
+otherwise leaves the thread flagged and every wait on it returning at once.
+
+**The 32-bit kernel keeps the old driver.** Its window manager places
+windows and draws frames itself and sends window-relative events, and its
+desktop tests double-click icons and maximize buttons at fixed points. The
+driver asks `/dev/wm` for `WMIO_LISTEN` at start-up; a kernel that cannot
+listen gets the earlier code, unchanged but for names, in
+`wine/winenovaris.drv/legacy.c`.
+
+### Tested
+
+- **A kernel layer** (inside layer 6c, before the picture
+  `tools/fbtest.py` checks is drawn): 29 assertions on the compositor's
+  own calls - the front window wins where two overlap, raising and
+  stacking by id reorder them, hiding and moving leave what was behind,
+  a shrunk window shows only that much, a listener is readable only with
+  input, moves not yet read merge into one, a press, a drag off the
+  window and a release reach the same process, the pointer is drawn, and
+  a key is its Linux keycode. Plus one in the input layer: `E0 48` is
+  `KEY_UP`.
+- **`winedesk64.exe` under Wine**: two overlapping captioned windows and
+  a borderless topmost popup; the composed screen read back through
+  `WMIO_PEEK` (the framebuffer, not the window's surface); a click and
+  keys injected through `WMIO_INJECT` into the PS/2 decoder - the bytes a
+  mouse sends - from a second thread while the window's thread sleeps.
+  19 checks: placement, overlap, the popup on screen, Wine's caption, the
+  click at the exact client point **347 ms after it was sent, 300 of them
+  the test's own delay**, the window activated and raised, `WM_KEYDOWN`
+  and `WM_CHAR` "a" and shift "B", a move, a hide, a close.
+- **`make chrome-window`** passes, and looks different: Chromium's
+  900x640 window is at the `--window-position=40,40` it asked for, on a
+  desktop, with its whole tab strip and caption buttons - Milestone 98
+  had it at the corner with 23 pixels of it cut off - and the pointer
+  over the desktop.
+- `make test`: 32 PASS, 0 FAIL. The 32-bit tree's `make test-wine-gui`
+  and `make test-desktop-gui` pass with the same driver, through
+  `legacy.c`.
+
+### What Steam needs next
+
+In order, each a milestone:
+
+1. **OpenGL.** Wine 11's win32u already renders OpenGL through EGL on
+   Mesa's surfaceless platform into ordinary window surfaces, with no
+   help from the display driver; this Wine was configured without EGL.
+   Mesa 25.2's llvmpipe is on the build host. Wine rebuilt with EGL,
+   Mesa in the image (about 190MB with LLVM), and a GL program drawing a
+   triangle into a window.
+2. **Vulkan**, the same way: lavapipe, and win32u's headless surface.
+   DXVK and vkd3d sit on it, and DXVK is how most Steam games' Direct3D
+   9-11 reaches the screen under Wine.
+3. **A GPU.** On QEMU, virtio-gpu with virgl (OpenGL) or Venus (Vulkan):
+   a virtio PCI driver here, and Linux's virtgpu DRM interface at
+   `/dev/dri/renderD128` so Mesa's own drivers run unmodified. A laptop's
+   real GPU needs its own DRM driver - i915, amdgpu, nouveau - which is
+   out of reach for this kernel; virtio-gpu and software rendering are
+   the GPU paths that are not.
+4. **Steam itself**: `SteamSetup.exe`, then `steam.exe`, which downloads
+   its client and starts `steamwebhelper.exe` - Chromium Embedded, which
+   Milestone 98 already runs. It needs the real internet, which this
+   build machine does not have; that part is for a machine that does.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the

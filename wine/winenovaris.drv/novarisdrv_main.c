@@ -27,6 +27,10 @@
  * /dev/wm - the kernel hands out a window on its own desktop and the
  * pixels behind it, and the driver copies the surface into them.
  *
+ * Window frames are win32u's own: since Milestone 109 the kernel draws no
+ * decorations, so the caption, its buttons and the borders are drawn and
+ * hit-tested by Wine exactly as they are on Windows.
+ *
  * That is the whole driver. There is no OpenGL, no Vulkan, no clipboard,
  * no IME, no display-mode changing: those are all optional entry points
  * and win32u has sensible behaviour for a driver that does not fill them
@@ -53,6 +57,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(novarisdrv);
 pthread_mutex_t novaris_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 struct wm_rect novaris_screen = { 0, 0, 1024, 768 };
+BOOL novaris_compositor;
 
 /**********************************************************************
  *      UpdateDisplayDevices
@@ -102,11 +107,13 @@ UINT NOVARIS_UpdateDisplayDevices(const struct gdi_device_manager *manager, void
 
 static const struct user_driver_funcs novarisdrv_funcs =
 {
+    .pActivateWindow = NOVARIS_ActivateWindow,
     .pCreateWindowSurface = NOVARIS_CreateWindowSurface,
     .pDestroyWindow = NOVARIS_DestroyWindow,
     .pGetWindowStyleMasks = NOVARIS_GetWindowStyleMasks,
     .pProcessEvents = NOVARIS_ProcessEvents,
     .pSetWindowText = NOVARIS_SetWindowText,
+    .pThreadDetach = NOVARIS_ThreadDetach,
     .pUpdateDisplayDevices = NOVARIS_UpdateDisplayDevices,
     .pWindowPosChanged = NOVARIS_WindowPosChanged,
 };
@@ -127,6 +134,13 @@ static BOOL query_screen(void)
     if (ioctl(fd, WMIO_SCREEN, &r) == 0 && r.w > 0 && r.h > 0) novaris_screen = r;
     else WARN("%s did not answer WMIO_SCREEN; assuming %dx%d\n", WMDEV_PATH,
               novaris_screen.w, novaris_screen.h);
+    /* A /dev/wm that can listen is the compositor; one that cannot is
+     * the 32-bit kernel's window manager. The probe's listener goes with
+     * the descriptor. */
+    {
+        int dummy = 0;
+        novaris_compositor = ioctl(fd, WMIO_LISTEN, &dummy) == 0;
+    }
     close(fd);
 
     TRACE("desktop work area %dx%d at (%d,%d)\n",

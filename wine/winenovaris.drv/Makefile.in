@@ -5,5 +5,6 @@ IMPORTS = user32 win32u
 
 SOURCES = \
 	dllmain.c \
+	legacy.c \
 	novarisdrv_main.c \
 	window.c

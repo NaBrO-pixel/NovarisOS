@@ -77,6 +77,10 @@ uint64_t input64_irqs(int device);
  * only part that needs real hardware, and it is deliberately the only
  * part this does not do. */
 void input64_feed_scancode(uint8_t byte);
+
+/* The set-1 scancode for a Linux keycode, with 0x100 set for one that
+ * needs the 0xE0 prefix; -1 for a key this keyboard does not have. */
+int  input64_scancode_for(int keycode);
 void input64_feed_mouse_byte(uint8_t byte);
 
 /* The modifier state the driver is tracking, for tests. */

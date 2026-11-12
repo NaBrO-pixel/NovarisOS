@@ -61,6 +61,11 @@
 #define WMIO_TITLE   0x5705u   /* char[64]           */
 #define WMIO_SCREEN  0x5706u   /* struct wm_rect*    */
 #define WMIO_GETINFO 0x5707u   /* struct wm_info*    */
+#define WMIO_MOVE    0x5708u   /* struct wm_rect*: screen position, shown size */
+#define WMIO_SHOW    0x5709u   /* int*               */
+#define WMIO_STACK   0x570Au   /* struct wm_stack*   */
+#define WMIO_SETID   0x570Bu   /* UINT64*: the HWND  */
+#define WMIO_LISTEN  0x570Cu   /* int* (ignored)     */
 
 #define WM_DEV_TITLE_MAX 64
 
@@ -75,19 +80,29 @@ struct wm_rect
     int x, y, w, h;
 };
 
-/* The client area and the buffer behind it, which are not the same thing:
- * the kernel allocates for the biggest the window could be shown at, so a
- * row is `stride` pixels and not `w`. That is what makes the mapping
- * survive a resize - see the kernel's wmdev.c. */
+/* The window's shown size and the buffer behind it: a row is `stride`
+ * pixels. The kernel allocates the buffer at the size the window was
+ * created; a window that grows past it is made again. */
 struct wm_info
 {
-    unsigned int w, h;          /* the client area now */
-    unsigned int stride;        /* pixels per row of the buffer, >= w */
-    unsigned int cap_h;         /* rows in the buffer, >= h */
-    unsigned int bytes;         /* the mmap length */
+    unsigned int w, h;
+    unsigned int stride;
+    unsigned int cap_h;
+    unsigned int bytes;
 };
 
-/* Mouse event kinds, as the window manager routes them (kernel/wm.h). */
+#define WM_STACK_TOP    0
+#define WM_STACK_BOTTOM 1
+#define WM_STACK_BELOW  2   /* directly below the window whose id is `other` */
+
+struct wm_stack
+{
+    unsigned int mode, pad;
+    UINT64 other;
+};
+
+/* Mouse event kinds, as the 32-bit kernel's window manager routes them
+ * (kernel/wm.h). */
 enum
 {
     WM_MOUSE_MOVE,
@@ -102,11 +117,17 @@ enum
 enum
 {
     WM_EV_NONE = 0,
-    WM_EV_MOUSE,        /* a: x, b: y, c: kind, d: buttons or wheel */
-    WM_EV_KEY,          /* a: character, b: keycode, c: mods, d: pressed */
+    WM_EV_MOUSE,        /* 32-bit kernel: a: x, b: y (window), c: kind, d: buttons or wheel */
+    WM_EV_KEY,          /* 32-bit kernel: a: character, b: keycode, c: mods, d: pressed */
     WM_EV_CLOSE,
-    WM_EV_RESIZE,       /* a: w, b: h */
+    WM_EV_RESIZE,       /* 32-bit kernel: a: w, b: h */
+    WM_EV_POINTER,      /* a, b: screen position; c: buttons held; d: wheel */
+    WM_EV_KEYCODE,      /* a: Linux keycode; b: pressed */
 };
+
+#define WM_BUTTON_LEFT   0x1
+#define WM_BUTTON_RIGHT  0x2
+#define WM_BUTTON_MIDDLE 0x4
 
 struct wm_event
 {
@@ -116,11 +137,10 @@ struct wm_event
 
 /* --- per-window state ---------------------------------------------------
  *
- * One of these per HWND that has a window on the Novaris desktop. Not
- * every HWND does: Wine creates message-only windows, tool windows and
- * windows that are never shown, and giving each of those a slot would
- * exhaust the sixteen the kernel has before the program's real window
- * appeared. See novaris_win_data_create() for what qualifies.
+ * One of these per top-level HWND that is shown on the Novaris desktop -
+ * every one, since Milestone 109, menus and tooltips included. Child
+ * windows are drawn into their top-level window's surface by win32u and
+ * need nothing here.
  */
 
 struct novaris_win_data
@@ -128,12 +148,13 @@ struct novaris_win_data
     HWND    hwnd;
     int     fd;                 /* /dev/wm, one per window */
     void   *pixels;             /* the mapping; NULL until created */
-    int     width, height;      /* the client area now - this follows a resize */
-    int     stride;             /* pixels per row of the mapping; fixed */
+    int     width, height;      /* shown now */
+    int     stride, cap_h;      /* the buffer */
     size_t  bytes;              /* the mapping's length, for munmap */
     struct window_rects rects;  /* what win32u last told us */
     BOOL    mapped;             /* the kernel has a window for this */
-    BOOL    closing;            /* the user clicked the X */
+    BOOL    shown;
+    BOOL    closing;            /* 32-bit kernel: the user clicked its X */
 };
 
 extern pthread_mutex_t novaris_mutex;
@@ -142,6 +163,21 @@ struct novaris_win_data *novaris_win_data_get(HWND hwnd);
 struct novaris_win_data *novaris_win_data_get_or_create(HWND hwnd);
 void novaris_win_data_release(struct novaris_win_data *data);
 void novaris_win_data_destroy(HWND hwnd);
+struct novaris_win_data *novaris_win_data_slot(int i);
+BOOL novaris_window_create(struct novaris_win_data *data, int width, int height);
+void novaris_win_data_close(struct novaris_win_data *data);
+
+/* Whether /dev/wm is the 64-bit kernel's compositor, which places windows
+ * where Wine says and leaves their frames to Wine, or the 32-bit kernel's
+ * window manager, which does both itself (legacy.c). */
+extern BOOL novaris_compositor;
+
+void legacy_window_pos_changed(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                               const struct window_rects *new_rects,
+                               struct window_surface *surface);
+BOOL legacy_get_window_style_masks(HWND hwnd, UINT style, UINT ex_style,
+                                   UINT *style_mask, UINT *ex_style_mask);
+BOOL legacy_process_events(DWORD mask);
 
 /* The desktop's work area, cached at init: the screen as far as Wine is
  * concerned. */
@@ -157,6 +193,8 @@ void     NOVARIS_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint,
                                   const struct window_rects *new_rects,
                                   struct window_surface *surface);
 void     NOVARIS_SetWindowText(HWND hwnd, LPCWSTR text);
+void     NOVARIS_ThreadDetach(void);
+void     NOVARIS_ActivateWindow(HWND hwnd, HWND previous);
 BOOL     NOVARIS_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style,
                                      UINT *style_mask, UINT *ex_style_mask);
 
