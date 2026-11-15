@@ -38,7 +38,10 @@
  *   and the cost is paid on every component of every one of them.
  */
 
-#define RAMFS64_MAX_NODES 4096
+/* 32768 since Milestone 113: Steam's client alone is 7,720 files, and
+ * Wine, its prefix and their directories come on top. About 12MB of heap,
+ * which file contents no longer take (RAMFS64_HEAP_FILE_MAX). */
+#define RAMFS64_MAX_NODES 32768
 #define RAMFS64_NAME_MAX  256
 #define RAMFS64_PATH_MAX  1024
 

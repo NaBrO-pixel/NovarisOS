@@ -78,8 +78,8 @@ typedef struct {
     int      next_sibling;
 } node64_t;
 
-/* In the heap rather than in BSS: 4096 x sizeof(node64_t) is about
- * 1.2MB, and a kernel image does not need to carry it. */
+/* In the heap rather than in BSS: RAMFS64_MAX_NODES x sizeof(node64_t)
+ * is megabytes, and a kernel image does not need to carry it. */
 static node64_t* nodes;
 static uint64_t  node_count;
 
