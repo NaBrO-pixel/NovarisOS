@@ -57,19 +57,29 @@ def main():
         if os.path.exists(p):
             os.unlink(p)
 
-    net = ["-netdev", "user,id=n0", "-device", "rtl8139,netdev=n0"]
+    # The boot's own network layer (userland/inet64.c) expects the servers
+    # tools/net64_helper.py runs, on the ports make test uses, and has the
+    # host connect to the guest's port 8080: without them it waits there.
+    here = os.path.dirname(os.path.abspath(__file__))
+    ports = dict(http=18780, dns=18781, fwd=18782, https=18783)
+    helper = subprocess.Popen(
+        [sys.executable, os.path.join(here, "net64_helper.py"), "--http", str(ports["http"]),
+         "--https", str(ports["https"]), "--dns", str(ports["dns"]), "--connect", str(ports["fwd"]),
+         "--status", os.path.join(build, "gui-net64.status")],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    net = ["-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:%d-:8080" % ports["fwd"],
+           "-device", "rtl8139,netdev=n0"]
     wrap, dns = [], None
     if proxy_port:
         resolv = os.path.join(build, "gui-resolv.conf")
         with open(resolv, "w") as f:
             f.write("nameserver 127.0.0.1\n")
-        wrap = ["sh", os.path.join(os.path.dirname(os.path.abspath(__file__)), "qemu_net64.sh"), resolv]
+        wrap = ["sh", os.path.join(here, "qemu_net64.sh"), resolv]
         probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             probe.bind(("127.0.0.1", 53))
             probe.close()
-            dns = subprocess.Popen([sys.executable, "-I", os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                                                     "dohdns.py")])
+            dns = subprocess.Popen([sys.executable, "-I", os.path.join(here, "dohdns.py")])
         except OSError:
             probe.close()   # one is already answering there
     qemu = subprocess.Popen(
@@ -121,6 +131,7 @@ def main():
         qemu.wait()
         if dns:
             dns.kill()
+        helper.kill()
 
     failed = [k for k, v in verdicts.items() if not v]
     print("--- %d screendumps in %s" % (len(taken), shots))
