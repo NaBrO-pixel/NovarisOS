@@ -1221,7 +1221,12 @@ static void run_wine_program(const void* image, uint64_t len,
  * A title of "-" is a step, not a window: a program that is meant to
  * exit by itself within its seconds - `regedit /S` importing the
  * settings the programs after it need (font stand-ins, a proxy). It
- * passes when it exits with 0: "<label> = ran" or "= failed". */
+ * passes when it exits with 0: "<label> = ran" or "= failed".
+ *
+ * A program of "cat" is not run at all: each argument is a file in this
+ * filesystem, printed to the serial line by the kernel - how a program's
+ * own logs leave the machine (Steam's, which name what went wrong) even
+ * when what is still running leaves no room to start another process. */
 #define GUI_APPS_PATH "/usr/share/novaris/gui-apps.txt"
 
 static char* gui_field(char** p) {
@@ -1272,6 +1277,29 @@ static void gui_apps_layer(const void* image, uint64_t len,
         }
         args[nargs] = 0;
 
+        if (!kstrcmp(program, "cat")) {
+            for (int a = 0; a < nargs; a++) {
+                static char chunk[4096];
+                int node = ramfs64_lookup(args[a]);
+                uint64_t off = 0;
+                int64_t got;
+
+                serial64_puts("NOVARIS64: --- cat ");
+                serial64_puts(args[a]);
+                serial64_puts(node < 0 ? " (no such file) ---\n" : " ---\n");
+                if (node < 0) continue;
+                while ((got = ramfs64_read(node, off, chunk, sizeof(chunk))) > 0) {
+                    for (int64_t k = 0; k < got; k++)
+                        if (chunk[k] != '\r') serial64_putc(chunk[k]);
+                    off += (uint64_t)got;
+                }
+                serial64_puts("\nNOVARIS64: --- end of cat ---\n");
+            }
+            serial64_puts("NOVARIS64: gui ");
+            serial64_puts(label);
+            serial64_puts(" = ran\n");
+            continue;
+        }
         if (title[0] == '-' && !title[1]) {
             run_wine_program(image, len, ld_image, ld_len, env, kspace, label,
                              "done", program, args, seconds * CLOCK64_HZ, 0);
