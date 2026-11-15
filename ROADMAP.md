@@ -11698,6 +11698,149 @@ here is the virtual one: **virtio-gpu**, found above, whose 3D mode
 (virgl for OpenGL, Venus for Vulkan) gives a guest the host's GPU
 through Mesa drivers that are already on this machine.
 
+## Milestone 113 - Steam's client, and graphical programs with all of Wine
+
+The request was Steam working, and graphical, DLL-heavy programs rather
+than headless ones. Both now run on NovarisOS: six of Wine's own
+programs open their windows with every Wine module staged
+(`docs-gui-apps.png`), and Steam's 64-bit client updates itself through
+the network, restarts, starts its whole Chromium process tree and shows
+its real sign-in window - form, links and a live QR code from Valve's
+authentication service - on the NovarisOS desktop
+(`docs-steam-on-novaris.png`).
+
+### Drawing into another process's window
+
+Steam's client is CEF, and Chromium paints from its GPU process: a
+`GetDC` on the browser's window, which belongs to another process, and a
+`BitBlt` into it. win32u gives such a DC no window surface, so it draws
+through the display driver's own GDI device - which winenovaris.drv did
+not have. Under X11 the X server is that device; here every
+Chromium-based window stayed black.
+
+- **`WMIO_ATTACH`** (kernel/wmdev64.c): a second descriptor on an
+  existing `/dev/wm` window, named by its id, with the window's pixels
+  mmapped. The driver gives every window its HWND as its id, so any
+  process can reach any window.
+- **`wine/winenovaris.drv/gdi.c`**: the driver's GDI device, the X11
+  driver's arrangement. `GetDC` tells it by escape which top-level
+  window and where in it; `PutImage` - every blit from a bitmap - writes
+  into that window's buffer through `WMIO_ATTACH` and damages it. A
+  window's own process still draws through its surface.
+- **Offscreen mode** (`NOVARIS_OFFSCREEN=<dir>`, `offscreen.c`): the same
+  driver on the build machine's Wine without `/dev/wm`, each window a
+  file, the desktop composited to a PPM every half second. Every fix
+  below was found there first, in seconds rather than an emulated hour.
+
+### Steam on the build machine first
+
+- **Network.** Steam's updater is WinHTTP, which reads only the IE
+  proxy settings; `tools/wine_proxy_reg.py` writes them (including the
+  binary `DefaultConnectionSettings`). It resolves names before asking
+  for a proxy, and this machine has no resolver of its own:
+  `tools/dohdns.py` answers DNS by DNS-over-HTTPS through the proxy.
+  Wine needed rebuilding with GnuTLS. With those, Steam downloaded its
+  update and launched the client.
+- **Text.** Steam's UI names "Motiva Sans, Arial, Helvetica,
+  sans-serif", and a Wine prefix has no Arial. Chromium 126, inside
+  Steam, then draws nothing at all - not even a fallback - and
+  reported its own web font as failed because no last-resort font
+  existed while it loaded. `tools/wine_font_reg.py` makes Arial,
+  Helvetica, Times New Roman, Courier New and others aliases of the
+  Liberation fonts (SIL OFL) in `HKCU\Software\Wine\Fonts\Replacements`,
+  which Wine's DirectWrite applies. Written as plain strings: `reg
+  import` widens a `hex(7)` multi-string's bytes a second time.
+
+### Graphical programs: `make -f Makefile.amd64 test-gui-apps`
+
+`/usr/share/novaris/gui-apps.txt` (`tools/gui_apps.txt`) is a list of
+`label|program|arguments|window title|seconds`. Each runs its time and
+must leave a shown window with that title and something drawn in it;
+`tools/guitest.py` photographs each through QEMU's monitor. A title of
+`-` is a step that must exit 0 (`regedit /S` importing fonts and proxy);
+a program of `cat` is the kernel printing files from its filesystem.
+Every Wine module is staged (`WINE64_ALL_MODULES`), and the Liberation
+fonts, the settings and an `/etc/resolv.conf` with it.
+
+It passed only after five things the extra modules exposed:
+
+1. **The kernel heap.** Every file up to 32MB lived in one heap block,
+   and the heap is 256MB shared with every pipe buffer. Unpacking the
+   initrd filled it with DLLs; `wineboot` copying each DLL into
+   `system32` filled it again, after which a pipe's 64KB buffer could
+   not be had and every new Wine process failed to reach its server
+   ("pipe: Too many open files in system"). Now only small files (64KB)
+   and initrd programs that `execve` reads in one piece - ELF programs
+   and the dynamic loader - are heap blocks; everything else is frames.
+2. **Mono.** With `appwiz.cpl` staged, `wineboot` ends by offering to
+   download Mono, in a dialog nobody answers. `WINEDLLOVERRIDES=
+   mscoree,mshtml=` skips both offers.
+3. **4GB of guest memory** for this test (12GB with Steam).
+4. **The boot's network layer** waits for the host to connect to the
+   guest; `guitest.py` runs `net64_helper.py` as `make test` does.
+5. A run is judged when its program exits; see "the run follows" below.
+
+Result: `PASS: 7 graphical program(s) opened their windows: settings
+notepad regedit winecfg taskmgr winemine control`.
+
+### Steam inside NovarisOS
+
+`make -f Makefile.amd64 test-gui-apps GUI_APPS_LIST=tools/gui_apps_steam.txt
+STEAM64_DIR=<installed Steam> GUI_PROXY_PORT=<proxy port>` stages Steam
+at `/opt/steam` (7,720 files, 1.1GB) and points the guest at the build
+machine's proxy as `10.0.2.2:<port>`, with guest DNS through QEMU's
+forwarder to `dohdns.py`. Six more walls, in order:
+
+- **`mkinitrd.py` was quadratic** (`blobs += data`): over half an hour
+  and 2.2GB for Steam. It streams now; the output is byte-identical.
+- **The boot window.** pmm64 writes its bitmap after the boot modules,
+  through the 1GB boot64.s maps, before the direct map exists; a 1.4GB
+  initrd ends past it, the allocator refused, and the boot found no
+  RAM. `0xFFFFFFFFC0000000` now maps the second gigabyte.
+- **4096 filesystem nodes**, now 32768.
+- **The run follows a launcher.** Steam's bootstrapper updates the
+  client, starts it again and exits 42; the run ended there and the
+  client was killed before it drew. `syscall64_set_leader_follow`, on
+  for windows, hands the run to the oldest newer process.
+- **`TCP_INFO`.** The client accepts its UI's WebSocket (loopback TCP)
+  only after finding the connecting socket in Windows' TCP table,
+  established and owned by steamwebhelper. Wine's server builds that
+  table from `getsockopt(TCP_INFO)`'s `tcpi_state`, which this kernel
+  answered, like every option it does not keep, with an int of 0 -
+  "closed" - so every connection was refused and Steam showed
+  "Unexpected Transport Error (0x3008)". Found from Steam's own logs,
+  printed from inside the guest by the `cat` step. TCP_INFO now
+  reports LISTEN, SYN_SENT, ESTABLISHED, FIN_WAIT1, CLOSE_WAIT or CLOSE.
+- Then the sign-in window: "Waiting for network…", and a few minutes
+  later the form and QR code.
+
+### Everything else still passes
+
+The kernel changes here touch every file (the heap and frames), every
+boot (the second gigabyte, 32768 nodes) and every socket (`TCP_INFO`),
+so all of it was run again: `make -f Makefile.amd64 WINE64_INSTALL=1
+MESA64_INSTALL=1 test` 38 PASS, `make -f Makefile.amd64 test` 32 PASS,
+`make test` (the 32-bit tree), `make -f Makefile.amd64 test-gpu`, `make
+-f Makefile.amd64 chrome-window` with `CHROMIUM64_FILES='$(CHROMIUM64_HEADLESS)'`,
+and the driver built into the 32-bit Wine tree - all passing.
+
+### What is not done
+
+- **Signing in.** This machine's proxy passes only HTTPS `CONNECT`;
+  Steam's connection managers (WebSockets to `*.steamserver.net`, ports
+  443 and 27xxx) fail from the host as well, so no login here can
+  complete. On an ordinary network the path is the same as the QR
+  request that worked.
+- **32-bit helpers.** Wine is built 64-bit only, so Steam's
+  `gldriverquery.exe` and `vulkandriverquery.exe` die (their 64-bit
+  twins run). Steam carries on without them.
+- **`taskkill /F /IM steam.exe`** reports success and leaves Steam's
+  process tree running inside NovarisOS.
+- **Time.** Under TCG a Steam run is about an hour: the boot re-seeds a
+  1.4GB initrd for each of ~25 layers, then wineboot, then Steam.
+- **GPU-accelerated CEF.** Steam runs with `-cef-disable-gpu`; its GPU
+  process still composites, in software, through `gdi.c`.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
