@@ -2,4 +2,6 @@
 #     GUI_APPS_LIST=tools/gui_apps_steam.txt STEAM64_DIR=<installed Steam> GUI_PROXY_PORT=<port>
 # label|unix path of the .exe|arguments|window title (its start)|seconds
 settings|/usr/bin/x86_64-windows/regedit.exe|/S Z:\usr\share\novaris\novaris.reg|-|600
-steam|/opt/steam/steam.exe|-cef-disable-gpu -cef-disable-gpu-compositing -no-cef-sandbox|Sign in to Steam|5400
+steam|/opt/steam/steam.exe|-cef-disable-gpu -cef-disable-gpu-compositing -no-cef-sandbox|Sign in to Steam|3600
+# Steam's own logs, printed to the serial line once it has been ended.
+logs|/usr/bin/x86_64-windows/cmd.exe|/c type Z:\opt\steam\logs\transport_steamui.txt Z:\opt\steam\logs\transport_client.txt Z:\opt\steam\logs\webhelper.txt Z:\opt\steam\logs\cef_log.txt Z:\opt\steam\logs\steamui_html.txt|-|900
