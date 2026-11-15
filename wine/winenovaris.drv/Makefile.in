@@ -5,10 +5,12 @@ IMPORTS = user32 win32u
 
 SOURCES = \
 	dllmain.c \
+	gdi.c \
 	legacy.c \
 	novarisdrv_main.c \
 	novawl_client.c \
 	novawl_server.c \
+	offscreen.c \
 	opengl.c \
 	vulkan.c \
 	window.c

@@ -303,7 +303,7 @@ static void breakpoint_handler(registers64_t* r) {
  *     (tools/gputest.py) takes a screendump at each step and answers on
  *     the serial line, which is what this waits for before going on. */
 static int host_ack(const char* what) {
-    serial64_puts("NOVARIS64: [gpu-test] ");
+    serial64_puts("NOVARIS64: [host] ");
     serial64_puts(what);
     serial64_putc('\n');
     for (uint64_t i = 0; i < 20000000ULL; i++)
@@ -1202,6 +1202,121 @@ static void run_wine_program(const void* image, uint64_t len,
 {
     run_program(image, len, ld_image, ld_len, env, kspace, label, success,
                 "/usr/bin/wine", program, args, budget, trace, 0);
+}
+
+/* --- graphical programs (Milestone 113) -------------------------------------
+ *
+ * Programs that open windows and do not exit: an editor, a registry
+ * editor, a control panel, a launcher. The list is a file in the image,
+ * /usr/share/novaris/gui-apps.txt, one program a line:
+ *
+ *     label|unix path of the .exe|arguments|window title|seconds
+ *
+ * Each runs for its seconds, which it uses up - it does not exit - and
+ * then the window it was expected to open has to be on the desktop with
+ * something drawn in it: "<label> = window shown" or "= no window". With
+ * GUI64_SHOTS the host takes a screendump then (tools/guitest.py). Then
+ * Wine's own taskkill ends it, so the next program has the desktop.
+ *
+ * A title of "-" is a step, not a window: a program that is meant to
+ * exit by itself within its seconds - `regedit /S` importing the
+ * settings the programs after it need (font stand-ins, a proxy). It
+ * passes when it exits with 0: "<label> = ran" or "= failed". */
+#define GUI_APPS_PATH "/usr/share/novaris/gui-apps.txt"
+
+static char* gui_field(char** p) {
+    char* start = *p;
+    while (**p && **p != '|' && **p != '\n') (*p)++;
+    if (**p == '|') *(*p)++ = 0;
+    else if (**p == '\n') { **p = 0; }
+    return start;
+}
+
+static void gui_apps_layer(const void* image, uint64_t len,
+                           const void* ld_image, uint64_t ld_len,
+                           const char* const* env, vmspace64_t* kspace) {
+    static char list[8192];
+    int node = ramfs64_lookup(GUI_APPS_PATH);
+    int64_t n;
+    char* p;
+
+    if (node < 0) return;
+    n = ramfs64_read(node, 0, list, sizeof(list) - 1);
+    if (n <= 0) return;
+    list[n] = 0;
+
+    for (p = list; *p; ) {
+        static const char* args[16];
+        static const char* kill_args[4];
+        char *label, *program, *argstr, *title, *secs, *line_end, *base;
+        uint64_t seconds = 0;
+        int nargs = 0;
+
+        line_end = p;
+        while (*line_end && *line_end != '\n') line_end++;
+        if (*p == '#' || p == line_end) { p = *line_end ? line_end + 1 : line_end; continue; }
+        if (*line_end) *line_end++ = 0;
+        label = gui_field(&p);
+        program = gui_field(&p);
+        argstr = gui_field(&p);
+        title = gui_field(&p);
+        secs = gui_field(&p);
+        p = line_end;
+        for (char* c = secs; *c >= '0' && *c <= '9'; c++) seconds = seconds * 10 + (uint64_t)(*c - '0');
+        if (!seconds) seconds = 120;
+        for (char* c = argstr; *c && nargs < 15; ) {
+            while (*c == ' ') *c++ = 0;
+            if (!*c) break;
+            args[nargs++] = c;
+            while (*c && *c != ' ') c++;
+        }
+        args[nargs] = 0;
+
+        if (title[0] == '-' && !title[1]) {
+            run_wine_program(image, len, ld_image, ld_len, env, kspace, label,
+                             "done", program, args, seconds * CLOCK64_HZ, 0);
+            serial64_puts("NOVARIS64: gui ");
+            serial64_puts(label);
+            if (syscall64_leader_exited() && syscall64_exit_code() == 0) {
+                serial64_puts(" = ran\n");
+            } else {
+                serial64_puts(" = failed\n");
+            }
+            continue;
+        }
+        run_wine_program(image, len, ld_image, ld_len, env, kspace, label,
+                         "it exited by itself", program, args, seconds * CLOCK64_HZ, 0);
+        serial64_puts("NOVARIS64: gui ");
+        serial64_puts(label);
+        if (wmdev64_has_window(title)) {
+            serial64_puts(" = window shown: \"");
+            serial64_puts(title);
+            serial64_puts("\"\n");
+        } else {
+            serial64_puts(" = no window \"");
+            serial64_puts(title);
+            serial64_puts("\"\n");
+        }
+#ifdef GUI64_SHOTS
+        {
+            char what[96] = "SHOT ";
+            kstrlcpy(what + 5, label, sizeof(what) - 5);
+            host_ack(what);
+        }
+#endif
+        base = program;
+        for (char* c = program; *c; c++) if (*c == '/') base = c + 1;
+        kill_args[0] = "/F";
+        kill_args[1] = "/IM";
+        kill_args[2] = base;
+        kill_args[3] = 0;
+        run_wine_program(image, len, ld_image, ld_len, env, kspace, "taskkill",
+                         "the program was ended", "/usr/bin/x86_64-windows/taskkill.exe",
+                         kill_args, 60u * CLOCK64_HZ, 0);
+    }
+#ifdef GUI64_SHOTS
+    host_ack("done");
+#endif
 }
 
 void kernel_main(uint32_t magic, void* mbi) {
@@ -5445,6 +5560,13 @@ fast_wine:
              * loader refuses to look for kernel32.dll anywhere, and
              * reports 0xc0000135 about a file that is present. */
             "WINEBOOTSTRAPMODE=1",
+#ifdef WINE64_PROXY
+            /* An HTTP proxy, as the guest sees it (Milestone 113): winhttp
+             * and wininet take $http_proxy for every scheme. Steam's
+             * updater is winhttp. */
+            "http_proxy=" WINE64_PROXY,
+            "https_proxy=" WINE64_PROXY,
+#endif
             0
         };
 
@@ -5879,6 +6001,10 @@ static const char* const chrome_args[] = {
                              "winedesk", "windows stack, move, and take clicks and keys",
                              "/usr/bin/x86_64-windows/winedesk64.exe",
                              0, 90u * CLOCK64_HZ, 1);
+
+            /* Graphical programs, a list of them, when the image has one
+             * (Milestone 113). */
+            gui_apps_layer(image, len, ld_image, ld_len, boot_env, &kspace);
 
             /* OpenGL with no window system: Mesa's surfaceless EGL
              * and llvmpipe, as a plain Linux program - the floor Wine's

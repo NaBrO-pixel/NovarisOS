@@ -109,14 +109,16 @@ UINT NOVARIS_UpdateDisplayDevices(const struct gdi_device_manager *manager, void
     return STATUS_SUCCESS;
 }
 
-static const struct user_driver_funcs novarisdrv_funcs =
+static struct user_driver_funcs novarisdrv_funcs =
 {
     .pActivateWindow = NOVARIS_ActivateWindow,
     .pCreateWindowSurface = NOVARIS_CreateWindowSurface,
     .pDestroyWindow = NOVARIS_DestroyWindow,
+    .pGetDC = NOVARIS_GetDC,
     .pGetWindowStyleMasks = NOVARIS_GetWindowStyleMasks,
     .pOpenGLInit = NOVARIS_OpenGLInit,
     .pProcessEvents = NOVARIS_ProcessEvents,
+    .pReleaseDC = NOVARIS_ReleaseDC,
     .pSetWindowText = NOVARIS_SetWindowText,
     .pThreadDetach = NOVARIS_ThreadDetach,
     .pUpdateDisplayDevices = NOVARIS_UpdateDisplayDevices,
@@ -130,14 +132,14 @@ static const struct user_driver_funcs novarisdrv_funcs =
 static BOOL query_screen(void)
 {
     struct wm_rect r;
-    int fd = open(WMDEV_PATH, O_RDWR);
+    int fd = novaris_wm_open();
 
     if (fd < 0)
     {
         WARN("no %s: this kernel has no window manager to draw on\n", WMDEV_PATH);
         return FALSE;
     }
-    if (ioctl(fd, WMIO_SCREEN, &r) == 0 && r.w > 0 && r.h > 0) novaris_screen = r;
+    if (novaris_wm_ioctl(fd, WMIO_SCREEN, &r) == 0 && r.w > 0 && r.h > 0) novaris_screen = r;
     else WARN("%s did not answer WMIO_SCREEN; assuming %dx%d\n", WMDEV_PATH,
               novaris_screen.w, novaris_screen.h);
     /* A /dev/wm that can listen is the compositor; one that cannot is
@@ -145,9 +147,9 @@ static BOOL query_screen(void)
      * the descriptor. */
     {
         int dummy = 0;
-        novaris_compositor = ioctl(fd, WMIO_LISTEN, &dummy) == 0;
+        novaris_compositor = novaris_wm_ioctl(fd, WMIO_LISTEN, &dummy) == 0;
     }
-    close(fd);
+    novaris_wm_close(fd);
 
     TRACE("desktop work area %dx%d at (%d,%d)\n",
           novaris_screen.w, novaris_screen.h, novaris_screen.x, novaris_screen.y);
@@ -158,6 +160,8 @@ static NTSTATUS novarisdrv_unix_init(void *arg)
 {
     if (!query_screen()) return STATUS_NOT_SUPPORTED;
 
+    /* A device of its own, for DCs on other processes' windows (gdi.c). */
+    if (novaris_compositor) novarisdrv_funcs.dc_funcs = *novaris_get_dc_funcs();
     __wine_set_user_driver(&novarisdrv_funcs, WINE_GDI_DRIVER_VERSION);
     return STATUS_SUCCESS;
 }

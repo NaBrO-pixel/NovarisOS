@@ -124,7 +124,7 @@ void novaris_win_data_close(struct novaris_win_data *data)
     }
     if (data->fd >= 0)
     {
-        close(data->fd);
+        novaris_wm_close(data->fd);
         data->fd = -1;
     }
     data->mapped = FALSE;
@@ -190,7 +190,7 @@ BOOL novaris_window_create(struct novaris_win_data *data, int width, int height)
 
     if (width <= 0 || height <= 0) return FALSE;
 
-    if ((data->fd = open(WMDEV_PATH, O_RDWR)) < 0)
+    if ((data->fd = novaris_wm_open()) < 0)
     {
         ERR("cannot open %s\n", WMDEV_PATH);
         return FALSE;
@@ -201,11 +201,11 @@ BOOL novaris_window_create(struct novaris_win_data *data, int width, int height)
     create.h = height;
     window_title(data->hwnd, create.title, sizeof(create.title));
 
-    if (ioctl(data->fd, WMIO_CREATE, &create) != 0 ||
-        ioctl(data->fd, WMIO_GETINFO, &info) != 0 || !info.stride || !info.bytes)
+    if (novaris_wm_ioctl(data->fd, WMIO_CREATE, &create) != 0 ||
+        novaris_wm_ioctl(data->fd, WMIO_GETINFO, &info) != 0 || !info.stride || !info.bytes)
     {
         ERR("%s refused a %dx%d window\n", WMDEV_PATH, width, height);
-        close(data->fd);
+        novaris_wm_close(data->fd);
         data->fd = -1;
         return FALSE;
     }
@@ -215,7 +215,7 @@ BOOL novaris_window_create(struct novaris_win_data *data, int width, int height)
     {
         ERR("cannot map the window's pixels\n");
         data->pixels = NULL;
-        close(data->fd);
+        novaris_wm_close(data->fd);
         data->fd = -1;
         return FALSE;
     }
@@ -223,7 +223,7 @@ BOOL novaris_window_create(struct novaris_win_data *data, int width, int height)
     /* The HWND is the window's name in the kernel too: it is the same
      * number in every Wine process, so a window in one process can be
      * stacked directly below another process's. */
-    ioctl(data->fd, WMIO_SETID, &id);
+    novaris_wm_ioctl(data->fd, WMIO_SETID, &id);
 
     data->width = width;
     data->height = height;
@@ -316,7 +316,7 @@ void NOVARIS_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         if (data->mapped && data->shown)
         {
             int off = 0;
-            ioctl(data->fd, WMIO_SHOW, &off);
+            novaris_wm_ioctl(data->fd, WMIO_SHOW, &off);
             data->shown = FALSE;
         }
         novaris_win_data_release(data);
@@ -344,15 +344,15 @@ void NOVARIS_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     place.y = new_rects->visible.top;
     place.w = width;
     place.h = height;
-    ioctl(data->fd, WMIO_MOVE, &place);
+    novaris_wm_ioctl(data->fd, WMIO_MOVE, &place);
     data->width = width;
     data->height = height;
 
-    if (restack) ioctl(data->fd, WMIO_STACK, &stack);
+    if (restack) novaris_wm_ioctl(data->fd, WMIO_STACK, &stack);
     if (!data->shown)
     {
         int on = 1;
-        ioctl(data->fd, WMIO_SHOW, &on);
+        novaris_wm_ioctl(data->fd, WMIO_SHOW, &on);
         data->shown = TRUE;
     }
 
@@ -402,7 +402,7 @@ void NOVARIS_SetWindowText(HWND hwnd, LPCWSTR text)
     if (data->mapped)
     {
         window_title(hwnd, title, sizeof(title));
-        ioctl(data->fd, WMIO_TITLE, title);
+        novaris_wm_ioctl(data->fd, WMIO_TITLE, title);
     }
     novaris_win_data_release(data);
 }
@@ -453,7 +453,7 @@ void novaris_present_client(HWND hwnd, const void *top_row, int width, int heigh
         damage.y = cy;
         damage.w = w;
         damage.h = h;
-        ioctl(data->fd, WMIO_DAMAGE, &damage);
+        novaris_wm_ioctl(data->fd, WMIO_DAMAGE, &damage);
     }
     novaris_win_data_release(data);
 }
@@ -522,6 +522,7 @@ static BOOL novaris_surface_flush(struct window_surface *base, const RECT *rect,
     char *dst;
     int src_stride, y, x0, y0, w, h, wx, wy;
 
+    TRACE("hwnd %p rect %s dirty %s\n", surface->hwnd, wine_dbgstr_rect(rect), wine_dbgstr_rect(dirty));
     if (!(data = novaris_win_data_get(surface->hwnd))) return FALSE;
     if (!data->mapped || !data->pixels)
     {
@@ -556,7 +557,7 @@ static BOOL novaris_surface_flush(struct window_surface *base, const RECT *rect,
     damage.y = wy;
     damage.w = w;
     damage.h = h;
-    ioctl(data->fd, WMIO_DAMAGE, &damage);
+    novaris_wm_ioctl(data->fd, WMIO_DAMAGE, &damage);
 
     novaris_win_data_release(data);
     return TRUE;
@@ -626,11 +627,14 @@ static int thread_listener(void)
     NTSTATUS status;
 
     if (info->driver_data) return (int)info->driver_data - 1;
+    /* Offscreen there is no input, and a memfd is always readable: the
+     * wineserver would wake this thread for ever. */
+    if (novaris_wm_offscreen()) return -1;
 
-    if ((fd = open(WMDEV_PATH, O_RDWR)) < 0) return -1;
-    if (ioctl(fd, WMIO_LISTEN, &dummy) != 0)
+    if ((fd = novaris_wm_open()) < 0) return -1;
+    if (novaris_wm_ioctl(fd, WMIO_LISTEN, &dummy) != 0)
     {
-        close(fd);
+        novaris_wm_close(fd);
         return -1;
     }
     info->driver_data = (UINT_PTR)fd + 1;
@@ -654,7 +658,7 @@ void NOVARIS_ThreadDetach(void)
 {
     struct ntuser_thread_info *info = NtUserGetThreadInfo();
 
-    if (info->driver_data) close((int)info->driver_data - 1);
+    if (info->driver_data) novaris_wm_close((int)info->driver_data - 1);
     info->driver_data = 0;
 }
 
@@ -754,7 +758,7 @@ BOOL NOVARIS_ProcessEvents(DWORD mask)
     if ((fd = thread_listener()) < 0) return FALSE;
     if (pthread_mutex_trylock(&input_mutex)) return TRUE;
 
-    while (ioctl(fd, WMIO_POLL, &ev) == 1)
+    while (novaris_wm_ioctl(fd, WMIO_POLL, &ev) == 1)
     {
         switch (ev.type)
         {

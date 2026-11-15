@@ -508,6 +508,20 @@ int wmdev64_create(const struct wm64_create* req) {
     return slot;
 }
 
+int wmdev64_attach(uint64_t id) {
+    uint64_t fl;
+    if (!id) return -22;
+    fl = spin64_acquire(&wm_lock);
+    for (int i = 0; i < WM64_MAX_WINDOWS; i++)
+        if (windows[i].used && windows[i].id == id) {
+            windows[i].refs++;
+            spin64_release(&wm_lock, fl);
+            return i;
+        }
+    spin64_release(&wm_lock, fl);
+    return -2;
+}
+
 int wmdev64_listen(void) {
     uint64_t fl = spin64_acquire(&wm_lock);
     for (int i = 0; i < WM64_MAX_LISTENERS; i++) {
@@ -788,6 +802,15 @@ const uint64_t* wmdev64_frames(int win, uint64_t* nframes, uint64_t* bytes) {
     if (nframes) *nframes = w->nframes;
     if (bytes)   *bytes   = w->bytes;
     return w->frames;
+}
+
+int wmdev64_has_window(const char* title) {
+    uint64_t n = kstrlen(title);
+    for (int i = 0; i < WM64_MAX_WINDOWS; i++)
+        if (windows[i].used && windows[i].shown && windows[i].damages &&
+            !kstrncmp(windows[i].title, title, n))
+            return 1;
+    return 0;
 }
 
 void wmdev64_report(void) {

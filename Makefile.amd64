@@ -394,6 +394,23 @@ $(BUILD_DIR)/spawn64_blob.o: $(BUILD_DIR)/spawn64_blob.c
 # from the initrd with Mesa staged beside it (MESA64_INSTALL=1), not as a
 # blob in the kernel.
 MESA64_INSTALL ?=
+# Every PE module Wine built, not only the measured list (Milestone 113).
+WINE64_ALL_MODULES ?=
+# A list of graphical programs to run and photograph, staged as
+# /usr/share/novaris/gui-apps.txt (Milestone 113; see tools/guitest.py).
+GUI64_APPS ?=
+# An installed Steam client directory, staged as /opt/steam, with the
+# host's CA certificates so Wine's TLS can check Valve's servers.
+STEAM64_DIR ?=
+# The proxy the guest's programs use, as host:port the guest can reach
+# (10.0.2.2 is this machine), written into the settings GUI64_APPS
+# imports first - /usr/share/novaris/novaris.reg.
+GUI64_PROXY ?=
+# Metric-compatible stand-ins for Arial, Times New Roman and Courier New
+# (SIL Open Font License), staged with the graphical programs: web pages
+# name those families, and Chromium 126 draws nothing in a family that
+# is not there (tools/wine_font_reg.py).
+GUI64_FONTS_DIR ?= /usr/share/fonts/truetype/liberation
 $(BUILD_DIR)/egl64.elf: userland/egl64.c | $(BUILD_DIR)
 	gcc -O2 -o $@ $< -lEGL
 $(BUILD_DIR)/vk64.elf: userland/vk64.c | $(BUILD_DIR)
@@ -782,7 +799,8 @@ INITRD_CONFIG_TEXT = WINE64_INSTALL=$(WINE64_INSTALL) \
     WINE64_LOADER=$(abspath $(WINE64_LOADER)) \
     WINE64_NTDLL=$(abspath $(WINE64_NTDLL)) \
     CHROMIUM64_DIR=$(CHROMIUM64_DIR) CHROMIUM64_FILES=$(CHROMIUM64_FILES) \
-    PE_PAGEALIGN=$(PE_PAGEALIGN) MESA64_INSTALL=$(MESA64_INSTALL)
+    PE_PAGEALIGN=$(PE_PAGEALIGN) MESA64_INSTALL=$(MESA64_INSTALL) \
+    WINE64_ALL_MODULES=$(WINE64_ALL_MODULES) GUI64_APPS=$(GUI64_APPS) STEAM64_DIR=$(STEAM64_DIR) GUI64_PROXY=$(GUI64_PROXY)
 # Only when this make is building the image. It used to be rewritten by
 # every invocation, so compiling one object without the Wine and
 # Chromium variables - `make -f Makefile.amd64 build64/inet64.o` - wrote
@@ -820,7 +838,7 @@ $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf $(WINE64_DRIVER
            $(if $(MESA64_INSTALL),$(BUILD_DIR)/egl64.elf $(BUILD_DIR)/vk64.elf \
                 $(BUILD_DIR)/vkwl64.elf tools/stage_mesa.sh) \
            $(BUILD_DIR)/chromeprobe64.exe tools/stage_wine.sh tools/wine_prefix_modules.txt \
-           tools/wine_chromium_modules.txt tools/pe_pagealign.py $(INITRD_CONFIG)
+           tools/wine_chromium_modules.txt tools/pe_pagealign.py $(INITRD_CONFIG) $(GUI64_APPS)
 	rm -rf $(INITRD_STAGE)
 	mkdir -p $(INITRD_STAGE)
 	cp $(BUILD_DIR)/dlllib64.dll $(INITRD_STAGE)/dlllib64.dll
@@ -886,7 +904,7 @@ $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf $(WINE64_DRIVER
 	@# With Chromium staged, the Wine modules it loads beyond a prefix's
 	@# go in too - tools/wine_chromium_modules.txt, measured on the host.
 	@if [ -n "$(WINE64_INSTALL)" ] && [ -x "$(WINE64_LOADER)" ]; then \
-	    bash tools/stage_wine.sh "$(dir $(WINE64_LOADER)).." \
+	    WINE_ALL_MODULES=$(WINE64_ALL_MODULES) bash tools/stage_wine.sh "$(dir $(WINE64_LOADER)).." \
 	        $(INITRD_STAGE) \
 	        $(if $(CHROMIUM64_DIR),tools/wine_chromium_modules.txt) \
 	        || exit 1; \
@@ -898,6 +916,30 @@ $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf $(WINE64_DRIVER
 	    cp $(BUILD_DIR)/winegui64.exe \
 	       $(INITRD_STAGE)/usr/bin/x86_64-windows/winegui64.exe; \
 	    echo "  initrd: winegui64.exe staged"; \
+	 fi
+	@if [ -n "$(GUI64_APPS)" ]; then \
+	    mkdir -p $(INITRD_STAGE)/usr/share/novaris; \
+	    cp $(GUI64_APPS) $(INITRD_STAGE)/usr/share/novaris/gui-apps.txt; \
+	    mkdir -p $(INITRD_STAGE)/usr/share/wine/fonts $(INITRD_STAGE)/etc; \
+	    if ls $(GUI64_FONTS_DIR)/Liberation*.ttf >/dev/null 2>&1; then \
+	        cp $(GUI64_FONTS_DIR)/Liberation*.ttf $(INITRD_STAGE)/usr/share/wine/fonts/; \
+	        python3 tools/wine_font_reg.py > $(INITRD_STAGE)/usr/share/novaris/novaris.reg; \
+	    else \
+	        python3 tools/wine_font_reg.py --tahoma > $(INITRD_STAGE)/usr/share/novaris/novaris.reg; \
+	    fi; \
+	    if [ -n "$(GUI64_PROXY)" ]; then \
+	        python3 tools/wine_proxy_reg.py $(GUI64_PROXY) | tail -n +2 \
+	            >> $(INITRD_STAGE)/usr/share/novaris/novaris.reg; \
+	    fi; \
+	    printf 'nameserver 10.0.2.3\n' > $(INITRD_STAGE)/etc/resolv.conf; \
+	    printf '127.0.0.1 localhost\n' > $(INITRD_STAGE)/etc/hosts; \
+	    echo "  initrd: graphical programs from $(GUI64_APPS), settings in novaris.reg"; \
+	 fi
+	@if [ -n "$(STEAM64_DIR)" ]; then \
+	    mkdir -p $(INITRD_STAGE)/opt $(INITRD_STAGE)/etc/ssl/certs; \
+	    cp -a $(STEAM64_DIR) $(INITRD_STAGE)/opt/steam; \
+	    cp /etc/ssl/certs/ca-certificates.crt $(INITRD_STAGE)/etc/ssl/certs/; \
+	    echo "  initrd: Steam from $(STEAM64_DIR)"; \
 	 fi
 	@if [ -n "$(MESA64_INSTALL)" ]; then \
 	    sh tools/stage_mesa.sh $(INITRD_STAGE) || exit 1; \
@@ -979,7 +1021,7 @@ iso: $(KERNEL) $(INITRD)
 # map, and the page tables of a 1.5TB address-space reservation - and a
 # run has four or five of them beside a 450MB browser. In 6G the page's
 # renderer was the one that ran out; 12G finishes with 6.7GB free.
-QEMU_RAM ?= $(if $(CHROMIUM64_DIR),12G,$(if $(MESA64_INSTALL),3G,2G))
+QEMU_RAM ?= $(if $(CHROMIUM64_DIR)$(STEAM64_DIR),12G,$(if $(MESA64_INSTALL),3G,2G))
 
 # Hardware virtualisation when this machine has it. With KVM the guest's
 # instructions run on the real processor instead of being translated one
@@ -1590,6 +1632,18 @@ CHROME_WINDOW_FLAGS   = -DNOVARIS64_FAST -DCHROME64_WINDOWED \
 test-gpu: iso
 	@python3 tools/gputest.py $(ISO) $(BUILD_DIR) rage128p
 	@python3 tools/gputest.py $(ISO) $(BUILD_DIR) rv100
+
+# Graphical programs under Wine, each photographed with its window open
+# (Milestone 113): every Wine module staged, the list in GUI64_APPS.
+GUI_APPS_LIST ?= tools/gui_apps.txt
+GUI_PROXY_PORT ?=
+.PHONY: test-gui-apps
+test-gui-apps:
+	@$(MAKE) -f Makefile.amd64 WINE64_INSTALL=1 WINE64_ALL_MODULES=1 GUI64_APPS=$(GUI_APPS_LIST) \
+	    $(if $(GUI_PROXY_PORT),GUI64_PROXY=10.0.2.2:$(GUI_PROXY_PORT)) \
+	    CFLAGS_EXTRA='-DNOVARIS64_FAST -DGUI64_SHOTS $(if $(GUI_PROXY_PORT),-DWINE64_PROXY=\"http://10.0.2.2:$(GUI_PROXY_PORT)\") $(CFLAGS_EXTRA)' iso
+	@GUITEST_QEMU_ARGS='$(QEMU_ACCEL) -smp $(QEMU_SMP) $(QEMU_EXTRA)' \
+	    python3 tools/guitest.py $(ISO) $(BUILD_DIR) $(QEMU_RAM) $(GUI_PROXY_PORT)
 
 .PHONY: chrome-window
 chrome-window:

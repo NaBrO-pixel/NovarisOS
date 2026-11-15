@@ -1,0 +1,5 @@
+# Steam's client on NovarisOS (Milestone 113): make -f Makefile.amd64 test-gui-apps
+#     GUI_APPS_LIST=tools/gui_apps_steam.txt STEAM64_DIR=<installed Steam> GUI_PROXY_PORT=<port>
+# label|unix path of the .exe|arguments|window title (its start)|seconds
+settings|/usr/bin/x86_64-windows/regedit.exe|/S Z:\usr\share\novaris\novaris.reg|-|600
+steam|/opt/steam/steam.exe|-cef-disable-gpu -cef-disable-gpu-compositing -no-cef-sandbox|Sign in to Steam|5400

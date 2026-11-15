@@ -8,7 +8,7 @@ on a socket, so this script can answer it. The kernel's GPU layer sets a
 mode, flips between buffers and puts the mode back, and after each step
 prints
 
-    NOVARIS64: [gpu-test] SHOT <name> <width> <height> [x,y=rrggbb ...]
+    NOVARIS64: [host] SHOT <name> <width> <height> [x,y=rrggbb ...]
 
 and waits. This takes a QEMU screendump - the emulated display's own
 picture, the far side of the driver - checks its size and the pixels
@@ -101,13 +101,13 @@ def main():
                     failures += 1
                 if "[gpu] " in text or "SKIP  no ATI" in text:
                     print(text[text.index("NOVARIS64:"):] if "NOVARIS64:" in text else text)
-                if "[gpu-test] done" in text:
+                if "[host] done" in text:
                     con.sendall(b"k")
                     done = True
                     break
-                if "[gpu-test] SHOT " not in text:
+                if "[host] SHOT " not in text:
                     continue
-                words = text.split("[gpu-test] SHOT ", 1)[1].split()
+                words = text.split("[host] SHOT ", 1)[1].split()
                 name, w, h, checks = words[0], int(words[1]), int(words[2]), words[3:]
                 ppm = os.path.join(build, "gpu-%s.ppm" % name)
                 monitor(mon, "screendump " + ppm)

@@ -66,6 +66,7 @@
 #define WMIO_STACK   0x570Au   /* struct wm_stack*   */
 #define WMIO_SETID   0x570Bu   /* UINT64*: the HWND  */
 #define WMIO_LISTEN  0x570Cu   /* int* (ignored)     */
+#define WMIO_ATTACH  0x5710u   /* UINT64*: another process's window, by HWND */
 
 #define WM_DEV_TITLE_MAX 64
 
@@ -171,6 +172,13 @@ void novaris_present_client(HWND hwnd, const void *top_row, int width, int heigh
 void novaris_detach_client(HWND hwnd);
 void novaris_win_data_close(struct novaris_win_data *data);
 
+/* /dev/wm, or the driver's own stand-in for it when NOVARIS_OFFSCREEN is
+ * set on a machine that has none (offscreen.c). */
+int  novaris_wm_open(void);
+int  novaris_wm_ioctl(int fd, unsigned int request, void *arg);
+void novaris_wm_close(int fd);
+BOOL novaris_wm_offscreen(void);
+
 /* Whether /dev/wm is the 64-bit kernel's compositor, which places windows
  * where Wine says and leaves their frames to Wine, or the 32-bit kernel's
  * window manager, which does both itself (legacy.c). */
@@ -199,6 +207,9 @@ void     NOVARIS_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint,
 void     NOVARIS_SetWindowText(HWND hwnd, LPCWSTR text);
 void     NOVARIS_ThreadDetach(void);
 void     NOVARIS_ActivateWindow(HWND hwnd, HWND previous);
+void     NOVARIS_GetDC(HDC hdc, HWND hwnd, HWND top, const RECT *win_rect, const RECT *top_rect, DWORD flags);
+void     NOVARIS_ReleaseDC(HWND hwnd, HDC hdc);
+const struct gdi_dc_funcs *novaris_get_dc_funcs(void);
 struct opengl_funcs;
 struct opengl_driver_funcs;
 UINT     NOVARIS_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs,

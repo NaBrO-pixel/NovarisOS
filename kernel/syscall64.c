@@ -4473,6 +4473,12 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
                 if (r < 0) return (uint64_t)(int64_t)r;
                 fds[a1].pos = (uint64_t)(r + 1);
                 return 0;
+            case WMIO64_ATTACH:
+                if (win >= 0) return (uint64_t)-22;
+                r = wmdev64_attach(*(const uint64_t*)a3);
+                if (r < 0) return (uint64_t)(int64_t)r;
+                fds[a1].pos = (uint64_t)(r + 1);
+                return 0;
             case WMIO64_MOVE:
                 return (uint64_t)(int64_t)wmdev64_move(win, (const struct wm64_rect*)a3);
             case WMIO64_SHOW:

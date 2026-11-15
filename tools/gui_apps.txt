@@ -1,0 +1,10 @@
+# Graphical programs for make -f Makefile.amd64 test-gui-apps (Milestone 113).
+# label|unix path of the .exe|arguments|window title (its start)|seconds
+# A title of "-" is a step that has to exit with 0 instead of opening a window.
+settings|/usr/bin/x86_64-windows/regedit.exe|/S Z:\usr\share\novaris\novaris.reg|-|600
+notepad|/usr/bin/x86_64-windows/notepad.exe||Untitled - Notepad|300
+regedit|/usr/bin/x86_64-windows/regedit.exe||Registry Editor|300
+winecfg|/usr/bin/x86_64-windows/winecfg.exe||Wine configuration|300
+taskmgr|/usr/bin/x86_64-windows/taskmgr.exe||Task Manager|300
+winemine|/usr/bin/x86_64-windows/winemine.exe||WineMine|300
+control|/usr/bin/x86_64-windows/control.exe||Wine Control Panel|300

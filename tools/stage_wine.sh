@@ -383,6 +383,22 @@ while IFS= read -r name; do
     fi
 done < <(cat "$LIST" $EXTRA_LISTS)
 
+# Or all of them (WINE_ALL_MODULES=1, Milestone 113). The measured list is
+# what creating a prefix and running Chromium load; a graphical program
+# reaches far past it - common controls, the shell, rich edit, GDI+,
+# Direct3D, Media Foundation - and a launcher like Steam past that. Every
+# PE module the tree built is about 200MB stripped.
+if [ "${WINE_ALL_MODULES:-}" = 1 ]; then
+    while IFS= read -r f; do
+        cp "$f" "$WIN/$(basename "$f")" && found_pe=$((found_pe+1))
+    done < <(find "$TREE/dlls" "$TREE/programs" -path "*/x86_64-windows/*" -type f \
+                 \( -name '*.dll' -o -name '*.exe' -o -name '*.drv' -o -name '*.cpl' \
+                    -o -name '*.ocx' -o -name '*.acm' -o -name '*.ax' -o -name '*.tlb' \
+                    -o -name '*.ds' -o -name '*.com' -o -name '*.msstyles' -o -name '*.vxd' \) \
+                 2>/dev/null)
+    echo "stage_wine: every PE module the tree built"
+fi
+
 # The kernel drivers, which are PE modules like the rest and are not on
 # the list because the list was written from what a prefix run opened
 # before it ever got as far as starting one.

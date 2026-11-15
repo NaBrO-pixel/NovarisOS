@@ -59,6 +59,7 @@
 #define WMIO64_LISTEN  0x570Cu   /* int* (ignored): become an input listener */
 #define WMIO64_INJECT  0x570Eu   /* struct wm64_inject*: as if from the hardware */
 #define WMIO64_PEEK    0x570Fu   /* struct wm64_rect*: x,y in; w = pixel out */
+#define WMIO64_ATTACH  0x5710u   /* uint64_t*: name the window with this id (Milestone 113) */
 
 #define WM64_EV_NONE    0
 #define WM64_EV_MOUSE   1        /* the 32-bit kernel's; not produced here */
@@ -97,6 +98,10 @@ int  wmdev64_register(void);
 
 int  wmdev64_create(const struct wm64_create* req);
 int  wmdev64_listen(void);               /* a listener for the caller's process */
+/* Another name for an existing window, by its id: how one process draws
+ * into a window another made - a browser's GPU process into the browser's
+ * window. -2 (-ENOENT) if no window has that id. */
+int  wmdev64_attach(uint64_t id);
 void wmdev64_close(int h);
 void wmdev64_ref(int h);                 /* one more descriptor names it */
 
@@ -128,6 +133,10 @@ const uint64_t* wmdev64_frames(int win, uint64_t* nframes, uint64_t* bytes);
 
 /* For the test layer: where the pointer is. */
 void wmdev64_pointer(int32_t* x, int32_t* y);
+
+/* Whether a shown window whose title begins with `title` has had
+ * something drawn in it. */
+int  wmdev64_has_window(const char* title);
 
 void wmdev64_report(void);       /* every open window, on the serial port */
 
