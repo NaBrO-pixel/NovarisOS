@@ -36,30 +36,42 @@ NAME_MAX = 124
 
 
 def pack(files, out_path):
+    """Write the archive: header, the entry table, then each file's bytes.
+
+    files is a list of (name, size, path). The contents are streamed from
+    disk in order rather than joined in memory: `blobs += data` copies
+    everything before it on each file, which was nothing at a few hundred
+    megabytes and hours (and gigabytes of memory) once Steam's client
+    went in (Milestone 113)."""
     header = struct.pack('<II', MAGIC, len(files))
     entry_size = 4 + NAME_MAX + 4 + 4  # magic + name + offset + length
     data_start = len(header) + entry_size * len(files)
 
-    entries = b''
-    blobs = b''
+    entries = []
     offset = data_start  # offsets are absolute (relative to archive start),
                           # matching kernel/ramfs.c's initrd_base + impl math
-    for name, data in files:
+    for name, size, _ in files:
         if len(name) >= NAME_MAX:
             raise ValueError(f'path too long for initrd: {name!r}')
         name_bytes = name.encode('ascii') + b'\x00' * (NAME_MAX - len(name))
-        entries += struct.pack('<I', FILE_MAGIC) + name_bytes + struct.pack('<II', offset, len(data))
-        blobs += data
-        offset += len(data)
+        entries.append(struct.pack('<I', FILE_MAGIC) + name_bytes + struct.pack('<II', offset, size))
+        offset += size
+    if offset >= 1 << 32:
+        raise ValueError(f'initrd too large for 32-bit offsets: {offset} bytes')
 
     with open(out_path, 'wb') as f:
         f.write(header)
-        f.write(entries)
-        f.write(blobs)
+        f.write(b''.join(entries))
+        for name, size, path in files:
+            with open(path, 'rb') as src:
+                data = src.read()
+            if len(data) != size:
+                raise ValueError(f'{name!r} changed size while being packed')
+            f.write(data)
 
 
 def collect(src_dir):
-    """Every file under src_dir, as (relative path with '/', bytes).
+    """Every file under src_dir, as (relative path with '/', size, path).
 
     Sorted so that a build is reproducible, and so that the kernel meets a
     directory's own entries together rather than scattered."""
@@ -71,8 +83,7 @@ def collect(src_dir):
             if not os.path.isfile(path) or os.path.islink(path):
                 continue
             rel = os.path.relpath(path, src_dir).replace(os.sep, '/')
-            with open(path, 'rb') as f:
-                files.append((rel, f.read()))
+            files.append((rel, os.path.getsize(path), path))
     return files
 
 
@@ -85,10 +96,10 @@ def main():
     files = collect(src_dir)
 
     pack(files, out_path)
-    total = sum(len(d) for _, d in files)
+    total = sum(size for _, size, _ in files)
     print(f'Packed {len(files)} file(s), {total} bytes, into {out_path}')
-    for name, data in files:
-        print(f'  {name}  ({len(data)} bytes)')
+    for name, size, _ in files:
+        print(f'  {name}  ({size} bytes)')
 
 
 if __name__ == '__main__':
