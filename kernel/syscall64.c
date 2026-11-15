@@ -1995,6 +1995,35 @@ void syscall64_set_trace(int on) { trace = on; }
  * shell does. -1 restores the old behaviour. */
 int syscall64_leader_pid(void) { return leader_pid; }
 
+/* Whether a leader that exits hands the run on (Milestone 113).
+ *
+ * A launcher's first process is often not the program: Steam's
+ * bootstrapper updates the client, starts it again as a new process and
+ * exits with 42 - and with the run ending on that exit, the layer judged
+ * Steam's window a moment after it had been asked for and then killed the
+ * client that was about to draw it. With this on, a leader that exits
+ * while a newer process is alive passes the run to the oldest of them,
+ * and the run goes on until the last one exits or its time runs out. */
+static int leader_follow;
+void syscall64_set_leader_follow(int on) { leader_follow = on; }
+
+/* 1 if the run was handed on and the exiting leader should leave as any
+ * other process does; 0 if the run ends here. */
+static int leader_hands_on(void) {
+    int next;
+
+    if (!leader_follow) return 0;
+    next = sched64_lowest_pid_above(leader_pid);
+    if (next < 0) return 0;
+    serial64_puts("NOVARIS64: [leader] pid ");
+    serial64_putdec((uint64_t)leader_pid);
+    serial64_puts(" exited; the run follows pid ");
+    serial64_putdec((uint64_t)next);
+    serial64_putc('\n');
+    leader_pid = next;
+    return 1;
+}
+
 void syscall64_set_leader(int pid) {
     leader_pid = pid;
     if (pid >= 0) report_pid = pid;
@@ -2171,7 +2200,7 @@ static void die_by_signal(int sig) {
         int parent = me ? me->parent : 0;
 
         proc64_exit_signalled(proc64_current_pid(), sig);
-        if (leader_pid >= 0 && proc64_current_pid() == leader_pid) {
+        if (leader_pid >= 0 && proc64_current_pid() == leader_pid && !leader_hands_on()) {
             leader_exited = 1;
             leader_leaves_scheduler();
             run_ends_here();                 /* never returns */
@@ -7544,7 +7573,7 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
              * A process that exits by exit(2) is exactly as finished as
              * one that exits by exit_group, and was being treated as
              * though it were neither. */
-            if (leader_pid >= 0 && proc64_current_pid() == leader_pid) {
+            if (leader_pid >= 0 && proc64_current_pid() == leader_pid && !leader_hands_on()) {
                 leader_exited = 1;
                 leader_leaves_scheduler();
                 run_ends_here();             /* never returns */
@@ -7595,7 +7624,7 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
             /* The program the layer was waiting for. Whatever else is
              * still running was started by it and is not what the layer
              * asked about. */
-            if (leader_pid >= 0 && proc64_current_pid() == leader_pid) {
+            if (leader_pid >= 0 && proc64_current_pid() == leader_pid && !leader_hands_on()) {
                 exit_code     = a1;
                 leader_exited = 1;
                 leader_leaves_scheduler();

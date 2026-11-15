@@ -491,6 +491,9 @@ int  syscall64_run_expired(void);
  * after a timed-out run is whatever the last process to exit happened to
  * return - a number that looks like an answer and is not. */
 int  syscall64_leader_exited(void);
+/* A leader that exits while a newer process lives hands the run on to it
+ * (Milestone 113; the graphical-programs layer). */
+void syscall64_set_leader_follow(int on);
 
 /* An uncaught ring-3 fault in a run of several processes: ends the
  * faulting process (not the leader) by the signal and does not return.

@@ -312,6 +312,16 @@ int sched64_blocked_pid(int i) {
     return tasks[i].pid;
 }
 
+/* The lowest pid above `pid` that still has a task, or -1 (Milestone 113:
+ * whom a run follows when its leader hands on). */
+int sched64_lowest_pid_above(int pid) {
+    int best = -1;
+    for (int i = 0; i < task_hwm; i++)
+        if (tasks[i].used && tasks[i].pid > pid && (best < 0 || tasks[i].pid < best))
+            best = tasks[i].pid;
+    return best;
+}
+
 int sched64_pid_tasks(int pid) {
     int n = 0;
     for (int i = 0; i < task_hwm; i++)

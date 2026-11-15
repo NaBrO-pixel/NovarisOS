@@ -1284,8 +1284,13 @@ static void gui_apps_layer(const void* image, uint64_t len,
             }
             continue;
         }
+        /* A window's program may hand over to another process - a
+         * launcher restarting itself - so the run follows it rather than
+         * ending when the first one exits. */
+        syscall64_set_leader_follow(1);
         run_wine_program(image, len, ld_image, ld_len, env, kspace, label,
                          "it exited by itself", program, args, seconds * CLOCK64_HZ, 0);
+        syscall64_set_leader_follow(0);
         serial64_puts("NOVARIS64: gui ");
         serial64_puts(label);
         if (wmdev64_has_window(title)) {

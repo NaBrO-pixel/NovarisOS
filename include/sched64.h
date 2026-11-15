@@ -102,6 +102,7 @@ int      sched64_task_peek(int i, int* pid, uint64_t* wait, uint64_t* gs,
 int      sched64_blocked_pid(int i);
 
 int  sched64_pid_tasks(int pid);
+int  sched64_lowest_pid_above(int pid);
 
 int  sched64_space_in_use(uint64_t pml4_phys);
 
