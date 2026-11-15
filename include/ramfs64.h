@@ -144,6 +144,16 @@ const char* ramfs64_name(int node);
  * 4.7MB - and well below the heap's own ceiling. */
 #define RAMFS64_CONTIGUOUS_MAX (32ull * 1024 * 1024)
 
+/* And that ceiling is for programs execve runs, from the initrd. Any
+ * other file is a heap block only while it is this small (Milestone
+ * 113): the heap is shared with every pipe buffer and descriptor table
+ * in the kernel, and wineboot copying each of Wine's DLLs into a prefix's
+ * system32 - all of them, once every module is staged - filled it, after
+ * which a pipe's 64KB buffer could not be had and every new Wine process
+ * failed to reach its wineserver ("pipe: Too many open files in
+ * system"). */
+#define RAMFS64_HEAP_FILE_MAX (64ull * 1024)
+
 /* The file's bytes in one piece, or NULL if it has none in one piece.
  *
  * Only small files are stored contiguously; a large one lives in frames

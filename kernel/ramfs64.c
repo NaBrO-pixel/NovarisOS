@@ -16,6 +16,10 @@ typedef struct {
     uint64_t capacity;
     int      is_dir;
     int      is_link;
+    /* A program from the initrd that execve reads in one piece, so it may
+     * be a heap block up to RAMFS64_CONTIGUOUS_MAX; everything else is
+     * one only while small (RAMFS64_HEAP_FILE_MAX). */
+    int      contiguous;
 
     /* The permission bits, as mkdir(2) and open(2) were given them.
      *
@@ -105,6 +109,7 @@ static int alloc_node(const char* name, int parent, int is_dir) {
     nodes[i].capacity     = 0;
     nodes[i].is_dir       = is_dir;
     nodes[i].is_link      = 0;
+    nodes[i].contiguous   = 0;
     nodes[i].frames       = 0;
     nodes[i].nframes      = 0;
     nodes[i].fcap         = 0;
@@ -681,7 +686,8 @@ int64_t ramfs64_write(int node, uint64_t offset, const void* buf,
     nd = &nodes[node];
     if (nd->is_dir) return -21;
 
-    if (!nd->frames && offset + len <= RAMFS64_CONTIGUOUS_MAX &&
+    if (!nd->frames &&
+        offset + len <= (nd->contiguous ? RAMFS64_CONTIGUOUS_MAX : RAMFS64_HEAP_FILE_MAX) &&
         ensure_capacity(nd, offset + len)) {
         kmemcpy(nd->data + offset, buf, len);
     } else {
@@ -713,9 +719,12 @@ int ramfs64_resize(int node, uint64_t len) {
     if (nodes[node].is_dir) return -21;             /* -EISDIR */
 
     if (len > nodes[node].size) {
-        if (nodes[node].frames) {
+        if (nodes[node].frames ||
+            len > (nodes[node].contiguous ? RAMFS64_CONTIGUOUS_MAX : RAMFS64_HEAP_FILE_MAX)) {
             /* Fresh frames arrive zeroed, so growing into them exposes
-             * zeros without doing anything more. */
+             * zeros without doing anything more - and a file that has
+             * outgrown the heap's share moves into them here as it
+             * would on a write. */
             if (!make_framed(&nodes[node], len)) return -28;
         } else {
             if (!ensure_capacity(&nodes[node], len)) return -28;  /* -ENOSPC */
@@ -932,7 +941,7 @@ uint64_t ramfs64_seed_failures(void) { return seed_failures; }
 static int seed_needs_heap(const char* name, const uint8_t* data, uint64_t len) {
     const char* base = name;
 
-    if (len < 65536) return 1;
+    if (len <= RAMFS64_HEAP_FILE_MAX) return 1;
     if (len > RAMFS64_CONTIGUOUS_MAX) return 0;
     if (len < 4 || data[0] != 0x7f || data[1] != 'E' || data[2] != 'L' || data[3] != 'F') return 0;
     for (const char* c = name; *c; c++) if (*c == '/') base = c + 1;
@@ -977,7 +986,8 @@ void ramfs64_seed_from_initrd(void) {
          * milestone. A file too big to store was created, left empty,
          * and reported to every reader as a zero-length file that was
          * definitely there - and nothing anywhere said so. */
-        if (!seed_needs_heap(name, (const uint8_t*)data, len) && !make_framed(&nodes[node], len)) {
+        if (seed_needs_heap(name, (const uint8_t*)data, len)) nodes[node].contiguous = 1;
+        else if (!make_framed(&nodes[node], len)) {
             seed_failures++;
             continue;
         }
