@@ -1637,13 +1637,17 @@ test-gpu: iso
 # (Milestone 113): every Wine module staged, the list in GUI64_APPS.
 GUI_APPS_LIST ?= tools/gui_apps.txt
 GUI_PROXY_PORT ?=
+# Every Wine module lives in the RAM filesystem, which 2G does not hold
+# with room to spare; Steam's client is another gigabyte and its
+# processes as much again.
+GUI_QEMU_RAM ?= $(if $(STEAM64_DIR),12G,4G)
 .PHONY: test-gui-apps
 test-gui-apps:
 	@$(MAKE) -f Makefile.amd64 WINE64_INSTALL=1 WINE64_ALL_MODULES=1 GUI64_APPS=$(GUI_APPS_LIST) \
 	    $(if $(GUI_PROXY_PORT),GUI64_PROXY=10.0.2.2:$(GUI_PROXY_PORT)) \
 	    CFLAGS_EXTRA='-DNOVARIS64_FAST -DGUI64_SHOTS $(if $(GUI_PROXY_PORT),-DWINE64_PROXY=\"http://10.0.2.2:$(GUI_PROXY_PORT)\") $(CFLAGS_EXTRA)' iso
 	@GUITEST_QEMU_ARGS='$(QEMU_ACCEL) -smp $(QEMU_SMP) $(QEMU_EXTRA)' \
-	    python3 tools/guitest.py $(ISO) $(BUILD_DIR) $(QEMU_RAM) $(GUI_PROXY_PORT)
+	    python3 tools/guitest.py $(ISO) $(BUILD_DIR) $(GUI_QEMU_RAM) $(GUI_PROXY_PORT)
 
 .PHONY: chrome-window
 chrome-window:
