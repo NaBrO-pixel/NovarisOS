@@ -67,6 +67,11 @@ def main():
          "--https", str(ports["https"]), "--dns", str(ports["dns"]), "--connect", str(ports["fwd"]),
          "--status", os.path.join(build, "gui-net64.status")],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1)
+    if helper.poll() is not None:
+        print("FAIL: tools/net64_helper.py did not start - is another one holding ports %s?"
+              % " ".join(str(p) for p in sorted(ports.values())))
+        sys.exit(1)
     net = ["-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:%d-:8080" % ports["fwd"],
            "-device", "rtl8139,netdev=n0"]
     wrap, dns = [], None
