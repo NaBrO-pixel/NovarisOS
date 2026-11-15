@@ -5560,6 +5560,15 @@ fast_wine:
              * loader refuses to look for kernel32.dll anywhere, and
              * reports 0xc0000135 about a file that is present. */
             "WINEBOOTSTRAPMODE=1",
+            /* No Mono and no Gecko (Milestone 113). With every module
+             * staged, appwiz.cpl is in the image, and wineboot's last
+             * step runs `control.exe appwiz.cpl install_mono` - a dialog
+             * offering to download .NET's stand-in, which nobody here
+             * answers, so wineboot waited on it until its five minutes
+             * ran out and left the prefix unfinished. Neither installer
+             * is staged; with mscoree and mshtml disabled Wine skips both
+             * offers, as it does on any machine set up without them. */
+            "WINEDLLOVERRIDES=mscoree,mshtml=",
 #ifdef WINE64_PROXY
             /* An HTTP proxy, as the guest sees it (Milestone 113): winhttp
              * and wininet take $http_proxy for every scheme. Steam's
