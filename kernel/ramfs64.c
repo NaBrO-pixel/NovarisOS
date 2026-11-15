@@ -923,6 +923,27 @@ static uint64_t seed_failures;
 
 uint64_t ramfs64_seed_failures(void) { return seed_failures; }
 
+/* Whether a file from the initrd has to be one heap block: only what
+ * execve runs is read through ramfs64_data, and that is an ELF program -
+ * not a shared object, which is mapped like anything else (Milestone
+ * 113) - and the dynamic loader. With every Wine module staged, the DLLs alone came to more than
+ * the 256MB heap; seeded into it, they left no heap for anything after,
+ * and the next big allocation failed. */
+static int seed_needs_heap(const char* name, const uint8_t* data, uint64_t len) {
+    const char* base = name;
+
+    if (len < 65536) return 1;
+    if (len > RAMFS64_CONTIGUOUS_MAX) return 0;
+    if (len < 4 || data[0] != 0x7f || data[1] != 'E' || data[2] != 'L' || data[3] != 'F') return 0;
+    for (const char* c = name; *c; c++) if (*c == '/') base = c + 1;
+    /* The dynamic loader is a shared object execve reads as the
+     * interpreter, so it is the one that stays contiguous. */
+    if (base[0] == 'l' && base[1] == 'd' && base[2] == '-') return 1;
+    for (const char* c = base; *c; c++)
+        if (c[0] == '.' && c[1] == 's' && c[2] == 'o' && (c[3] == 0 || c[3] == '.')) return 0;
+    return 1;
+}
+
 void ramfs64_seed_from_initrd(void) {
     uint64_t n = initrd64_file_count();
 
@@ -956,6 +977,10 @@ void ramfs64_seed_from_initrd(void) {
          * milestone. A file too big to store was created, left empty,
          * and reported to every reader as a zero-length file that was
          * definitely there - and nothing anywhere said so. */
+        if (!seed_needs_heap(name, (const uint8_t*)data, len) && !make_framed(&nodes[node], len)) {
+            seed_failures++;
+            continue;
+        }
         if (ramfs64_write(node, 0, data, len) != (int64_t)len) seed_failures++;
     }
 }
