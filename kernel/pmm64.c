@@ -25,7 +25,7 @@ static void watch_report(const char* what, uint64_t f);
 
 #define KERNEL_VMA        0xFFFFFFFF80000000ULL
 /* How much physical memory boot64.s maps at KERNEL_VMA. */
-#define BOOT_WINDOW_BYTES 0x40000000ULL          /* 1GB */
+#define BOOT_WINDOW_BYTES 0x80000000ULL          /* 2GB, at KERNEL_VMA (boot64.s) */
 
 static uint8_t* bitmap;                  /* through the KERNEL_VMA window */
 static uint64_t bitmap_phys_addr;
@@ -200,7 +200,7 @@ void pmm64_init(const multiboot_info_t* mbi,
 
     /* The refcount table is eight times the bitmap and goes immediately
      * after it, so both are covered by the one window check below. At
-     * 6GB that is 1.5MB of bitmap-plus-counts against a 1GB window. */
+     * 6GB that is 1.5MB of bitmap-plus-counts against a 2GB window. */
     refs_size_bytes = frame_count;
     ram_size_bytes  = (frame_count + 7) / 8;
 

@@ -147,6 +147,9 @@ build_page_tables:
     mov ecx, (3 * 4096) / 4
     cld
     rep stosd
+    mov edi, pd_hi2
+    mov ecx, 4096 / 4
+    rep stosd
 
     mov eax, pdpt
     or eax, PG_PRESENT | PG_WRITE
@@ -167,6 +170,26 @@ build_page_tables:
     add eax, 0x200000
     add edi, 8
     loop .fill
+
+    ; The second gigabyte, in the higher half only (Milestone 113): at
+    ; 0xFFFFFFFFC0000000, the PDPT slot after the kernel's. pmm64 puts its
+    ; bitmap after the boot modules and writes it through this window
+    ; before the direct map exists; an initrd over a gigabyte - Steam's
+    ; client staged - ends past the first one. The identity half stays at
+    ; one gigabyte: it is only for crossing CR0.PG, and slot 0 is left
+    ; in the kernel's tables, where more of it would only be in the way.
+    mov eax, pd_hi2
+    or eax, PG_PRESENT | PG_WRITE
+    mov [pdpt + (PDPT_HIGH + 1) * 8], eax   ; 0xFFFFFFFFC0000000
+    mov edi, pd_hi2
+    mov eax, 0x40000000 | PG_PRESENT | PG_WRITE | PG_HUGE
+    mov ecx, 512
+.fill2:
+    mov [edi], eax
+    mov dword [edi + 4], 0
+    add eax, 0x200000
+    add edi, 8
+    loop .fill2
     ret
 
 ; --- failure path -------------------------------------------------------
@@ -269,6 +292,7 @@ section .boot.data progbits alloc noexec write align=4096
 pml4: times 4096 db 0
 pdpt: times 4096 db 0
 pd:   times 4096 db 0
+pd_hi2: times 4096 db 0
 
 mb_magic: dd 0
 mb_info:  dd 0
