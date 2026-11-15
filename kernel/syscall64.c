@@ -5830,6 +5830,22 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
 
     case SYS64_GETSOCKOPT:
         if (a1 >= FD_MAX || !fds[a1].used) return (uint64_t)-9;
+        /* TCP_INFO (Milestone 113): a zeroed struct tcp_info with the
+         * state set, as long as the caller's buffer, up to Linux's 232
+         * bytes. Answering it as an int of 0 said "no such state" for
+         * every socket - Wine's server maps that to CLOSED in the TCP
+         * table Steam's client checks before accepting its UI. */
+        if (fds[a1].kind == FD64_INET && args->a4 && args->a5 && a2 == 6 && a3 == 11) {
+            uint32_t n;
+            if (!user_range_ok(args->a5, 4)) return (uint64_t)-14;
+            n = *(uint32_t*)args->a5;
+            if (n > 232) n = 232;
+            if (n && !user_range_ok(args->a4, n)) return (uint64_t)-14;
+            for (uint32_t k = 0; k < n; k++) ((uint8_t*)args->a4)[k] = 0;
+            if (n) ((uint8_t*)args->a4)[0] = (uint8_t)inet64_tcp_state(fds[a1].sock);
+            *(uint32_t*)args->a5 = n;
+            return 0;
+        }
         if (fds[a1].kind == FD64_INET && args->a4 && args->a5) {
             int v = 0, s2 = fds[a1].sock;
             if (!user_range_ok(args->a4, 4) || !user_range_ok(args->a5, 4))

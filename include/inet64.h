@@ -56,6 +56,8 @@ int  inet64_tx(int s);
 int  inet64_bind(int s, uint32_t ip, uint16_t port);
 int  inet64_listen(int s);
 int  inet64_is_listening(int s);
+/* Linux TCP_* state number (TCP_INFO's tcpi_state). */
+int inet64_tcp_state(int s);
 int  inet64_accept(int s);       /* a new socket's index, -EAGAIN, -errno */
 int  inet64_accept_ready(int s);
 

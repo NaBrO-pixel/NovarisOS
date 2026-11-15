@@ -587,6 +587,27 @@ int inet64_listen(int s) {
     return 0;
 }
 
+/* The socket's state as Linux numbers it in struct tcp_info (Milestone
+ * 113): what getsockopt(TCP_INFO) reports, and what Wine's server reads to
+ * build Windows' TCP connection table. Steam's client accepts its UI's
+ * WebSocket only after finding the connecting socket in that table,
+ * established and owned by steamwebhelper; with no TCP_INFO every socket
+ * read as closed and every connection was refused. */
+int inet64_tcp_state(int s) {
+    isock_t* k;
+    if (!inet64_valid(s)) return 7;                    /* TCP_CLOSE */
+    k = &socks[s];
+    switch (k->state) {
+    case S_LISTEN:     return 10;                      /* TCP_LISTEN */
+    case S_CONNECTING: return 2;                       /* TCP_SYN_SENT */
+    case S_CONNECTED:
+        if (k->shut_wr) return 4;                      /* TCP_FIN_WAIT1 */
+        if (k->tcp >= 0 && tcp_eof(k->tcp)) return 8;  /* TCP_CLOSE_WAIT */
+        return 1;                                      /* TCP_ESTABLISHED */
+    default:           return 7;                       /* TCP_CLOSE */
+    }
+}
+
 int inet64_is_listening(int s) {
     return inet64_valid(s) && socks[s].state == S_LISTEN;
 }
