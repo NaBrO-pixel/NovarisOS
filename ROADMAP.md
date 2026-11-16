@@ -11894,8 +11894,11 @@ The last two are PE32 binaries from `i386-windows`, running as 32-bit
 code in 64-bit processes (`docs-wow64.png`); no fatal signal anywhere in
 the run.
 
-`make -f Makefile.amd64 test` passes 32 of 32 with the new layout; the
-other suites were rerun as well (below).
+Everything else, rerun on the new layout and the WoW64-built Wine: `make
+-f Makefile.amd64 test` 32 PASS, `make -f Makefile.amd64
+WINE64_INSTALL=1 MESA64_INSTALL=1 test` 38 PASS, `test-gpu`,
+`chrome-window` (with `CHROMIUM64_FILES='$(CHROMIUM64_HEADLESS)'`) and
+the 32-bit tree's `make test` - all passing.
 
 ### Still open
 
