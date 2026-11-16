@@ -23,6 +23,7 @@
 #include "kstring.h"
 #include "proc64.h"
 #include "pipe64.h"
+#include "kheap64.h"
 #include "epoll64.h"
 #include "sock64.h"
 #include "clock64.h"
@@ -4292,9 +4293,36 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
     /* execve(path, argv, envp). Replaces the calling process rather
      * than returning to it, so on success there is nothing to return
      * to: the syscall ends by entering the new program. */
-    case SYS64_EXECVE:
-        return do_execve((const char*)a1, (const char* const*)a2,
-                         (const char* const*)a3, args);
+    case SYS64_EXECVE: {
+        /* A failure is said, with the path and the error (Milestone 113):
+         * a successful exec prints its [exec] line and a failed one used
+         * to print nothing, so "wine: could not exec the wine loader"
+         * had no kernel side to read. */
+        uint64_t r = do_execve((const char*)a1, (const char* const*)a2,
+                               (const char* const*)a3, args);
+        if ((int64_t)r < 0) {
+            uint64_t used = 0, total = 0;
+            kheap64_stats(&used, &total);
+            serial64_puts("NOVARIS64: [exec failed] pid ");
+            serial64_putdec((uint64_t)proc64_current_pid());
+            serial64_puts(" error ");
+            serial64_putdec((uint64_t)-(int64_t)r);
+            if (a1 && user_range_ok(a1, 1)) {
+                serial64_puts(" path ");
+                serial64_puts((const char*)a1);
+            }
+            serial64_puts(", heap ");
+            serial64_putdec(used >> 20);
+            serial64_puts("MB used of ");
+            serial64_putdec(total >> 20);
+            serial64_puts("MB, ");
+            serial64_putdec(pipe64_live());
+            serial64_puts(" pipes, ");
+            serial64_putdec(pmm64_free_frames());
+            serial64_puts(" frames free\n");
+        }
+        return r;
+    }
 
     /* wait4(pid, status, options, rusage).
      *

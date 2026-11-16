@@ -1091,7 +1091,18 @@ static void run_program(const void* image, uint64_t len,
             serial64_putdec((uint64_t)sched64_pid_tasks(q));
         }
     }
-    serial64_puts(" (pid/tasks)\n");
+    serial64_puts(" (pid/tasks)");
+    {
+        uint64_t used = 0, total = 0;
+        kheap64_stats(&used, &total);
+        serial64_puts(", heap ");
+        serial64_putdec(used >> 20);
+        serial64_puts("MB of ");
+        serial64_putdec(total >> 20);
+        serial64_puts("MB, pipes ");
+        serial64_putdec(pipe64_live());
+    }
+    serial64_putc('\n');
 
     proc64_set_current(pid);
     p = proc64_current();
