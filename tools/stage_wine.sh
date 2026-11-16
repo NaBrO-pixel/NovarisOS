@@ -397,6 +397,22 @@ if [ "${WINE_ALL_MODULES:-}" = 1 ]; then
                     -o -name '*.ds' -o -name '*.com' -o -name '*.msstyles' -o -name '*.vxd' \) \
                  2>/dev/null)
     echo "stage_wine: every PE module the tree built"
+    # And the 32-bit ones, when Wine was built for WoW64 as well
+    # (--enable-archs=i386,x86_64; Milestone 114): beside the 64-bit set,
+    # in i386-windows, where Wine looks for a 32-bit builtin. They run in
+    # 64-bit processes - no 32-bit Linux library is involved.
+    WIN32DIR="$DEST/usr/bin/i386-windows"
+    n32=0
+    while IFS= read -r f; do
+        mkdir -p "$WIN32DIR"
+        cp "$f" "$WIN32DIR/$(basename "$f")" && n32=$((n32+1))
+    done < <(find "$TREE/dlls" "$TREE/programs" -path "*/i386-windows/*" -type f \
+                 \( -name '*.dll' -o -name '*.exe' -o -name '*.drv' -o -name '*.cpl' \
+                    -o -name '*.ocx' -o -name '*.acm' -o -name '*.ax' -o -name '*.tlb' \
+                    -o -name '*.ds' -o -name '*.com' -o -name '*.msstyles' -o -name '*.vxd' \
+                    -o -name '*.sys' \) \
+                 2>/dev/null)
+    [ "$n32" -gt 0 ] && echo "stage_wine: $n32 32-bit PE modules (WoW64), in i386-windows"
 fi
 
 # The kernel drivers, which are PE modules like the rest and are not on

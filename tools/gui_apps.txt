@@ -8,3 +8,8 @@ winecfg|/usr/bin/x86_64-windows/winecfg.exe||Wine configuration|300
 taskmgr|/usr/bin/x86_64-windows/taskmgr.exe||Task Manager|300
 winemine|/usr/bin/x86_64-windows/winemine.exe||WineMine|300
 control|/usr/bin/x86_64-windows/control.exe||Wine Control Panel|300
+# 32-bit Windows programs, through WoW64 (Milestone 114): staged when Wine
+# was built with --enable-archs=i386,x86_64; run in 64-bit processes, the
+# 32-bit code in compatibility mode on GDT selector 0x23.
+notepad32|/usr/bin/i386-windows/notepad.exe||Untitled - Notepad|300
+winemine32|/usr/bin/i386-windows/winemine.exe||WineMine|300
