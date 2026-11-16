@@ -100,10 +100,12 @@ void syscall64_init(void) {
 
     /* STAR[47:32] is the SYSCALL base, STAR[63:48] the SYSRET base. See
      * syscall64.h for how each expands into a CS/SS pair; the values are
-     * 0x08 and 0x10 because of how gdt64.c orders its descriptors, and
-     * changing that order silently changes which selectors land here. */
+     * 0x08 and 0x23 because of how gdt64.c orders its descriptors, and
+     * changing that order silently changes which selectors land here -
+     * as it did once in Milestone 114, when this second copy kept the
+     * old base and sysret handed ring 3 an ss of 0x1b, a null slot. */
     star = ((uint64_t)GDT64_KCODE_SEL << 32)
-         | ((uint64_t)GDT64_KDATA_SEL << 48);
+         | ((uint64_t)USER_CS32 << 48);
     write_msr(IA32_STAR, star);
 
     write_msr(IA32_LSTAR, (uint64_t)&syscall64_entry);

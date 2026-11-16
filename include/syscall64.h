@@ -19,7 +19,8 @@
  *   SYSRET :  CS = STAR[63:48] + 16, SS = STAR[63:48] + 8   (both RPL 3)
  *
  * With STAR[47:32] = 0x08 that gives kernel 0x08/0x10, and with
- * STAR[63:48] = 0x10 it gives user 0x23/0x1B. */
+ * STAR[63:48] = 0x23 - the 32-bit user code selector, Linux's layout
+ * since Milestone 114 - it gives user 0x33/0x2b. */
 
 /* Linux's x86-64 numbers, not Novaris's own and not the i386 ones.
  *
