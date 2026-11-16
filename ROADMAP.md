@@ -11841,6 +11841,75 @@ and the driver built into the 32-bit Wine tree - all passing.
 - **GPU-accelerated CEF.** Steam runs with `-cef-disable-gpu`; its GPU
   process still composites, in software, through `gdi.c`.
 
+## Milestone 114 - 32-bit Windows programs, through WoW64
+
+Most Windows software that ships today is still 32-bit, and Steam's own
+helpers include 32-bit programs (`gldriverquery.exe`,
+`vulkandriverquery.exe`) that died in Milestone 113 because Wine was
+built for x86-64 alone. Wine 11's WoW64 runs 32-bit Windows code inside
+64-bit processes: the 32-bit PE modules are cross-compiled, there is no
+32-bit Linux library anywhere, and the Unix side is the same 64-bit
+ntdll. What it does need is the x86-64 kernel conventions it was written
+against - Linux's - and NovarisOS had its own.
+
+**The kernel half:**
+
+- **Linux's GDT layout.** Wine hard-codes `0x23` as the selector that
+  runs 32-bit code in compatibility mode - Linux's `__USER32_CS` - and
+  reads its 64-bit selectors from `cs` and `ss`. Ring 3's selectors are
+  now Linux's: 0x23 32-bit code (4GB, D=1), 0x2b data (4GB: in
+  compatibility mode base and limit apply again), 0x33 64-bit code.
+  `STAR` is based at 0x23, so `sysret` lands on 0x33/0x2b; entries 12-14
+  are TLS slots; each CPU's TSS moves to 16+. `STAR` turned out to be
+  written in two places, and the second one kept the old base - `sysret`
+  handed ring 3 an `ss` of 0x1b, a null slot, and the boot stopped at the
+  first `iretq` back to glibc (#GP, error 0x18).
+- **`ds` and `es` are ring 3's data segment for everyone**, as on Linux.
+  The kernel's DPL-0 selector was nulled by `iret` or left behind by
+  `sysret`; either way the first memory access from 32-bit code faults.
+- **`set_thread_area`/`get_thread_area`**, as 64-bit syscalls 205/211 and
+  through an **`int 0x80` gate** as i386 243/244 - which is how Wine
+  makes the 32-bit TEB's `%fs`, from 64-bit code. Three descriptors per
+  thread, loaded into the running CPU's GDT at every switch, copied by
+  `fork` and `clone`, cleared by `execve`. Anything else through `int
+  0x80` is `-ENOSYS`.
+- **Signals**: a handler always runs as 64-bit code; `rt_sigreturn` goes
+  back to 32-bit code when that is what was interrupted (it used to force
+  0x23, which is now the 32-bit selector, and before that ran 32-bit code
+  as 64-bit).
+
+**Wine** is configured `--enable-archs=i386,x86_64` and builds its 758
+32-bit PE modules beside the 64-bit ones; `stage_wine.sh` stages them in
+`usr/bin/i386-windows` with `WINE64_ALL_MODULES`, and `wineboot` makes a
+prefix with `syswow64`. On the build machine first, through
+`winenovaris.drv` offscreen: Wine's 32-bit Notepad and WineMine open
+their windows.
+
+**Inside NovarisOS**, `make -f Makefile.amd64 test-gui-apps`:
+
+    PASS: 9 graphical program(s) opened their windows: settings notepad
+    regedit winecfg taskmgr winemine control notepad32 winemine32
+
+The last two are PE32 binaries from `i386-windows`, running as 32-bit
+code in 64-bit processes (`docs-wow64.png`); no fatal signal anywhere in
+the run.
+
+`make -f Makefile.amd64 test` passes 32 of 32 with the new layout; the
+other suites were rerun as well (below).
+
+### Still open
+
+- **Starting a program while Steam runs.** In Milestone 113's Steam run,
+  every Wine process started after Steam - `taskkill`, `cmd` - stopped at
+  "could not exec the wine loader". A failed `execve` now prints its path,
+  error, heap use, live pipes and free frames; the next uncontended Steam
+  run will say which. (Run 9, slowed by a concurrent Wine build, never got
+  Steam far enough to reproduce it, and its `taskkill` started.)
+- **Steam's 32-bit helpers** have not yet been run inside NovarisOS with
+  WoW64 staged.
+- `modify_ldt`: Wine falls back to the LDT when `set_thread_area` fails;
+  NovarisOS has no LDT, and with `set_thread_area` working it is not used.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
