@@ -78,14 +78,19 @@ static inline void write_msr(uint32_t msr, uint64_t value) {
 extern const uint64_t syscall64_entry_table[];
 void syscall64_init_cpu(int cpu) {
     write_msr(IA32_EFER, read_msr(IA32_EFER) | EFER_SCE);
+    /* sysret: cs = STAR[63:48] + 16, ss = + 8 - so the 32-bit user code
+     * selector, below data and 64-bit code, as on Linux. */
     write_msr(IA32_STAR, ((uint64_t)GDT64_KCODE_SEL << 32) |
-                         ((uint64_t)GDT64_KDATA_SEL << 48));
+                         ((uint64_t)USER_CS32 << 48));
     write_msr(IA32_LSTAR, syscall64_entry_table[cpu]);
     write_msr(IA32_FMASK, (1ULL << 9) | (1ULL << 10) | (1ULL << 8));
 }
 
+void syscall64_int80(registers64_t* r);
 void syscall64_init(void) {
     uint64_t star;
+
+    register_interrupt_handler64(128, syscall64_int80);
 
     call_count = last_arg = exit_code = 0;
 
@@ -1772,6 +1777,8 @@ static uint64_t do_fork_common(const syscall64_args_t* args,
         /* A fork's only thread is a copy of the calling one, alternate
          * signal stack and all; a new thread's is not. */
         signal64_task_inherit_altstack(slot, sched64_current());
+        /* And its TLS descriptors, as Linux copies them (Milestone 114). */
+        sched64_copy_tls(slot, sched64_current());
 
         /* The tid words, which glibc's fork asks for - it is
          * clone(CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID|SIGCHLD) with
@@ -1881,10 +1888,10 @@ static void frame_from_args(const syscall64_args_t* args, uint64_t rax,
     out->int_no   = 0;
     out->err_code = 0;
     out->rip    = args->ret_rip;
-    out->cs     = 0x23;
+    out->cs     = USER_CS;
     out->rflags = args->ret_rflags | 0x200;
     out->rsp    = saved_user_rsp;
-    out->ss     = 0x1B;
+    out->ss     = USER_DS;
 }
 
 uint64_t syscall64_thread_exits(void) { return thread_exits; }
@@ -2070,6 +2077,87 @@ int syscall64_run_expired(void) { return run_expired; }
 int syscall64_leader_exited(void) { return leader_exited; }
 
 static uint64_t dispatch(syscall64_args_t* args);
+
+/* set_thread_area(2) and get_thread_area(2) (Milestone 114): a TLS
+ * descriptor in one of the thread's three GDT slots, 12-14. Wine's WoW64
+ * makes the 32-bit TEB's %fs this way - through int 0x80, i386 number
+ * 243, from 64-bit code, as on Linux. struct user_desc is entry_number,
+ * base_addr, limit, then the flag bits: seg_32bit, contents (2),
+ * read_exec_only, limit_in_pages, seg_not_present, useable, lm. */
+struct user_desc64 { uint32_t entry, base, limit, flags; };
+
+static uint64_t make_tls_desc(const struct user_desc64* u) {
+    uint32_t f = u->flags;
+    uint64_t d = 0;
+    int seg_32bit = f & 1, contents = (f >> 1) & 3, read_exec_only = (f >> 3) & 1;
+    int limit_in_pages = (f >> 4) & 1, not_present = (f >> 5) & 1, useable = (f >> 6) & 1;
+    int lm = (f >> 7) & 1;
+    uint8_t access, flags4;
+
+    /* The "empty" descriptor clears the slot, as Linux's LDT_empty. */
+    if (!u->base && !u->limit && contents == 0 && read_exec_only && !seg_32bit &&
+        !limit_in_pages && not_present && !useable)
+        return 0;
+    access = (uint8_t)((not_present ? 0 : 0x80) | 0x60 | 0x10 |
+                       (contents << 2) | ((read_exec_only ^ 1) << 1) | 1);
+    flags4 = (uint8_t)((limit_in_pages << 3) | (seg_32bit << 2) | (lm << 1) | useable);
+    d |= (uint64_t)(u->limit & 0xFFFF);
+    d |= (uint64_t)(u->base & 0xFFFFFF) << 16;
+    d |= (uint64_t)access << 40;
+    d |= (uint64_t)((u->limit >> 16) & 0xF) << 48;
+    d |= (uint64_t)flags4 << 52;
+    d |= (uint64_t)((u->base >> 24) & 0xFF) << 56;
+    return d;
+}
+
+static uint64_t tls_area(uint64_t uptr, int set) {
+    struct user_desc64 u;
+    uint64_t* tls = sched64_tls(sched64_current());
+    int idx;
+
+    if (!tls) return (uint64_t)-3;                    /* -ESRCH */
+    if (!user_range_ok(uptr, sizeof(u))) return (uint64_t)-14;
+    kmemcpy(&u, (const void*)uptr, sizeof(u));
+    idx = (int)u.entry;
+    if (set && idx == -1) {
+        for (idx = 0; idx < GDT64_TLS_COUNT; idx++)
+            if (!tls[idx]) break;
+        if (idx == GDT64_TLS_COUNT) return (uint64_t)-3;   /* -ESRCH: full */
+        idx += GDT64_TLS_FIRST;
+        ((struct user_desc64*)uptr)->entry = (uint32_t)idx;
+    }
+    if (idx < GDT64_TLS_FIRST || idx >= GDT64_TLS_FIRST + GDT64_TLS_COUNT)
+        return (uint64_t)-22;                          /* -EINVAL */
+    if (set) {
+        tls[idx - GDT64_TLS_FIRST] = make_tls_desc(&u);
+        gdt64_load_tls(tls);
+        return 0;
+    }
+    {
+        uint64_t d = tls[idx - GDT64_TLS_FIRST];
+        struct user_desc64* o = (struct user_desc64*)uptr;
+        uint8_t access = (uint8_t)(d >> 40), fl = (uint8_t)(d >> 52);
+        o->base  = (uint32_t)(((d >> 16) & 0xFFFFFF) | (((d >> 56) & 0xFF) << 24));
+        o->limit = (uint32_t)((d & 0xFFFF) | (((d >> 48) & 0xF) << 16));
+        o->flags = (uint32_t)(((fl >> 2) & 1) | (((access >> 2) & 3) << 1) |
+                              ((((access >> 1) & 1) ^ 1) << 3) | (((fl >> 3) & 1) << 4) |
+                              ((((access >> 7) & 1) ^ 1) << 5) | ((fl & 1) << 6) |
+                              (((fl >> 1) & 1) << 7));
+        if (!d) o->flags = 0x28;                       /* the empty one */
+        return 0;
+    }
+}
+
+/* int 0x80 from ring 3: Linux's i386 entry, of which only the TLS calls
+ * are answered - all WoW64 uses it for. Anything else is -ENOSYS. */
+void syscall64_int80(registers64_t* r) {
+    uint32_t nr = (uint32_t)r->rax;
+    uint64_t ebx = (uint32_t)r->rbx;
+    if (nr == 243)      r->rax = tls_area(ebx, 1);    /* set_thread_area */
+    else if (nr == 244) r->rax = tls_area(ebx, 0);    /* get_thread_area */
+    else                r->rax = (uint64_t)-38;
+    r->rax = (uint32_t)r->rax | ((int64_t)(int32_t)r->rax < 0 ? 0xFFFFFFFF00000000ULL : 0);
+}
 
 /* --- the KUSER_SHARED_DATA canary (Milestone 81) --------------------- */
 
@@ -3204,6 +3292,9 @@ static uint64_t do_execve(const char* path, const char* const* argv,
      * handler of its own must get the default action rather than
      * somebody else's. */
     signal64_exec();
+    /* A new image starts with no TLS descriptors (Milestone 114). */
+    sched64_copy_tls(sched64_current(), -1);
+    gdt64_load_tls(0);
 
     /* Close-on-exec, which nothing was doing.
      *
@@ -3292,8 +3383,8 @@ static uint64_t do_execve(const char* path, const char* const* argv,
      * program and calls its entry point itself. */
     entry.rip    = interp_base ? interp.entry : info.entry;
     entry.rsp    = rsp;
-    entry.cs     = 0x23;
-    entry.ss     = 0x1B;
+    entry.cs     = USER_CS;
+    entry.ss     = USER_DS;
     entry.rflags = 0x202;
 
     sched64_set_current_space(&fresh);
@@ -4256,16 +4347,17 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
         child.int_no   = 0;
         child.err_code = 0;
         child.rip      = args->ret_rip;      /* just after its `syscall` */
-        child.cs       = 0x23;
+        child.cs       = USER_CS;
         child.rflags   = args->ret_rflags | 0x200;   /* IF, or it never
                                                       * yields the CPU  */
         child.rsp      = a2;
-        child.ss       = 0x1B;
+        child.ss       = USER_DS;
 
         tid = sched64_add_frame(&child, space,
                                 (a1 & CLONE_SETTLS) ? args->a5 : 0);
         if (tid < 0) return (uint64_t)-11;              /* -EAGAIN */
         wait_slot_reset(tid);
+        sched64_copy_tls(tid, sched64_current());       /* Milestone 114 */
 
         /* The three tid words. glibc passes &pd->tid as both pointers,
          * and the first is how pthread_create learns the tid at all. A
@@ -4293,6 +4385,11 @@ static uint64_t dispatch_body(syscall64_args_t* args) {
     /* execve(path, argv, envp). Replaces the calling process rather
      * than returning to it, so on success there is nothing to return
      * to: the syscall ends by entering the new program. */
+    case SYS64_SET_THREAD_AREA:
+        return tls_area(a1, 1);
+    case SYS64_GET_THREAD_AREA:
+        return tls_area(a1, 0);
+
     case SYS64_EXECVE: {
         /* A failure is said, with the path and the error (Milestone 113):
          * a successful exec prints its [exec] line and a failed one used

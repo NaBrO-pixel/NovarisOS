@@ -290,6 +290,8 @@ typedef struct {
 #define SYS64_GETTID          186
 #define SYS64_PRCTL           157
 #define SYS64_ARCH_PRCTL      158
+#define SYS64_SET_THREAD_AREA 205   /* Milestone 114: WoW64's 32-bit %fs */
+#define SYS64_GET_THREAD_AREA 211
 
 /* The prctl options this kernel answers. Everything else is EINVAL,
  * which is what Linux says about an option it does not know - including

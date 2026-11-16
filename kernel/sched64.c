@@ -10,8 +10,8 @@
 #include "serial64.h"
 #include "spin64.h"
 
-#define UCODE_SEL_RPL3 0x23
-#define UDATA_SEL_RPL3 0x1B
+#define UCODE_SEL_RPL3 USER_CS
+#define UDATA_SEL_RPL3 USER_DS
 #define RFLAGS_IF      0x202    /* IF, plus the bit that is always set */
 
 typedef struct {
@@ -19,6 +19,9 @@ typedef struct {
     vmspace64_t   space;
     uint64_t      fs_base;   /* the thread pointer, per thread          */
     uint64_t      gs_base;   /* and the TEB, which Wine keeps at GS      */
+    /* The thread's three TLS descriptors (set_thread_area), GDT entries
+     * 12-14 while it runs (Milestone 114): WoW64's 32-bit fs. */
+    uint64_t      tls[3];
     uint64_t      wait_addr; /* the futex it is blocked on, 0 if awake  */
     /* What rax becomes when this thread is woken. futex wants 0 - the
      * value FUTEX_WAIT returns - but a syscall that blocks and then
@@ -366,6 +369,7 @@ int sched64_add(uint64_t rip, uint64_t rsp, uint64_t arg,
 
     tasks[i].space     = *space;
     tasks[i].fs_base   = 0;  /* a task that has never run has no TLS yet */
+    tasks[i].tls[0] = tasks[i].tls[1] = tasks[i].tls[2] = 0;
     tasks[i].blocked   = 0;
     tasks[i].wait_addr = 0;
     /* Belongs to whoever is running. Leaving this zero would make the
@@ -421,6 +425,7 @@ int sched64_add_frame_for(const registers64_t* regs, const vmspace64_t* space,
     tasks[i].regs      = *regs;
     tasks[i].space     = *space;
     tasks[i].fs_base   = fs_base;
+    tasks[i].tls[0] = tasks[i].tls[1] = tasks[i].tls[2] = 0;
     tasks[i].blocked   = 0;
     tasks[i].wait_addr = 0;
     tasks[i].gen++;
@@ -450,12 +455,24 @@ const vmspace64_t* sched64_current_space(void) {
     return &tasks[current].space;
 }
 
+uint64_t* sched64_tls(int index) {
+    return index >= 0 && index < SCHED64_MAX_TASKS ? tasks[index].tls : 0;
+}
+
+void sched64_copy_tls(int to, int from) {
+    if (to < 0 || to >= SCHED64_MAX_TASKS) return;
+    for (int k = 0; k < 3; k++)
+        tasks[to].tls[k] = (from >= 0 && from < SCHED64_MAX_TASKS) ? tasks[from].tls[k] : 0;
+}
+
 void sched64_set_current(int index) {
     current = index;
     /* The first task is entered directly rather than switched to, so the
      * scheduler never got to record what it was running with. */
-    if (index >= 0 && index < SCHED64_MAX_TASKS)
+    if (index >= 0 && index < SCHED64_MAX_TASKS) {
         tasks[index].fs_base = read_fs_base();
+        gdt64_load_tls(tasks[index].tls);
+    }
 }
 int  sched64_current(void)          { return current; }
 uint64_t sched64_switches(void)     { return switch_count; }
@@ -535,7 +552,7 @@ int sched64_exit_current(registers64_t* out_regs, vmspace64_t* out_space,
     if (out_regs)     *out_regs     = tasks[next].regs;
     if (out_space)    *out_space    = tasks[next].space;
     if (out_fs_base)  *out_fs_base  = tasks[next].fs_base;
-    proc64_set_current(tasks[next].pid);
+    proc64_set_current(tasks[next].pid); gdt64_load_tls(tasks[next].tls);
     return 1;
 }
 
@@ -609,7 +626,7 @@ int sched64_exit_process(int pid, registers64_t* out_regs,
     if (out_regs)    *out_regs    = tasks[next].regs;
     if (out_space)   *out_space   = tasks[next].space;
     if (out_fs_base) *out_fs_base = tasks[next].fs_base;
-    proc64_set_current(tasks[next].pid);
+    proc64_set_current(tasks[next].pid); gdt64_load_tls(tasks[next].tls);
     return 1;
 }
 
@@ -890,7 +907,7 @@ switch_to_next:
     if (out_regs)    *out_regs    = tasks[next].regs;
     if (out_space)   *out_space   = tasks[next].space;
     if (out_fs_base) *out_fs_base = tasks[next].fs_base;
-    proc64_set_current(tasks[next].pid);
+    proc64_set_current(tasks[next].pid); gdt64_load_tls(tasks[next].tls);
     return 1;
 }
 
@@ -934,7 +951,7 @@ int sched64_yield_current(const registers64_t* regs, registers64_t* out_regs,
     if (out_regs)    *out_regs    = tasks[next].regs;
     if (out_space)   *out_space   = tasks[next].space;
     if (out_fs_base) *out_fs_base = tasks[next].fs_base;
-    proc64_set_current(tasks[next].pid);
+    proc64_set_current(tasks[next].pid); gdt64_load_tls(tasks[next].tls);
     return 1;
 }
 
@@ -1065,7 +1082,7 @@ static void switch_on_frame(registers64_t* frame, int next) {
     write_fs_base(tasks[current].fs_base);
     /* The process changes with the thread. Miss this and the incoming
      * thread runs with the outgoing one's open files and heap. */
-    proc64_set_current(tasks[current].pid);
+    proc64_set_current(tasks[current].pid); gdt64_load_tls(tasks[current].tls);
     switch_count++;
 
     /* Ending the run by redirecting a resume rather than by counting
@@ -1153,7 +1170,7 @@ int sched64_migrate_current(const registers64_t* regs, int cpu,
     if (out_regs)    *out_regs    = tasks[next].regs;
     if (out_space)   *out_space   = tasks[next].space;
     if (out_fs_base) *out_fs_base = tasks[next].fs_base;
-    proc64_set_current(tasks[next].pid);
+    proc64_set_current(tasks[next].pid); gdt64_load_tls(tasks[next].tls);
     return 1;
 }
 
@@ -1190,7 +1207,7 @@ static void load_task(int n) {
     write_gs_base(tasks[n].gs_base);
     write_fs_base(tasks[n].fs_base);
     vmspace64_switch(&tasks[n].space);
-    proc64_set_current(tasks[n].pid);
+    proc64_set_current(tasks[n].pid); gdt64_load_tls(tasks[n].tls);
 }
 
 /* From an interrupt that found its thread ended: the frame becomes the
@@ -1243,7 +1260,7 @@ int sched64_run_this_cpu(void) {
     write_gs_base(tasks[n].gs_base);
     write_fs_base(tasks[n].fs_base);
     vmspace64_switch(&tasks[n].space);
-    proc64_set_current(tasks[n].pid);
+    proc64_set_current(tasks[n].pid); gdt64_load_tls(tasks[n].tls);
     sched64_resume(&tasks[n].regs);            /* releases the lock */
     return 1;
 }

@@ -21,7 +21,7 @@
 
 /* null, kcode, kdata, udata, ucode, then the TSS (2 slots) - at slot
  * 5 + 2 * cpu, so its selector says which CPU this is (gdt64_cpu). */
-#define GDT_ENTRIES (7 + 2 * (SMP64_MAX_CPUS - 1))
+#define GDT_ENTRIES (18 + 2 * (SMP64_MAX_CPUS - 1))
 
 struct gdt64_entry {
     uint16_t limit_low;
@@ -107,6 +107,13 @@ static void set_tss_entry(int i, uint64_t base, uint32_t limit) {
     e->reserved         = 0;
 }
 
+void gdt64_load_tls(const uint64_t* tls) {
+    int cpu = gdt64_cpu();
+    uint64_t* g = (uint64_t*)gdt_all[cpu];
+    for (int k = 0; k < GDT64_TLS_COUNT; k++)
+        g[GDT64_TLS_FIRST + k] = tls ? tls[k] : 0;
+}
+
 void gdt64_set_kernel_stack_cpu(int cpu, uint64_t rsp0) {
     tss_all[cpu].rsp[0] = rsp0;
 }
@@ -148,14 +155,22 @@ void gdt64_install_cpu(int cpu) {
     set_entry(1, 0x9A, 0xA0);           /* kernel code: P,S,exec,read   L=1 */
     set_entry(2, 0x92, 0x00);           /* kernel data: P,S,write            */
 
-    /* User data before user code, and both adjacent to the kernel pair.
-     * That ordering is not cosmetic: sysret derives cs and ss from a
-     * single MSR by adding fixed offsets, so it only works if the
-     * selectors sit where it expects them. */
-    set_entry(3, 0xF2, 0x00);           /* user data: DPL=3                  */
-    set_entry(4, 0xFA, 0xA0);           /* user code: DPL=3, L=1             */
+    /* Ring 3's three, in Linux's order (Milestone 114): 32-bit code, data,
+     * 64-bit code. Not cosmetic twice over: sysret derives cs and ss from
+     * one MSR by fixed offsets from the first, and Wine's WoW64 hard-codes
+     * 0x23 as the selector that runs 32-bit Windows code. The 32-bit code
+     * and the data segment cover 4GB - in compatibility mode base and
+     * limit apply again, and a data segment of limit 0 faults on the
+     * first 32-bit stack push. */
+    set_entry(3, 0, 0);                 /* unused                            */
+    set_entry(4, 0xFA, 0xCF);           /* user code 32: DPL=3, D=1, G=1     */
+    gdt[4].limit_low = 0xFFFF;
+    set_entry(5, 0xF2, 0xCF);           /* user data: DPL=3, B=1, G=1        */
+    gdt[5].limit_low = 0xFFFF;
+    set_entry(6, 0xFA, 0xA0);           /* user code 64: DPL=3, L=1          */
+    for (i = 7; i < 16; i++) set_entry((int)i, 0, 0);   /* TLS slots: empty  */
 
-    set_tss_entry(5 + 2 * cpu, (uint64_t)&tss, sizeof(tss) - 1);
+    set_tss_entry(16 + 2 * cpu, (uint64_t)&tss, sizeof(tss) - 1);
 
     gdt_ptr.limit = (uint16_t)(sizeof(gdt_all[cpu]) - 1);
     gdt_ptr.base  = (uint64_t)gdt_all[cpu];

@@ -2141,17 +2141,17 @@ void kernel_main(uint32_t magic, void* mbi) {
         enter_user_mode64(UCODE_VA, USTACK_VA + PAGE64_SIZE, 0);
 
         check("ring 3 was entered and returned", syscall64_count() == 2);
-        /* The program read its own CS and handed it over. 0x23 is the
+        /* The program read its own CS and handed it over. 0x33 is the
          * user code selector with RPL 3, and it is the one value here
          * that ring 0 could not have produced: the same code running at
          * ring 0 would have reported 0x08. */
-        check("the program really was at ring 3 (CS = 0x23)",
-              syscall64_last_arg() == 0x23);
+        check("the program really was at ring 3 (CS = 0x33)",
+              syscall64_last_arg() == USER_CS);
         /* And it resumed after the first syscall with the value the
          * kernel returned, which is what proves SYSRET went back rather
          * than the program simply never continuing. */
         check("SYSRET returned to ring 3 with the result",
-              syscall64_exit_code() == 0x23 + 0x1111);
+              syscall64_exit_code() == USER_CS + 0x1111);
 
         serial64_puts("NOVARIS64: user cs = ");
         serial64_puthex(syscall64_last_arg());
@@ -2285,9 +2285,9 @@ void kernel_main(uint32_t magic, void* mbi) {
         vmspace64_switch(&kspace);
 
         check("it ran and exited", syscall64_count() == calls_before + 2);
-        check("it ran at ring 3", syscall64_last_arg() == 0x23);
+        check("it ran at ring 3", syscall64_last_arg() == USER_CS);
         check("and the syscall found the kernel from inside its space",
-              syscall64_exit_code() == 0x23 + 0x1111);
+              syscall64_exit_code() == USER_CS + 0x1111);
 
         vmspace64_destroy(&proc);
         pmm64_free_frame(code_frame);

@@ -1,6 +1,7 @@
 /* signal64.c - delivering a fault to a ring-3 handler. */
 
 #include "signal64.h"
+#include "gdt64.h"
 #include "kstring.h"
 #include "serial64.h"
 #include "proc64.h"
@@ -793,6 +794,12 @@ static int deliver_frame(int sig, registers64_t* r, uint64_t fault_addr,
      * ucontext*) - the third is what makes resuming elsewhere possible. */
     r->rip = sa->handler;
     r->rsp = sp;
+    /* A handler is 64-bit code, whatever was interrupted (Milestone 114):
+     * a signal that lands in 32-bit Windows code under WoW64 has cs 0x23
+     * in the frame, recorded above for the handler to see, and resuming
+     * the handler with it would run 64-bit code in compatibility mode. */
+    r->cs = USER_CS;
+    r->ss = USER_DS;
     r->rdi = (uint64_t)sig;
     r->rsi = (uint64_t)frame->info;
     r->rdx = (uint64_t)&frame->uc;
@@ -851,9 +858,12 @@ int signal64_sigreturn(uint64_t user_rsp, registers64_t* out) {
     /* The selectors and the interrupt flag are the kernel's to decide,
      * not the handler's: a process that could write its own cs, or turn
      * interrupts off, would be writing itself into ring 0. Only the
-     * flags a program may legitimately change are taken from the frame. */
-    out->cs     = 0x23;
-    out->ss     = 0x1B;
+     * flags a program may legitimately change are taken from the frame -
+     * and which of ring 3's two code segments to go back to (Milestone
+     * 114): Wine resumes 32-bit Windows code through sigreturn with cs
+     * 0x23, and forcing 0x33 ran it as 64-bit code. */
+    out->cs     = sc->cs == USER_CS32 ? USER_CS32 : USER_CS;
+    out->ss     = USER_DS;
     out->rflags = (sc->eflags & 0x0CD5ULL) | 0x202ULL;
 
     /* The mask from before the handler ran - or whatever the handler

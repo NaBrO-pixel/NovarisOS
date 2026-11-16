@@ -103,6 +103,10 @@ int      sched64_blocked_pid(int i);
 
 int  sched64_pid_tasks(int pid);
 int  sched64_lowest_pid_above(int pid);
+/* A task's three TLS descriptors (set_thread_area; Milestone 114), and a
+ * copy of one task's into another's - clone and fork inherit them. */
+uint64_t* sched64_tls(int index);
+void sched64_copy_tls(int to, int from);
 
 int  sched64_space_in_use(uint64_t pml4_phys);
 

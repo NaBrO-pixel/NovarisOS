@@ -120,6 +120,7 @@ ISR_NOERR 28
 ISR_ERR   29   ; #VC VMM communication
 ISR_ERR   30   ; #SX security exception
 ISR_NOERR 31
+ISR_NOERR 128  ; int 0x80, Linux's i386 entry (Milestone 114: WoW64's TLS)
 
 ; The 8259s are remapped to 32-47 exactly as in the 32-bit kernel.
 IRQ 0,  32
@@ -180,9 +181,18 @@ tss64_flush:
 global gdt64_flush
 gdt64_flush:
     lgdt [rdi]
-    mov ax, 0x10            ; kernel data
+    ; ds and es are ring 3's data segment, 0x2b, for everyone and for
+    ; good (Milestone 114), as on Linux: nothing in the kernel reloads them,
+    ; so they are what ring 3 ends up holding - and 32-bit code under
+    ; WoW64 runs in compatibility mode, where they are real segments. The
+    ; kernel's own 0x10 is DPL 0: iret nulls it on the way to ring 3,
+    ; sysret leaves it, and either way a 32-bit program faults on its
+    ; first memory access. Ring 0 may load a DPL 3 data segment; ss may
+    ; not, so ss stays the kernel's.
+    mov ax, 0x2b            ; user data, RPL 3 (include/gdt64.h USER_DS)
     mov ds, ax
     mov es, ax
+    mov ax, 0x10            ; kernel data
     mov ss, ax
     mov fs, ax
     mov gs, ax

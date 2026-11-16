@@ -17,8 +17,8 @@
 
 bits 64
 
-UDATA_SEL equ 0x18
-UCODE_SEL equ 0x20
+UDATA_SEL equ 0x28                  ; include/gdt64.h (Milestone 114)
+UCODE_SEL equ 0x30
 RPL3      equ 3
 
 ; Linux x86-64 numbers. Both of these leave ring 3 rather than returning
@@ -278,7 +278,7 @@ sched64_resume_raw:                 ; through sched64_resume (sched64.c)
 ;
 ; It reads its own CS and hands it to the kernel, which is the only
 ; unforgeable evidence that this really is ring 3: a copy of this code
-; running at ring 0 would report 0x08, not 0x23. Then it feeds the value
+; running at ring 0 would report 0x08, not 0x33. Then it feeds the value
 ; the kernel returned into the exit call, which proves SYSRET came back
 ; here with a result rather than the program never resuming.
 ; ---------------------------------------------------------------------
@@ -286,7 +286,7 @@ global user_test_code
 global user_test_code_end
 user_test_code:
     mov rax, SYS64_ECHO
-    mov rdi, cs                     ; 0x23 if this is really ring 3
+    mov rdi, cs                     ; 0x33 if this is really ring 3
     syscall                         ; -> rax = rdi + 0x1111
     mov rdi, rax
     mov rax, SYS64_EXIT             ; with that value

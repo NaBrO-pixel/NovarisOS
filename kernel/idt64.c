@@ -78,6 +78,7 @@ extern void isr21(void); extern void isr22(void); extern void isr23(void);
 extern void isr24(void); extern void isr25(void); extern void isr26(void);
 extern void isr27(void); extern void isr28(void); extern void isr29(void);
 extern void isr30(void); extern void isr31(void);
+extern void isr128(void);
 
 extern void irq0(void);  extern void irq1(void);  extern void irq2(void);
 extern void irq3(void);  extern void irq4(void);  extern void irq5(void);
@@ -385,6 +386,8 @@ void idt64_install(void) {
     set_gate(29, (uint64_t)isr29, 0, 0);
     set_gate(30, (uint64_t)isr30, 0, 0);
     set_gate(31, (uint64_t)isr31, 0, 0);
+    /* int 0x80, reachable from ring 3 (Milestone 114). */
+    set_gate(128, (uint64_t)isr128, 0, 3);
 
     set_gate(32, (uint64_t)irq0,  0, 0);
     set_gate(33, (uint64_t)irq1,  0, 0);
