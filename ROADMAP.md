@@ -11900,18 +11900,36 @@ WINE64_INSTALL=1 MESA64_INSTALL=1 test` 38 PASS, `test-gpu`,
 `chrome-window` (with `CHROMIUM64_FILES='$(CHROMIUM64_HEADLESS)'`) and
 the 32-bit tree's `make test` - all passing.
 
+### Steam with WoW64, and starting programs beside it
+
+- **Steam's 32-bit helpers run.** With the i386 modules staged,
+  `vulkandriverquery.exe` - which died in Milestone 113 - runs through
+  WoW64; `gldriverquery.exe` loads and stops only at `SDL2.dll`, which
+  Steam does not ship beside it. Steam still reaches its sign-in window
+  (`test-gui-apps GUI_APPS_LIST=tools/gui_apps_steam.txt`: PASS).
+- **A program can be started while Steam runs.** Every Wine process
+  started after Steam - `taskkill`, `cmd` - used to stop at "could not
+  exec the wine loader". A failed `execve` now prints its path, error,
+  heap use, live pipes and free frames, and it said ENOEXEC on
+  `/usr/bin/wine`, with heap and frames to spare. Mapping a file puts it
+  in frames, and `make_framed` freed the heap copy - the one piece
+  `execve` reads - so once something in Steam's process tree had mapped
+  the Wine loader, it could not be executed again. A file seeded from the
+  initrd as contiguous now keeps that copy beside its frames, a write
+  drops it, and the boot checks it (map `/dynhello64`; the image is still
+  there). With Steam's fourteen processes alive, `taskkill` starts and
+  ends it.
+- **The proxy port moves between sessions.** `GUI_PROXY_PORT` now
+  defaults to `$HTTPS_PROXY`'s when `STEAM64_DIR` is set, and
+  `guitest.py` refuses to boot when nothing answers on it - an image
+  built with a stale port told Steam it was offline an hour later.
+
 ### Still open
 
-- **Starting a program while Steam runs.** In Milestone 113's Steam run,
-  every Wine process started after Steam - `taskkill`, `cmd` - stopped at
-  "could not exec the wine loader". A failed `execve` now prints its path,
-  error, heap use, live pipes and free frames; the next uncontended Steam
-  run will say which. (Run 9, slowed by a concurrent Wine build, never got
-  Steam far enough to reproduce it, and its `taskkill` started.)
-- **Steam's 32-bit helpers** have not yet been run inside NovarisOS with
-  WoW64 staged.
 - `modify_ldt`: Wine falls back to the LDT when `set_thread_area` fails;
   NovarisOS has no LDT, and with `set_thread_area` working it is not used.
+- Signing in to Steam: this machine's proxy passes only HTTPS `CONNECT`,
+  so Steam's connection managers stay out of reach (Milestone 113).
 
 ## Where chrome.exe actually is from here
 
