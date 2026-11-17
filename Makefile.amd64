@@ -1636,7 +1636,11 @@ test-gpu: iso
 # Graphical programs under Wine, each photographed with its window open
 # (Milestone 113): every Wine module staged, the list in GUI64_APPS.
 GUI_APPS_LIST ?= tools/gui_apps.txt
-GUI_PROXY_PORT ?=
+# The proxy port, for a run that needs the network (Steam): by default
+# the one this machine's own traffic uses, from $HTTPS_PROXY
+# (http://127.0.0.1:PORT) - it moves between sessions, and an image built
+# with yesterday's port tells Steam it is offline.
+GUI_PROXY_PORT ?= $(if $(STEAM64_DIR),$(shell printf '%s' "$$HTTPS_PROXY" | sed -n 's|^http://127\.0\.0\.1:\([0-9][0-9]*\)/*$$|\1|p'))
 # Every Wine module lives in the RAM filesystem, which 2G does not hold
 # with room to spare; Steam's client is another gigabyte and its
 # processes as much again.

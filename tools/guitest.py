@@ -76,6 +76,18 @@ def main():
            "-device", "rtl8139,netdev=n0"]
     wrap, dns = [], None
     if proxy_port:
+        # The guest reaches it as 10.0.2.2:<port>; nothing answering here
+        # means an image that will spend an hour discovering it is offline.
+        probe = socket.socket()
+        probe.settimeout(5)
+        try:
+            probe.connect(("127.0.0.1", int(proxy_port)))
+        except OSError:
+            print("FAIL: nothing answers on the proxy port %s here - see $HTTPS_PROXY" % proxy_port)
+            helper.kill()
+            sys.exit(1)
+        finally:
+            probe.close()
         resolv = os.path.join(build, "gui-resolv.conf")
         with open(resolv, "w") as f:
             f.write("nameserver 127.0.0.1\n")
