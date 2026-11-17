@@ -595,6 +595,7 @@ static int make_framed(node64_t* nd, uint64_t bytes) {
     uint64_t need = (bytes + PAGE64_SIZE - 1) / PAGE64_SIZE;
     uint64_t* fresh;
     uint64_t got = 0;
+    int first = !nd->frames;
 
     if (!need) need = 1;
     if (nd->frames && nd->nframes >= need) return 1;
@@ -632,14 +633,32 @@ static int make_framed(node64_t* nd, uint64_t bytes) {
     }
     nd->nframes = need;
 
-    /* First time: move the contents in and let the heap copy go. */
-    if (nd->data) {
+    /* First time: move the contents in and let the heap copy go - unless
+     * this is a program execve reads in one piece (Milestone 114). Mapping
+     * a file is enough to frame it, and something in Steam's process tree
+     * maps /usr/bin/wine; from then on every execve of the Wine loader
+     * found no contiguous image and failed with ENOEXEC ("could not exec
+     * the wine loader"), and no new Wine program could start. Such a file
+     * keeps its heap copy beside the frames; a write drops it. */
+    if (first && nd->data) {
         frame_copy(nd, 0, nd->data, nd->size, 1);
+        if (!nd->contiguous) {
+            kfree64(nd->data);
+            nd->data     = 0;
+            nd->capacity = 0;
+        }
+    }
+    return 1;
+}
+
+/* A framed file's retained heap copy (make_framed) is stale once the
+ * file changes: let it go, and ramfs64_data says there is none. */
+static void drop_heap_copy(node64_t* nd) {
+    if (nd->frames && nd->data) {
         kfree64(nd->data);
         nd->data     = 0;
         nd->capacity = 0;
     }
-    return 1;
 }
 
 static int ensure_capacity(node64_t* nd, uint64_t want) {
@@ -697,6 +716,7 @@ int64_t ramfs64_write(int node, uint64_t offset, const void* buf,
          * falling through to here loses nothing. */
         if (!make_framed(nd, offset + len)) return -12;
         frame_copy(nd, offset, (void*)buf, len, 1);
+        drop_heap_copy(nd);
     }
     if (offset + len > nd->size) nd->size = offset + len;
     return (int64_t)len;
@@ -726,6 +746,7 @@ int ramfs64_resize(int node, uint64_t len) {
              * outgrown the heap's share moves into them here as it
              * would on a write. */
             if (!make_framed(&nodes[node], len)) return -28;
+            drop_heap_copy(&nodes[node]);
         } else {
             if (!ensure_capacity(&nodes[node], len)) return -28;  /* -ENOSPC */
             kmemset(nodes[node].data + nodes[node].size, 0,

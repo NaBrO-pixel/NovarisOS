@@ -3047,6 +3047,22 @@ void kernel_main(uint32_t magic, void* mbi) {
         check("and the initrd's contents were carried into it",
               ramfs64_lookup("/dlllib64.dll") >= 0);
 
+        /* A program from the initrd stays executable once it has been
+         * mapped (Milestone 114). Mapping a file puts it in frames, and a
+         * program used to give up its one-piece copy then - the one
+         * execve reads - so after something in Steam's process tree
+         * mapped /usr/bin/wine, no new Wine program could start. */
+        {
+            int prog = ramfs64_lookup("/dynhello64");
+            uint64_t nf = 0;
+            const uint8_t* before = prog >= 0 ? (const uint8_t*)ramfs64_data(prog) : 0;
+            const uint64_t* fr = prog >= 0 ? ramfs64_frames(prog, ramfs64_size(prog), &nf) : 0;
+            const uint8_t* after = prog >= 0 ? (const uint8_t*)ramfs64_data(prog) : 0;
+            check("an initrd program can be mapped", fr != 0 && nf > 0);
+            check("and execve still has its image in one piece afterwards",
+                  before && after && after[0] == 0x7f && after[1] == 'E');
+        }
+
         /* A file bigger than any single heap block.
          *
          * The kernel heap is 256MB in total and ensure_capacity doubles
