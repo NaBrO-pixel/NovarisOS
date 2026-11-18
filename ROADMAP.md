@@ -11931,6 +11931,42 @@ the 32-bit tree's `make test` - all passing.
 - Signing in to Steam: this machine's proxy passes only HTTPS `CONNECT`,
   so Steam's connection managers stay out of reach (Milestone 113).
 
+## Milestone 115 - third-party Windows programs
+
+Milestones 113 and 114 ran Wine's own programs and Steam. This one runs
+software from elsewhere - downloaded, checked against its publisher's
+checksum where there is one, and kept out of the tree:
+
+| Program | From | Kind |
+|---|---|---|
+| PuTTY 0.85, 64-bit | the.earth.li, SHA-512 checked | a property-sheet dialog: tree view, edits, combo boxes |
+| PuTTY 0.85, 32-bit | the same | the same, through WoW64 (Milestone 114) |
+| SumatraPDF 3.5.2, 64-bit | sumatrapdfreader.org | a custom-drawn window and toolbar |
+| VLC 3.0.21, win64 | download.videolan.org, SHA-256 checked | Qt 5, 369 DLLs, 853 files, 183MB |
+
+`APPS64_DIR` stages a directory of programs as `/opt/apps`, and
+`tools/gui_apps_thirdparty.txt` runs them:
+
+    make -f Makefile.amd64 test-gui-apps GUI_APPS_LIST=tools/gui_apps_thirdparty.txt \
+        APPS64_DIR=<dir with putty64/, putty32/, sumatra/, vlc/>
+
+    PASS: 5 graphical program(s) opened their windows: settings putty64
+    putty32 sumatra vlc
+
+On the build machine first, through `winenovaris.drv` offscreen, then
+inside NovarisOS: all four open their windows and draw them as they do
+on the host (`docs-thirdparty.png`) - VLC's main window with its menus
+and controls, and its first-run privacy dialog over it. The 32-bit PuTTY
+is the first program from outside Wine to run 32-bit code on NovarisOS.
+No fatal signal in the run. Nothing needed changing in NovarisOS for any
+of them; what they exercise was built in Milestones 109-114.
+
+Not tried: Notepad++ and 7-Zip, whose downloads are on GitHub, which this
+build machine's GitHub access does not reach. VLC logs a missing
+`WinSCard.dll` for one plugin (smart-card ARIB descrambling), and has no
+audio device - Wine's `mmdevapi` finds no ALSA or PulseAudio, here or on
+NovarisOS.
+
 ## Where chrome.exe actually is from here
 
 Worth stating plainly, because the milestones are accumulating and the
