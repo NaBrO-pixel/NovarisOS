@@ -1,0 +1,12 @@
+# Third-party Windows programs on NovarisOS (Milestone 115):
+#     make -f Makefile.amd64 test-gui-apps GUI_APPS_LIST=tools/gui_apps_thirdparty.txt
+#         APPS64_DIR=<a directory with putty64/putty.exe, putty32/putty.exe,
+#                     sumatra/SumatraPDF.exe and vlc/ (VLC 3.0.21 win64)>
+# None of them is in this tree: PuTTY 0.85 (the.earth.li), SumatraPDF 3.5.2
+# (sumatrapdfreader.org), VLC 3.0.21 (download.videolan.org).
+# label|unix path of the .exe|arguments|window title (its start)|seconds
+settings|/usr/bin/x86_64-windows/regedit.exe|/S Z:\usr\share\novaris\novaris.reg|-|600
+putty64|/opt/apps/putty64/putty.exe||PuTTY Configuration|300
+putty32|/opt/apps/putty32/putty.exe||PuTTY Configuration|300
+sumatra|/opt/apps/sumatra/SumatraPDF.exe||SumatraPDF|420
+vlc|/opt/apps/vlc/vlc.exe||VLC media player|1200

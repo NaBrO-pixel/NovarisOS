@@ -402,6 +402,9 @@ GUI64_APPS ?=
 # An installed Steam client directory, staged as /opt/steam, with the
 # host's CA certificates so Wine's TLS can check Valve's servers.
 STEAM64_DIR ?=
+# A directory of other Windows programs, staged as /opt/apps (Milestone
+# 115): third-party software for test-gui-apps, kept out of the tree.
+APPS64_DIR ?=
 # The proxy the guest's programs use, as host:port the guest can reach
 # (10.0.2.2 is this machine), written into the settings GUI64_APPS
 # imports first - /usr/share/novaris/novaris.reg.
@@ -800,7 +803,7 @@ INITRD_CONFIG_TEXT = WINE64_INSTALL=$(WINE64_INSTALL) \
     WINE64_NTDLL=$(abspath $(WINE64_NTDLL)) \
     CHROMIUM64_DIR=$(CHROMIUM64_DIR) CHROMIUM64_FILES=$(CHROMIUM64_FILES) \
     PE_PAGEALIGN=$(PE_PAGEALIGN) MESA64_INSTALL=$(MESA64_INSTALL) \
-    WINE64_ALL_MODULES=$(WINE64_ALL_MODULES) GUI64_APPS=$(GUI64_APPS) STEAM64_DIR=$(STEAM64_DIR) GUI64_PROXY=$(GUI64_PROXY)
+    WINE64_ALL_MODULES=$(WINE64_ALL_MODULES) GUI64_APPS=$(GUI64_APPS) STEAM64_DIR=$(STEAM64_DIR) APPS64_DIR=$(APPS64_DIR) GUI64_PROXY=$(GUI64_PROXY)
 # Only when this make is building the image. It used to be rewritten by
 # every invocation, so compiling one object without the Wine and
 # Chromium variables - `make -f Makefile.amd64 build64/inet64.o` - wrote
@@ -934,6 +937,11 @@ $(INITRD): $(BUILD_DIR)/dlllib64.dll $(BUILD_DIR)/dynhello64.elf $(WINE64_DRIVER
 	    printf 'nameserver 10.0.2.3\n' > $(INITRD_STAGE)/etc/resolv.conf; \
 	    printf '127.0.0.1 localhost\n' > $(INITRD_STAGE)/etc/hosts; \
 	    echo "  initrd: graphical programs from $(GUI64_APPS), settings in novaris.reg"; \
+	 fi
+	@if [ -n "$(APPS64_DIR)" ]; then \
+	    mkdir -p $(INITRD_STAGE)/opt; \
+	    cp -a $(APPS64_DIR) $(INITRD_STAGE)/opt/apps; \
+	    echo "  initrd: Windows programs from $(APPS64_DIR)"; \
 	 fi
 	@if [ -n "$(STEAM64_DIR)" ]; then \
 	    mkdir -p $(INITRD_STAGE)/opt $(INITRD_STAGE)/etc/ssl/certs; \
@@ -1644,7 +1652,7 @@ GUI_PROXY_PORT ?= $(if $(STEAM64_DIR),$(shell printf '%s' "$$HTTPS_PROXY" | sed 
 # Every Wine module lives in the RAM filesystem, which 2G does not hold
 # with room to spare; Steam's client is another gigabyte and its
 # processes as much again.
-GUI_QEMU_RAM ?= $(if $(STEAM64_DIR),12G,4G)
+GUI_QEMU_RAM ?= $(if $(STEAM64_DIR),12G,$(if $(APPS64_DIR),6G,4G))
 .PHONY: test-gui-apps
 test-gui-apps:
 	@$(MAKE) -f Makefile.amd64 WINE64_INSTALL=1 WINE64_ALL_MODULES=1 GUI64_APPS=$(GUI_APPS_LIST) \
